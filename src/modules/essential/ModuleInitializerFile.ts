@@ -1,7 +1,7 @@
 import { unique } from "octagonal-wheels/collection";
 import { throttle } from "octagonal-wheels/function";
 import { EVENT_ON_UNRESOLVED_ERROR, eventHub } from "../../common/events.ts";
-import { BASE_IS_NEW, compareFileFreshness, EVEN, isValidPath, TARGET_IS_NEW } from "../../common/utils.ts";
+import { BASE_IS_NEW, EVEN, isValidPath, TARGET_IS_NEW } from "../../common/utils.ts";
 import {
     type FilePathWithPrefixLC,
     type FilePathWithPrefix,
@@ -308,7 +308,7 @@ export class ModuleInitializerFile extends AbstractModule {
             }
         }
 
-        const compareResult = compareFileFreshness(file, doc);
+        const compareResult = this.services.path.compareFileFreshness(file, doc);
         switch (compareResult) {
             case BASE_IS_NEW:
                 if (!this.services.vault.isFileSizeTooLarge(file.stat.size)) {

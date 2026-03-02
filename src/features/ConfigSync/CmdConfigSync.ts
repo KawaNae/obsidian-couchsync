@@ -53,9 +53,7 @@ import {
     PeriodicProcessor,
     disposeMemoObject,
     isCustomisationSyncMetadata,
-    isMarkedAsSameChanges,
     isPluginMetadata,
-    markChangesAreSame,
     memoIfNotExist,
     memoObject,
     retrieveMemoObject,
@@ -1308,7 +1306,7 @@ export class ConfigSync extends LiveSyncCommands {
                         eden: {},
                     };
                 } else {
-                    if (isMarkedAsSameChanges(prefixedFileName, [old.mtime, mtime + 1]) == EVEN) {
+                    if (this.services.path.isMarkedAsSameChanges(prefixedFileName, [old.mtime, mtime + 1]) == EVEN) {
                         this._log(
                             `STORAGE --> DB:${prefixedFileName}: (config) Skipped (Already checked the same)`,
                             LOG_LEVEL_DEBUG
@@ -1328,7 +1326,7 @@ export class ConfigSync extends LiveSyncCommands {
                             `STORAGE --> DB:${prefixedFileName}: (config) Skipped (the same content)`,
                             LOG_LEVEL_VERBOSE
                         );
-                        markChangesAreSame(prefixedFileName, old.mtime, mtime + 1);
+                        this.services.path.markChangesAreSame(prefixedFileName, old.mtime, mtime + 1);
                         return true;
                     }
                     saveData = {

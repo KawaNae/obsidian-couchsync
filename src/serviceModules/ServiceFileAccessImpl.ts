@@ -1,6 +1,5 @@
-import type { TAbstractFile, TFile, TFolder, Stat } from "@/deps";
-
 import { ServiceFileAccessBase } from "@lib/serviceModules/ServiceFileAccessBase";
+import type { ObsidianFileSystemAdapter } from "./FileSystemAdapters/ObsidianFileSystemAdapter";
 
-// For typechecking purpose
-export class ServiceFileAccessObsidian extends ServiceFileAccessBase<TAbstractFile, TFile, TFolder, Stat> {}
+// For now, this is just a re-export of ServiceFileAccess with the Obsidian-specific adapter type.
+export class ServiceFileAccessObsidian extends ServiceFileAccessBase<ObsidianFileSystemAdapter> {}

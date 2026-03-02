@@ -336,6 +336,7 @@ export default class ObsidianLiveSyncPlugin
             vaultService: this.services.vault,
             settingService: this.services.setting,
             APIService: this.services.API,
+            pathService: this.services.path,
         });
         const storageEventManager = new StorageEventManagerObsidian(this, this, {
             fileProcessing: this.services.fileProcessing,

@@ -257,20 +257,8 @@ export function requestToCouchDBWithCredentials(
 import { BASE_IS_NEW, EVEN, TARGET_IS_NEW } from "@lib/common/models/shared.const.symbols.ts";
 export { BASE_IS_NEW, EVEN, TARGET_IS_NEW };
 // Why 2000? : ZIP FILE Does not have enough resolution.
-const resolution = 2000;
-export function compareMTime(
-    baseMTime: number,
-    targetMTime: number
-): typeof BASE_IS_NEW | typeof TARGET_IS_NEW | typeof EVEN {
-    const truncatedBaseMTime = ~~(baseMTime / resolution) * resolution;
-    const truncatedTargetMTime = ~~(targetMTime / resolution) * resolution;
-    // Logger(`Resolution MTime ${truncatedBaseMTime} and ${truncatedTargetMTime} `, LOG_LEVEL_VERBOSE);
-    if (truncatedBaseMTime == truncatedTargetMTime) return EVEN;
-    if (truncatedBaseMTime > truncatedTargetMTime) return BASE_IS_NEW;
-    if (truncatedBaseMTime < truncatedTargetMTime) return TARGET_IS_NEW;
-    throw new Error("Unexpected error");
-}
-
+import { compareMTime } from "@lib/common/utils.ts";
+export { compareMTime };
 function getKey(file: AnyEntry | string | UXFileInfoStub) {
     const key = typeof file == "string" ? file : stripAllPrefixes(file.path);
     return key;

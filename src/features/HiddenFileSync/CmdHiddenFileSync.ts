@@ -29,9 +29,7 @@ import {
 } from "../../lib/src/common/utils.ts";
 import {
     compareMTime,
-    unmarkChanges,
     isInternalMetadata,
-    markChangesAreSame,
     PeriodicProcessor,
     TARGET_IS_NEW,
     scheduleTask,
@@ -362,13 +360,13 @@ export class HiddenFileSync extends LiveSyncCommands {
         const dbMTime = getComparingMTime(db);
         const storageMTime = getComparingMTime(stat);
         if (dbMTime == 0 || storageMTime == 0) {
-            unmarkChanges(path);
+            this.services.path.unmarkChanges(path);
         } else {
-            markChangesAreSame(path, getComparingMTime(db), getComparingMTime(stat));
+            this.services.path.markChangesAreSame(path, getComparingMTime(db), getComparingMTime(stat));
         }
     }
     updateLastProcessedDeletion(path: FilePath, db: MetaEntry | LoadedEntry | false) {
-        unmarkChanges(path);
+        this.services.path.unmarkChanges(path);
         if (db) this.updateLastProcessedDatabase(path, db);
         this.updateLastProcessedFile(path, this.statToKey(null));
     }
