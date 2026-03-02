@@ -3,6 +3,10 @@ name: unit-ci
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+      - beta
 
 permissions:
   contents: read
