@@ -267,32 +267,60 @@ export class ModuleMigration extends AbstractModule {
             return false;
         }
         if (this.settings.isConfigured) {
-            if (!(await this.hasCompromisedChunks())) {
-                return false;
-            }
-            if (!(await this.hasIncompleteDocs())) {
-                return false;
-            }
-            if (!(await this.migrateUsingDoctor(false))) {
-                return false;
-            }
-            // await this.migrationCheck();
+            // Check for compromised chunks (Notice only, no dialog)
+            await this.checkCompromisedChunksQuiet();
+            // Check for incomplete docs (Notice only, no dialog)
+            await this.checkIncompleteDocsQuiet();
+            // Silent setting migration
             await this.migrateDisableBulkSend();
         }
         if (!this.settings.isConfigured) {
-            // if (!(await this.initialMessage()) || !(await this.askAgainForSetupURI())) {
-            //     this._log($msg("moduleMigration.logSetupCancelled"), LOG_LEVEL_NOTICE);
-            //     return false;
-            // }
-            if (!(await this.initialMessage())) {
-                this._log($msg("moduleMigration.logSetupCancelled"), LOG_LEVEL_NOTICE);
-                return false;
-            }
-            if (!(await this.migrateUsingDoctor(true))) {
-                return false;
-            }
+            await this.initialMessage();
         }
         return true;
+    }
+
+    /**
+     * Check for compromised chunks and notify via Notice (no dialog).
+     */
+    private async checkCompromisedChunksQuiet(): Promise<void> {
+        if (!this.settings.encrypt) return;
+        const localCompromised = await countCompromisedChunks(this.localDatabase.localDatabase);
+        if (localCompromised === false || localCompromised === 0) return;
+        Logger(
+            `Found ${localCompromised} compromised chunks in local database. Run Doctor from Maintenance tab to fix.`,
+            LOG_LEVEL_NOTICE
+        );
+    }
+
+    /**
+     * Check for incomplete docs and notify via Notice (no dialog).
+     */
+    private async checkIncompleteDocsQuiet(): Promise<void> {
+        const incompleteDocsChecked = (await this.core.kvDB.get<boolean>("checkIncompleteDocs")) || false;
+        if (incompleteDocsChecked) return;
+
+        let incompleteCount = 0;
+        for await (const metaDoc of this.localDatabase.findAllNormalDocs({ conflicts: true })) {
+            const path = this.getPath(metaDoc);
+            if (!isValidPath(path)) continue;
+            if (!(await this.services.vault.isTargetFile(path))) continue;
+            if (!isMetaEntry(metaDoc)) continue;
+            const doc = await this.localDatabase.getDBEntryFromMeta(metaDoc);
+            if (!doc || !isLoadedEntry(doc)) continue;
+            if (isDeletedEntry(doc)) continue;
+            const dataContent = readAsBlob(doc);
+            if (doc.size !== dataContent.size) {
+                incompleteCount++;
+            }
+        }
+        await this.core.kvDB.set("checkIncompleteDocs", true);
+        if (incompleteCount > 0) {
+            Logger(
+                `Found ${incompleteCount} files with size mismatches. Check Maintenance tab for repair options.`,
+                LOG_LEVEL_NOTICE
+            );
+        }
     }
     _everyOnLayoutReady(): Promise<boolean> {
         eventHub.onEvent(EVENT_REQUEST_RUN_DOCTOR, async (reason) => {
