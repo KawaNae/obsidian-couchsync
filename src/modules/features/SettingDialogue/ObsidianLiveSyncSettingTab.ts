@@ -36,13 +36,13 @@ import {
     type OnSavedHandler,
     type OnUpdateFunc,
     type OnUpdateResult,
-    type PageFunctions,
     type UpdateFunction,
 } from "./SettingPane.ts";
 import { tabSetup } from "./tabs/SetupTab.ts";
 import { tabSync } from "./tabs/SyncTab.ts";
 import { tabFiles } from "./tabs/FilesTab.ts";
-import { tabAdvanced } from "./tabs/AdvancedTab.ts";
+import { tabDatabase } from "./tabs/DatabaseTab.ts";
+import { tabDisplay } from "./tabs/DisplayTab.ts";
 import { tabMaintenance } from "./tabs/MaintenanceTab.ts";
 
 export class ObsidianLiveSyncSettingTab extends PluginSettingTab {
@@ -589,23 +589,13 @@ export class ObsidianLiveSyncSettingTab extends PluginSettingTab {
         const nav = wrapper.createDiv("cs-settings__nav");
         const content = wrapper.createDiv("cs-settings__content");
 
-        const addPanel = (
-            parentEl: HTMLElement,
-            title: string,
-            callback?: (el: HTMLDivElement) => void,
-            func?: OnUpdateFunc,
-        ) => {
-            const el = this.createEl(parentEl, "div", { text: "" }, callback, func);
-            this.createEl(el, "h4", { text: title, cls: "sls-setting-panel-title" });
-            return Promise.resolve(el);
-        };
-
         const tabs = [
-            { id: "setup",       label: "Setup",       render: (el: HTMLElement) => tabSetup.call(this, el, { addPane: undefined as any, addPanel }) },
-            { id: "sync",        label: "Sync",        render: (el: HTMLElement) => tabSync.call(this, el, { addPane: undefined as any, addPanel }) },
-            { id: "files",       label: "Files",       render: (el: HTMLElement) => tabFiles.call(this, el, { addPane: undefined as any, addPanel }) },
-            { id: "advanced",    label: "Advanced",    render: (el: HTMLElement) => tabAdvanced.call(this, el, { addPane: undefined as any, addPanel }) },
-            { id: "maintenance", label: "Maintenance", render: (el: HTMLElement) => tabMaintenance.call(this, el, { addPanel } as any) },
+            { id: "setup",       label: "Setup",       render: (el: HTMLElement) => tabSetup.call(this, el) },
+            { id: "sync",        label: "Sync",        render: (el: HTMLElement) => tabSync.call(this, el) },
+            { id: "files",       label: "Files",       render: (el: HTMLElement) => tabFiles.call(this, el) },
+            { id: "database",    label: "Database",    render: (el: HTMLElement) => tabDatabase.call(this, el) },
+            { id: "display",     label: "Display",     render: (el: HTMLElement) => tabDisplay.call(this, el) },
+            { id: "maintenance", label: "Maintenance", render: (el: HTMLElement) => tabMaintenance.call(this, el) },
         ];
 
         tabs.forEach((tab) => {
@@ -621,7 +611,7 @@ export class ObsidianLiveSyncSettingTab extends PluginSettingTab {
             tab.render(panel);
         });
 
-        const selectedTab = this.selectedScreen || (this.isAnySyncEnabled() ? "general" : "setup");
+        const selectedTab = this.selectedScreen || (this.isAnySyncEnabled() ? "sync" : "setup");
         this.activateTab(wrapper, selectedTab);
 
         nav.addEventListener("click", (e) => {

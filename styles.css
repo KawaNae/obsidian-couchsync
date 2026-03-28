@@ -95,13 +95,6 @@
     --sls-log-text: "";
 }
 
-.sls-troubleshoot-preview {
-    max-width: max-content;
-}
-
-.sls-troubleshoot-preview img {
-    max-width: 100%;
-}
 
 /* ─── Tab Navigation (cs-settings) ──────────────────────── */
 
@@ -155,6 +148,17 @@
     overflow-y: auto;
     border-top: 1px solid var(--background-modifier-border);
     padding: 16px 0 0;
+}
+
+/* Section headers within tabs */
+.cs-settings .cs-settings__panel .setting-section-header {
+    margin-top: 20px;
+    margin-bottom: 4px;
+    font-size: var(--font-ui-medium);
+}
+
+.cs-settings .cs-settings__panel .setting-section-header:first-child {
+    margin-top: 4px;
 }
 
 body {
@@ -266,13 +270,6 @@ body {
     border-radius: 4px;
 }
 
-.isWizard .wizardHidden {
-    display: none;
-}
-
-.sls-setting:not(.isWizard) .wizardOnly {
-    display: none;
-}
 
 .sls-item-dirty::before {
     content: "✏";
@@ -427,18 +424,6 @@ div.workspace-leaf-content[data-type=bases]  .livesync-status {
 
 
 
-.sls-setting-panel-title {
-    position: sticky;
-    font-size: medium;
-    top: 2.5em;
-    background-color: var(--background-secondary-alt);
-    border-radius: 10px;
-    padding: 0.5em 1.0em;
-}
-
-.active-pane .sls-setting-panel-title {
-    border: 1px solid var(--interactive-accent);
-}
 
 .sls-dialogue-note-wrapper {
     display: flex;
