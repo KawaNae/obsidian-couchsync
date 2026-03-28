@@ -59,7 +59,7 @@ const context = await esbuild.context({
         "@lezer/common",
         "@lezer/highlight",
         "@lezer/lr",
-        ...builtins,
+        // Note: NOT including builtins — pouchdb-browser needs 'events' polyfill bundled for mobile
     ],
     format: "cjs",
     target: "es2022",
