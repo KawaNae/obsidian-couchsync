@@ -1,4 +1,5 @@
-import PouchDB from "pouchdb-browser";
+import * as PouchDBModule from "pouchdb-browser";
+const PouchDB = (PouchDBModule as any).default || PouchDBModule;
 import type { CouchSyncDoc, FileDoc, ChunkDoc } from "../types.ts";
 
 export class LocalDB {
