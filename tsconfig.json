@@ -10,7 +10,7 @@
         "importHelpers": false,
         "alwaysStrict": true,
         "allowImportingTsExtensions": true,
-        "verbatimModuleSyntax": true,
+        "esModuleInterop": true,
         "noEmit": true,
         "lib": ["ES2018", "DOM", "ES2021.WeakRef"],
         "strictBindCallApply": true,
