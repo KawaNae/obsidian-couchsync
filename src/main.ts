@@ -63,11 +63,7 @@ export default class CouchSyncPlugin extends Plugin {
         // Start on layout ready
         this.app.workspace.onLayoutReady(() => {
             this.changeTracker.start();
-
-            if (this.settings.isConfigured) {
-                this.replicator.start();
-                this.initialScan();
-            }
+            this.startSync();
         });
 
         // Commands
@@ -87,6 +83,13 @@ export default class CouchSyncPlugin extends Plugin {
     async loadSettings(): Promise<void> {
         const data = await this.loadData();
         this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
+    }
+
+    async startSync(): Promise<void> {
+        if (!this.settings.isConfigured) return;
+        this.replicator.stop();
+        this.replicator.start();
+        await this.initialScan();
     }
 
     async saveSettings(): Promise<void> {

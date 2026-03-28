@@ -6,6 +6,7 @@ interface ConnectionTabDeps {
     getSettings: () => CouchSyncSettings;
     updateSettings: (patch: Partial<CouchSyncSettings>) => Promise<void>;
     replicator: Replicator;
+    startSync: () => Promise<void>;
 }
 
 export function renderConnectionTab(el: HTMLElement, deps: ConnectionTabDeps): void {
@@ -72,7 +73,8 @@ export function renderConnectionTab(el: HTMLElement, deps: ConnectionTabDeps): v
                 } else {
                     btn.setButtonText("Success!");
                     await deps.updateSettings({ isConfigured: true });
-                    new Notice("Connection successful!", 3000);
+                    await deps.startSync();
+                    new Notice("Connected! Sync started.", 3000);
                 }
                 setTimeout(() => {
                     btn.setButtonText("Test");

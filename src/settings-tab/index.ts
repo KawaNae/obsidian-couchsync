@@ -53,6 +53,7 @@ export class CouchSyncSettingTab extends PluginSettingTab {
             renderConnectionTab(connectionPanel, {
                 ...settingsDeps,
                 replicator: this.plugin.replicator,
+                startSync: () => this.plugin.startSync(),
             });
         }
 
