@@ -1,6 +1,4 @@
 {
-    "extends": "@tsconfig/svelte/tsconfig.json",
-    "inlineSourceMap": true,
     "compilerOptions": {
         "baseUrl": ".",
         "module": "ESNext",
@@ -8,22 +6,19 @@
         "allowJs": true,
         "noImplicitAny": true,
         "moduleResolution": "bundler",
-        "types": ["svelte", "node"],
-        // "importsNotUsedAsValues": "error",
+        "types": ["node"],
         "importHelpers": false,
         "alwaysStrict": true,
         "allowImportingTsExtensions": true,
         "verbatimModuleSyntax": true,
-        "noImplicitOverride": true,
         "noEmit": true,
-        "lib": ["es2018", "DOM", "ES5", "ES6", "ES7", "es2019.array", "ES2021.WeakRef", "ES2020.BigInt", "ESNext.Intl"],
+        "lib": ["ES2018", "DOM", "ES2021.WeakRef"],
         "strictBindCallApply": true,
         "strictFunctionTypes": true,
         "paths": {
-            "@/*": ["src/*"],
-            "@lib/*": ["src/lib/src/*"]
+            "@/*": ["src/*"]
         }
     },
-    "include": ["**/*.ts", "test/**/*.test.ts", "**/*.unit.spec.ts"],
-    "exclude": ["pouchdb-browser-webpack", "utils", "src/apps", "src/**/*.test.ts", "**/_test/**"]
+    "include": ["src/**/*.ts"],
+    "exclude": ["node_modules"]
 }
