@@ -3,7 +3,6 @@ import { normalizePath } from "../../deps.ts";
 import {
     FlagFilesHumanReadable,
     FlagFilesOriginal,
-    REMOTE_MINIO,
     TweakValuesShouldMatchedTemplate,
     type ObsidianLiveSyncSettings,
 } from "../../lib/src/common/types.ts";
@@ -185,7 +184,7 @@ export class ModuleRedFlag extends AbstractModule {
             this.services.appLifecycle.performRestart();
             return false;
         }
-        const { extra } = method;
+        const { extra } = method as { extra: any };
         await this.adjustSettingToRemoteIfNeeded(extra, this.settings);
         return await this.processVaultInitialisation(async () => {
             await this.core.rebuilder.$rebuildEverything();
@@ -207,9 +206,8 @@ export class ModuleRedFlag extends AbstractModule {
             this.services.appLifecycle.performRestart();
             return false;
         }
-        const { vault, extra } = method;
-        // If remote is MinIO, makeLocalChunkBeforeSync is not available. (because no-deduplication on sending).
-        const makeLocalChunkBeforeSyncAvailable = this.settings.remoteType !== REMOTE_MINIO;
+        const { vault, extra } = method as { vault: any; extra: any };
+        const makeLocalChunkBeforeSyncAvailable = true;
         const mapVaultStateToAction = {
             identical: {
                 // If both are identical, no need to make local files/chunks before sync,
@@ -239,7 +237,7 @@ export class ModuleRedFlag extends AbstractModule {
         return await this.processVaultInitialisation(async () => {
             await this.adjustSettingToRemoteIfNeeded(extra, this.settings);
             // Okay, proceed to fetch everything.
-            const { makeLocalChunkBeforeSync, makeLocalFilesBeforeSync } = mapVaultStateToAction[vault];
+            const { makeLocalChunkBeforeSync, makeLocalFilesBeforeSync } = mapVaultStateToAction[vault as keyof typeof mapVaultStateToAction];
             this._log(
                 `Fetching everything with settings: makeLocalChunkBeforeSync=${makeLocalChunkBeforeSync}, makeLocalFilesBeforeSync=${makeLocalFilesBeforeSync}`,
                 LOG_LEVEL_INFO

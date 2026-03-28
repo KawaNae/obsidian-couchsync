@@ -1,5 +1,5 @@
 import { delay } from "octagonal-wheels/promises";
-import { LOG_LEVEL_NOTICE, REMOTE_MINIO, type FilePathWithPrefix } from "src/lib/src/common/types";
+import { LOG_LEVEL_NOTICE, type FilePathWithPrefix } from "src/lib/src/common/types";
 import { shareRunningResult } from "octagonal-wheels/concurrency/lock";
 import { AbstractObsidianModule } from "../AbstractObsidianModule";
 
@@ -431,7 +431,6 @@ Line4:D`;
         try {
             this._log(`Starting Test`);
             await this.testBasicEvent(isLeader);
-            if (this.settings.remoteType == REMOTE_MINIO) await this.testBasicLive(isLeader);
         } catch (e) {
             this._log(e);
             this._log(`Error: ${e}`);

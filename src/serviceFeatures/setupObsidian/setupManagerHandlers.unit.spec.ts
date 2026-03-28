@@ -1,7 +1,7 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
 import { eventHub } from "@lib/hub/hub";
-import { EVENT_REQUEST_OPEN_P2P_SETTINGS, EVENT_REQUEST_OPEN_SETUP_URI } from "@lib/events/coreEvents";
-import { openP2PSettings, openSetupURI, useSetupManagerHandlersFeature } from "./setupManagerHandlers";
+import { EVENT_REQUEST_OPEN_SETUP_URI } from "@lib/events/coreEvents";
+import { openSetupURI, useSetupManagerHandlersFeature } from "./setupManagerHandlers";
 
 vi.mock("@/modules/features/SetupManager", () => {
     return {
@@ -27,23 +27,6 @@ describe("setupObsidian/setupManagerHandlers", () => {
         expect(setupManager.onUseSetupURI).toHaveBeenCalledWith("unknown");
     });
 
-    it("openP2PSettings should delegate to SetupManager.onP2PManualSetup", async () => {
-        const settings = { x: 1 };
-        const host = {
-            services: {
-                setting: {
-                    currentSettings: vi.fn(() => settings),
-                },
-            },
-        } as any;
-        const setupManager = {
-            onP2PManualSetup: vi.fn(async () => await Promise.resolve(true)),
-        } as any;
-
-        await openP2PSettings(host, setupManager);
-        expect(setupManager.onP2PManualSetup).toHaveBeenCalledWith("unknown", settings, false);
-    });
-
     it("useSetupManagerHandlersFeature should register onLoaded handler that wires command and events", async () => {
         const addHandler = vi.fn();
         const addCommand = vi.fn();
@@ -66,7 +49,6 @@ describe("setupObsidian/setupManagerHandlers", () => {
         } as any;
         const setupManager = {
             onUseSetupURI: vi.fn(async () => await Promise.resolve(true)),
-            onP2PManualSetup: vi.fn(async () => await Promise.resolve(true)),
         } as any;
 
         useSetupManagerHandlersFeature(host, setupManager);
@@ -82,6 +64,5 @@ describe("setupObsidian/setupManagerHandlers", () => {
             })
         );
         expect(onEventSpy).toHaveBeenCalledWith(EVENT_REQUEST_OPEN_SETUP_URI, expect.any(Function));
-        expect(onEventSpy).toHaveBeenCalledWith(EVENT_REQUEST_OPEN_P2P_SETTINGS, expect.any(Function));
     });
 });

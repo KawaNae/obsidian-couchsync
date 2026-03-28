@@ -7,7 +7,6 @@ import {
     LOG_LEVEL_VERBOSE,
     type LoadedEntry,
     REMOTE_COUCHDB,
-    REMOTE_MINIO,
     type MetaEntry,
     type FilePath,
     DEFAULT_SETTINGS,
@@ -108,9 +107,6 @@ export function paneHatch(this: ObsidianLiveSyncSettingTab, paneEl: HTMLElement,
                                 error: "Requesting information from the remote CouchDB has failed. If you are using IBM Cloudant, this is normal behaviour.",
                             };
                         }
-                    } else if (this.editingSettings.remoteType == REMOTE_MINIO) {
-                        responseConfig = { error: "Object Storage Synchronisation" };
-                        //
                     }
                     const defaultKeys = Object.keys(DEFAULT_SETTINGS) as (keyof ObsidianLiveSyncSettings)[];
                     const pluginConfig = JSON.parse(JSON.stringify(this.editingSettings)) as ObsidianLiveSyncSettings;

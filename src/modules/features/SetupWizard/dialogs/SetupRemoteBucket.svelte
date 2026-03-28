@@ -70,7 +70,7 @@
         const trialRemoteSetting: ObsidianLiveSyncSettings = {
             ...DEFAULT_SETTINGS,
             ...PREFERRED_JOURNAL_SYNC,
-            remoteType: RemoteTypes.REMOTE_MINIO,
+            remoteType: RemoteTypes.REMOTE_COUCHDB,
             ...trialSettings,
         };
         return trialRemoteSetting;

@@ -75,11 +75,7 @@ export class ModuleSetupObsidian extends AbstractModule {
         eventHub.onEvent(EVENT_REQUEST_OPEN_SETUP_URI, () => fireAndForget(() => this.command_openSetupURI()));
         eventHub.onEvent(EVENT_REQUEST_COPY_SETUP_URI, () => fireAndForget(() => this.command_copySetupURI()));
         eventHub.onEvent(EVENT_REQUEST_SHOW_SETUP_QR, () => fireAndForget(() => this.encodeQR()));
-        eventHub.onEvent(EVENT_REQUEST_OPEN_P2P_SETTINGS, () =>
-            fireAndForget(() => {
-                return this._setupManager.onP2PManualSetup(UserMode.Update, this.settings, false);
-            })
-        );
+        // P2P settings removed in CouchDB-only fork
         return Promise.resolve(true);
     }
     async encodeQR() {

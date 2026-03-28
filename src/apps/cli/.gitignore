@@ -1,5 +1,0 @@
-.livesync
-test/*
-!test/*.sh
-node_modules
-.*.json

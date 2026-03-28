@@ -4,8 +4,6 @@ import {
     LOG_LEVEL_NOTICE,
     LOG_LEVEL_VERBOSE,
     REMOTE_COUCHDB,
-    REMOTE_MINIO,
-    REMOTE_P2P,
 } from "../../lib/src/common/types.ts";
 import { generatePatchObj, isObjectDifferent } from "../../lib/src/common/utils.ts";
 import Intro from "./SetupWizard/dialogs/Intro.svelte";
@@ -18,8 +16,6 @@ import OutroExistingUser from "./SetupWizard/dialogs/OutroExistingUser.svelte";
 import OutroAskUserMode from "./SetupWizard/dialogs/OutroAskUserMode.svelte";
 import SetupRemote from "./SetupWizard/dialogs/SetupRemote.svelte";
 import SetupRemoteCouchDB from "./SetupWizard/dialogs/SetupRemoteCouchDB.svelte";
-import SetupRemoteBucket from "./SetupWizard/dialogs/SetupRemoteBucket.svelte";
-import SetupRemoteP2P from "./SetupWizard/dialogs/SetupRemoteP2P.svelte";
 import SetupRemoteE2EE from "./SetupWizard/dialogs/SetupRemoteE2EE.svelte";
 import { decodeSettingsFromQRCodeData } from "../../lib/src/API/processSetting.ts";
 import { AbstractModule } from "../AbstractModule.ts";
@@ -123,7 +119,7 @@ export class SetupManager extends AbstractModule {
             return false;
         }
         this._log("Setup URI dialog closed.", LOG_LEVEL_VERBOSE);
-        return await this.onConfirmApplySettingsFromWizard(newSetting, userMode);
+        return await this.onConfirmApplySettingsFromWizard(newSetting as ObsidianLiveSyncSettings, userMode);
     }
 
     /**
@@ -145,57 +141,9 @@ export class SetupManager extends AbstractModule {
             this._log("Manual configuration cancelled.", LOG_LEVEL_NOTICE);
             return await this.onOnboard(userMode);
         }
-        const newSetting = { ...baseSetting, ...couchConf } as ObsidianLiveSyncSettings;
+        const newSetting = { ...baseSetting, ...(couchConf as object) } as ObsidianLiveSyncSettings;
         if (activate) {
             newSetting.remoteType = REMOTE_COUCHDB;
-        }
-        return await this.onConfirmApplySettingsFromWizard(newSetting, userMode, activate);
-    }
-
-    /**
-     * Handles manual setup for S3-compatible bucket
-     * @param userMode
-     * @param currentSetting
-     * @param activate Whether to activate the Bucket as remote type
-     * @returns Promise that resolves to true if setup completed successfully, false otherwise
-     */
-    async onBucketManualSetup(
-        userMode: UserMode,
-        currentSetting: ObsidianLiveSyncSettings,
-        activate = true
-    ): Promise<boolean> {
-        const bucketConf = await this.dialogManager.openWithExplicitCancel(SetupRemoteBucket, currentSetting);
-        if (bucketConf === "cancelled") {
-            this._log("Manual configuration cancelled.", LOG_LEVEL_NOTICE);
-            return await this.onOnboard(userMode);
-        }
-        const newSetting = { ...currentSetting, ...bucketConf } as ObsidianLiveSyncSettings;
-        if (activate) {
-            newSetting.remoteType = REMOTE_MINIO;
-        }
-        return await this.onConfirmApplySettingsFromWizard(newSetting, userMode, activate);
-    }
-
-    /**
-     * Handles manual setup for P2P
-     * @param userMode
-     * @param currentSetting
-     * @param activate Whether to activate the P2P as remote type (as P2P Only setup)
-     * @returns Promise that resolves to true if setup completed successfully, false otherwise
-     */
-    async onP2PManualSetup(
-        userMode: UserMode,
-        currentSetting: ObsidianLiveSyncSettings,
-        activate = true
-    ): Promise<boolean> {
-        const p2pConf = await this.dialogManager.openWithExplicitCancel(SetupRemoteP2P, currentSetting);
-        if (p2pConf === "cancelled") {
-            this._log("Manual configuration cancelled.", LOG_LEVEL_NOTICE);
-            return await this.onOnboard(userMode);
-        }
-        const newSetting = { ...currentSetting, ...p2pConf } as ObsidianLiveSyncSettings;
-        if (activate) {
-            newSetting.remoteType = REMOTE_P2P;
         }
         return await this.onConfirmApplySettingsFromWizard(newSetting, userMode, activate);
     }
@@ -214,7 +162,7 @@ export class SetupManager extends AbstractModule {
         }
         const newSetting = {
             ...currentSetting,
-            ...e2eeConf,
+            ...(e2eeConf as object),
         } as ObsidianLiveSyncSettings;
         return await this.onConfirmApplySettingsFromWizard(newSetting, userMode);
     }
@@ -233,7 +181,7 @@ export class SetupManager extends AbstractModule {
         }
         const currentSetting = {
             ...originalSetting,
-            ...e2eeConf,
+            ...(e2eeConf as object),
         } as ObsidianLiveSyncSettings;
         return await this.onSelectServer(currentSetting, userMode);
     }
@@ -248,10 +196,6 @@ export class SetupManager extends AbstractModule {
         const method = await this.dialogManager.openWithExplicitCancel(SetupRemote);
         if (method === "couchdb") {
             return await this.onCouchDBManualSetup(userMode, currentSetting, true);
-        } else if (method === "bucket") {
-            return await this.onBucketManualSetup(userMode, currentSetting, true);
-        } else if (method === "p2p") {
-            return await this.onP2PManualSetup(userMode, currentSetting, true);
         } else if (method === "cancelled") {
             this._log("Manual configuration cancelled.", LOG_LEVEL_NOTICE);
             if (userMode !== UserMode.Unknown) {

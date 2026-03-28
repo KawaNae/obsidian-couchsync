@@ -9,9 +9,7 @@ export async function openSetupURI(setupManager: SetupManager) {
     await setupManager.onUseSetupURI(UserMode.Unknown);
 }
 
-export async function openP2PSettings(host: SetupFeatureHost, setupManager: SetupManager) {
-    return await setupManager.onP2PManualSetup(UserMode.Update, host.services.setting.currentSettings(), false);
-}
+// P2P settings removed in CouchDB-only fork
 
 export function useSetupManagerHandlersFeature(
     host: NecessaryServices<"API" | "UI" | "setting" | "appLifecycle", never>,
@@ -25,9 +23,6 @@ export function useSetupManagerHandlersFeature(
         });
 
         eventHub.onEvent(EVENT_REQUEST_OPEN_SETUP_URI, () => fireAndForget(() => openSetupURI(setupManager)));
-        eventHub.onEvent(EVENT_REQUEST_OPEN_P2P_SETTINGS, () =>
-            fireAndForget(() => openP2PSettings(host, setupManager))
-        );
 
         return Promise.resolve(true);
     });

@@ -30,7 +30,6 @@ import { LOG_LEVEL_NOTICE, setGlobalLogFunction } from "octagonal-wheels/common/
 import { LogPaneView, VIEW_TYPE_LOG } from "./Log/LogPaneView.ts";
 import { serialized } from "octagonal-wheels/concurrency/lock";
 import { $msg } from "src/lib/src/common/i18n.ts";
-import { P2PLogCollector } from "@/lib/src/replication/trystero/P2PLogCollector.ts";
 import type { LiveSyncCore } from "../../main.ts";
 import { LiveSyncError } from "@lib/common/LSError.ts";
 import { isValidPath } from "@/common/utils.ts";
@@ -79,7 +78,6 @@ export class ModuleLog extends AbstractObsidianModule {
     statusLog = reactiveSource("");
     activeFileStatus = reactiveSource("");
     notifies: { [key: string]: { notice: Notice; count: number } } = {};
-    p2pLogCollector = new P2PLogCollector();
 
     observeForLogs() {
         const padSpaces = `\u{2007}`.repeat(10);
@@ -185,9 +183,8 @@ export class ModuleLog extends AbstractObsidianModule {
             const queued = queueCountLabel();
             const waiting = waitingLabel();
             const networkActivity = requestingStatLabel();
-            const p2p = this.p2pLogCollector.p2pReplicationLine.value;
             return {
-                message: `${networkActivity}Sync: ${w} ↑ ${sent}${pushLast} ↓ ${arrived}${pullLast}${waiting}${queued}${p2p == "" ? "" : "\n" + p2p}`,
+                message: `${networkActivity}Sync: ${w} ↑ ${sent}${pushLast} ↓ ${arrived}${pullLast}${waiting}${queued}`,
             };
         });
 

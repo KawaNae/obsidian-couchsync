@@ -39,9 +39,6 @@ import { useSetupProtocolFeature } from "./serviceFeatures/setupObsidian/setupPr
 import { useSetupQRCodeFeature } from "@lib/serviceFeatures/setupObsidian/qrCode";
 import { useSetupURIFeature } from "@lib/serviceFeatures/setupObsidian/setupUri";
 import { useSetupManagerHandlersFeature } from "./serviceFeatures/setupObsidian/setupManagerHandlers.ts";
-import { useP2PReplicatorFeature } from "@lib/replication/trystero/useP2PReplicatorFeature.ts";
-import { useP2PReplicatorCommands } from "@lib/replication/trystero/useP2PReplicatorCommands.ts";
-import { useP2PReplicatorUI } from "./serviceFeatures/useP2PReplicatorUI.ts";
 export type LiveSyncCore = LiveSyncBaseCore<ObsidianServiceContext, LiveSyncCommands>;
 export default class ObsidianLiveSyncPlugin extends Plugin {
     core: LiveSyncCore;
@@ -181,13 +178,6 @@ export default class ObsidianLiveSyncPlugin extends Plugin {
                 useOfflineScanner(core);
                 useRedFlagFeatures(core);
                 useCheckRemoteSize(core);
-                // p2pReplicatorResult = useP2PReplicator(core, [
-                //     VIEW_TYPE_P2P,
-                //     (leaf: any) => new P2PReplicatorPaneView(leaf, core, p2pReplicatorResult!),
-                // ]);
-                const replicator = useP2PReplicatorFeature(core);
-                useP2PReplicatorCommands(core, replicator);
-                useP2PReplicatorUI(core, core, replicator);
             }
         );
     }

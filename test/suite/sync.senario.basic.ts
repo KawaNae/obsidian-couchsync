@@ -3,7 +3,7 @@
 // and edge, resolving conflicts, etc. will be covered in separate test suites.
 import { afterAll, beforeAll, describe, expect, it, test } from "vitest";
 import { generateHarness, waitForIdle, waitForReady, type LiveSyncHarness } from "../harness/harness";
-import { RemoteTypes, type FilePath, type ObsidianLiveSyncSettings } from "@/lib/src/common/types";
+import { type FilePath, type ObsidianLiveSyncSettings } from "@/lib/src/common/types";
 
 import {
     DummyFileSourceInisialised,
@@ -14,7 +14,6 @@ import {
 } from "../utils/dummyfile";
 import { checkStoredFileInDB, testFileRead, testFileWrite } from "./db_common";
 import { delay } from "@/lib/src/common/utils";
-import { commands } from "vitest/browser";
 import { closeReplication, performReplication, prepareRemote } from "./sync_common";
 import type { DataWriteOptions } from "@/deps.ts";
 
@@ -29,28 +28,10 @@ function generateName(prefix: string, type: string, ext: string, size: number) {
 export function syncBasicCase(label: string, { setting, fileOptions }: TestOptions) {
     describe("Replication Suite Tests - " + label, () => {
         const nameFile = (type: string, ext: string, size: number) => generateName("sync-test", type, ext, size);
-        let serverPeerName = "";
-        // TODO: Harness disposal may broke the event loop of P2P replication
-        // so we keep the harnesses alive until all tests are done.
-        // It may trystero's somethong, or not.
         let harnessUpload: LiveSyncHarness;
         let harnessDownload: LiveSyncHarness;
         beforeAll(async () => {
             await DummyFileSourceInisialised;
-            if (setting.remoteType === RemoteTypes.REMOTE_P2P) {
-                // await commands.closeWebPeer();
-                serverPeerName = "t-" + Date.now();
-                setting.P2P_AutoAcceptingPeers = serverPeerName;
-                setting.P2P_AutoSyncPeers = serverPeerName;
-                setting.P2P_DevicePeerName = "client-" + Date.now();
-                await commands.openWebPeer(setting, serverPeerName);
-            }
-        });
-        afterAll(async () => {
-            if (setting.remoteType === RemoteTypes.REMOTE_P2P) {
-                await commands.closeWebPeer();
-                // await closeP2PReplicatorConnections(harnessUpload);
-            }
         });
 
         describe("Remote Database Initialization", () => {
@@ -80,13 +61,11 @@ export function syncBasicCase(label: string, { setting, fileOptions }: TestOptio
             });
             it("should be prepared for replication", async () => {
                 await waitForReady(harnessInit);
-                if (setting.remoteType !== RemoteTypes.REMOTE_P2P) {
-                    const status = await harnessInit.plugin.core.services.replicator
-                        .getActiveReplicator()
-                        ?.getRemoteStatus(sync_test_setting_init);
-                    console.log("Connected devices after reset:", status);
-                    expect(status).not.toBeFalsy();
-                }
+                const status = await harnessInit.plugin.core.services.replicator
+                    .getActiveReplicator()
+                    ?.getRemoteStatus(sync_test_setting_init);
+                console.log("Connected devices after reset:", status);
+                expect(status).not.toBeFalsy();
             });
         });
 
@@ -98,11 +77,6 @@ export function syncBasicCase(label: string, { setting, fileOptions }: TestOptio
             beforeAll(async () => {
                 const vaultName = "TestVault" + Date.now();
                 console.log(`BeforeAll - Replication Upload - Vault: ${vaultName}`);
-                if (setting.remoteType === RemoteTypes.REMOTE_P2P) {
-                    sync_test_setting_upload.P2P_AutoAcceptingPeers = serverPeerName;
-                    sync_test_setting_upload.P2P_AutoSyncPeers = serverPeerName;
-                    sync_test_setting_upload.P2P_DevicePeerName = "up-" + Date.now();
-                }
                 harnessUpload = await generateHarness(vaultName, sync_test_setting_upload);
                 await waitForReady(harnessUpload);
                 expect(harnessUpload.plugin).toBeDefined();
@@ -185,11 +159,6 @@ export function syncBasicCase(label: string, { setting, fileOptions }: TestOptio
             beforeAll(async () => {
                 const vaultName = "TestVault" + Date.now();
                 console.log(`BeforeAll - Replication Download - Vault: ${vaultName}`);
-                if (setting.remoteType === RemoteTypes.REMOTE_P2P) {
-                    sync_test_setting_download.P2P_AutoAcceptingPeers = serverPeerName;
-                    sync_test_setting_download.P2P_AutoSyncPeers = serverPeerName;
-                    sync_test_setting_download.P2P_DevicePeerName = "down-" + Date.now();
-                }
                 harnessDownload = await generateHarness(vaultName, sync_test_setting_download);
                 await waitForReady(harnessDownload);
                 await prepareRemote(harnessDownload, sync_test_setting_download, false);

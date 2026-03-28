@@ -1,7 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import type { LogFunction } from "@lib/services/lib/logUtils";
 import { FlagFilesHumanReadable, FlagFilesOriginal } from "@lib/common/models/redflag.const";
-import { REMOTE_MINIO } from "@lib/common/models/setting.const";
 import {
     createFetchAllFlagHandler,
     createRebuildFlagHandler,
@@ -637,28 +636,6 @@ describe("Red Flag Feature", () => {
             await adjustSettingToRemoteIfNeeded(host as any, log, null as any, config);
 
             expect(host.mocks.tweakValue.fetchRemotePreferred).toHaveBeenCalled();
-        });
-    });
-
-    describe("MinIO configuration handling", () => {
-        it("should not enable makeLocalChunkBeforeSync when remote is MinIO", () => {
-            const host = createHostMock();
-            host.mocks.setting.settings.remoteType = REMOTE_MINIO;
-
-            const settings = host.mocks.setting.currentSettings();
-            const isMinIO = settings.remoteType === REMOTE_MINIO;
-
-            expect(isMinIO).toBe(true);
-        });
-
-        it("should enable makeLocalChunkBeforeSync for non-MinIO remotes", () => {
-            const host = createHostMock();
-            host.mocks.setting.settings.remoteType = "CouchDB";
-
-            const settings = host.mocks.setting.currentSettings();
-            const isMinIO = settings.remoteType === REMOTE_MINIO;
-
-            expect(isMinIO).toBe(false);
         });
     });
 

@@ -6,12 +6,10 @@ import {
     FLAGMD_REDFLAG2_HR,
     FLAGMD_REDFLAG3_HR,
     REMOTE_COUCHDB,
-    REMOTE_MINIO,
     type ConfigLevel,
     LEVEL_POWER_USER,
     LEVEL_ADVANCED,
     LEVEL_EDGE_CASE,
-    REMOTE_P2P,
 } from "../../../lib/src/common/types.ts";
 import { delay, isObjectDifferent, sizeToHumanReadable } from "../../../lib/src/common/utils.ts";
 import { versionNumberString2Number } from "../../../lib/src/string_and_binary/convert.ts";
@@ -36,7 +34,6 @@ import { LiveSyncSetting as Setting } from "./LiveSyncSetting.ts";
 import { fireAndForget, yieldNextAnimationFrame } from "octagonal-wheels/promises";
 import { confirmWithMessage } from "../../coreObsidian/UILib/dialogs.ts";
 import { EVENT_REQUEST_RELOAD_SETTING_TAB, eventHub } from "../../../common/events.ts";
-import { JournalSyncMinio } from "../../../lib/src/replication/journal/objectstore/JournalSyncMinio.ts";
 import { paneChangeLog } from "./PaneChangeLog.ts";
 import {
     enableOnly,
@@ -524,33 +521,17 @@ export class ObsidianLiveSyncSettingTab extends PluginSettingTab {
 
     enableOnlySyncDisabled = enableOnly(() => !this.isAnySyncEnabled());
 
-    onlyOnP2POrCouchDB = () =>
-        ({
-            visibility:
-                this.isConfiguredAs("remoteType", REMOTE_P2P) || this.isConfiguredAs("remoteType", REMOTE_COUCHDB),
-        }) as OnUpdateResult;
-
     onlyOnCouchDB = () =>
         ({
             visibility: this.isConfiguredAs("remoteType", REMOTE_COUCHDB),
         }) as OnUpdateResult;
-    onlyOnMinIO = () =>
-        ({
-            visibility: this.isConfiguredAs("remoteType", REMOTE_MINIO),
-        }) as OnUpdateResult;
-    onlyOnOnlyP2P = () =>
-        ({
-            visibility: this.isConfiguredAs("remoteType", REMOTE_P2P),
-        }) as OnUpdateResult;
-    onlyOnCouchDBOrMinIO = () =>
-        ({
-            visibility:
-                this.isConfiguredAs("remoteType", REMOTE_COUCHDB) || this.isConfiguredAs("remoteType", REMOTE_MINIO),
-        }) as OnUpdateResult;
+    // CouchDB-only fork: these always resolve to CouchDB visibility or hidden
+    onlyOnP2POrCouchDB = this.onlyOnCouchDB;
+    onlyOnCouchDBOrMinIO = this.onlyOnCouchDB;
+    onlyOnMinIO = () => ({ visibility: false }) as OnUpdateResult;
+    onlyOnOnlyP2P = () => ({ visibility: false }) as OnUpdateResult;
     // E2EE Function
     checkWorkingPassphrase = async (): Promise<boolean> => {
-        if (this.editingSettings.remoteType == REMOTE_MINIO) return true;
-
         const settingForCheck: RemoteDBSettings = {
             ...this.editingSettings,
         };
@@ -870,11 +851,10 @@ export class ObsidianLiveSyncSettingTab extends PluginSettingTab {
         });
     }
 
-    getMinioJournalSyncClient() {
-        return new JournalSyncMinio(this.core.settings, this.core.simpleStore, this.core);
+    getMinioJournalSyncClient(): never {
+        throw new Error("MinIO/S3 is not supported in this CouchDB-only fork");
     }
-    async resetRemoteBucket() {
-        const minioJournal = this.getMinioJournalSyncClient();
-        await minioJournal.resetBucket();
+    async resetRemoteBucket(): Promise<void> {
+        throw new Error("MinIO/S3 is not supported in this CouchDB-only fork");
     }
 }

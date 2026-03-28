@@ -9,8 +9,6 @@ import type { IFileHandler } from "./lib/src/interfaces/FileHandler";
 import type { StorageAccess } from "./lib/src/interfaces/StorageAccess";
 import type { LiveSyncLocalDBEnv } from "./lib/src/pouchdb/LiveSyncLocalDB";
 import type { LiveSyncCouchDBReplicatorEnv } from "./lib/src/replication/couchdb/LiveSyncReplicator";
-import type { CheckPointInfo } from "./lib/src/replication/journal/JournalSyncTypes";
-import type { LiveSyncJournalReplicatorEnv } from "./lib/src/replication/journal/LiveSyncJournalReplicatorEnv";
 import type { LiveSyncReplicatorEnv } from "./lib/src/replication/LiveSyncAbstractReplicator";
 import { useTargetFilters } from "./lib/src/serviceFeatures/targetFilter";
 import type { ServiceContext } from "./lib/src/services/base/ServiceBase";
@@ -19,7 +17,6 @@ import { AbstractModule } from "./modules/AbstractModule";
 import { ModulePeriodicProcess } from "./modules/core/ModulePeriodicProcess";
 import { ModuleReplicator } from "./modules/core/ModuleReplicator";
 import { ModuleReplicatorCouchDB } from "./modules/core/ModuleReplicatorCouchDB";
-import { ModuleReplicatorMinIO } from "./modules/core/ModuleReplicatorMinIO";
 import { ModuleConflictChecker } from "./modules/coreFeatures/ModuleConflictChecker";
 import { ModuleConflictResolver } from "./modules/coreFeatures/ModuleConflictResolver";
 import { ModuleResolvingMismatchedTweaks } from "./modules/coreFeatures/ModuleResolveMismatchedTweaks";
@@ -35,7 +32,6 @@ export class LiveSyncBaseCore<
     implements
         LiveSyncLocalDBEnv,
         LiveSyncReplicatorEnv,
-        LiveSyncJournalReplicatorEnv,
         LiveSyncCouchDBReplicatorEnv,
         HasSettings<ObsidianLiveSyncSettings>
 {
@@ -136,7 +132,6 @@ export class LiveSyncBaseCore<
     public registerModules(extraModules: AbstractModule[] = []) {
         this._registerModule(new ModuleLiveSyncMain(this));
         this._registerModule(new ModuleConflictChecker(this));
-        this._registerModule(new ModuleReplicatorMinIO(this));
         this._registerModule(new ModuleReplicatorCouchDB(this));
         this._registerModule(new ModuleReplicator(this));
         this._registerModule(new ModuleConflictResolver(this));
@@ -214,7 +209,7 @@ export class LiveSyncBaseCore<
      * @obsolete Use services.keyValueDB.simpleStore instead. A simple key-value store for storing non-file data, such as checkpoints, sync status, etc.
      */
     get simpleStore() {
-        return this.services.keyValueDB.simpleStore as SimpleStore<CheckPointInfo>;
+        return this.services.keyValueDB.simpleStore as SimpleStore<any>;
     }
 
     /**

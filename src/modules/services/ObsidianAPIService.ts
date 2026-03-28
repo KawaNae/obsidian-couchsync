@@ -1,7 +1,6 @@
 import { InjectableAPIService } from "@lib/services/implements/injectable/InjectableAPIService";
 import type { ObsidianServiceContext } from "@lib/services/implements/obsidian/ObsidianServiceContext";
 import { Platform, type Command, type ViewCreator } from "obsidian";
-import { ObsHttpHandler } from "../essentialObsidian/APILib/ObsHttpHandler";
 import { ObsidianConfirm } from "./ObsidianConfirm";
 import type { Confirm } from "@lib/interfaces/Confirm";
 import { requestUrl, type RequestUrlParam } from "@/deps";
@@ -9,15 +8,13 @@ import { requestUrl, type RequestUrlParam } from "@/deps";
 // This is a migration step.
 
 export class ObsidianAPIService extends InjectableAPIService<ObsidianServiceContext> {
-    _customHandler: ObsHttpHandler | undefined;
     _confirmInstance: Confirm;
     constructor(context: ObsidianServiceContext) {
         super(context);
         this._confirmInstance = new ObsidianConfirm(context);
     }
-    getCustomFetchHandler(): ObsHttpHandler {
-        if (!this._customHandler) this._customHandler = new ObsHttpHandler(undefined, undefined);
-        return this._customHandler;
+    getCustomFetchHandler(): any {
+        return undefined;
     }
 
     async showWindow(viewType: string): Promise<void> {

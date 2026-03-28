@@ -3,7 +3,6 @@
 // and edge, resolving conflicts, etc. will be covered in separate test suites.
 import { describe } from "vitest";
 import {
-    PREFERRED_JOURNAL_SYNC,
     PREFERRED_SETTING_SELF_HOSTED,
     RemoteTypes,
     type ObsidianLiveSyncSettings,
@@ -18,11 +17,8 @@ function* generateCase() {
     const passpharse = "thetest-Passphrase3+9-for-e2ee!";
     const REMOTE_RECOMMENDED = {
         [RemoteTypes.REMOTE_COUCHDB]: PREFERRED_SETTING_SELF_HOSTED,
-        [RemoteTypes.REMOTE_MINIO]: PREFERRED_JOURNAL_SYNC,
-        [RemoteTypes.REMOTE_P2P]: PREFERRED_SETTING_SELF_HOSTED,
     };
     const remoteTypes = [RemoteTypes.REMOTE_COUCHDB];
-    // const remoteTypes = [RemoteTypes.REMOTE_P2P];
     const e2eeOptions = [false];
     // const e2eeOptions = [true];
     for (const remoteType of remoteTypes) {

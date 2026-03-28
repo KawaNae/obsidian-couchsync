@@ -5,7 +5,6 @@ import { FlagFilesHumanReadable, FlagFilesOriginal } from "@lib/common/models/re
 import FetchEverything from "../modules/features/SetupWizard/dialogs/FetchEverything.svelte";
 import RebuildEverything from "../modules/features/SetupWizard/dialogs/RebuildEverything.svelte";
 import { extractObject } from "octagonal-wheels/object";
-import { REMOTE_MINIO } from "@lib/common/models/setting.const";
 import type { ObsidianLiveSyncSettings } from "@lib/common/models/setting.type";
 import { TweakValuesShouldMatchedTemplate } from "@lib/common/models/tweak.definition";
 
@@ -72,10 +71,9 @@ export function createFetchAllFlagHandler(
             host.services.appLifecycle.performRestart();
             return false;
         }
-        const { vault, extra } = method;
+        const { vault, extra } = method as { vault: any; extra: any };
         const settings = await host.services.setting.currentSettings();
-        // If remote is MinIO, makeLocalChunkBeforeSync is not available. (because no-deduplication on sending).
-        const makeLocalChunkBeforeSyncAvailable = settings.remoteType !== REMOTE_MINIO;
+        const makeLocalChunkBeforeSyncAvailable = true;
         const mapVaultStateToAction = {
             identical: {
                 makeLocalChunkBeforeSync: makeLocalChunkBeforeSyncAvailable,
@@ -98,7 +96,7 @@ export function createFetchAllFlagHandler(
         return await processVaultInitialisation(host, log, async () => {
             const settings = host.services.setting.currentSettings();
             await adjustSettingToRemoteIfNeeded(host, log, extra, settings);
-            const vaultStateToAction = mapVaultStateToAction[vault];
+            const vaultStateToAction = mapVaultStateToAction[vault as keyof typeof mapVaultStateToAction];
             const { makeLocalChunkBeforeSync, makeLocalFilesBeforeSync } = vaultStateToAction;
             log(
                 `Fetching everything with settings: makeLocalChunkBeforeSync=${makeLocalChunkBeforeSync}, makeLocalFilesBeforeSync=${makeLocalFilesBeforeSync}`,
@@ -296,7 +294,7 @@ export function createRebuildFlagHandler(
             host.services.appLifecycle.performRestart();
             return false;
         }
-        const { extra } = method;
+        const { extra } = method as { extra: any };
         const settings = host.services.setting.currentSettings();
         await adjustSettingToRemoteIfNeeded(host, log, extra, settings);
         return await processVaultInitialisation(host, log, async () => {

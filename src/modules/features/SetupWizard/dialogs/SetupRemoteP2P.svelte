@@ -66,7 +66,7 @@
         const trialRemoteSetting: ObsidianLiveSyncSettings = {
             ...DEFAULT_SETTINGS,
             ...PREFERRED_BASE,
-            remoteType: RemoteTypes.REMOTE_P2P,
+            remoteType: RemoteTypes.REMOTE_COUCHDB,
             ...trialSettings,
         };
         return trialRemoteSetting;
