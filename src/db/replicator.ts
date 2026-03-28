@@ -114,6 +114,26 @@ export class Replicator {
         this.setState("disconnected");
     }
 
+    /** One-shot push: local → remote. Returns number of docs pushed. */
+    async pushToRemote(): Promise<number> {
+        const remoteUrl = this.getRemoteUrl();
+        const remoteDb = new PouchDB<CouchSyncDoc>(remoteUrl, { skip_setup: true });
+        const db = this.localDb.getDb();
+        const result = await db.replicate.to(remoteDb, { batch_size: 100 });
+        await remoteDb.close();
+        return result.docs_written;
+    }
+
+    /** One-shot pull: remote → local. Returns number of docs pulled. */
+    async pullFromRemote(): Promise<number> {
+        const remoteUrl = this.getRemoteUrl();
+        const remoteDb = new PouchDB<CouchSyncDoc>(remoteUrl, { skip_setup: true });
+        const db = this.localDb.getDb();
+        const result = await db.replicate.from(remoteDb, { batch_size: 100 });
+        await remoteDb.close();
+        return result.docs_written;
+    }
+
     async testConnection(): Promise<string | null> {
         try {
             const remoteUrl = this.getRemoteUrl();

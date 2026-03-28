@@ -24,7 +24,9 @@ export interface CouchSyncSettings {
     showVerboseLog: boolean;
 
     // Internal
-    isConfigured: boolean;
+    connectionTested: boolean;
+    setupComplete: boolean;
+    syncEnabled: boolean;
 }
 
 export const DEFAULT_SETTINGS: CouchSyncSettings = {
@@ -48,5 +50,7 @@ export const DEFAULT_SETTINGS: CouchSyncSettings = {
 
     showVerboseLog: false,
 
-    isConfigured: false,
+    connectionTested: false,
+    setupComplete: false,
+    syncEnabled: false,
 };

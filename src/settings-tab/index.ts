@@ -53,7 +53,11 @@ export class CouchSyncSettingTab extends PluginSettingTab {
             renderConnectionTab(connectionPanel, {
                 ...settingsDeps,
                 replicator: this.plugin.replicator,
+                initVault: () => this.plugin.initVault(),
+                cloneFromRemote: () => this.plugin.cloneFromRemote(),
                 startSync: () => this.plugin.startSync(),
+                stopSync: () => this.plugin.stopSync(),
+                refresh: () => this.display(),
             });
         }
 
@@ -70,7 +74,6 @@ export class CouchSyncSettingTab extends PluginSettingTab {
                 replicator: this.plugin.replicator,
                 conflictResolver: this.plugin.conflictResolver,
                 onRestart: () => {
-                    // Reload plugin
                     const app = this.plugin.app as any;
                     app.plugins?.disablePlugin("obsidian-couchsync");
                     app.plugins?.enablePlugin("obsidian-couchsync");

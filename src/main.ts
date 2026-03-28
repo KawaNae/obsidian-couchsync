@@ -9,7 +9,7 @@ import { ChangeTracker } from "./sync/change-tracker.ts";
 import { ConflictResolver } from "./conflict/conflict-resolver.ts";
 import { StatusBar } from "./ui/status-bar.ts";
 import { CouchSyncSettingTab } from "./settings-tab/index.ts";
-import { isFileDoc, isHiddenFileDoc, isPluginConfigDoc, type CouchSyncDoc } from "./types.ts";
+import { isFileDoc, isHiddenFileDoc, isPluginConfigDoc, type CouchSyncDoc, type FileDoc } from "./types.ts";
 
 export default class CouchSyncPlugin extends Plugin {
     settings!: CouchSyncSettings;
@@ -25,7 +25,6 @@ export default class CouchSyncPlugin extends Plugin {
     async onload(): Promise<void> {
         await this.loadSettings();
 
-        // Initialize services
         const dbName = `couchsync-${this.app.vault.getName()}`;
         this.localDb = new LocalDB(dbName);
         this.localDb.open();
@@ -37,18 +36,15 @@ export default class CouchSyncPlugin extends Plugin {
         this.changeTracker = new ChangeTracker(this.app, this.vaultSync, () => this.settings);
         this.conflictResolver = new ConflictResolver(this.localDb);
 
-        // UI
         this.statusBar = new StatusBar(this);
         this.replicator.onStateChange((state) => this.statusBar.update(state));
 
-        // Handle incoming remote changes
         this.replicator.onChange((doc: CouchSyncDoc) => {
             if (isFileDoc(doc)) {
                 this.changeTracker.pause();
                 this.vaultSync.dbToFile(doc).finally(() => {
                     setTimeout(() => this.changeTracker.resume(), 500);
                 });
-                // Check for conflicts
                 this.conflictResolver.resolveIfConflicted(doc);
             } else if (isHiddenFileDoc(doc)) {
                 this.hiddenSync.dbToFile(doc);
@@ -57,20 +53,19 @@ export default class CouchSyncPlugin extends Plugin {
             }
         });
 
-        // Settings tab
         this.addSettingTab(new CouchSyncSettingTab(this.app, this));
 
-        // Start on layout ready
         this.app.workspace.onLayoutReady(() => {
-            this.changeTracker.start();
-            this.startSync();
+            if (this.settings.syncEnabled && this.settings.setupComplete) {
+                this.changeTracker.start();
+                this.startSync();
+            }
         });
 
-        // Commands
         this.addCommand({
             id: "couchsync-force-sync",
             name: "Force sync all files now",
-            callback: () => this.initialScan(),
+            callback: () => this.scanVaultToDb(),
         });
     }
 
@@ -85,18 +80,54 @@ export default class CouchSyncPlugin extends Plugin {
         this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
     }
 
-    async startSync(): Promise<void> {
-        if (!this.settings.isConfigured) return;
-        this.replicator.stop();
-        this.replicator.start();
-        await this.initialScan();
-    }
-
     async saveSettings(): Promise<void> {
         await this.saveData(this.settings);
     }
 
-    private async initialScan(): Promise<void> {
+    /** Init: scan local vault → local DB → push to remote */
+    async initVault(): Promise<void> {
+        await this.scanVaultToDb();
+        const count = await this.replicator.pushToRemote();
+        console.log(`CouchSync: Init pushed ${count} docs to remote`);
+        this.settings.setupComplete = true;
+        await this.saveSettings();
+    }
+
+    /** Clone: pull remote → local DB → write to vault */
+    async cloneFromRemote(): Promise<void> {
+        const count = await this.replicator.pullFromRemote();
+        console.log(`CouchSync: Clone pulled ${count} docs from remote`);
+
+        // Write all file docs to vault
+        const allFiles = await this.localDb.allFileDocs();
+        for (const fileDoc of allFiles) {
+            try {
+                await this.vaultSync.dbToFile(fileDoc);
+            } catch (e) {
+                console.error(`CouchSync: Failed to write ${fileDoc._id}:`, e);
+            }
+        }
+        console.log(`CouchSync: Clone wrote ${allFiles.length} files to vault`);
+        this.settings.setupComplete = true;
+        await this.saveSettings();
+    }
+
+    /** Start live bidirectional sync */
+    async startSync(): Promise<void> {
+        if (!this.settings.setupComplete) return;
+        this.replicator.stop();
+        this.replicator.start();
+        this.changeTracker.start();
+    }
+
+    /** Stop live sync */
+    stopSync(): void {
+        this.replicator.stop();
+        this.changeTracker.stop();
+    }
+
+    /** Scan vault files into local PouchDB */
+    private async scanVaultToDb(): Promise<void> {
         const files = this.app.vault.getFiles();
         let synced = 0;
         for (const file of files) {
@@ -111,10 +142,9 @@ export default class CouchSyncPlugin extends Plugin {
             }
         }
         if (synced > 0) {
-            console.log(`CouchSync: Initial scan synced ${synced} files`);
+            console.log(`CouchSync: Scanned ${synced} files to local DB`);
         }
 
-        // Scan hidden files and plugins
         if (this.settings.enableHiddenSync) {
             const hiddenCount = await this.hiddenSync.scanAndSync();
             if (hiddenCount > 0) {
