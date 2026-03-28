@@ -1,7 +1,5 @@
 import { LOG_LEVEL_NOTICE, LOG_LEVEL_VERBOSE, Logger } from "../../lib/src/common/logger.ts";
 import {
-    EVENT_REQUEST_OPEN_P2P,
-    EVENT_REQUEST_OPEN_SETTING_WIZARD,
     EVENT_REQUEST_OPEN_SETTINGS,
     EVENT_REQUEST_RUN_DOCTOR,
     EVENT_REQUEST_RUN_FIX_INCOMPLETE,
@@ -15,7 +13,7 @@ import { isMetaEntry } from "../../lib/src/common/types.ts";
 import { isDeletedEntry, isDocContentSame, isLoadedEntry, readAsBlob } from "../../lib/src/common/utils.ts";
 import { countCompromisedChunks } from "../../lib/src/pouchdb/negotiation.ts";
 import type { LiveSyncCore } from "../../main.ts";
-import { SetupManager } from "../features/SetupManager.ts";
+
 
 type ErrorInfo = {
     path: string;
@@ -66,55 +64,9 @@ export class ModuleMigration extends AbstractModule {
     }
 
     async initialMessage() {
-        const manager = this.core.getModule(SetupManager);
-        return await manager.startOnBoarding();
-        /*
-        const message = $msg("moduleMigration.msgInitialSetup", {
-            URI_DOC: $msg("moduleMigration.docUri"),
-        });
-        const USE_SETUP = $msg("moduleMigration.optionHaveSetupUri");
-        const NEXT = $msg("moduleMigration.optionNoSetupUri");
-
-        const ret = await this.core.confirm.askSelectStringDialogue(message, [USE_SETUP, NEXT], {
-            title: $msg("moduleMigration.titleWelcome"),
-            defaultAction: USE_SETUP,
-        });
-        if (ret === USE_SETUP) {
-            eventHub.emitEvent(EVENT_REQUEST_OPEN_SETUP_URI);
-            return false;
-        } else if (ret == NEXT) {
-            return true;
-        }
-        return false;
-        */
-    }
-
-    async askAgainForSetupURI() {
-        const message = $msg("moduleMigration.msgRecommendSetupUri", { URI_DOC: $msg("moduleMigration.docUri") });
-        const USE_MINIMAL = $msg("moduleMigration.optionSetupWizard");
-        const USE_P2P = $msg("moduleMigration.optionSetupViaP2P");
-        const USE_SETUP = $msg("moduleMigration.optionManualSetup");
-        const NEXT = $msg("moduleMigration.optionRemindNextLaunch");
-
-        const ret = await this.core.confirm.askSelectStringDialogue(message, [USE_MINIMAL, USE_SETUP, USE_P2P, NEXT], {
-            title: $msg("moduleMigration.titleRecommendSetupUri"),
-            defaultAction: USE_MINIMAL,
-        });
-        if (ret === USE_MINIMAL) {
-            eventHub.emitEvent(EVENT_REQUEST_OPEN_SETTING_WIZARD);
-            return false;
-        }
-        if (ret === USE_P2P) {
-            eventHub.emitEvent(EVENT_REQUEST_OPEN_P2P);
-            return false;
-        }
-        if (ret === USE_SETUP) {
-            eventHub.emitEvent(EVENT_REQUEST_OPEN_SETTINGS);
-            return false;
-        } else if (ret == NEXT) {
-            return false;
-        }
-        return false;
+        // No wizard - just open Settings tab directly
+        eventHub.emitEvent(EVENT_REQUEST_OPEN_SETTINGS);
+        return true;
     }
 
     async hasIncompleteDocs(force: boolean = false): Promise<boolean> {

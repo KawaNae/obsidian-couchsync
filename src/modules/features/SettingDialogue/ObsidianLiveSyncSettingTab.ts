@@ -389,19 +389,6 @@ export class ObsidianLiveSyncSettingTab extends PluginSettingTab {
 
     lastVersion = ~~(versionNumberString2Number(this.manifestVersion) / 1000);
 
-    async enableMinimalSetup() {
-        this.editingSettings.liveSync = false;
-        this.editingSettings.periodicReplication = false;
-        this.editingSettings.syncOnSave = false;
-        this.editingSettings.syncOnEditorSave = false;
-        this.editingSettings.syncOnStart = false;
-        this.editingSettings.syncOnFileOpen = false;
-        this.editingSettings.syncAfterMerge = false;
-        this.core.replicator.closeReplication();
-        await this.saveAllDirtySettings();
-        this.selectedScreen = "sync";
-        this.display();
-    }
 
     isNeedRebuildLocal() {
         return this.isSomeDirty([
