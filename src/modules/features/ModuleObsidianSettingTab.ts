@@ -17,7 +17,7 @@ export class ModuleObsidianSettingDialogue extends AbstractObsidianModule {
         //@ts-ignore
         this.app.setting.open();
         //@ts-ignore
-        this.app.setting.openTabById("obsidian-livesync");
+        this.app.setting.openTabById("obsidian-couchsync");
     }
 
     get appId() {

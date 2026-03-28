@@ -22,8 +22,8 @@ export function tabFiles(this: ObsidianLiveSyncSettingTab, el: HTMLElement): voi
     mount(MultipleRegExpControl, {
         target: syncFilesSetting.controlEl,
         props: {
-            patterns: splitCustomRegExpList(this.editingSettings.syncOnlyRegEx, "|[]|"),
-            originals: splitCustomRegExpList(this.editingSettings.syncOnlyRegEx, "|[]|"),
+            patterns: splitCustomRegExpList(this.editingSettings.syncOnlyRegEx || "" as any, "|[]|"),
+            originals: splitCustomRegExpList(this.editingSettings.syncOnlyRegEx || "" as any, "|[]|"),
             apply: async (newPatterns: CustomRegExpSource[]) => {
                 this.editingSettings.syncOnlyRegEx = constructCustomRegExpList(newPatterns, "|[]|");
                 await this.saveAllDirtySettings();
@@ -39,8 +39,8 @@ export function tabFiles(this: ObsidianLiveSyncSettingTab, el: HTMLElement): voi
     mount(MultipleRegExpControl, {
         target: nonSyncFilesSetting.controlEl,
         props: {
-            patterns: splitCustomRegExpList(this.editingSettings.syncIgnoreRegEx, "|[]|"),
-            originals: splitCustomRegExpList(this.editingSettings.syncIgnoreRegEx, "|[]|"),
+            patterns: splitCustomRegExpList(this.editingSettings.syncIgnoreRegEx || "" as any, "|[]|"),
+            originals: splitCustomRegExpList(this.editingSettings.syncIgnoreRegEx || "" as any, "|[]|"),
             apply: async (newPatterns: CustomRegExpSource[]) => {
                 this.editingSettings.syncIgnoreRegEx = constructCustomRegExpList(newPatterns, "|[]|");
                 await this.saveAllDirtySettings();
@@ -114,7 +114,7 @@ export function tabFiles(this: ObsidianLiveSyncSettingTab, el: HTMLElement): voi
     const targetPatternSetting = new Setting(el)
         .setName("Target patterns")
         .setDesc("Patterns to match files for syncing");
-    const patTarget = splitCustomRegExpList(this.editingSettings.syncInternalFilesTargetPatterns, ",");
+    const patTarget = splitCustomRegExpList(this.editingSettings.syncInternalFilesTargetPatterns || "" as any, ",");
     mount(MultipleRegExpControl, {
         target: targetPatternSetting.controlEl,
         props: {
@@ -128,11 +128,11 @@ export function tabFiles(this: ObsidianLiveSyncSettingTab, el: HTMLElement): voi
         },
     });
 
-    const defaultSkipPattern = "\\/node_modules\\/, \\/\\.git\\/, ^\\.git\\/, \\/obsidian-livesync\\/";
+    const defaultSkipPattern = "\\/node_modules\\/, \\/\\.git\\/, ^\\.git\\/, \\/obsidian-couchsync\\/";
     const defaultSkipPatternXPlat =
         defaultSkipPattern + ",\\/workspace$ ,\\/workspace.json$,\\/workspace-mobile.json$";
 
-    const pat = splitCustomRegExpList(this.editingSettings.syncInternalFilesIgnorePatterns, ",");
+    const pat = splitCustomRegExpList(this.editingSettings.syncInternalFilesIgnorePatterns || "" as any, ",");
     const patSetting = new Setting(el).setName("Ignore patterns").setDesc("");
 
     mount(MultipleRegExpControl, {
@@ -149,7 +149,7 @@ export function tabFiles(this: ObsidianLiveSyncSettingTab, el: HTMLElement): voi
     });
 
     const addDefaultPatterns = async (patterns: string) => {
-        const oldList = splitCustomRegExpList(this.editingSettings.syncInternalFilesIgnorePatterns, ",");
+        const oldList = splitCustomRegExpList(this.editingSettings.syncInternalFilesIgnorePatterns || "" as any, ",");
         const newList = splitCustomRegExpList(
             patterns as unknown as typeof this.editingSettings.syncInternalFilesIgnorePatterns,
             ","
@@ -176,7 +176,7 @@ export function tabFiles(this: ObsidianLiveSyncSettingTab, el: HTMLElement): voi
     const overwritePatterns = new Setting(el)
         .setName("Overwrite patterns")
         .setDesc("Patterns to match files for overwriting instead of merging");
-    const patTarget2 = splitCustomRegExpList(this.editingSettings.syncInternalFileOverwritePatterns, ",");
+    const patTarget2 = splitCustomRegExpList(this.editingSettings.syncInternalFileOverwritePatterns || "" as any, ",");
     mount(MultipleRegExpControl, {
         target: overwritePatterns.controlEl,
         props: {

@@ -608,7 +608,12 @@ export class ObsidianLiveSyncSettingTab extends PluginSettingTab {
 
             const panel = content.createDiv("cs-settings__panel");
             panel.dataset.tabId = tab.id;
-            tab.render(panel);
+            try {
+                tab.render(panel);
+            } catch (e) {
+                console.error(`Error rendering tab "${tab.id}":`, e);
+                panel.createEl("div", { text: `Error loading ${tab.label} tab. Check console.`, cls: "op-warn" });
+            }
         });
 
         const selectedTab = this.selectedScreen || (this.isAnySyncEnabled() ? "sync" : "setup");
