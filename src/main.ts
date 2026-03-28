@@ -3,16 +3,22 @@ import { type CouchSyncSettings, DEFAULT_SETTINGS } from "./settings.ts";
 import { LocalDB } from "./db/local-db.ts";
 import { Replicator } from "./db/replicator.ts";
 import { VaultSync } from "./sync/vault-sync.ts";
+import { HiddenSync } from "./sync/hidden-sync.ts";
+import { PluginSync } from "./sync/plugin-sync.ts";
 import { ChangeTracker } from "./sync/change-tracker.ts";
+import { ConflictResolver } from "./conflict/conflict-resolver.ts";
 import { StatusBar } from "./ui/status-bar.ts";
 import { CouchSyncSettingTab } from "./settings-tab/index.ts";
-import { isFileDoc, type CouchSyncDoc } from "./types.ts";
+import { isFileDoc, isHiddenFileDoc, isPluginConfigDoc, type CouchSyncDoc } from "./types.ts";
 
 export default class CouchSyncPlugin extends Plugin {
     settings!: CouchSyncSettings;
-    private localDb!: LocalDB;
+    localDb!: LocalDB;
     replicator!: Replicator;
+    conflictResolver!: ConflictResolver;
     private vaultSync!: VaultSync;
+    private hiddenSync!: HiddenSync;
+    private pluginSync!: PluginSync;
     private changeTracker!: ChangeTracker;
     private statusBar!: StatusBar;
 
@@ -26,7 +32,10 @@ export default class CouchSyncPlugin extends Plugin {
 
         this.replicator = new Replicator(this.localDb, () => this.settings);
         this.vaultSync = new VaultSync(this.app, this.localDb, () => this.settings);
+        this.hiddenSync = new HiddenSync(this.app, this.localDb, () => this.settings);
+        this.pluginSync = new PluginSync(this.app, this.localDb, () => this.settings);
         this.changeTracker = new ChangeTracker(this.app, this.vaultSync, () => this.settings);
+        this.conflictResolver = new ConflictResolver(this.localDb);
 
         // UI
         this.statusBar = new StatusBar(this);
@@ -39,6 +48,12 @@ export default class CouchSyncPlugin extends Plugin {
                 this.vaultSync.dbToFile(doc).finally(() => {
                     setTimeout(() => this.changeTracker.resume(), 500);
                 });
+                // Check for conflicts
+                this.conflictResolver.resolveIfConflicted(doc);
+            } else if (isHiddenFileDoc(doc)) {
+                this.hiddenSync.dbToFile(doc);
+            } else if (isPluginConfigDoc(doc)) {
+                this.pluginSync.applyRemoteConfig(doc);
             }
         });
 
@@ -94,6 +109,20 @@ export default class CouchSyncPlugin extends Plugin {
         }
         if (synced > 0) {
             console.log(`CouchSync: Initial scan synced ${synced} files`);
+        }
+
+        // Scan hidden files and plugins
+        if (this.settings.enableHiddenSync) {
+            const hiddenCount = await this.hiddenSync.scanAndSync();
+            if (hiddenCount > 0) {
+                console.log(`CouchSync: Synced ${hiddenCount} hidden files`);
+            }
+        }
+        if (this.settings.enablePluginSync) {
+            const pluginCount = await this.pluginSync.scanAndSync();
+            if (pluginCount > 0) {
+                console.log(`CouchSync: Synced ${pluginCount} plugin configs`);
+            }
         }
     }
 }

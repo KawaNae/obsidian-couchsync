@@ -1,6 +1,8 @@
 import { PluginSettingTab, type App } from "obsidian";
 import type CouchSyncPlugin from "../main.ts";
 import { renderConnectionTab } from "./connection-tab.ts";
+import { renderFilesTab } from "./files-tab.ts";
+import { renderMaintenanceTab } from "./maintenance-tab.ts";
 
 export class CouchSyncSettingTab extends PluginSettingTab {
     plugin: CouchSyncPlugin;
@@ -16,10 +18,10 @@ export class CouchSyncSettingTab extends PluginSettingTab {
 
         const wrapper = containerEl.createDiv({ cls: "cs-settings__wrapper" });
 
-        // Tab navigation
         const nav = wrapper.createDiv({ cls: "cs-settings__nav" });
         const tabs = [
             { id: "connection", label: "Connection" },
+            { id: "files", label: "Files" },
             { id: "maintenance", label: "Maintenance" },
         ];
 
@@ -38,28 +40,43 @@ export class CouchSyncSettingTab extends PluginSettingTab {
             panels.set(tab.id, panel);
         }
 
-        // Render tab contents
+        const settingsDeps = {
+            getSettings: () => this.plugin.settings,
+            updateSettings: async (patch: Partial<typeof this.plugin.settings>) => {
+                Object.assign(this.plugin.settings, patch);
+                await this.plugin.saveSettings();
+            },
+        };
+
         const connectionPanel = panels.get("connection");
         if (connectionPanel) {
             renderConnectionTab(connectionPanel, {
-                getSettings: () => this.plugin.settings,
-                updateSettings: async (patch) => {
-                    Object.assign(this.plugin.settings, patch);
-                    await this.plugin.saveSettings();
-                },
+                ...settingsDeps,
                 replicator: this.plugin.replicator,
             });
         }
 
+        const filesPanel = panels.get("files");
+        if (filesPanel) {
+            renderFilesTab(filesPanel, settingsDeps);
+        }
+
         const maintenancePanel = panels.get("maintenance");
         if (maintenancePanel) {
-            maintenancePanel.createEl("h3", { text: "Maintenance" });
-            maintenancePanel.createEl("p", {
-                text: "Maintenance options will be available in a future update.",
+            renderMaintenanceTab(maintenancePanel, {
+                ...settingsDeps,
+                localDb: this.plugin.localDb,
+                replicator: this.plugin.replicator,
+                conflictResolver: this.plugin.conflictResolver,
+                onRestart: () => {
+                    // Reload plugin
+                    const app = this.plugin.app as any;
+                    app.plugins?.disablePlugin("obsidian-couchsync");
+                    app.plugins?.enablePlugin("obsidian-couchsync");
+                },
             });
         }
 
-        // Activate first tab
         this.activateTab(wrapper, "connection");
     }
 
