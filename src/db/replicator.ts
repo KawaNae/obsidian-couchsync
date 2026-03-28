@@ -1,5 +1,4 @@
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const PouchDB = require("pouchdb-browser") as PouchDB.Static;
+import PouchDB from "pouchdb-browser/lib/index.js";
 import type { CouchSyncDoc } from "../types.ts";
 import type { LocalDB } from "./local-db.ts";
 import type { CouchSyncSettings } from "../settings.ts";

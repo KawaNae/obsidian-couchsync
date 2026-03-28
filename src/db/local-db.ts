@@ -1,5 +1,5 @@
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const PouchDB = require("pouchdb-browser") as PouchDB.Static;
+// Use CJS entry directly — ESM entry's `export default` breaks in esbuild CJS output
+import PouchDB from "pouchdb-browser/lib/index.js";
 import type { CouchSyncDoc, FileDoc, ChunkDoc } from "../types.ts";
 
 export class LocalDB {
