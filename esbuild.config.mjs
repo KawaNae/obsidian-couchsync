@@ -68,7 +68,7 @@ const context = await esbuild.context({
     sourcemap: prod ? false : "inline",
     treeShaking: prod,
     outfile: path.join(outDir, "main.js"),
-    mainFields: ["browser", "module", "main"],
+    mainFields: ["main", "browser"],
     minify: prod,
     plugins: [copyStaticFiles],
 });

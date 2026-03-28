@@ -1,5 +1,5 @@
-// @ts-ignore - PouchDB is a UMD module
-import PouchDB from "pouchdb-browser";
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const PouchDB = require("pouchdb-browser") as PouchDB.Static;
 import type { CouchSyncDoc } from "../types.ts";
 import type { LocalDB } from "./local-db.ts";
 import type { CouchSyncSettings } from "../settings.ts";

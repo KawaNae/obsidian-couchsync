@@ -79,9 +79,9 @@ export default class CouchSyncPlugin extends Plugin {
     }
 
     async onunload(): Promise<void> {
-        this.changeTracker.stop();
-        this.replicator.stop();
-        await this.localDb.close();
+        this.changeTracker?.stop();
+        this.replicator?.stop();
+        await this.localDb?.close();
     }
 
     async loadSettings(): Promise<void> {
