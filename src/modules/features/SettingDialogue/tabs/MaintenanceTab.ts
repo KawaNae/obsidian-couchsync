@@ -1,4 +1,4 @@
-import { stringifyYaml } from "../../../deps.ts";
+import { stringifyYaml } from "../../../../deps.ts";
 import {
     type ObsidianLiveSyncSettings,
     type FilePathWithPrefix,
@@ -10,37 +10,42 @@ import {
     type MetaEntry,
     type FilePath,
     DEFAULT_SETTINGS,
-} from "../../../lib/src/common/types.ts";
+    FlagFilesHumanReadable,
+    FLAGMD_REDFLAG,
+} from "../../../../lib/src/common/types.ts";
 import {
     createBlob,
+    fireAndForget,
     getFileRegExp,
     isDocContentSame,
     parseHeaderValues,
     readAsBlob,
-} from "../../../lib/src/common/utils.ts";
-import { Logger } from "../../../lib/src/common/logger.ts";
-import { isCloudantURI } from "../../../lib/src/pouchdb/utils_couchdb.ts";
-import { requestToCouchDBWithCredentials } from "../../../common/utils.ts";
-import { addPrefix, shouldBeIgnored, stripAllPrefixes } from "../../../lib/src/string_and_binary/path.ts";
-import { $msg } from "../../../lib/src/common/i18n.ts";
+} from "../../../../lib/src/common/utils.ts";
+import { Logger } from "../../../../lib/src/common/logger.ts";
+import { isCloudantURI } from "../../../../lib/src/pouchdb/utils_couchdb.ts";
+import { requestToCouchDBWithCredentials } from "../../../../common/utils.ts";
+import { addPrefix, shouldBeIgnored, stripAllPrefixes } from "../../../../lib/src/string_and_binary/path.ts";
+import { $msg } from "../../../../lib/src/common/i18n.ts";
 import { Semaphore } from "octagonal-wheels/concurrency/semaphore";
-import { LiveSyncSetting as Setting } from "./LiveSyncSetting.ts";
+import { LiveSyncSetting as Setting } from "../LiveSyncSetting.ts";
 import {
     EVENT_ANALYSE_DB_USAGE,
     EVENT_REQUEST_CHECK_REMOTE_SIZE,
+    EVENT_REQUEST_PERFORM_GC_V3,
     EVENT_REQUEST_RUN_DOCTOR,
     EVENT_REQUEST_RUN_FIX_INCOMPLETE,
     eventHub,
-} from "../../../common/events.ts";
-import { ICHeader, ICXHeader, PSCHeader } from "../../../common/types.ts";
-import { HiddenFileSync } from "../../../features/HiddenFileSync/CmdHiddenFileSync.ts";
-import { EVENT_REQUEST_SHOW_HISTORY } from "../../../common/obsidianEvents.ts";
-import { generateCredentialObject } from "../../../lib/src/replication/httplib.ts";
-import type { ObsidianLiveSyncSettingTab } from "./ObsidianLiveSyncSettingTab.ts";
-import type { PageFunctions } from "./SettingPane.ts";
-export function paneHatch(this: ObsidianLiveSyncSettingTab, paneEl: HTMLElement, { addPanel }: PageFunctions): void {
-    // const hatchWarn = this.createEl(paneEl, "div", { text: `To stop the boot up sequence for fixing problems on databases, you can put redflag.md on top of your vault (Rebooting obsidian is required).` });
-    // hatchWarn.addClass("op-warn-info");
+} from "@/common/events.ts";
+import { ICHeader, ICXHeader, PSCHeader } from "../../../../common/types.ts";
+import { HiddenFileSync } from "../../../../features/HiddenFileSync/CmdHiddenFileSync.ts";
+import { EVENT_REQUEST_SHOW_HISTORY } from "../../../../common/obsidianEvents.ts";
+import { generateCredentialObject } from "../../../../lib/src/replication/httplib.ts";
+import { LiveSyncCouchDBReplicator } from "../../../../lib/src/replication/couchdb/LiveSyncReplicator.ts";
+import type { ObsidianLiveSyncSettingTab } from "../ObsidianLiveSyncSettingTab.ts";
+import { visibleOnly, type PageFunctions } from "../SettingPane.ts";
+
+export function tabMaintenance(this: ObsidianLiveSyncSettingTab, paneEl: HTMLElement, { addPanel }: PageFunctions): void {
+    // --- Troubleshooting (from PaneHatch) ---
     void addPanel(paneEl, $msg("Setting.TroubleShooting")).then((paneEl) => {
         new Setting(paneEl)
             .setName($msg("Setting.TroubleShooting.Doctor"))
@@ -176,11 +181,6 @@ ${stringifyYaml({
 })}`;
                     console.log(msgConfig);
                     if ((await this.services.UI.promptCopyToClipboard("Generated report", msgConfig)) == true) {
-                        // await navigator.clipboard.writeText(msgConfig);
-                        // Logger(
-                        //     `Generated report has been copied to clipboard. Please report the issue with this! Thank you for your cooperation!`,
-                        //     LOG_LEVEL_NOTICE
-                        // );
                     }
                 })
         );
@@ -207,6 +207,7 @@ ${stringifyYaml({
         new Setting(paneEl).autoWireToggle("writeLogToTheFile");
     });
 
+    // --- Scram Switches (from PaneHatch) ---
     void addPanel(paneEl, "Scram Switches").then((paneEl) => {
         new Setting(paneEl).autoWireToggle("suspendFileWatching");
         this.addOnSaved("suspendFileWatching", () => this.services.appLifecycle.askRestart());
@@ -215,6 +216,7 @@ ${stringifyYaml({
         this.addOnSaved("suspendParseReplicationResult", () => this.services.appLifecycle.askRestart());
     });
 
+    // --- Recovery and Repair (from PaneHatch) ---
     void addPanel(paneEl, "Recovery and Repair").then((paneEl) => {
         const addResult = async (path: string, file: FilePathWithPrefix | false, fileOnDB: LoadedEntry | false) => {
             const storageFileStat = file ? await this.core.storageAccess.statHidden(file) : null;
@@ -449,7 +451,6 @@ ${stringifyYaml({
                         });
                         await Promise.all(processes);
                         Logger("done", LOG_LEVEL_NOTICE, "verify");
-                        // Logger(`${i}/${files.length}\n`, LOG_LEVEL_NOTICE, "verify-processed");
                     })
             );
         const resultArea = paneEl.createDiv({ text: "" });
@@ -472,7 +473,6 @@ ${stringifyYaml({
                                 }
                                 if (doc?.deleted ?? false) continue;
                                 const newDoc = { ...doc };
-                                //Prepare converted data
                                 newDoc._id = idEncoded;
                                 newDoc.path = docName as FilePathWithPrefix;
                                 // @ts-ignore
@@ -481,14 +481,11 @@ ${stringifyYaml({
                                     const obfuscatedDoc = await this.core.localDatabase.getRaw(idEncoded, {
                                         revs_info: true,
                                     });
-                                    // Unfortunately we have to delete one of them.
-                                    // Just now, save it as a conflicted document.
-                                    obfuscatedDoc._revs_info?.shift(); // Drop latest revision.
-                                    const previousRev = obfuscatedDoc._revs_info?.shift(); // Use second revision.
+                                    obfuscatedDoc._revs_info?.shift();
+                                    const previousRev = obfuscatedDoc._revs_info?.shift();
                                     if (previousRev) {
                                         newDoc._rev = previousRev.rev;
                                     } else {
-                                        //If there are no revisions, set the possibly unique one
                                         newDoc._rev =
                                             "1-" +
                                             `00000000000000000000000000000000${~~(Math.random() * 1e9)}${~~(Math.random() * 1e9)}${~~(Math.random() * 1e9)}${~~(Math.random() * 1e9)}`.slice(
@@ -512,7 +509,6 @@ ${stringifyYaml({
                                     }
                                 } catch (ex: any) {
                                     if (ex?.status == 404) {
-                                        // We can perform this safely
                                         if ((await this.core.localDatabase.putRaw(newDoc)).ok) {
                                             Logger(`${docName} has been converted`, LOG_LEVEL_NOTICE);
                                             doc._deleted = true;
@@ -523,7 +519,6 @@ ${stringifyYaml({
                                     } else {
                                         Logger(`Something went wrong while converting ${docName}`, LOG_LEVEL_NOTICE);
                                         Logger(ex, LOG_LEVEL_VERBOSE);
-                                        // Something wrong.
                                     }
                                 }
                             }
@@ -532,6 +527,8 @@ ${stringifyYaml({
                     })
             );
     });
+
+    // --- Reset (from PaneHatch) ---
     void addPanel(paneEl, "Reset").then((paneEl) => {
         new Setting(paneEl).setName("Back to non-configured").addButton((button) =>
             button
@@ -561,12 +558,218 @@ ${stringifyYaml({
                         _deleted: true,
                     }));
                     const r = await this.core.localDatabase.bulkDocsRaw(newData as any[]);
-                    // Do not care about the result.
                     Logger(
                         `${r.length} items have been removed, to confirm how many items are left, please perform it again.`,
                         LOG_LEVEL_NOTICE
                     );
                 })
         );
+    });
+
+    // --- Lock warning messages (from PaneMaintenance) ---
+    const isRemoteLockedAndDeviceNotAccepted = () => this.core?.replicator?.remoteLockedAndDeviceNotAccepted;
+    const isRemoteLocked = () => this.core?.replicator?.remoteLocked;
+
+    this.createEl(
+        paneEl,
+        "div",
+        {
+            text: "The remote database is locked for synchronization to prevent vault corruption because this device isn't marked as 'resolved'. Please backup your vault, reset the local database, and select 'Mark this device as resolved'. This warning will persist until the device is confirmed as resolved by replication.",
+            cls: "op-warn",
+        },
+        (c) => {
+            this.createEl(
+                c,
+                "button",
+                {
+                    text: "I've made a backup, mark this device 'resolved'",
+                    cls: "mod-warning",
+                },
+                (e) => {
+                    e.addEventListener("click", () => {
+                        fireAndForget(async () => {
+                            await this.services.replication.markResolved();
+                            this.display();
+                        });
+                    });
+                }
+            );
+        },
+        visibleOnly(isRemoteLockedAndDeviceNotAccepted)
+    );
+    this.createEl(
+        paneEl,
+        "div",
+        {
+            text: "To prevent unwanted vault corruption, the remote database has been locked for synchronization. (This device is marked 'resolved') When all your devices are marked 'resolved', unlock the database. This warning kept showing until confirming the device is resolved by the replication",
+            cls: "op-warn",
+        },
+        (c) =>
+            this.createEl(
+                c,
+                "button",
+                {
+                    text: "I'm ready, unlock the database",
+                    cls: "mod-warning",
+                },
+                (e) => {
+                    e.addEventListener("click", () => {
+                        fireAndForget(async () => {
+                            await this.services.replication.markUnlocked();
+                            this.display();
+                        });
+                    });
+                }
+            ),
+        visibleOnly(isRemoteLocked)
+    );
+
+    // --- Scram! (from PaneMaintenance) ---
+    void addPanel(paneEl, "Scram!").then((paneEl) => {
+        new Setting(paneEl)
+            .setName("Lock Server")
+            .setDesc("Lock the remote server to prevent synchronization with other devices.")
+            .addButton((button) =>
+                button
+                    .setButtonText("Lock")
+                    .setDisabled(false)
+                    .setWarning()
+                    .onClick(async () => {
+                        await this.services.replication.markLocked();
+                    })
+            )
+            .addOnUpdate(this.onlyOnCouchDB);
+
+        new Setting(paneEl)
+            .setName("Emergency restart")
+            .setDesc("Disables all synchronization and restart.")
+            .addButton((button) =>
+                button
+                    .setButtonText("Flag and restart")
+                    .setDisabled(false)
+                    .setWarning()
+                    .onClick(async () => {
+                        await this.core.storageAccess.writeFileAuto(FLAGMD_REDFLAG, "");
+                        this.services.appLifecycle.performRestart();
+                    })
+            );
+    });
+
+    // --- Reset Synchronisation information (from PaneMaintenance) ---
+    void addPanel(paneEl, "Reset Synchronisation information").then((paneEl) => {
+        new Setting(paneEl)
+            .setName("Reset Synchronisation on This Device")
+            .setDesc("Restore or reconstruct local database from remote.")
+            .addButton((button) =>
+                button
+                    .setButtonText("Schedule and Restart")
+                    .setCta()
+                    .setDisabled(false)
+                    .onClick(async () => {
+                        await this.core.storageAccess.writeFileAuto(FlagFilesHumanReadable.FETCH_ALL, "");
+                        this.services.appLifecycle.performRestart();
+                    })
+            );
+        new Setting(paneEl)
+            .setName("Overwrite Server Data with This Device's Files")
+            .setDesc("Rebuild local and remote database with local files.")
+            .addButton((button) =>
+                button
+                    .setButtonText("Schedule and Restart")
+                    .setCta()
+                    .setDisabled(false)
+                    .onClick(async () => {
+                        await this.core.storageAccess.writeFileAuto(FlagFilesHumanReadable.REBUILD_ALL, "");
+                        this.services.appLifecycle.performRestart();
+                    })
+            );
+    });
+
+    // --- Syncing (from PaneMaintenance) ---
+    void addPanel(paneEl, "Syncing", () => {}, this.onlyOnCouchDB).then((paneEl) => {
+        new Setting(paneEl)
+            .setName("Resend")
+            .setDesc("Resend all chunks to the remote.")
+            .addButton((button) =>
+                button
+                    .setButtonText("Send chunks")
+                    .setWarning()
+                    .setDisabled(false)
+                    .onClick(async () => {
+                        if (this.core.replicator instanceof LiveSyncCouchDBReplicator) {
+                            await this.core.replicator.sendChunks(this.core.settings, undefined, true, 0);
+                        }
+                    })
+            )
+            .addOnUpdate(this.onlyOnCouchDB);
+    });
+
+    // --- Garbage Collection V3 (from PaneMaintenance) ---
+    void addPanel(paneEl, "Garbage Collection V3 (Beta)", (e) => e, this.onlyOnCouchDB).then((paneEl) => {
+        new Setting(paneEl)
+            .setName("Perform Garbage Collection")
+            .setDesc("Perform Garbage Collection to remove unused chunks and reduce database size.")
+            .addButton((button) =>
+                button
+                    .setButtonText("Perform Garbage Collection")
+                    .setDisabled(false)
+                    .onClick(() => {
+                        this.closeSetting();
+                        eventHub.emitEvent(EVENT_REQUEST_PERFORM_GC_V3);
+                    })
+            );
+    });
+
+    // --- Rebuilding Operations (from PaneMaintenance) ---
+    void addPanel(paneEl, "Rebuilding Operations (Remote Only)", () => {}, this.onlyOnCouchDB).then((paneEl) => {
+        new Setting(paneEl)
+            .setName("Perform cleanup")
+            .setDesc(
+                "Reduces storage space by discarding all non-latest revisions. This requires the same amount of free space on the remote server and the local client."
+            )
+            .addButton((button) =>
+                button
+                    .setButtonText("Perform")
+                    .setDisabled(false)
+                    .onClick(async () => {
+                        const replicator = this.core.replicator as LiveSyncCouchDBReplicator;
+                        Logger(`Cleanup has been began`, LOG_LEVEL_NOTICE, "compaction");
+                        if (await replicator.compactRemote(this.editingSettings)) {
+                            Logger(`Cleanup has been completed!`, LOG_LEVEL_NOTICE, "compaction");
+                        } else {
+                            Logger(`Cleanup has been failed!`, LOG_LEVEL_NOTICE, "compaction");
+                        }
+                    })
+            )
+            .addOnUpdate(this.onlyOnCouchDB);
+
+        new Setting(paneEl)
+            .setName("Overwrite remote")
+            .setDesc("Overwrite remote with local DB and passphrase.")
+            .addButton((button) =>
+                button
+                    .setButtonText("Send")
+                    .setWarning()
+                    .setDisabled(false)
+                    .onClick(async () => {
+                        await this.rebuildDB("remoteOnly");
+                    })
+            );
+    });
+
+    // --- Reset (from PaneMaintenance) ---
+    void addPanel(paneEl, "Reset").then((paneEl) => {
+        new Setting(paneEl)
+            .setName("Delete local database to reset or uninstall Self-hosted LiveSync")
+            .addButton((button) =>
+                button
+                    .setButtonText("Delete")
+                    .setWarning()
+                    .setDisabled(false)
+                    .onClick(async () => {
+                        await this.services.database.resetDatabase();
+                        await this.services.databaseEvents.initialiseDatabase();
+                    })
+            );
     });
 }

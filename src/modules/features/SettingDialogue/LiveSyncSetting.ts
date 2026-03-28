@@ -14,7 +14,11 @@ import {
     statusDisplay,
     type ConfigurationItem,
 } from "../../../lib/src/common/types.ts";
-import { createStub, type ObsidianLiveSyncSettingTab } from "./ObsidianLiveSyncSettingTab.ts";
+import { type ObsidianLiveSyncSettingTab } from "./ObsidianLiveSyncSettingTab.ts";
+
+function createStub(_name: string, _key: string, _value: string, _panel: string, _pane: string) {
+    // No-op: documentation stub generation removed
+}
 import {
     type AllSettingItemKey,
     getConfig,

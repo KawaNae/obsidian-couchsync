@@ -6,10 +6,6 @@ import {
     FLAGMD_REDFLAG2_HR,
     FLAGMD_REDFLAG3_HR,
     REMOTE_COUCHDB,
-    type ConfigLevel,
-    LEVEL_POWER_USER,
-    LEVEL_ADVANCED,
-    LEVEL_EDGE_CASE,
 } from "../../../lib/src/common/types.ts";
 import { delay, isObjectDifferent, sizeToHumanReadable } from "../../../lib/src/common/utils.ts";
 import { versionNumberString2Number } from "../../../lib/src/string_and_binary/convert.ts";
@@ -34,13 +30,8 @@ import { LiveSyncSetting as Setting } from "./LiveSyncSetting.ts";
 import { fireAndForget, yieldNextAnimationFrame } from "octagonal-wheels/promises";
 import { confirmWithMessage } from "../../coreObsidian/UILib/dialogs.ts";
 import { EVENT_REQUEST_RELOAD_SETTING_TAB, eventHub } from "../../../common/events.ts";
-import { paneChangeLog } from "./PaneChangeLog.ts";
 import {
     enableOnly,
-    findAttrFromParent,
-    getLevelStr,
-    setLevelClass,
-    setStyle,
     visibleOnly,
     type OnSavedHandler,
     type OnUpdateFunc,
@@ -48,38 +39,11 @@ import {
     type PageFunctions,
     type UpdateFunction,
 } from "./SettingPane.ts";
-import { paneSetup } from "./PaneSetup.ts";
-import { paneGeneral } from "./PaneGeneral.ts";
-import { paneRemoteConfig } from "./PaneRemoteConfig.ts";
-import { paneSelector } from "./PaneSelector.ts";
-import { paneSyncSettings } from "./PaneSyncSettings.ts";
-import { paneCustomisationSync } from "./PaneCustomisationSync.ts";
-import { paneHatch } from "./PaneHatch.ts";
-import { paneAdvanced } from "./PaneAdvanced.ts";
-import { panePowerUsers } from "./PanePowerUsers.ts";
-import { panePatches } from "./PanePatches.ts";
-import { paneMaintenance } from "./PaneMaintenance.ts";
-
-// For creating a document
-const toc = new Set<string>();
-const stubs = {} as {
-    [key: string]: { [key: string]: Map<string, Record<string, string>> };
-};
-export function createStub(name: string, key: string, value: string, panel: string, pane: string) {
-    DEV: {
-        if (!(pane in stubs)) {
-            stubs[pane] = {};
-        }
-        if (!(panel in stubs[pane])) {
-            stubs[pane][panel] = new Map<string, Record<string, string>>();
-        }
-        const old = stubs[pane][panel].get(name) ?? {};
-        stubs[pane][panel].set(name, { ...old, [key]: value });
-        scheduleTask("update-stub", 100, () => {
-            eventHub.emitEvent("document-stub-created", { toc: toc, stub: stubs });
-        });
-    }
-}
+import { tabSetup } from "./tabs/SetupTab.ts";
+import { tabSync } from "./tabs/SyncTab.ts";
+import { tabFiles } from "./tabs/FilesTab.ts";
+import { tabAdvanced } from "./tabs/AdvancedTab.ts";
+import { tabMaintenance } from "./tabs/MaintenanceTab.ts";
 
 export class ObsidianLiveSyncSettingTab extends PluginSettingTab {
     plugin: ObsidianLiveSyncPlugin;
@@ -285,8 +249,6 @@ export class ObsidianLiveSyncSettingTab extends PluginSettingTab {
     controlledElementFunc = [] as UpdateFunction[];
     onSavedHandlers = [] as OnSavedHandler<any>[];
 
-    inWizard: boolean = false;
-
     constructor(app: App, plugin: ObsidianLiveSyncPlugin) {
         super(app, plugin);
         this.plugin = plugin;
@@ -427,28 +389,6 @@ export class ObsidianLiveSyncSettingTab extends PluginSettingTab {
 
     lastVersion = ~~(versionNumberString2Number(this.manifestVersion) / 1000);
 
-    screenElements: { [key: string]: HTMLElement[] } = {};
-    changeDisplay(screen: string) {
-        for (const k in this.screenElements) {
-            if (k == screen) {
-                this.screenElements[k].forEach((element) => element.removeClass("setting-collapsed"));
-            } else {
-                this.screenElements[k].forEach((element) => element.addClass("setting-collapsed"));
-            }
-        }
-        if (this.menuEl) {
-            this.menuEl.querySelectorAll(`.sls-setting-label`).forEach((element) => {
-                if (element.hasClass(`c-${screen}`)) {
-                    element.addClass("selected");
-                    element.querySelector<HTMLInputElement>("input[type=radio]")!.checked = true;
-                } else {
-                    element.removeClass("selected");
-                    element.querySelector<HTMLInputElement>("input[type=radio]")!.checked = false;
-                }
-            });
-        }
-        this.selectedScreen = screen;
-    }
     async enableMinimalSetup() {
         this.editingSettings.liveSync = false;
         this.editingSettings.periodicReplication = false;
@@ -459,27 +399,8 @@ export class ObsidianLiveSyncSettingTab extends PluginSettingTab {
         this.editingSettings.syncAfterMerge = false;
         this.core.replicator.closeReplication();
         await this.saveAllDirtySettings();
-        this.containerEl.addClass("isWizard");
-        this.inWizard = true;
-        this.changeDisplay("20");
-    }
-    menuEl?: HTMLElement;
-
-    addScreenElement(key: string, element: HTMLElement) {
-        if (!(key in this.screenElements)) {
-            this.screenElements[key] = [];
-        }
-        this.screenElements[key].push(element);
-    }
-
-    selectPane(event: Event) {
-        const target = event.target as HTMLElement;
-        if (target.tagName == "INPUT") {
-            const value = target.getAttribute("value");
-            if (value && this.selectedScreen != value) {
-                this.changeDisplay(value);
-            }
-        }
+        this.selectedScreen = "sync";
+        this.display();
     }
 
     isNeedRebuildLocal() {
@@ -525,11 +446,6 @@ export class ObsidianLiveSyncSettingTab extends PluginSettingTab {
         ({
             visibility: this.isConfiguredAs("remoteType", REMOTE_COUCHDB),
         }) as OnUpdateResult;
-    // CouchDB-only fork: these always resolve to CouchDB visibility or hidden
-    onlyOnP2POrCouchDB = this.onlyOnCouchDB;
-    onlyOnCouchDBOrMinIO = this.onlyOnCouchDB;
-    onlyOnMinIO = () => ({ visibility: false }) as OnUpdateResult;
-    onlyOnOnlyP2P = () => ({ visibility: false }) as OnUpdateResult;
     // E2EE Function
     checkWorkingPassphrase = async (): Promise<boolean> => {
         const settingForCheck: RemoteDBSettings = {
@@ -644,7 +560,6 @@ export class ObsidianLiveSyncSettingTab extends PluginSettingTab {
     }
 
     display(): void {
-        const changeDisplay = this.changeDisplay.bind(this);
         const { containerEl } = this;
         this.settingComponents.length = 0;
         this.controlledElementFunc.length = 0;
@@ -659,30 +574,14 @@ export class ObsidianLiveSyncSettingTab extends PluginSettingTab {
         this.isShown = true;
 
         containerEl.empty();
+        containerEl.addClass("cs-settings");
 
-        containerEl.addClass("sls-setting");
-        containerEl.removeClass("isWizard");
-
-        setStyle(containerEl, "menu-setting-poweruser", () => this.isConfiguredAs("usePowerUserMode", true));
-        setStyle(containerEl, "menu-setting-advanced", () => this.isConfiguredAs("useAdvancedMode", true));
-        setStyle(containerEl, "menu-setting-edgecase", () => this.isConfiguredAs("useEdgeCaseMode", true));
-
-        // const addScreenElement = (key: string, element: HTMLElement) => addScreenElement.bind(this)(key, element);
-        const menuWrapper = this.createEl(containerEl, "div", { cls: "sls-setting-menu-wrapper" });
-
-        if (this.menuEl) {
-            this.menuEl.remove();
-        }
-        this.menuEl = menuWrapper.createDiv("");
-        this.menuEl.addClass("sls-setting-menu");
-        const menuTabs = this.menuEl.querySelectorAll(".sls-setting-label");
-
+        // Rebuild warning banner
         this.createEl(
-            menuWrapper,
+            containerEl,
             "div",
             { cls: "sls-setting-menu-buttons" },
             (el) => {
-                el.addClass("wizardHidden");
                 el.createEl("label", { text: $msg("obsidianLiveSyncSettingTab.msgChangesNeedToBeApplied") });
                 void this.addEl(
                     el,
@@ -698,163 +597,66 @@ export class ObsidianLiveSyncSettingTab extends PluginSettingTab {
             visibleOnly(() => this.isNeedRebuildLocal() || this.isNeedRebuildRemote())
         );
 
-        let paneNo = 0;
-        const addPane = (
-            parentEl: HTMLElement,
-            title: string,
-            icon: string,
-            order: number,
-            wizardHidden: boolean,
-            level?: ConfigLevel
-        ) => {
-            const el = this.createEl(parentEl, "div", { text: "" });
-            DEV: {
-                const mdTitle = `${paneNo++}. ${title}${getLevelStr(level ?? "")}`;
-                el.setAttribute("data-pane", mdTitle);
-                toc.add(
-                    `| ${icon} | [${mdTitle}](#${mdTitle
-                        .toLowerCase()
-                        .replace(/ /g, "-")
-                        .replace(/[^\w\s-]/g, "")}) | `
-                );
-            }
-            setLevelClass(el, level);
-            el.createEl("h3", { text: title, cls: "sls-setting-pane-title" });
-            if (this.menuEl) {
-                this.menuEl.createEl(
-                    "label",
-                    { cls: `sls-setting-label c-${order} ${wizardHidden ? "wizardHidden" : ""}` },
-                    (el) => {
-                        setLevelClass(el, level);
-                        const inputEl = el.createEl("input", {
-                            type: "radio",
-                            name: "disp",
-                            value: `${order}`,
-                            cls: "sls-setting-tab",
-                        } as DomElementInfo);
-                        el.createEl("div", {
-                            cls: "sls-setting-menu-btn",
-                            text: icon,
-                            title: title,
-                        });
-                        inputEl.addEventListener("change", (evt) => this.selectPane(evt));
-                        inputEl.addEventListener("click", (evt) => this.selectPane(evt));
-                    }
-                );
-            }
-            this.addScreenElement(`${order}`, el);
-            const p = Promise.resolve(el);
-            // fireAndForget
-            // p.finally(() => {
-            //     // Recap at the end.
-            // });
-            return p;
-        };
-        const panelNoMap = {} as { [key: string]: number };
+        // Tab UI (task-viewer style)
+        const wrapper = containerEl.createDiv("cs-settings__wrapper");
+        const nav = wrapper.createDiv("cs-settings__nav");
+        const content = wrapper.createDiv("cs-settings__content");
+
         const addPanel = (
             parentEl: HTMLElement,
             title: string,
             callback?: (el: HTMLDivElement) => void,
             func?: OnUpdateFunc,
-            level?: ConfigLevel
         ) => {
             const el = this.createEl(parentEl, "div", { text: "" }, callback, func);
-            DEV: {
-                const paneNo = findAttrFromParent(parentEl, "data-pane");
-                if (!(paneNo in panelNoMap)) {
-                    panelNoMap[paneNo] = 0;
-                }
-                panelNoMap[paneNo] += 1;
-                const panelNo = panelNoMap[paneNo];
-                el.setAttribute("data-panel", `${panelNo}. ${title}${getLevelStr(level ?? "")}`);
-            }
-            setLevelClass(el, level);
             this.createEl(el, "h4", { text: title, cls: "sls-setting-panel-title" });
-            const p = Promise.resolve(el);
-            // p.finally(() => {
-            //     // Recap at the end.
-            // })
-            return p;
+            return Promise.resolve(el);
         };
 
-        menuTabs.forEach((element) => {
-            const e = element.querySelector(".sls-setting-tab");
-            if (!e) return;
-            e.addEventListener("change", (event) => {
-                menuTabs.forEach((element) => element.removeClass("selected"));
-                this.changeDisplay((event.currentTarget as HTMLInputElement).value);
-                element.addClass("selected");
+        const tabs = [
+            { id: "setup",       label: "Setup",       render: (el: HTMLElement) => tabSetup.call(this, el, { addPane: undefined as any, addPanel }) },
+            { id: "sync",        label: "Sync",        render: (el: HTMLElement) => tabSync.call(this, el, { addPane: undefined as any, addPanel }) },
+            { id: "files",       label: "Files",       render: (el: HTMLElement) => tabFiles.call(this, el, { addPane: undefined as any, addPanel }) },
+            { id: "advanced",    label: "Advanced",    render: (el: HTMLElement) => tabAdvanced.call(this, el, { addPane: undefined as any, addPanel }) },
+            { id: "maintenance", label: "Maintenance", render: (el: HTMLElement) => tabMaintenance.call(this, el, { addPanel } as any) },
+        ];
+
+        tabs.forEach((tab) => {
+            const btn = nav.createEl("div", {
+                cls: "cs-settings__nav-btn",
+                text: tab.label,
+                attr: { role: "tab", tabindex: "0" },
             });
+            btn.dataset.tabId = tab.id;
+
+            const panel = content.createDiv("cs-settings__panel");
+            panel.dataset.tabId = tab.id;
+            tab.render(panel);
         });
 
-        // Panes
+        const selectedTab = this.selectedScreen || (this.isAnySyncEnabled() ? "general" : "setup");
+        this.activateTab(wrapper, selectedTab);
 
-        const bindPane = (
-            paneFunc: (this: ObsidianLiveSyncSettingTab, paneEl: HTMLElement, funcs: PageFunctions) => void
-        ): ((paneEl: HTMLElement) => void) => {
-            const callback = (paneEl: HTMLElement) => {
-                paneFunc.call(this, paneEl, {
-                    addPane,
-                    addPanel,
-                });
-            };
-            return callback;
-        };
-
-        void addPane(containerEl, $msg("obsidianLiveSyncSettingTab.panelChangeLog"), "💬", 100, false).then(
-            bindPane(paneChangeLog)
-        );
-        void addPane(containerEl, $msg("obsidianLiveSyncSettingTab.panelSetup"), "🧙‍♂️", 110, false).then(
-            bindPane(paneSetup)
-        );
-        void addPane(containerEl, $msg("obsidianLiveSyncSettingTab.panelGeneralSettings"), "⚙️", 20, false).then(
-            bindPane(paneGeneral)
-        );
-        void addPane(containerEl, $msg("obsidianLiveSyncSettingTab.panelRemoteConfiguration"), "🛰️", 0, false).then(
-            bindPane(paneRemoteConfig)
-        );
-        void addPane(containerEl, $msg("obsidianLiveSyncSettingTab.titleSyncSettings"), "🔄", 30, false).then(
-            bindPane(paneSyncSettings)
-        );
-        void addPane(containerEl, "Selector", "🚦", 33, false, LEVEL_ADVANCED).then(bindPane(paneSelector));
-        void addPane(containerEl, "Customization sync", "🔌", 60, false, LEVEL_ADVANCED).then(
-            bindPane(paneCustomisationSync)
-        );
-
-        void addPane(containerEl, "Hatch", "🧰", 50, true).then(bindPane(paneHatch));
-        void addPane(containerEl, "Advanced", "🔧", 46, false, LEVEL_ADVANCED).then(bindPane(paneAdvanced));
-        void addPane(containerEl, "Power users", "💪", 47, true, LEVEL_POWER_USER).then(bindPane(panePowerUsers));
-
-        void addPane(containerEl, "Patches", "🩹", 51, false, LEVEL_EDGE_CASE).then(bindPane(panePatches));
-
-        void addPane(containerEl, "Maintenance", "🎛️", 70, true).then(bindPane(paneMaintenance));
+        nav.addEventListener("click", (e) => {
+            const btn = (e.target as HTMLElement).closest(".cs-settings__nav-btn") as HTMLElement | null;
+            if (btn?.dataset.tabId) {
+                this.selectedScreen = btn.dataset.tabId;
+                this.activateTab(wrapper, btn.dataset.tabId);
+            }
+        });
 
         void yieldNextAnimationFrame().then(() => {
-            if (this.selectedScreen == "") {
-                if (this.lastVersion != this.editingSettings.lastReadUpdates) {
-                    if (this.editingSettings.isConfigured) {
-                        changeDisplay("100");
-                    } else {
-                        changeDisplay("110");
-                    }
-                } else {
-                    if (this.isAnySyncEnabled()) {
-                        changeDisplay("20");
-                    } else {
-                        changeDisplay("110");
-                    }
-                }
-            } else {
-                changeDisplay(this.selectedScreen);
-            }
             this.requestUpdate();
         });
     }
 
-    getMinioJournalSyncClient(): never {
-        throw new Error("MinIO/S3 is not supported in this CouchDB-only fork");
+    private activateTab(wrapper: HTMLElement, tabId: string): void {
+        wrapper.querySelectorAll(".cs-settings__nav-btn").forEach((btn) =>
+            btn.toggleClass("cs-settings__nav-btn--active", (btn as HTMLElement).dataset.tabId === tabId)
+        );
+        wrapper.querySelectorAll(".cs-settings__panel").forEach((panel) =>
+            ((panel as HTMLElement).style.display = (panel as HTMLElement).dataset.tabId === tabId ? "" : "none")
+        );
     }
-    async resetRemoteBucket(): Promise<void> {
-        throw new Error("MinIO/S3 is not supported in this CouchDB-only fork");
-    }
+
 }

@@ -1,21 +1,26 @@
-import { LEVEL_ADVANCED, type CustomRegExpSource } from "../../../lib/src/common/types.ts";
-import { constructCustomRegExpList, splitCustomRegExpList } from "../../../lib/src/common/utils.ts";
-import MultipleRegExpControl from "./MultipleRegExpControl.svelte";
-import { LiveSyncSetting as Setting } from "./LiveSyncSetting.ts";
+import {
+    type CustomRegExpSource,
+} from "../../../../lib/src/common/types.ts";
+import { constructCustomRegExpList, splitCustomRegExpList } from "../../../../lib/src/common/utils.ts";
+import { LiveSyncSetting as Setting } from "../LiveSyncSetting.ts";
+import { EVENT_REQUEST_OPEN_PLUGIN_SYNC_DIALOG, eventHub } from "../../../../common/events.ts";
+import type { ObsidianLiveSyncSettingTab } from "../ObsidianLiveSyncSettingTab.ts";
+import type { PageFunctions } from "../SettingPane.ts";
+import { enableOnly, visibleOnly } from "../SettingPane.ts";
+import MultipleRegExpControl from "../MultipleRegExpControl.svelte";
 import { mount } from "svelte";
-import type { ObsidianLiveSyncSettingTab } from "./ObsidianLiveSyncSettingTab.ts";
-import type { PageFunctions } from "./SettingPane.ts";
-import { visibleOnly } from "./SettingPane.ts";
-export function paneSelector(this: ObsidianLiveSyncSettingTab, paneEl: HTMLElement, { addPanel }: PageFunctions): void {
+
+export function tabFiles(this: ObsidianLiveSyncSettingTab, paneEl: HTMLElement, { addPanel }: PageFunctions): void {
+    // --- PaneSelector: Normal Files ---
     void addPanel(paneEl, "Normal Files").then((paneEl) => {
-        paneEl.addClass("wizardHidden");
+        paneEl;
 
         const syncFilesSetting = new Setting(paneEl)
             .setName("Synchronising files")
             .setDesc(
                 "(RegExp) Empty to sync all files. Set filter as a regular expression to limit synchronising files."
             )
-            .setClass("wizardHidden");
+            ;
         mount(MultipleRegExpControl, {
             target: syncFilesSetting.controlEl,
             props: {
@@ -32,7 +37,7 @@ export function paneSelector(this: ObsidianLiveSyncSettingTab, paneEl: HTMLEleme
         const nonSyncFilesSetting = new Setting(paneEl)
             .setName("Non-Synchronising files")
             .setDesc("(RegExp) If this is set, any changes to local and remote files that match this will be skipped.")
-            .setClass("wizardHidden");
+            ;
 
         mount(MultipleRegExpControl, {
             target: nonSyncFilesSetting.controlEl,
@@ -46,17 +51,19 @@ export function paneSelector(this: ObsidianLiveSyncSettingTab, paneEl: HTMLEleme
                 },
             },
         });
-        new Setting(paneEl).setClass("wizardHidden").autoWireNumeric("syncMaxSizeInMB", { clampMin: 0 });
+        new Setting(paneEl).autoWireNumeric("syncMaxSizeInMB", { clampMin: 0 });
 
-        new Setting(paneEl).setClass("wizardHidden").autoWireToggle("useIgnoreFiles");
-        new Setting(paneEl).setClass("wizardHidden").autoWireTextArea("ignoreFiles", {
+        new Setting(paneEl).autoWireToggle("useIgnoreFiles");
+        new Setting(paneEl).autoWireTextArea("ignoreFiles", {
             onUpdate: visibleOnly(() => this.isConfiguredAs("useIgnoreFiles", true)),
         });
     });
-    void addPanel(paneEl, "Hidden Files", undefined, undefined, LEVEL_ADVANCED).then((paneEl) => {
+
+    // --- PaneSelector: Hidden Files ---
+    void addPanel(paneEl, "Hidden Files").then((paneEl) => {
         const targetPatternSetting = new Setting(paneEl)
             .setName("Target patterns")
-            .setClass("wizardHidden")
+
             .setDesc("Patterns to match files for syncing");
         const patTarget = splitCustomRegExpList(this.editingSettings.syncInternalFilesTargetPatterns, ",");
         mount(MultipleRegExpControl, {
@@ -77,7 +84,7 @@ export function paneSelector(this: ObsidianLiveSyncSettingTab, paneEl: HTMLEleme
             defaultSkipPattern + ",\\/workspace$ ,\\/workspace.json$,\\/workspace-mobile.json$";
 
         const pat = splitCustomRegExpList(this.editingSettings.syncInternalFilesIgnorePatterns, ",");
-        const patSetting = new Setting(paneEl).setName("Ignore patterns").setClass("wizardHidden").setDesc("");
+        const patSetting = new Setting(paneEl).setName("Ignore patterns").setDesc("");
 
         mount(MultipleRegExpControl, {
             target: patSetting.controlEl,
@@ -106,7 +113,7 @@ export function paneSelector(this: ObsidianLiveSyncSettingTab, paneEl: HTMLEleme
 
         new Setting(paneEl)
             .setName("Add default patterns")
-            .setClass("wizardHidden")
+
             .addButton((button) => {
                 button.setButtonText("Default").onClick(async () => {
                     await addDefaultPatterns(defaultSkipPattern);
@@ -120,7 +127,7 @@ export function paneSelector(this: ObsidianLiveSyncSettingTab, paneEl: HTMLEleme
 
         const overwritePatterns = new Setting(paneEl)
             .setName("Overwrite patterns")
-            .setClass("wizardHidden")
+
             .setDesc("Patterns to match files for overwriting instead of merging");
         const patTarget2 = splitCustomRegExpList(this.editingSettings.syncInternalFileOverwritePatterns, ",");
         mount(MultipleRegExpControl, {
@@ -138,5 +145,71 @@ export function paneSelector(this: ObsidianLiveSyncSettingTab, paneEl: HTMLEleme
                 },
             },
         });
+    });
+
+    // --- PaneCustomisationSync: Customization Sync ---
+    // With great respect, thank you TfTHacker!
+    // Refer: https://github.com/TfTHacker/obsidian42-brat/blob/main/src/features/BetaPlugins.ts
+    void addPanel(paneEl, "Customization Sync").then((paneEl) => {
+        const enableOnlyOnPluginSyncIsNotEnabled = enableOnly(() => this.isConfiguredAs("usePluginSync", false));
+        const visibleOnlyOnPluginSyncEnabled = visibleOnly(() => this.isConfiguredAs("usePluginSync", true));
+
+        this.createEl(
+            paneEl,
+            "div",
+            {
+                text: "Please set device name to identify this device. This name should be unique among your devices. While not configured, we cannot enable this feature.",
+                cls: "op-warn",
+            },
+            (c) => {},
+            visibleOnly(() => this.isConfiguredAs("deviceAndVaultName", ""))
+        );
+        this.createEl(
+            paneEl,
+            "div",
+            {
+                text: "We cannot change the device name while this feature is enabled. Please disable this feature to change the device name.",
+                cls: "op-warn-info",
+            },
+            (c) => {},
+            visibleOnly(() => this.isConfiguredAs("usePluginSync", true))
+        );
+
+        new Setting(paneEl).autoWireText("deviceAndVaultName", {
+            placeHolder: "desktop",
+            onUpdate: enableOnlyOnPluginSyncIsNotEnabled,
+        });
+
+        new Setting(paneEl).autoWireToggle("usePluginSyncV2");
+
+        new Setting(paneEl).autoWireToggle("usePluginSync", {
+            onUpdate: enableOnly(() => !this.isConfiguredAs("deviceAndVaultName", "")),
+        });
+
+        new Setting(paneEl).autoWireToggle("autoSweepPlugins", {
+            onUpdate: visibleOnlyOnPluginSyncEnabled,
+        });
+
+        new Setting(paneEl).autoWireToggle("autoSweepPluginsPeriodic", {
+            onUpdate: visibleOnly(
+                () => this.isConfiguredAs("usePluginSync", true) && this.isConfiguredAs("autoSweepPlugins", true)
+            ),
+        });
+        new Setting(paneEl).autoWireToggle("notifyPluginOrSettingUpdated", {
+            onUpdate: visibleOnlyOnPluginSyncEnabled,
+        });
+
+        new Setting(paneEl)
+            .setName("Open")
+            .setDesc("Open the dialog")
+            .addButton((button) => {
+                button
+                    .setButtonText("Open")
+                    .setDisabled(false)
+                    .onClick(() => {
+                        eventHub.emitEvent(EVENT_REQUEST_OPEN_PLUGIN_SYNC_DIALOG);
+                    });
+            })
+            .addOnUpdate(visibleOnlyOnPluginSyncEnabled);
     });
 }

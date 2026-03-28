@@ -1,34 +1,133 @@
 import {
+    ChunkAlgorithmNames,
     E2EEAlgorithmNames,
     E2EEAlgorithms,
+    ExtraSuffixIndexedDB,
     type HashAlgorithm,
     LOG_LEVEL_NOTICE,
     SuffixDatabaseName,
-} from "../../../lib/src/common/types.ts";
-import { Logger } from "../../../lib/src/common/logger.ts";
-import { LiveSyncSetting as Setting } from "./LiveSyncSetting.ts";
-import type { ObsidianLiveSyncSettingTab } from "./ObsidianLiveSyncSettingTab.ts";
-import type { PageFunctions } from "./SettingPane.ts";
-import { visibleOnly } from "./SettingPane.ts";
-import { PouchDB } from "../../../lib/src/pouchdb/pouchdb-browser";
-import { ExtraSuffixIndexedDB } from "../../../lib/src/common/types.ts";
-import { migrateDatabases } from "./settingUtils.ts";
+    type ConfigPassphraseStore,
+} from "../../../../lib/src/common/types.ts";
+import { Logger } from "../../../../lib/src/common/logger.ts";
+import { PouchDB } from "../../../../lib/src/pouchdb/pouchdb-browser";
+import { LiveSyncSetting as Setting } from "../LiveSyncSetting.ts";
+import { EVENT_ON_UNRESOLVED_ERROR, eventHub } from "../../../../common/events.ts";
+import type { ObsidianLiveSyncSettingTab } from "../ObsidianLiveSyncSettingTab.ts";
+import type { PageFunctions } from "../SettingPane.ts";
+import { visibleOnly } from "../SettingPane.ts";
+import { migrateDatabases } from "../settingUtils.ts";
+import { $msg, $t } from "../../../../lib/src/common/i18n.ts";
+import { SUPPORTED_I18N_LANGS, type I18N_LANGS } from "../../../../lib/src/common/rosetta.ts";
+import { NetworkWarningStyles } from "../../../../lib/src/common/models/setting.const.ts";
 
-export function panePatches(this: ObsidianLiveSyncSettingTab, paneEl: HTMLElement, { addPanel }: PageFunctions): void {
+export function tabAdvanced(this: ObsidianLiveSyncSettingTab, paneEl: HTMLElement, { addPanel, addPane }: PageFunctions): void {
+    // --- PaneAdvanced: Memory cache ---
+    void addPanel(paneEl, "Memory cache").then((paneEl) => {
+        new Setting(paneEl).autoWireNumeric("hashCacheMaxCount", { clampMin: 10 });
+    });
+
+    // --- PaneAdvanced: Local Database Tweak ---
+    void addPanel(paneEl, "Local Database Tweak").then((paneEl) => {
+        paneEl;
+
+        const items = ChunkAlgorithmNames;
+        new Setting(paneEl).autoWireDropDown("chunkSplitterVersion", {
+            options: items,
+        });
+        new Setting(paneEl).autoWireNumeric("customChunkSize", { clampMin: 0, acceptZero: true });
+    });
+
+    // --- PaneAdvanced: Transfer Tweak ---
+    void addPanel(paneEl, "Transfer Tweak").then((paneEl) => {
+        new Setting(paneEl)
+            
+            .autoWireToggle("readChunksOnline", { onUpdate: this.onlyOnCouchDB });
+        new Setting(paneEl)
+            
+            .autoWireToggle("useOnlyLocalChunk", { onUpdate: this.onlyOnCouchDB });
+
+        new Setting(paneEl).autoWireNumeric("concurrencyOfReadChunksOnline", {
+            clampMin: 10,
+            onUpdate: this.onlyOnCouchDB,
+        });
+
+        new Setting(paneEl).autoWireNumeric("minimumIntervalOfReadChunksOnline", {
+            clampMin: 10,
+            onUpdate: this.onlyOnCouchDB,
+        });
+    });
+
+    // --- PanePowerUsers: CouchDB Connection Tweak ---
+    void addPanel(paneEl, "CouchDB Connection Tweak", undefined, this.onlyOnCouchDB).then((paneEl) => {
+        paneEl;
+
+        this.createEl(
+            paneEl,
+            "div",
+            {
+                text: `If you reached the payload size limit when using IBM Cloudant, please decrease batch size and batch limit to a lower value.`,
+            },
+            undefined,
+            this.onlyOnCouchDB
+        );
+
+        new Setting(paneEl)
+            
+            .autoWireNumeric("batch_size", { clampMin: 2, onUpdate: this.onlyOnCouchDB });
+        new Setting(paneEl).autoWireNumeric("batches_limit", {
+            clampMin: 2,
+            onUpdate: this.onlyOnCouchDB,
+        });
+        new Setting(paneEl).autoWireToggle("useTimeouts", { onUpdate: this.onlyOnCouchDB });
+    });
+
+    // --- PanePowerUsers: Configuration Encryption ---
+    void addPanel(paneEl, "Configuration Encryption").then((paneEl) => {
+        const passphrase_options: Record<ConfigPassphraseStore, string> = {
+            "": "Default",
+            LOCALSTORAGE: "Use a custom passphrase",
+            ASK_AT_LAUNCH: "Ask an passphrase at every launch",
+        };
+
+        new Setting(paneEl)
+            .setName("Encrypting sensitive configuration items")
+            .autoWireDropDown("configPassphraseStore", {
+                options: passphrase_options,
+                holdValue: true,
+            })
+            ;
+
+        new Setting(paneEl)
+            .autoWireText("configPassphrase", { isPassword: true, holdValue: true })
+            
+            .addOnUpdate(() => ({
+                disabled: !this.isConfiguredAs("configPassphraseStore", "LOCALSTORAGE"),
+            }));
+        new Setting(paneEl).addApplyButton(["configPassphrase", "configPassphraseStore"]);
+    });
+
+    // --- PanePowerUsers: Developer ---
+    void addPanel(paneEl, "Developer").then((paneEl) => {
+        new Setting(paneEl).autoWireToggle("enableDebugTools");
+    });
+
+    // --- PanePatches: Compatibility (Metadata) ---
     void addPanel(paneEl, "Compatibility (Metadata)").then((paneEl) => {
-        new Setting(paneEl).setClass("wizardHidden").autoWireToggle("deleteMetadataOfDeletedFiles");
+        new Setting(paneEl).autoWireToggle("deleteMetadataOfDeletedFiles");
 
-        new Setting(paneEl).setClass("wizardHidden").autoWireNumeric("automaticallyDeleteMetadataOfDeletedFiles", {
+        new Setting(paneEl).autoWireNumeric("automaticallyDeleteMetadataOfDeletedFiles", {
             onUpdate: visibleOnly(() => this.isConfiguredAs("deleteMetadataOfDeletedFiles", true)),
         });
     });
 
+    // --- PanePatches: Compatibility (Conflict Behaviour) ---
     void addPanel(paneEl, "Compatibility (Conflict Behaviour)").then((paneEl) => {
-        paneEl.addClass("wizardHidden");
-        new Setting(paneEl).setClass("wizardHidden").autoWireToggle("disableMarkdownAutoMerge");
-        new Setting(paneEl).setClass("wizardHidden").autoWireToggle("writeDocumentsIfConflicted");
+        paneEl;
+        new Setting(paneEl).autoWireToggle("disableMarkdownAutoMerge");
+        new Setting(paneEl).autoWireToggle("writeDocumentsIfConflicted");
     });
 
+    // --- PanePatches: Compatibility (Database structure) ---
     void addPanel(paneEl, "Compatibility (Database structure)").then((paneEl) => {
         const migrateAllToIndexedDB = async () => {
             const dbToName = this.core.localDatabase.dbname + SuffixDatabaseName + ExtraSuffixIndexedDB;
@@ -47,8 +146,6 @@ export function panePatches(this: ObsidianLiveSyncSettingTab, paneEl: HTMLElemen
                     "Migration to IndexedDB completed. Obsidian will be restarted with new configuration immediately.",
                     LOG_LEVEL_NOTICE
                 );
-                // this.plugin.settings.useIndexedDBAdapter = true;
-                // await this.services.setting.saveSettingData();
                 await this.core.services.setting.applyPartial({ useIndexedDBAdapter: true }, true);
                 this.services.appLifecycle.performRestart();
             }
@@ -69,8 +166,6 @@ export function panePatches(this: ObsidianLiveSyncSettingTab, paneEl: HTMLElemen
                     LOG_LEVEL_NOTICE
                 );
                 await this.core.services.setting.applyPartial({ useIndexedDBAdapter: false }, true);
-                // this.core.settings.useIndexedDBAdapter = false;
-                // await this.services.setting.saveSettingData();
                 this.services.appLifecycle.performRestart();
             }
         };
@@ -113,12 +208,15 @@ export function panePatches(this: ObsidianLiveSyncSettingTab, paneEl: HTMLElemen
                 });
             }
         }
-        new Setting(paneEl).autoWireToggle("handleFilenameCaseSensitive", { holdValue: true }).setClass("wizardHidden");
+        new Setting(paneEl).autoWireToggle("handleFilenameCaseSensitive", { holdValue: true });
     });
 
+    // --- PanePatches: Compatibility (Internal API Usage) ---
     void addPanel(paneEl, "Compatibility (Internal API Usage)").then((paneEl) => {
         new Setting(paneEl).autoWireToggle("watchInternalFileChanges", { invert: true });
     });
+
+    // --- PanePatches: Compatibility (Remote Database) ---
     void addPanel(paneEl, "Compatibility (Remote Database)").then((paneEl) => {
         new Setting(paneEl).autoWireDropDown("E2EEAlgorithm", {
             options: E2EEAlgorithmNames,
@@ -133,6 +231,7 @@ export function panePatches(this: ObsidianLiveSyncSettingTab, paneEl: HTMLElemen
         ),
     });
 
+    // --- PanePatches: Edge case addressing (Database) ---
     void addPanel(paneEl, "Edge case addressing (Database)").then((paneEl) => {
         new Setting(paneEl)
             .autoWireText("additionalSuffixOfDatabaseName", { holdValue: true })
@@ -156,12 +255,15 @@ export function panePatches(this: ObsidianLiveSyncSettingTab, paneEl: HTMLElemen
             await this.core.localDatabase._prepareHashFunctions();
         });
     });
+
+    // --- PanePatches: Edge case addressing (Behaviour) ---
     void addPanel(paneEl, "Edge case addressing (Behaviour)").then((paneEl) => {
         new Setting(paneEl).autoWireToggle("doNotSuspendOnFetching");
-        new Setting(paneEl).setClass("wizardHidden").autoWireToggle("doNotDeleteFolder");
+        new Setting(paneEl).autoWireToggle("doNotDeleteFolder");
         new Setting(paneEl).autoWireToggle("processSizeMismatchedFiles");
     });
 
+    // --- PanePatches: Edge case addressing (Processing) ---
     void addPanel(paneEl, "Edge case addressing (Processing)").then((paneEl) => {
         new Setting(paneEl).autoWireToggle("disableWorkerForGeneratingChunks");
 
@@ -169,12 +271,13 @@ export function panePatches(this: ObsidianLiveSyncSettingTab, paneEl: HTMLElemen
             onUpdate: visibleOnly(() => this.isConfiguredAs("disableWorkerForGeneratingChunks", false)),
         });
     });
-    // void addPanel(paneEl, "Edge case addressing (Networking)").then((paneEl) => {
-    // new Setting(paneEl).autoWireToggle("useRequestAPI");
-    // });
+
+    // --- PanePatches: Compatibility (Trouble addressed) ---
     void addPanel(paneEl, "Compatibility (Trouble addressed)").then((paneEl) => {
         new Setting(paneEl).autoWireToggle("disableCheckingConfigMismatch");
     });
+
+    // --- PanePatches: Remediation ---
     void addPanel(paneEl, "Remediation").then((paneEl) => {
         let dateEl: HTMLSpanElement;
         new Setting(paneEl)
@@ -231,15 +334,42 @@ export function panePatches(this: ObsidianLiveSyncSettingTab, paneEl: HTMLElemen
             }
         });
     });
-    void addPanel(paneEl, "Remote Database Tweak (In sunset)").then((paneEl) => {
-        // new Setting(paneEl).autoWireToggle("useEden").setClass("wizardHidden");
-        // const onlyUsingEden = visibleOnly(() => this.isConfiguredAs("useEden", true));
-        // new Setting(paneEl).autoWireNumeric("maxChunksInEden", { onUpdate: onlyUsingEden }).setClass("wizardHidden");
-        // new Setting(paneEl)
-        //     .autoWireNumeric("maxTotalLengthInEden", { onUpdate: onlyUsingEden })
-        //     .setClass("wizardHidden");
-        // new Setting(paneEl).autoWireNumeric("maxAgeInEden", { onUpdate: onlyUsingEden }).setClass("wizardHidden");
 
-        new Setting(paneEl).autoWireToggle("enableCompression").setClass("wizardHidden");
+    // --- PanePatches: Remote Database Tweak (In sunset) ---
+    void addPanel(paneEl, "Remote Database Tweak (In sunset)").then((paneEl) => {
+        new Setting(paneEl).autoWireToggle("enableCompression");
+    });
+
+    // --- Display & Logging ---
+    void addPanel(paneEl, $msg("obsidianLiveSyncSettingTab.titleAppearance")).then((paneEl) => {
+        const languages = Object.fromEntries([
+            ...SUPPORTED_I18N_LANGS.map((e) => [e, $t(`lang-${e}`)]),
+        ]) as Record<I18N_LANGS, string>;
+        new Setting(paneEl).autoWireDropDown("displayLanguage", {
+            options: languages,
+        });
+        this.addOnSaved("displayLanguage", () => this.display());
+        new Setting(paneEl).autoWireToggle("showStatusOnEditor");
+        new Setting(paneEl).autoWireToggle("showOnlyIconsOnEditor", {
+            onUpdate: visibleOnly(() => this.isConfiguredAs("showStatusOnEditor", true)),
+        });
+        new Setting(paneEl).autoWireToggle("showStatusOnStatusbar");
+        new Setting(paneEl).autoWireToggle("hideFileWarningNotice");
+        new Setting(paneEl).autoWireDropDown("networkWarningStyle", {
+            options: {
+                [NetworkWarningStyles.BANNER]: "Show full banner",
+                [NetworkWarningStyles.ICON]: "Show icon only",
+                [NetworkWarningStyles.HIDDEN]: "Hide completely",
+            },
+        });
+        this.addOnSaved("networkWarningStyle", () => {
+            eventHub.emitEvent(EVENT_ON_UNRESOLVED_ERROR);
+        });
+    });
+    void addPanel(paneEl, $msg("obsidianLiveSyncSettingTab.titleLogging")).then((paneEl) => {
+        new Setting(paneEl).autoWireToggle("lessInformationInLog");
+        new Setting(paneEl).autoWireToggle("showVerboseLog", {
+            onUpdate: visibleOnly(() => this.isConfiguredAs("lessInformationInLog", false)),
+        });
     });
 }

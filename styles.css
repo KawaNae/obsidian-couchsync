@@ -103,53 +103,58 @@
     max-width: 100%;
 }
 
-.sls-setting-tab {
+/* ─── Tab Navigation (cs-settings) ──────────────────────── */
+
+.cs-settings .cs-settings__wrapper {
+    display: flex;
+    flex-direction: column;
+}
+
+.cs-settings .cs-settings__nav {
+    display: flex;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;
+    padding: 0;
+}
+
+.cs-settings .cs-settings__nav::-webkit-scrollbar {
     display: none;
 }
 
-div.sls-setting-menu-btn {
-    color: var(--text-normal);
-    background-color: var(--background-secondary-alt);
-    border-radius: 8px;
-    padding: 6px 10px;
+.cs-settings .cs-settings__nav-btn {
+    flex-shrink: 0;
+    white-space: nowrap;
+    padding: 12px 12px;
+    border: 1px solid transparent;
+    border-bottom: none;
+    background-color: transparent;
+    color: var(--text-muted);
     cursor: pointer;
-    margin-right: 2px;
-    font-family: "Inter", sans-serif;
-    outline: none;
+    border-radius: var(--radius-s, 4px) var(--radius-s, 4px) 0 0;
+    font-size: var(--font-ui-small);
+    margin-bottom: -1px;
+    box-shadow: none;
+    transition: color 0.15s ease;
     user-select: none;
-    flex-grow: 1;
-    text-align: center;
-    flex-shrink: 1;
 }
 
-.sls-setting-label.selected {
-    /* order: 1; */
-    flex-grow: 1;
-    /* width: 100%; */
+.cs-settings .cs-settings__nav-btn:hover {
+    color: var(--text-normal);
 }
 
-.sls-setting-tab:hover~div.sls-setting-menu-btn,
-.sls-setting-label.selected .sls-setting-tab:checked~div.sls-setting-menu-btn {
-    background-color: var(--interactive-accent);
-    color: var(--text-on-accent);
+.cs-settings .cs-settings__nav-btn--active {
+    border-color: var(--background-modifier-border);
+    background-color: var(--background-secondary);
+    color: var(--text-normal);
 }
 
-.sls-setting-menu-wrapper {
-    display: flex;
-    flex-direction: column;
-    flex-grow: 1;
-    position: sticky;
-    top: 0;
-    backdrop-filter: blur(15px);
-    padding: 4px;
-    border-radius: 10px;
-    z-index: 10;
-}
-
-.sls-setting-menu {
-    display: flex;
-    flex-direction: row;
-    overflow-x: auto;
+.cs-settings .cs-settings__content {
+    flex: 1;
+    overflow-y: auto;
+    border-top: 1px solid var(--background-modifier-border);
+    padding: 16px 0 0;
 }
 
 body {
@@ -195,15 +200,6 @@ body {
     color: var(--text-warning);
 }
 
-.sls-setting-label {
-    flex-grow: 1;
-    display: inline-flex;
-    justify-content: center;
-}
-
-.setting-collapsed {
-    display: none;
-}
 
 .sls-plugins-tbl-buttons {
     text-align: right;
@@ -430,17 +426,6 @@ div.workspace-leaf-content[data-type=bases]  .livesync-status {
 }
 
 
-.menu-setting-poweruser-disabled .sls-setting-poweruser {
-    display: none;
-}
-
-.menu-setting-advanced-disabled .sls-setting-advanced {
-    display: none;
-}
-
-.menu-setting-edgecase-disabled .sls-setting-edgecase {
-    display: none;
-}
 
 .sls-setting-panel-title {
     position: sticky;
