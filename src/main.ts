@@ -9,7 +9,7 @@ import { ConflictResolver } from "./conflict/conflict-resolver.ts";
 import { StatusBar } from "./ui/status-bar.ts";
 import { CouchSyncSettingTab } from "./settings-tab/index.ts";
 import { isFileDoc, type CouchSyncDoc } from "./types.ts";
-import { showNotice } from "./ui/notices.ts";
+import { showNotice, ProgressNotice } from "./ui/notices.ts";
 
 export default class CouchSyncPlugin extends Plugin {
     settings!: CouchSyncSettings;
@@ -115,28 +115,36 @@ export default class CouchSyncPlugin extends Plugin {
     }
 
     async initVault(): Promise<void> {
-        await this.scanVaultToDb();
+        const progress = new ProgressNotice("Init");
+        progress.update("Scanning vault files...");
+        await this.scanVaultToDb(progress);
+        progress.update("Pushing to remote...");
         const count = await this.replicator.pushToRemote();
-        console.log(`CouchSync: Init pushed ${count} docs to remote`);
         this.settings.setupComplete = true;
         await this.saveSettings();
+        progress.done(`Init complete! Pushed ${count} docs to remote.`);
     }
 
     async cloneFromRemote(): Promise<void> {
+        const progress = new ProgressNotice("Clone");
+        progress.update("Pulling from remote...");
         const count = await this.replicator.pullFromRemote();
-        console.log(`CouchSync: Clone pulled ${count} docs from remote`);
 
         const allFiles = await this.localDb.allFileDocs();
+        progress.update(`Pulled ${count} docs. Writing ${allFiles.length} files...`);
+        let written = 0;
         for (const fileDoc of allFiles) {
             try {
+                progress.update(`Writing: ${fileDoc._id} (${written + 1}/${allFiles.length})`);
                 await this.vaultSync.dbToFile(fileDoc);
+                written++;
             } catch (e) {
                 console.error(`CouchSync: Failed to write ${fileDoc._id}:`, e);
             }
         }
-        console.log(`CouchSync: Clone wrote ${allFiles.length} files to vault`);
         this.settings.setupComplete = true;
         await this.saveSettings();
+        progress.done(`Clone complete! Wrote ${written} files.`);
     }
 
     async startSync(): Promise<void> {
@@ -151,13 +159,15 @@ export default class CouchSyncPlugin extends Plugin {
         this.changeTracker.stop();
     }
 
-    private async scanVaultToDb(): Promise<void> {
+    private async scanVaultToDb(progress?: ProgressNotice): Promise<void> {
         const files = this.app.vault.getFiles();
         let synced = 0;
-        for (const file of files) {
+        for (let i = 0; i < files.length; i++) {
+            const file = files[i];
             try {
                 const existing = await this.localDb.getFileDoc(file.path);
                 if (!existing || existing.mtime < file.stat.mtime) {
+                    progress?.update(`Scanning: ${file.path} (${i + 1}/${files.length})`);
                     await this.vaultSync.fileToDb(file);
                     synced++;
                 }

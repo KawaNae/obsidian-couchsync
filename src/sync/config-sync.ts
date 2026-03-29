@@ -4,6 +4,7 @@ import type { Replicator } from "../db/replicator.ts";
 import type { ConfigDoc } from "../types.ts";
 import { DOC_PREFIX } from "../types.ts";
 import type { CouchSyncSettings } from "../settings.ts";
+import { ProgressNotice } from "../ui/notices.ts";
 
 export class ConfigSync {
     constructor(
@@ -18,28 +19,39 @@ export class ConfigSync {
         const paths = this.getSettings().configSyncPaths;
         if (paths.length === 0) return 0;
 
+        const progress = new ProgressNotice("Config Push");
         let pushed = 0;
         for (const path of paths) {
+            progress.update(`Pushing: ${path}`);
             pushed += await this.pushPath(path);
         }
 
         if (pushed > 0) {
+            progress.update("Sending to remote...");
             await this.replicator.pushToRemote();
         }
+        progress.done(`Pushed ${pushed} config file(s).`);
         return pushed;
     }
 
     /** Pull: remote → DB → write configured paths to filesystem */
     async pull(): Promise<number> {
+        const progress = new ProgressNotice("Config Pull");
+        progress.update("Pulling from remote...");
         await this.replicator.pullFromRemote();
 
         const paths = this.getSettings().configSyncPaths;
-        if (paths.length === 0) return 0;
+        if (paths.length === 0) {
+            progress.done("No config paths configured.");
+            return 0;
+        }
 
         let pulled = 0;
         for (const path of paths) {
+            progress.update(`Writing: ${path}`);
             pulled += await this.pullPath(path);
         }
+        progress.done(`Pulled ${pulled} config file(s).`);
         return pulled;
     }
 
