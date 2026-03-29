@@ -127,8 +127,8 @@
     pointer-events: none;
 }
 
-/* Fallback when .mobile-navbar not found */
-.cs-mobile-status--fallback {
+/* iPad / tablet: no navbar, no status bar — fixed bottom-right */
+.cs-mobile-status--tablet {
     position: fixed;
     bottom: 12px;
     right: 12px;
