@@ -6,6 +6,7 @@ import { renderMaintenanceTab } from "./maintenance-tab.ts";
 
 export class CouchSyncSettingTab extends PluginSettingTab {
     plugin: CouchSyncPlugin;
+    private activeTabId = "connection";
 
     constructor(app: App, plugin: CouchSyncPlugin) {
         super(app, plugin);
@@ -15,31 +16,43 @@ export class CouchSyncSettingTab extends PluginSettingTab {
     display(): void {
         const { containerEl } = this;
         containerEl.empty();
+        containerEl.addClass("cs-settings");
 
         const wrapper = containerEl.createDiv({ cls: "cs-settings__wrapper" });
 
+        // Tab navigation — event delegation on nav parent
         const nav = wrapper.createDiv({ cls: "cs-settings__nav" });
+        nav.addEventListener("click", (e) => {
+            const btn = (e.target as HTMLElement).closest(".cs-settings__nav-btn") as HTMLElement | null;
+            if (btn?.dataset.tabId) {
+                this.activateTab(wrapper, btn.dataset.tabId);
+            }
+        });
+
         const tabs = [
             { id: "connection", label: "Connection" },
             { id: "files", label: "Files" },
             { id: "maintenance", label: "Maintenance" },
         ];
 
+        // Content area
+        const content = wrapper.createDiv({ cls: "cs-settings__content" });
         const panels = new Map<string, HTMLElement>();
 
         for (const tab of tabs) {
-            const btn = nav.createEl("button", {
+            nav.createDiv({
                 text: tab.label,
                 cls: "cs-settings__nav-btn",
+                attr: { "data-tab-id": tab.id, role: "tab", tabindex: "0" },
             });
-            btn.dataset.tabId = tab.id;
-            btn.addEventListener("click", () => this.activateTab(wrapper, tab.id));
 
-            const panel = wrapper.createDiv({ cls: "cs-settings__panel" });
+            const panel = content.createDiv({ cls: "cs-settings__panel" });
             panel.dataset.tabId = tab.id;
+            panel.style.display = "none";
             panels.set(tab.id, panel);
         }
 
+        // Shared deps
         const settingsDeps = {
             getSettings: () => this.plugin.settings,
             updateSettings: async (patch: Partial<typeof this.plugin.settings>) => {
@@ -85,21 +98,20 @@ export class CouchSyncSettingTab extends PluginSettingTab {
             });
         }
 
-        this.activateTab(wrapper, "connection");
+        // Restore active tab (survives refresh)
+        this.activateTab(wrapper, this.activeTabId);
     }
 
     private activateTab(wrapper: HTMLElement, tabId: string): void {
+        this.activeTabId = tabId;
+
         wrapper.querySelectorAll(".cs-settings__nav-btn").forEach((btn) => {
-            btn.removeClass("is-active");
-            if ((btn as HTMLElement).dataset.tabId === tabId) {
-                btn.addClass("is-active");
-            }
+            const el = btn as HTMLElement;
+            el.toggleClass("cs-settings__nav-btn--active", el.dataset.tabId === tabId);
         });
         wrapper.querySelectorAll(".cs-settings__panel").forEach((panel) => {
-            panel.removeClass("is-active");
-            if ((panel as HTMLElement).dataset.tabId === tabId) {
-                panel.addClass("is-active");
-            }
+            const el = panel as HTMLElement;
+            el.style.display = el.dataset.tabId === tabId ? "" : "none";
         });
     }
 }

@@ -1,42 +1,67 @@
-/* CouchSync Settings Tabs */
-.cs-settings__wrapper {
+/**
+ * CouchSync Settings
+ * BEM naming: cs-settings
+ */
+
+.cs-settings .cs-settings__wrapper {
     display: flex;
     flex-direction: column;
-    height: 100%;
 }
 
-.cs-settings__nav {
+/* ─── Tab Navigation ──────────────────────────────────────── */
+
+.cs-settings .cs-settings__nav {
     display: flex;
-    gap: 4px;
-    border-bottom: 1px solid var(--background-modifier-border);
-    padding-bottom: 8px;
-    margin-bottom: 16px;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;
+    padding: 0;
 }
 
-.cs-settings__nav-btn {
-    padding: 4px 12px;
-    border: none;
-    background: none;
-    cursor: pointer;
-    border-radius: 4px;
-    font-size: 13px;
-    color: var(--text-muted);
-}
-
-.cs-settings__nav-btn.is-active {
-    background: var(--interactive-accent);
-    color: var(--text-on-accent);
-}
-
-.cs-settings__panel {
+.cs-settings .cs-settings__nav::-webkit-scrollbar {
     display: none;
 }
 
-.cs-settings__panel.is-active {
-    display: block;
+.cs-settings .cs-settings__nav-btn {
+    flex-shrink: 0;
+    white-space: nowrap;
+    padding: 12px 12px;
+    border: 1px solid transparent;
+    border-bottom: none;
+    background-color: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    border-radius: var(--radius-s, 4px) var(--radius-s, 4px) 0 0;
+    font-size: var(--font-ui-small);
+    margin-bottom: -1px;
+    box-shadow: none;
+    transition: color 0.15s ease;
+    user-select: none;
 }
 
-/* Status bar */
+.cs-settings .cs-settings__nav-btn:hover {
+    color: var(--text-normal);
+    box-shadow: none;
+}
+
+.cs-settings .cs-settings__nav-btn--active {
+    border-color: var(--background-modifier-border);
+    background-color: var(--background-secondary);
+    color: var(--text-normal);
+}
+
+/* ─── Content Area ────────────────────────────────────────── */
+
+.cs-settings .cs-settings__content {
+    flex: 1;
+    overflow-y: auto;
+    border-top: 1px solid var(--background-modifier-border);
+    padding: 16px 0 0;
+}
+
+/* ─── Status Bar ──────────────────────────────────────────── */
+
 .cs-status {
     display: flex;
     align-items: center;
@@ -54,7 +79,8 @@
 .cs-status__dot--disconnected { background: var(--text-error); }
 .cs-status__dot--syncing { background: var(--text-warning); }
 
-/* Config sync suggestions */
+/* ─── Config Sync Suggestions ─────────────────────────────── */
+
 .cs-suggest-list {
     max-height: 200px;
     overflow-y: auto;
