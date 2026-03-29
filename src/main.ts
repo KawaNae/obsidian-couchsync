@@ -18,7 +18,7 @@ export default class CouchSyncPlugin extends Plugin {
     replicator!: Replicator;
     conflictResolver!: ConflictResolver;
     private vaultSync!: VaultSync;
-    private hiddenSync!: HiddenSync;
+    hiddenSync!: HiddenSync;
     pluginSync!: PluginSync;
     private changeTracker!: ChangeTracker;
     private statusBar!: StatusBar;
@@ -162,13 +162,13 @@ export default class CouchSyncPlugin extends Plugin {
             console.log(`CouchSync: Scanned ${synced} files to local DB`);
         }
 
-        if (this.settings.enableHiddenSync) {
+        if (this.settings.hiddenSyncMode === "push" || this.settings.hiddenSyncMode === "sync") {
             const hiddenCount = await this.hiddenSync.scanAndSync();
             if (hiddenCount > 0) {
                 console.log(`CouchSync: Synced ${hiddenCount} hidden files`);
             }
         }
-        if (this.settings.enablePluginSync) {
+        if (this.settings.pluginSyncMode === "push" || this.settings.pluginSyncMode === "sync") {
             const pluginCount = await this.pluginSync.scanAndSync();
             if (pluginCount > 0) {
                 console.log(`CouchSync: Synced ${pluginCount} plugin configs`);

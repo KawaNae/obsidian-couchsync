@@ -39,7 +39,7 @@ export class PluginSync {
 
     async scanAndSync(): Promise<number> {
         const settings = this.getSettings();
-        if (!settings.enablePluginSync || !settings.deviceName) return 0;
+        if ((settings.pluginSyncMode !== "push" && settings.pluginSyncMode !== "sync") || !settings.deviceName) return 0;
 
         const adapter = this.app.vault.adapter;
         const pluginsDir = ".obsidian/plugins";
@@ -88,7 +88,7 @@ export class PluginSync {
 
     async applyRemoteConfig(doc: PluginConfigDoc): Promise<void> {
         const settings = this.getSettings();
-        if (!settings.enablePluginSync) return;
+        if (settings.pluginSyncMode !== "pull" && settings.pluginSyncMode !== "sync") return;
         if (doc.deviceName === settings.deviceName) return;
         if (doc.deleted) return;
 

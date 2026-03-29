@@ -16,7 +16,7 @@ export class HiddenSync {
      */
     async scanAndSync(): Promise<number> {
         const settings = this.getSettings();
-        if (!settings.enableHiddenSync) return 0;
+        if (settings.hiddenSyncMode !== "push" && settings.hiddenSyncMode !== "sync") return 0;
 
         const adapter = this.app.vault.adapter;
         const files = await this.listHiddenFiles(".obsidian");
@@ -55,7 +55,7 @@ export class HiddenSync {
      */
     async dbToFile(doc: HiddenFileDoc): Promise<void> {
         const settings = this.getSettings();
-        if (!settings.enableHiddenSync) return;
+        if (settings.hiddenSyncMode !== "pull" && settings.hiddenSyncMode !== "sync") return;
 
         const path = doc._id.slice(DOC_PREFIX.HIDDEN.length);
 
@@ -87,7 +87,7 @@ export class HiddenSync {
      */
     async fileToDb(path: string): Promise<void> {
         const settings = this.getSettings();
-        if (!settings.enableHiddenSync) return;
+        if (settings.hiddenSyncMode !== "push" && settings.hiddenSyncMode !== "sync") return;
         if (this.shouldIgnore(path)) return;
 
         try {

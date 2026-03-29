@@ -9,8 +9,8 @@ export interface CouchSyncSettings {
     syncFilter: string;
     syncIgnore: string;
     maxFileSizeMB: number;
-    enableHiddenSync: boolean;
-    enablePluginSync: boolean;
+    hiddenSyncMode: "off" | "push" | "pull" | "sync";
+    pluginSyncMode: "off" | "push" | "pull" | "sync";
     deviceName: string;
     hiddenSyncIgnore: string;
     pluginSyncList: Record<string, boolean>;
@@ -39,8 +39,8 @@ export const DEFAULT_SETTINGS: CouchSyncSettings = {
     syncFilter: "",
     syncIgnore: "",
     maxFileSizeMB: 50,
-    enableHiddenSync: false,
-    enablePluginSync: false,
+    hiddenSyncMode: "off",
+    pluginSyncMode: "off",
     deviceName: "",
     hiddenSyncIgnore: "\\.git/",
     pluginSyncList: {},

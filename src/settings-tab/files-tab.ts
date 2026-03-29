@@ -1,18 +1,29 @@
 import { Setting } from "obsidian";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { PluginSync } from "../sync/plugin-sync.ts";
+import type { HiddenSync } from "../sync/hidden-sync.ts";
+
+type SyncMode = "off" | "push" | "pull" | "sync";
+
+const SYNC_MODE_OPTIONS: Record<SyncMode, string> = {
+    off: "Off",
+    push: "Push only",
+    pull: "Pull only",
+    sync: "Sync (bidirectional)",
+};
 
 interface FilesTabDeps {
     getSettings: () => CouchSyncSettings;
     updateSettings: (patch: Partial<CouchSyncSettings>) => Promise<void>;
     pluginSync: PluginSync;
+    hiddenSync: HiddenSync;
     refresh: () => void;
 }
 
 export function renderFilesTab(el: HTMLElement, deps: FilesTabDeps): void {
     const settings = deps.getSettings();
 
-    // File Filtering
+    // ── File Filtering ──────────────────────────────────────
     el.createEl("h3", { text: "File Filtering" });
 
     new Setting(el)
@@ -53,17 +64,24 @@ export function renderFilesTab(el: HTMLElement, deps: FilesTabDeps): void {
                 })
         );
 
-    // Hidden File Sync
+    // ── Hidden File Sync ────────────────────────────────────
     el.createEl("h3", { text: "Hidden File Sync" });
 
     new Setting(el)
-        .setName("Enable hidden file sync")
-        .setDesc("Sync .obsidian/ configuration files between devices.")
-        .addToggle((toggle) =>
-            toggle.setValue(settings.enableHiddenSync).onChange(async (value) => {
-                await deps.updateSettings({ enableHiddenSync: value });
-            })
-        );
+        .setName("Hidden file sync mode")
+        .setDesc("How to sync .obsidian/ configuration files.")
+        .addDropdown((dropdown) => {
+            for (const [value, label] of Object.entries(SYNC_MODE_OPTIONS)) {
+                dropdown.addOption(value, label);
+            }
+            dropdown.setValue(settings.hiddenSyncMode);
+            dropdown.onChange(async (value) => {
+                await deps.updateSettings({ hiddenSyncMode: value as SyncMode });
+                if (value === "push" || value === "sync") {
+                    deps.hiddenSync.scanAndSync();
+                }
+            });
+        });
 
     new Setting(el)
         .setName("Hidden file ignore (RegExp)")
@@ -77,18 +95,25 @@ export function renderFilesTab(el: HTMLElement, deps: FilesTabDeps): void {
                 })
         );
 
-    // Plugin Sync
+    // ── Plugin Sync ─────────────────────────────────────────
     el.createEl("h3", { text: "Plugin Sync" });
 
     new Setting(el)
-        .setName("Enable plugin sync")
-        .setDesc("Sync plugin settings (data.json) between devices.")
-        .addToggle((toggle) =>
-            toggle.setValue(settings.enablePluginSync).onChange(async (value) => {
-                await deps.updateSettings({ enablePluginSync: value });
+        .setName("Plugin sync mode")
+        .setDesc("How to sync plugin settings (data.json) between devices.")
+        .addDropdown((dropdown) => {
+            for (const [value, label] of Object.entries(SYNC_MODE_OPTIONS)) {
+                dropdown.addOption(value, label);
+            }
+            dropdown.setValue(settings.pluginSyncMode);
+            dropdown.onChange(async (value) => {
+                await deps.updateSettings({ pluginSyncMode: value as SyncMode });
+                if (value === "push" || value === "sync") {
+                    deps.pluginSync.scanAndSync();
+                }
                 deps.refresh();
-            })
-        );
+            });
+        });
 
     new Setting(el)
         .setName("Device name")
@@ -102,8 +127,8 @@ export function renderFilesTab(el: HTMLElement, deps: FilesTabDeps): void {
                 })
         );
 
-    // Plugin selection list (only when plugin sync is enabled)
-    if (settings.enablePluginSync) {
+    // Plugin selection list (only when plugin sync is not off)
+    if (settings.pluginSyncMode !== "off") {
         const listContainer = el.createDiv();
 
         new Setting(listContainer)
@@ -128,13 +153,12 @@ export function renderFilesTab(el: HTMLElement, deps: FilesTabDeps): void {
                 })
             );
 
-        // Load plugin list async
         deps.pluginSync.listInstalledPlugins().then((plugins) => {
             const currentList = { ...settings.pluginSyncList };
             for (const pluginId of plugins) {
                 const isEnabled =
                     Object.keys(currentList).length === 0
-                        ? true // Empty list = all enabled by default
+                        ? true
                         : currentList[pluginId] === true;
 
                 new Setting(listContainer)
