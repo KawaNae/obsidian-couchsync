@@ -1,22 +1,11 @@
-import { Setting } from "obsidian";
+import { Notice, Setting } from "obsidian";
 import type { CouchSyncSettings } from "../settings.ts";
-import type { PluginSync } from "../sync/plugin-sync.ts";
-import type { HiddenSync } from "../sync/hidden-sync.ts";
-
-type SyncMode = "off" | "push" | "pull" | "sync";
-
-const SYNC_MODE_OPTIONS: Record<SyncMode, string> = {
-    off: "Off",
-    push: "Push only",
-    pull: "Pull only",
-    sync: "Sync (bidirectional)",
-};
+import type { ConfigSync } from "../sync/config-sync.ts";
 
 interface FilesTabDeps {
     getSettings: () => CouchSyncSettings;
     updateSettings: (patch: Partial<CouchSyncSettings>) => Promise<void>;
-    pluginSync: PluginSync;
-    hiddenSync: HiddenSync;
+    configSync: ConfigSync;
     refresh: () => void;
 }
 
@@ -64,113 +53,160 @@ export function renderFilesTab(el: HTMLElement, deps: FilesTabDeps): void {
                 })
         );
 
-    // ── Hidden File Sync ────────────────────────────────────
-    el.createEl("h3", { text: "Hidden File Sync" });
+    // ── Config Sync ─────────────────────────────────────────
+    el.createEl("h3", { text: "Config Sync" });
+    el.createEl("p", {
+        text: "Manually push/pull config files (.obsidian/ settings, plugin data). Add paths below, then use Push or Pull.",
+        cls: "setting-item-description",
+    });
 
-    new Setting(el)
-        .setName("Hidden file sync mode")
-        .setDesc("How to sync .obsidian/ configuration files.")
-        .addDropdown((dropdown) => {
-            for (const [value, label] of Object.entries(SYNC_MODE_OPTIONS)) {
-                dropdown.addOption(value, label);
-            }
-            dropdown.setValue(settings.hiddenSyncMode);
-            dropdown.onChange(async (value) => {
-                await deps.updateSettings({ hiddenSyncMode: value as SyncMode });
-                if (value === "push" || value === "sync") {
-                    deps.hiddenSync.scanAndSync();
-                }
-            });
-        });
-
-    new Setting(el)
-        .setName("Hidden file ignore (RegExp)")
-        .setDesc("Skip hidden files matching this pattern.")
-        .addText((text) =>
-            text
-                .setPlaceholder("\\.git/")
-                .setValue(settings.hiddenSyncIgnore)
-                .onChange(async (value) => {
-                    await deps.updateSettings({ hiddenSyncIgnore: value });
-                })
-        );
-
-    // ── Plugin Sync ─────────────────────────────────────────
-    el.createEl("h3", { text: "Plugin Sync" });
-
-    new Setting(el)
-        .setName("Plugin sync mode")
-        .setDesc("How to sync plugin settings (data.json) between devices.")
-        .addDropdown((dropdown) => {
-            for (const [value, label] of Object.entries(SYNC_MODE_OPTIONS)) {
-                dropdown.addOption(value, label);
-            }
-            dropdown.setValue(settings.pluginSyncMode);
-            dropdown.onChange(async (value) => {
-                await deps.updateSettings({ pluginSyncMode: value as SyncMode });
-                if (value === "push" || value === "sync") {
-                    deps.pluginSync.scanAndSync();
-                }
-                deps.refresh();
-            });
-        });
-
-    new Setting(el)
-        .setName("Device name")
-        .setDesc("Unique name for this device. Required for plugin sync.")
-        .addText((text) =>
-            text
-                .setPlaceholder("desktop")
-                .setValue(settings.deviceName)
-                .onChange(async (value) => {
-                    await deps.updateSettings({ deviceName: value });
-                })
-        );
-
-    // Plugin selection list (only when plugin sync is not off)
-    if (settings.pluginSyncMode !== "off") {
-        const listContainer = el.createDiv();
-
-        new Setting(listContainer)
-            .setName("Select plugins to sync")
-            .setDesc("Choose which plugins' settings to sync. If none selected, all are synced.")
+    // Current paths list
+    const paths = settings.configSyncPaths;
+    for (const path of paths) {
+        new Setting(el)
+            .setName(path)
             .addButton((btn) =>
-                btn.setButtonText("Select All").onClick(async () => {
-                    const plugins = await deps.pluginSync.listInstalledPlugins();
-                    const list: Record<string, boolean> = {};
-                    for (const id of plugins) list[id] = true;
-                    await deps.updateSettings({ pluginSyncList: list });
-                    deps.refresh();
-                })
-            )
-            .addButton((btn) =>
-                btn.setButtonText("Deselect All").onClick(async () => {
-                    const plugins = await deps.pluginSync.listInstalledPlugins();
-                    const list: Record<string, boolean> = {};
-                    for (const id of plugins) list[id] = false;
-                    await deps.updateSettings({ pluginSyncList: list });
-                    deps.refresh();
-                })
+                btn
+                    .setButtonText("×")
+                    .setWarning()
+                    .onClick(async () => {
+                        const updated = settings.configSyncPaths.filter((p) => p !== path);
+                        await deps.updateSettings({ configSyncPaths: updated });
+                        deps.refresh();
+                    })
             );
+    }
 
-        deps.pluginSync.listInstalledPlugins().then((plugins) => {
-            const currentList = { ...settings.pluginSyncList };
-            for (const pluginId of plugins) {
-                const isEnabled =
-                    Object.keys(currentList).length === 0
-                        ? true
-                        : currentList[pluginId] === true;
+    // Add path with suggestions
+    const addPathContainer = el.createDiv();
+    const addSetting = new Setting(addPathContainer).setName("Add path");
 
-                new Setting(listContainer)
-                    .setName(pluginId)
-                    .addToggle((toggle) =>
-                        toggle.setValue(isEnabled).onChange(async (value) => {
-                            const updated = { ...deps.getSettings().pluginSyncList };
-                            updated[pluginId] = value;
-                            await deps.updateSettings({ pluginSyncList: updated });
-                        })
-                    );
-            }
+    let inputValue = "";
+    const suggestionsEl = addPathContainer.createDiv({ cls: "cs-suggest-list" });
+    suggestionsEl.style.display = "none";
+
+    addSetting.addText((text) => {
+        text.setPlaceholder(".obsidian/plugins/my-plugin/data.json");
+        text.inputEl.addEventListener("focus", () => loadSuggestions(text.inputEl, suggestionsEl, deps));
+        text.inputEl.addEventListener("input", () => {
+            inputValue = text.inputEl.value;
+            filterSuggestions(suggestionsEl, inputValue);
         });
+        text.onChange((value) => {
+            inputValue = value;
+        });
+    });
+
+    addSetting.addButton((btn) =>
+        btn.setButtonText("+ Add").onClick(async () => {
+            if (!inputValue.trim()) return;
+            const trimmed = inputValue.trim();
+            if (settings.configSyncPaths.includes(trimmed)) {
+                new Notice("Path already added.");
+                return;
+            }
+            const updated = [...settings.configSyncPaths, trimmed];
+            await deps.updateSettings({ configSyncPaths: updated });
+            deps.refresh();
+        })
+    );
+
+    // Push / Pull buttons
+    new Setting(el)
+        .setName("Sync actions")
+        .setDesc(`${paths.length} path(s) configured`)
+        .addButton((btn) =>
+            btn.setButtonText("Push ↑").onClick(async () => {
+                btn.setButtonText("Pushing...");
+                btn.setDisabled(true);
+                try {
+                    const count = await deps.configSync.push();
+                    new Notice(`CouchSync: Pushed ${count} config file(s).`);
+                } catch (e: any) {
+                    new Notice(`Push failed: ${e.message}`);
+                }
+                btn.setButtonText("Push ↑");
+                btn.setDisabled(false);
+            })
+        )
+        .addButton((btn) =>
+            btn.setButtonText("Pull ↓").onClick(async () => {
+                btn.setButtonText("Pulling...");
+                btn.setDisabled(true);
+                try {
+                    const count = await deps.configSync.pull();
+                    new Notice(`CouchSync: Pulled ${count} config file(s).`);
+                } catch (e: any) {
+                    new Notice(`Pull failed: ${e.message}`);
+                }
+                btn.setButtonText("Pull ↓");
+                btn.setDisabled(false);
+            })
+        );
+}
+
+async function loadSuggestions(
+    inputEl: HTMLInputElement,
+    suggestionsEl: HTMLElement,
+    deps: FilesTabDeps
+): Promise<void> {
+    suggestionsEl.empty();
+    suggestionsEl.style.display = "block";
+
+    const currentPaths = new Set(deps.getSettings().configSyncPaths);
+
+    // Common config files
+    const commonFiles = [
+        ".obsidian/app.json",
+        ".obsidian/appearance.json",
+        ".obsidian/hotkeys.json",
+        ".obsidian/community-plugins.json",
+        ".obsidian/core-plugins.json",
+        ".obsidian/core-plugins-migration.json",
+    ];
+
+    suggestionsEl.createEl("div", { text: "── Common configs ──", cls: "cs-suggest-header" });
+    for (const path of commonFiles) {
+        if (currentPaths.has(path)) continue;
+        createSuggestionItem(suggestionsEl, path, inputEl, deps);
+    }
+
+    // Plugin data.json files
+    try {
+        const pluginPaths = await deps.configSync.listPluginDataPaths();
+        if (pluginPaths.length > 0) {
+            suggestionsEl.createEl("div", { text: "── Plugin settings ──", cls: "cs-suggest-header" });
+            for (const path of pluginPaths) {
+                if (currentPaths.has(path)) continue;
+                createSuggestionItem(suggestionsEl, path, inputEl, deps);
+            }
+        }
+    } catch (e) {
+        // ignore
+    }
+}
+
+function createSuggestionItem(
+    container: HTMLElement,
+    path: string,
+    inputEl: HTMLInputElement,
+    deps: FilesTabDeps
+): void {
+    const item = container.createDiv({ cls: "cs-suggest-item", text: path });
+    item.addEventListener("click", async () => {
+        const current = deps.getSettings().configSyncPaths;
+        if (!current.includes(path)) {
+            await deps.updateSettings({ configSyncPaths: [...current, path] });
+            deps.refresh();
+        }
+    });
+}
+
+function filterSuggestions(suggestionsEl: HTMLElement, filter: string): void {
+    const items = suggestionsEl.querySelectorAll(".cs-suggest-item");
+    const lower = filter.toLowerCase();
+    for (const item of items) {
+        const el = item as HTMLElement;
+        el.style.display = el.textContent?.toLowerCase().includes(lower) ? "" : "none";
     }
 }

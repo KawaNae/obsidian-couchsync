@@ -53,3 +53,32 @@
 .cs-status__dot--connected { background: var(--text-success); }
 .cs-status__dot--disconnected { background: var(--text-error); }
 .cs-status__dot--syncing { background: var(--text-warning); }
+
+/* Config sync suggestions */
+.cs-suggest-list {
+    max-height: 200px;
+    overflow-y: auto;
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 4px;
+    margin: 4px 0 8px;
+    padding: 4px;
+}
+
+.cs-suggest-header {
+    font-size: 11px;
+    color: var(--text-muted);
+    padding: 4px 8px 2px;
+    font-weight: 600;
+}
+
+.cs-suggest-item {
+    padding: 4px 8px;
+    cursor: pointer;
+    border-radius: 3px;
+    font-size: 12px;
+    font-family: var(--font-monospace);
+}
+
+.cs-suggest-item:hover {
+    background: var(--background-modifier-hover);
+}

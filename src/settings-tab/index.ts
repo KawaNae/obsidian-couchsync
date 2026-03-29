@@ -65,8 +65,7 @@ export class CouchSyncSettingTab extends PluginSettingTab {
         if (filesPanel) {
             renderFilesTab(filesPanel, {
                 ...settingsDeps,
-                pluginSync: this.plugin.pluginSync,
-                hiddenSync: this.plugin.hiddenSync,
+                configSync: this.plugin.configSync,
                 refresh: () => this.display(),
             });
         }

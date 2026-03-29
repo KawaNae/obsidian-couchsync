@@ -21,22 +21,12 @@ export interface ChunkDoc extends CouchSyncDocBase {
     data: string; // base64-encoded content
 }
 
-/** A hidden file from .obsidian/ directory */
-export interface HiddenFileDoc extends CouchSyncDocBase {
-    type: "hidden";
+/** A config file (.obsidian/ settings, plugin data.json, etc.) */
+export interface ConfigDoc extends CouchSyncDocBase {
+    type: "config";
     data: string;
     mtime: number;
     size: number;
-    deleted?: boolean;
-}
-
-/** Plugin configuration file */
-export interface PluginConfigDoc extends CouchSyncDocBase {
-    type: "plugin-config";
-    data: string;
-    mtime: number;
-    deviceName: string;
-    deleted?: boolean;
 }
 
 /** Local-only sync metadata (not replicated) */
@@ -49,16 +39,14 @@ export interface SyncMetaDoc {
 }
 
 /** Union of all document types stored in PouchDB */
-export type CouchSyncDoc = FileDoc | ChunkDoc | HiddenFileDoc | PluginConfigDoc;
+export type CouchSyncDoc = FileDoc | ChunkDoc | ConfigDoc;
 
 /** Prefix constants for document IDs */
 export const DOC_PREFIX = {
     CHUNK: "chunk:",
-    HIDDEN: "hidden:",
-    PLUGIN: "plugin:",
+    CONFIG: "config:",
 } as const;
 
-/** Check if a doc ID represents a file (no prefix = file path) */
 export function isFileDoc(doc: CouchSyncDoc): doc is FileDoc {
     return doc.type === "file";
 }
@@ -67,10 +55,6 @@ export function isChunkDoc(doc: CouchSyncDoc): doc is ChunkDoc {
     return doc.type === "chunk";
 }
 
-export function isHiddenFileDoc(doc: CouchSyncDoc): doc is HiddenFileDoc {
-    return doc.type === "hidden";
-}
-
-export function isPluginConfigDoc(doc: CouchSyncDoc): doc is PluginConfigDoc {
-    return doc.type === "plugin-config";
+export function isConfigDoc(doc: CouchSyncDoc): doc is ConfigDoc {
+    return doc.type === "config";
 }

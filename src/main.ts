@@ -3,13 +3,12 @@ import { type CouchSyncSettings, DEFAULT_SETTINGS } from "./settings.ts";
 import { LocalDB } from "./db/local-db.ts";
 import { Replicator } from "./db/replicator.ts";
 import { VaultSync } from "./sync/vault-sync.ts";
-import { HiddenSync } from "./sync/hidden-sync.ts";
-import { PluginSync } from "./sync/plugin-sync.ts";
+import { ConfigSync } from "./sync/config-sync.ts";
 import { ChangeTracker } from "./sync/change-tracker.ts";
 import { ConflictResolver } from "./conflict/conflict-resolver.ts";
 import { StatusBar } from "./ui/status-bar.ts";
 import { CouchSyncSettingTab } from "./settings-tab/index.ts";
-import { isFileDoc, isHiddenFileDoc, isPluginConfigDoc, type CouchSyncDoc } from "./types.ts";
+import { isFileDoc, type CouchSyncDoc } from "./types.ts";
 import { showNotice } from "./ui/notices.ts";
 
 export default class CouchSyncPlugin extends Plugin {
@@ -17,9 +16,8 @@ export default class CouchSyncPlugin extends Plugin {
     localDb!: LocalDB;
     replicator!: Replicator;
     conflictResolver!: ConflictResolver;
+    configSync!: ConfigSync;
     private vaultSync!: VaultSync;
-    hiddenSync!: HiddenSync;
-    pluginSync!: PluginSync;
     private changeTracker!: ChangeTracker;
     private statusBar!: StatusBar;
 
@@ -32,8 +30,7 @@ export default class CouchSyncPlugin extends Plugin {
 
         this.replicator = new Replicator(this.localDb, () => this.settings);
         this.vaultSync = new VaultSync(this.app, this.localDb, () => this.settings);
-        this.hiddenSync = new HiddenSync(this.app, this.localDb, () => this.settings);
-        this.pluginSync = new PluginSync(this.app, this.localDb, () => this.settings);
+        this.configSync = new ConfigSync(this.app, this.localDb, this.replicator, () => this.settings);
         this.changeTracker = new ChangeTracker(this.app, this.vaultSync, () => this.settings);
         this.conflictResolver = new ConflictResolver(this.localDb);
 
@@ -41,6 +38,7 @@ export default class CouchSyncPlugin extends Plugin {
         this.replicator.onStateChange((state) => this.statusBar.update(state));
         this.replicator.onError((msg) => showNotice(msg, 8000));
 
+        // Handle incoming remote changes — vault files only (config is manual pull)
         this.replicator.onChange((doc: CouchSyncDoc) => {
             if (isFileDoc(doc)) {
                 this.changeTracker.pause();
@@ -48,10 +46,6 @@ export default class CouchSyncPlugin extends Plugin {
                     setTimeout(() => this.changeTracker.resume(), 500);
                 });
                 this.conflictResolver.resolveIfConflicted(doc);
-            } else if (isHiddenFileDoc(doc)) {
-                this.hiddenSync.dbToFile(doc);
-            } else if (isPluginConfigDoc(doc)) {
-                this.pluginSync.applyRemoteConfig(doc);
             }
         });
 
@@ -84,6 +78,24 @@ export default class CouchSyncPlugin extends Plugin {
             name: "Force sync all files now",
             callback: () => this.scanVaultToDb(),
         });
+
+        this.addCommand({
+            id: "couchsync-config-push",
+            name: "Push config files to remote",
+            callback: async () => {
+                const count = await this.configSync.push();
+                showNotice(`Pushed ${count} config file(s).`);
+            },
+        });
+
+        this.addCommand({
+            id: "couchsync-config-pull",
+            name: "Pull config files from remote",
+            callback: async () => {
+                const count = await this.configSync.pull();
+                showNotice(`Pulled ${count} config file(s).`);
+            },
+        });
     }
 
     async onunload(): Promise<void> {
@@ -101,7 +113,6 @@ export default class CouchSyncPlugin extends Plugin {
         await this.saveData(this.settings);
     }
 
-    /** Init: scan local vault → local DB → push to remote */
     async initVault(): Promise<void> {
         await this.scanVaultToDb();
         const count = await this.replicator.pushToRemote();
@@ -110,12 +121,10 @@ export default class CouchSyncPlugin extends Plugin {
         await this.saveSettings();
     }
 
-    /** Clone: pull remote → local DB → write to vault */
     async cloneFromRemote(): Promise<void> {
         const count = await this.replicator.pullFromRemote();
         console.log(`CouchSync: Clone pulled ${count} docs from remote`);
 
-        // Write all file docs to vault
         const allFiles = await this.localDb.allFileDocs();
         for (const fileDoc of allFiles) {
             try {
@@ -129,7 +138,6 @@ export default class CouchSyncPlugin extends Plugin {
         await this.saveSettings();
     }
 
-    /** Start live bidirectional sync */
     async startSync(): Promise<void> {
         if (!this.settings.setupComplete) return;
         this.replicator.stop();
@@ -137,13 +145,11 @@ export default class CouchSyncPlugin extends Plugin {
         this.changeTracker.start();
     }
 
-    /** Stop live sync */
     stopSync(): void {
         this.replicator.stop();
         this.changeTracker.stop();
     }
 
-    /** Scan vault files into local PouchDB */
     private async scanVaultToDb(): Promise<void> {
         const files = this.app.vault.getFiles();
         let synced = 0;
@@ -160,19 +166,6 @@ export default class CouchSyncPlugin extends Plugin {
         }
         if (synced > 0) {
             console.log(`CouchSync: Scanned ${synced} files to local DB`);
-        }
-
-        if (this.settings.hiddenSyncMode === "push" || this.settings.hiddenSyncMode === "sync") {
-            const hiddenCount = await this.hiddenSync.scanAndSync();
-            if (hiddenCount > 0) {
-                console.log(`CouchSync: Synced ${hiddenCount} hidden files`);
-            }
-        }
-        if (this.settings.pluginSyncMode === "push" || this.settings.pluginSyncMode === "sync") {
-            const pluginCount = await this.pluginSync.scanAndSync();
-            if (pluginCount > 0) {
-                console.log(`CouchSync: Synced ${pluginCount} plugin configs`);
-            }
         }
     }
 }
