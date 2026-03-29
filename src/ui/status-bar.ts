@@ -1,5 +1,6 @@
 import { Platform, type Plugin } from "obsidian";
 import type { SyncState } from "../db/replicator.ts";
+import type { CouchSyncSettings } from "../settings.ts";
 
 const STATE_LABELS: Record<SyncState, string> = {
     disconnected: "Disconnected",
@@ -21,8 +22,11 @@ export class StatusBar {
     private dotEl: HTMLSpanElement | null = null;
     private textEl: HTMLSpanElement | null = null;
     private floatingEl: HTMLElement | null = null;
+    private getSettings: () => CouchSyncSettings;
 
-    constructor(plugin: Plugin) {
+    constructor(plugin: Plugin, getSettings: () => CouchSyncSettings) {
+        this.getSettings = getSettings;
+
         if (!Platform.isMobile) {
             const el = plugin.addStatusBarItem();
             el.addClass("cs-status");
@@ -32,8 +36,8 @@ export class StatusBar {
             this.floatingEl = createDiv({ cls: "cs-mobile-status" });
             this.dotEl = this.floatingEl.createSpan({ cls: "cs-status__dot" });
             this.textEl = this.floatingEl.createSpan();
-
             document.body.appendChild(this.floatingEl);
+            this.applyPosition();
         }
 
         this.update("disconnected");
@@ -47,6 +51,15 @@ export class StatusBar {
         if (this.textEl) {
             this.textEl.setText(STATE_LABELS[state]);
         }
+    }
+
+    /** Re-apply position from settings (call after settings change) */
+    applyPosition(): void {
+        if (!this.floatingEl) return;
+        const s = this.getSettings();
+        this.floatingEl.style.bottom = `${s.mobileStatusBottom}px`;
+        this.floatingEl.style.left = s.mobileStatusAlign === "left" ? `${s.mobileStatusOffset}px` : "";
+        this.floatingEl.style.right = s.mobileStatusAlign === "right" ? `${s.mobileStatusOffset}px` : "";
     }
 
     destroy(): void {

@@ -19,7 +19,7 @@ export default class CouchSyncPlugin extends Plugin {
     configSync!: ConfigSync;
     private vaultSync!: VaultSync;
     private changeTracker!: ChangeTracker;
-    private statusBar!: StatusBar;
+    statusBar!: StatusBar;
 
     async onload(): Promise<void> {
         await this.loadSettings();
@@ -34,7 +34,7 @@ export default class CouchSyncPlugin extends Plugin {
         this.changeTracker = new ChangeTracker(this.app, this.vaultSync, () => this.settings);
         this.conflictResolver = new ConflictResolver(this.localDb);
 
-        this.statusBar = new StatusBar(this);
+        this.statusBar = new StatusBar(this, () => this.settings);
         this.replicator.onStateChange((state) => this.statusBar.update(state));
         this.replicator.onError((msg) => showNotice(msg, 8000));
 

@@ -1,8 +1,9 @@
-import { Notice, Setting } from "obsidian";
+import { Notice, Platform, Setting } from "obsidian";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { LocalDB } from "../db/local-db.ts";
 import type { Replicator } from "../db/replicator.ts";
 import type { ConflictResolver } from "../conflict/conflict-resolver.ts";
+import type { StatusBar } from "../ui/status-bar.ts";
 
 interface MaintenanceTabDeps {
     getSettings: () => CouchSyncSettings;
@@ -10,11 +11,56 @@ interface MaintenanceTabDeps {
     localDb: LocalDB;
     replicator: Replicator;
     conflictResolver: ConflictResolver;
+    statusBar: StatusBar;
     onRestart: () => void;
 }
 
 export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps): void {
     const settings = deps.getSettings();
+
+    // Mobile status position (only show on mobile)
+    if (Platform.isMobile) {
+        el.createEl("h3", { text: "Status Indicator" });
+
+        new Setting(el)
+            .setName("Align")
+            .setDesc("Which side of the screen to show the sync status.")
+            .addDropdown((dropdown) => {
+                dropdown.addOption("left", "Left");
+                dropdown.addOption("right", "Right");
+                dropdown.setValue(settings.mobileStatusAlign);
+                dropdown.onChange(async (value) => {
+                    await deps.updateSettings({ mobileStatusAlign: value as "left" | "right" });
+                    deps.statusBar.applyPosition();
+                });
+            });
+
+        new Setting(el)
+            .setName("Bottom (px)")
+            .setDesc("Distance from the bottom of the screen.")
+            .addText((text) =>
+                text.setValue(String(settings.mobileStatusBottom)).onChange(async (value) => {
+                    const num = parseInt(value, 10);
+                    if (!isNaN(num) && num >= 0) {
+                        await deps.updateSettings({ mobileStatusBottom: num });
+                        deps.statusBar.applyPosition();
+                    }
+                })
+            );
+
+        new Setting(el)
+            .setName("Horizontal offset (px)")
+            .setDesc("Distance from the left or right edge.")
+            .addText((text) =>
+                text.setValue(String(settings.mobileStatusOffset)).onChange(async (value) => {
+                    const num = parseInt(value, 10);
+                    if (!isNaN(num) && num >= 0) {
+                        await deps.updateSettings({ mobileStatusOffset: num });
+                        deps.statusBar.applyPosition();
+                    }
+                })
+            );
+    }
 
     // Logging
     el.createEl("h3", { text: "Logging" });

@@ -90,6 +90,7 @@ export class CouchSyncSettingTab extends PluginSettingTab {
                 localDb: this.plugin.localDb,
                 replicator: this.plugin.replicator,
                 conflictResolver: this.plugin.conflictResolver,
+                statusBar: this.plugin.statusBar,
                 onRestart: () => {
                     const app = this.plugin.app as any;
                     app.plugins?.disablePlugin("obsidian-couchsync");

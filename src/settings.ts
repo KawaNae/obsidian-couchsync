@@ -17,6 +17,11 @@ export interface CouchSyncSettings {
     historyMinIntervalMs: number;
     historyMaxStorageMB: number;
 
+    // Mobile status position
+    mobileStatusAlign: "left" | "right";
+    mobileStatusBottom: number;
+    mobileStatusOffset: number;
+
     // Maintenance
     showVerboseLog: boolean;
 
@@ -41,6 +46,10 @@ export const DEFAULT_SETTINGS: CouchSyncSettings = {
     historyDebounceMs: 5000,
     historyMinIntervalMs: 60000,
     historyMaxStorageMB: 500,
+
+    mobileStatusAlign: "left",
+    mobileStatusBottom: 50,
+    mobileStatusOffset: 8,
 
     showVerboseLog: false,
 
