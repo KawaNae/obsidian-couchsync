@@ -23,16 +23,14 @@ export class StatusBar {
     private desktopDot: HTMLSpanElement | null = null;
     private desktopText: HTMLSpanElement | null = null;
 
-    // Mobile: floating indicator
+    // Mobile: anchored to navbar
     private mobileEl: HTMLElement | null = null;
     private mobileDot: HTMLSpanElement | null = null;
     private mobileText: HTMLSpanElement | null = null;
 
     constructor(plugin: Plugin) {
         if (Platform.isMobile) {
-            this.mobileEl = document.body.createDiv({ cls: "cs-mobile-status" });
-            this.mobileDot = this.mobileEl.createSpan({ cls: "cs-status__dot" });
-            this.mobileText = this.mobileEl.createSpan();
+            this.createMobileIndicator();
         } else {
             this.desktopEl = plugin.addStatusBarItem();
             this.desktopEl.addClass("cs-status");
@@ -41,6 +39,22 @@ export class StatusBar {
         }
 
         this.update("disconnected");
+    }
+
+    private createMobileIndicator(): void {
+        this.mobileEl = createDiv({ cls: "cs-mobile-status" });
+        this.mobileDot = this.mobileEl.createSpan({ cls: "cs-status__dot" });
+        this.mobileText = this.mobileEl.createSpan();
+
+        // Insert inside .mobile-navbar, at the beginning
+        const navbar = document.querySelector(".mobile-navbar");
+        if (navbar) {
+            navbar.insertBefore(this.mobileEl, navbar.firstChild);
+        } else {
+            // Fallback: append to body with fixed position
+            this.mobileEl.addClass("cs-mobile-status--fallback");
+            document.body.appendChild(this.mobileEl);
+        }
     }
 
     update(state: SyncState): void {
