@@ -113,8 +113,8 @@
 
 .cs-mobile-status {
     position: absolute;
-    top: -20px;
-    right: 8px;
+    top: 0px;
+    right: 70px;
     display: flex;
     align-items: center;
     gap: 4px;
