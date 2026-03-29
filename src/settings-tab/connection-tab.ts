@@ -15,32 +15,40 @@ interface ConnectionTabDeps {
 
 export function renderConnectionTab(el: HTMLElement, deps: ConnectionTabDeps): void {
     const settings = deps.getSettings();
+    const connectionLocked = settings.syncEnabled;
 
     // ── Step 1: Connection ──────────────────────────────────
     el.createEl("h3", { text: "Step 1: Connection" });
 
+    if (connectionLocked) {
+        el.createEl("p", {
+            text: "Disable sync to change connection settings.",
+            cls: "setting-item-description",
+        });
+    }
+
     new Setting(el)
         .setName("Server URI")
         .setDesc("e.g. https://your-couchdb-server:5984")
-        .addText((text) =>
-            text
-                .setPlaceholder("https://localhost:5984")
+        .addText((text) => {
+            text.setPlaceholder("https://localhost:5984")
                 .setValue(settings.couchdbUri)
                 .onChange(async (value) => {
                     await deps.updateSettings({ couchdbUri: value, connectionTested: false });
-                })
-        );
+                });
+            text.setDisabled(connectionLocked);
+        });
 
     new Setting(el)
         .setName("Username")
-        .addText((text) =>
-            text
-                .setPlaceholder("admin")
+        .addText((text) => {
+            text.setPlaceholder("admin")
                 .setValue(settings.couchdbUser)
                 .onChange(async (value) => {
                     await deps.updateSettings({ couchdbUser: value, connectionTested: false });
-                })
-        );
+                });
+            text.setDisabled(connectionLocked);
+        });
 
     new Setting(el)
         .setName("Password")
@@ -51,42 +59,46 @@ export function renderConnectionTab(el: HTMLElement, deps: ConnectionTabDeps): v
                     await deps.updateSettings({ couchdbPassword: value, connectionTested: false });
                 });
             text.inputEl.type = "password";
+            text.setDisabled(connectionLocked);
         });
 
     new Setting(el)
         .setName("Database Name")
-        .addText((text) =>
-            text
-                .setPlaceholder("obsidian")
+        .addText((text) => {
+            text.setPlaceholder("obsidian")
                 .setValue(settings.couchdbDbName)
                 .onChange(async (value) => {
                     await deps.updateSettings({ couchdbDbName: value, connectionTested: false });
-                })
-        );
+                });
+            text.setDisabled(connectionLocked);
+        });
 
     new Setting(el)
         .setName("Test Connection")
         .setDesc("Verify connection to CouchDB server")
         .addButton((btn) =>
-            btn.setButtonText("Test").onClick(async () => {
-                btn.setButtonText("Testing...");
-                btn.setDisabled(true);
-                const error = await deps.replicator.testConnection();
-                if (error) {
-                    btn.setButtonText("Failed");
-                    await deps.updateSettings({ connectionTested: false });
-                    new Notice(`Connection failed: ${error}`, 8000);
-                } else {
-                    btn.setButtonText("Success!");
-                    await deps.updateSettings({ connectionTested: true });
-                    new Notice("Connection successful!", 3000);
-                    deps.refresh();
-                }
-                setTimeout(() => {
-                    btn.setButtonText("Test");
-                    btn.setDisabled(false);
-                }, 3000);
-            })
+            btn
+                .setButtonText("Test")
+                .setDisabled(connectionLocked)
+                .onClick(async () => {
+                    btn.setButtonText("Testing...");
+                    btn.setDisabled(true);
+                    const error = await deps.replicator.testConnection();
+                    if (error) {
+                        btn.setButtonText("Failed");
+                        await deps.updateSettings({ connectionTested: false });
+                        new Notice(`Connection failed: ${error}`, 8000);
+                    } else {
+                        btn.setButtonText("Success!");
+                        await deps.updateSettings({ connectionTested: true });
+                        new Notice("Connection successful!", 3000);
+                        deps.refresh();
+                    }
+                    setTimeout(() => {
+                        btn.setButtonText("Test");
+                        btn.setDisabled(false);
+                    }, 3000);
+                })
         );
 
     // ── Step 2: Setup ───────────────────────────────────────
