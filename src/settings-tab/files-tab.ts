@@ -56,7 +56,7 @@ export function renderFilesTab(el: HTMLElement, deps: FilesTabDeps): void {
     // ── Config Sync ─────────────────────────────────────────
     el.createEl("h3", { text: "Config Sync" });
     el.createEl("p", {
-        text: "Manually push/pull config files (.obsidian/ settings, plugin data). Add paths below, then use Push or Pull.",
+        text: "Manually push/pull config files and plugin folders. Add paths below, then use Push or Pull.",
         cls: "setting-item-description",
     });
 
@@ -86,8 +86,8 @@ export function renderFilesTab(el: HTMLElement, deps: FilesTabDeps): void {
     suggestionsEl.style.display = "none";
 
     addSetting.addText((text) => {
-        text.setPlaceholder(".obsidian/plugins/my-plugin/data.json");
-        text.inputEl.addEventListener("focus", () => loadSuggestions(text.inputEl, suggestionsEl, deps));
+        text.setPlaceholder(".obsidian/plugins/my-plugin/");
+        text.inputEl.addEventListener("focus", () => loadSuggestions(suggestionsEl, deps));
         text.inputEl.addEventListener("input", () => {
             inputValue = text.inputEl.value;
             filterSuggestions(suggestionsEl, inputValue);
@@ -145,40 +145,28 @@ export function renderFilesTab(el: HTMLElement, deps: FilesTabDeps): void {
         );
 }
 
-async function loadSuggestions(
-    inputEl: HTMLInputElement,
-    suggestionsEl: HTMLElement,
-    deps: FilesTabDeps
-): Promise<void> {
+async function loadSuggestions(suggestionsEl: HTMLElement, deps: FilesTabDeps): Promise<void> {
     suggestionsEl.empty();
     suggestionsEl.style.display = "block";
 
     const currentPaths = new Set(deps.getSettings().configSyncPaths);
 
     // Common config files
-    const commonFiles = [
-        ".obsidian/app.json",
-        ".obsidian/appearance.json",
-        ".obsidian/hotkeys.json",
-        ".obsidian/community-plugins.json",
-        ".obsidian/core-plugins.json",
-        ".obsidian/core-plugins-migration.json",
-    ];
-
+    const commonFiles = deps.configSync.getCommonConfigPaths();
     suggestionsEl.createEl("div", { text: "── Common configs ──", cls: "cs-suggest-header" });
     for (const path of commonFiles) {
         if (currentPaths.has(path)) continue;
-        createSuggestionItem(suggestionsEl, path, inputEl, deps);
+        createSuggestionItem(suggestionsEl, path, deps);
     }
 
-    // Plugin data.json files
+    // Plugin folders
     try {
-        const pluginPaths = await deps.configSync.listPluginDataPaths();
-        if (pluginPaths.length > 0) {
-            suggestionsEl.createEl("div", { text: "── Plugin settings ──", cls: "cs-suggest-header" });
-            for (const path of pluginPaths) {
-                if (currentPaths.has(path)) continue;
-                createSuggestionItem(suggestionsEl, path, inputEl, deps);
+        const pluginFolders = await deps.configSync.listPluginFolders();
+        if (pluginFolders.length > 0) {
+            suggestionsEl.createEl("div", { text: "── Plugin folders ──", cls: "cs-suggest-header" });
+            for (const folder of pluginFolders) {
+                if (currentPaths.has(folder)) continue;
+                createSuggestionItem(suggestionsEl, folder, deps);
             }
         }
     } catch (e) {
@@ -186,12 +174,7 @@ async function loadSuggestions(
     }
 }
 
-function createSuggestionItem(
-    container: HTMLElement,
-    path: string,
-    inputEl: HTMLInputElement,
-    deps: FilesTabDeps
-): void {
+function createSuggestionItem(container: HTMLElement, path: string, deps: FilesTabDeps): void {
     const item = container.createDiv({ cls: "cs-suggest-item", text: path });
     item.addEventListener("click", async () => {
         const current = deps.getSettings().configSyncPaths;
