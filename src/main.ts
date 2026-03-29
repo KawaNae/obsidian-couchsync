@@ -67,7 +67,6 @@ export default class CouchSyncPlugin extends Plugin {
             ) {
                 const state = this.replicator.getState();
                 if (state === "disconnected" || state === "error") {
-                    this.replicator.resetRetries();
                     this.startSync();
                 }
             }
