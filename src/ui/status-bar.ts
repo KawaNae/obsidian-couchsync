@@ -33,12 +33,7 @@ export class StatusBar {
             this.dotEl = this.floatingEl.createSpan({ cls: "cs-status__dot" });
             this.textEl = this.floatingEl.createSpan();
 
-            const navbar = document.querySelector(".mobile-navbar");
-            if (navbar) {
-                navbar.insertBefore(this.floatingEl, navbar.firstChild);
-            } else {
-                document.body.appendChild(this.floatingEl);
-            }
+            document.body.appendChild(this.floatingEl);
         }
 
         this.update("disconnected");
