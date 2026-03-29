@@ -161,7 +161,7 @@ export class Replicator {
     /** One-shot push: local → remote */
     async pushToRemote(): Promise<number> {
         const remoteUrl = this.getRemoteUrl();
-        const remoteDb = new PouchDB<CouchSyncDoc>(remoteUrl, { skip_setup: true });
+        const remoteDb = new PouchDB<CouchSyncDoc>(remoteUrl, {});
         const db = this.localDb.getDb();
         const result = await db.replicate.to(remoteDb, { batch_size: 100 });
         await remoteDb.close();
@@ -171,7 +171,7 @@ export class Replicator {
     /** One-shot pull: remote → local */
     async pullFromRemote(): Promise<number> {
         const remoteUrl = this.getRemoteUrl();
-        const remoteDb = new PouchDB<CouchSyncDoc>(remoteUrl, { skip_setup: true });
+        const remoteDb = new PouchDB<CouchSyncDoc>(remoteUrl, {});
         const db = this.localDb.getDb();
         const result = await db.replicate.from(remoteDb, { batch_size: 100 });
         await remoteDb.close();
@@ -182,7 +182,7 @@ export class Replicator {
     async testConnection(): Promise<string | null> {
         try {
             const remoteUrl = this.getRemoteUrl();
-            const remoteDb = new PouchDB(remoteUrl, { skip_setup: true });
+            const remoteDb = new PouchDB(remoteUrl, {});
             await remoteDb.info();
             await remoteDb.close();
             return null;
