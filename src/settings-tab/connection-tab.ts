@@ -13,24 +13,32 @@ interface ConnectionTabDeps {
     refresh: () => void;
 }
 
+type ConnectionState = "editing" | "tested" | "setupDone" | "syncing";
+
+function getState(settings: CouchSyncSettings): ConnectionState {
+    if (settings.syncEnabled) return "syncing";
+    if (settings.setupComplete) return "setupDone";
+    if (settings.connectionTested) return "tested";
+    return "editing";
+}
+
 export function renderConnectionTab(el: HTMLElement, deps: ConnectionTabDeps): void {
     const settings = deps.getSettings();
-    // Fields editable only when sync is off AND setup not complete
-    const fieldsLocked = settings.syncEnabled || settings.setupComplete;
+    const state = getState(settings);
+
+    const fieldsEditable = state === "editing" || state === "tested";
+    const testEnabled = state === "editing" || state === "tested";
+    const applyEnabled = state !== "syncing";
+    const initCloneEnabled = state === "tested";
+    const syncToggleEnabled = state === "setupDone" || state === "syncing";
 
     // ── Step 1: Connection ──────────────────────────────────
     el.createEl("h3", { text: "Step 1: Connection" });
 
-    if (settings.syncEnabled) {
-        el.createEl("p", {
-            text: "Disable sync first, then use Apply to change connection.",
-            cls: "setting-item-description",
-        });
-    } else if (settings.setupComplete) {
-        el.createEl("p", {
-            text: "Use Apply to reset and change connection settings.",
-            cls: "setting-item-description",
-        });
+    if (state === "syncing") {
+        el.createEl("p", { text: "Disable sync to change connection.", cls: "setting-item-description" });
+    } else if (state === "setupDone") {
+        el.createEl("p", { text: "Use Reset Connection to change settings.", cls: "setting-item-description" });
     }
 
     new Setting(el)
@@ -40,9 +48,10 @@ export function renderConnectionTab(el: HTMLElement, deps: ConnectionTabDeps): v
             text.setPlaceholder("https://localhost:5984")
                 .setValue(settings.couchdbUri)
                 .onChange(async (value) => {
-                    await deps.updateSettings({ couchdbUri: value });
+                    await deps.updateSettings({ couchdbUri: value, connectionTested: false });
+                    deps.refresh();
                 });
-            text.setDisabled(fieldsLocked);
+            text.setDisabled(!fieldsEditable);
         });
 
     new Setting(el)
@@ -51,9 +60,10 @@ export function renderConnectionTab(el: HTMLElement, deps: ConnectionTabDeps): v
             text.setPlaceholder("admin")
                 .setValue(settings.couchdbUser)
                 .onChange(async (value) => {
-                    await deps.updateSettings({ couchdbUser: value });
+                    await deps.updateSettings({ couchdbUser: value, connectionTested: false });
+                    deps.refresh();
                 });
-            text.setDisabled(fieldsLocked);
+            text.setDisabled(!fieldsEditable);
         });
 
     new Setting(el)
@@ -62,10 +72,11 @@ export function renderConnectionTab(el: HTMLElement, deps: ConnectionTabDeps): v
             text.setPlaceholder("password")
                 .setValue(settings.couchdbPassword)
                 .onChange(async (value) => {
-                    await deps.updateSettings({ couchdbPassword: value });
+                    await deps.updateSettings({ couchdbPassword: value, connectionTested: false });
+                    deps.refresh();
                 });
             text.inputEl.type = "password";
-            text.setDisabled(fieldsLocked);
+            text.setDisabled(!fieldsEditable);
         });
 
     new Setting(el)
@@ -74,22 +85,26 @@ export function renderConnectionTab(el: HTMLElement, deps: ConnectionTabDeps): v
             text.setPlaceholder("obsidian")
                 .setValue(settings.couchdbDbName)
                 .onChange(async (value) => {
-                    await deps.updateSettings({ couchdbDbName: value });
+                    await deps.updateSettings({ couchdbDbName: value, connectionTested: false });
+                    deps.refresh();
                 });
-            text.setDisabled(fieldsLocked);
+            text.setDisabled(!fieldsEditable);
         });
 
     new Setting(el)
-        .setName("Apply")
+        .setName(state === "setupDone" ? "Reset Connection" : "Apply")
         .setDesc(
-            settings.syncEnabled
+            state === "syncing"
                 ? "Disable sync first."
-                : "Reset connection to allow re-configuration."
+                : state === "setupDone"
+                    ? "Unlock fields to change connection settings."
+                    : "Confirm connection settings."
         )
         .addButton((btn) =>
             btn
-                .setButtonText("Apply")
-                .setDisabled(settings.syncEnabled)
+                .setButtonText(state === "setupDone" ? "Reset" : "Apply")
+                .setDisabled(!applyEnabled)
+                .setWarning(state === "setupDone")
                 .onClick(async () => {
                     deps.stopSync();
                     await deps.updateSettings({
@@ -97,7 +112,7 @@ export function renderConnectionTab(el: HTMLElement, deps: ConnectionTabDeps): v
                         setupComplete: false,
                         syncEnabled: false,
                     });
-                    new Notice("Connection reset. Edit settings and test.", 3000);
+                    new Notice("Connection reset. Edit and test again.", 3000);
                     deps.refresh();
                 })
         );
@@ -108,7 +123,7 @@ export function renderConnectionTab(el: HTMLElement, deps: ConnectionTabDeps): v
         .addButton((btn) =>
             btn
                 .setButtonText("Test")
-                .setDisabled(fieldsLocked)
+                .setDisabled(!testEnabled)
                 .onClick(async () => {
                     btn.setButtonText("Testing...");
                     btn.setDisabled(true);
@@ -121,8 +136,8 @@ export function renderConnectionTab(el: HTMLElement, deps: ConnectionTabDeps): v
                         btn.setButtonText("Success!");
                         await deps.updateSettings({ connectionTested: true });
                         new Notice("Connection successful!", 3000);
-                        deps.refresh();
                     }
+                    deps.refresh();
                     setTimeout(() => {
                         btn.setButtonText("Test");
                         btn.setDisabled(false);
@@ -133,14 +148,13 @@ export function renderConnectionTab(el: HTMLElement, deps: ConnectionTabDeps): v
     // ── Step 2: Setup ───────────────────────────────────────
     el.createEl("h3", { text: "Step 2: Setup" });
 
-    const setupDisabled = !settings.connectionTested || settings.syncEnabled;
-    const setupDesc = !settings.connectionTested
+    const setupDesc = state === "editing"
         ? "Test connection first."
-        : settings.syncEnabled
-            ? "Disable sync before re-running setup."
-            : settings.setupComplete
-                ? "Setup complete. You can re-run if needed."
-                : "Choose how to initialize this vault.";
+        : state === "tested"
+            ? "Choose how to initialize this vault."
+            : state === "setupDone"
+                ? "Setup complete."
+                : "Disable sync to re-run setup.";
 
     new Setting(el)
         .setName("Init")
@@ -148,19 +162,19 @@ export function renderConnectionTab(el: HTMLElement, deps: ConnectionTabDeps): v
         .addButton((btn) =>
             btn
                 .setButtonText("Init")
-                .setDisabled(setupDisabled)
+                .setDisabled(!initCloneEnabled)
                 .onClick(async () => {
                     btn.setButtonText("Pushing...");
                     btn.setDisabled(true);
                     try {
                         await deps.initVault();
-                        new Notice("Init complete! Local vault pushed to remote.", 5000);
+                        new Notice("Init complete!", 5000);
                         deps.refresh();
                     } catch (e: any) {
                         new Notice(`Init failed: ${e.message}`, 8000);
+                        btn.setButtonText("Init");
+                        btn.setDisabled(false);
                     }
-                    btn.setButtonText("Init");
-                    btn.setDisabled(false);
                 })
         );
 
@@ -170,44 +184,40 @@ export function renderConnectionTab(el: HTMLElement, deps: ConnectionTabDeps): v
         .addButton((btn) =>
             btn
                 .setButtonText("Clone")
-                .setDisabled(setupDisabled)
+                .setDisabled(!initCloneEnabled)
                 .onClick(async () => {
                     btn.setButtonText("Pulling...");
                     btn.setDisabled(true);
                     try {
                         await deps.cloneFromRemote();
-                        new Notice("Clone complete! Remote data pulled to local vault.", 5000);
+                        new Notice("Clone complete!", 5000);
                         deps.refresh();
                     } catch (e: any) {
                         new Notice(`Clone failed: ${e.message}`, 8000);
+                        btn.setButtonText("Clone");
+                        btn.setDisabled(false);
                     }
-                    btn.setButtonText("Clone");
-                    btn.setDisabled(false);
                 })
         );
 
-    if (setupDesc) {
-        el.createEl("p", { text: setupDesc, cls: "setting-item-description" });
-    }
+    el.createEl("p", { text: setupDesc, cls: "setting-item-description" });
 
     // ── Step 3: Sync ────────────────────────────────────────
     el.createEl("h3", { text: "Step 3: Sync" });
 
-    const syncToggleDisabled = !settings.setupComplete;
-
     new Setting(el)
         .setName("Live Sync")
         .setDesc(
-            !settings.setupComplete
-                ? "Complete Init or Clone first."
-                : settings.syncEnabled
-                    ? "Bidirectional live sync is active."
-                    : "Enable to start live bidirectional sync."
+            state === "syncing"
+                ? "Bidirectional live sync is active."
+                : state === "setupDone"
+                    ? "Enable to start live bidirectional sync."
+                    : "Complete Init or Clone first."
         )
         .addToggle((toggle) =>
             toggle
                 .setValue(settings.syncEnabled)
-                .setDisabled(syncToggleDisabled)
+                .setDisabled(!syncToggleEnabled)
                 .onChange(async (value) => {
                     await deps.updateSettings({ syncEnabled: value });
                     if (value) {
