@@ -1,31 +1,19 @@
-# Intellij
-*.iml
-.idea
+node_modules/
 
-# npm
-node_modules
-package-lock.json
-
-# build
+# Build output
 main.js
-main_org.js
-main_org_*.js
 *.js.map
 meta.json
 meta-*.json
 
-
-# obsidian
+# Obsidian
 data.json
+
+# IDE
 .vscode
+.idea
+*.iml
 
-# environment variables
+# Environment
 .env
-
-# local config files
 *.local
-
-cov_profile/**
-
-coverage
-src/apps/cli/dist/*
