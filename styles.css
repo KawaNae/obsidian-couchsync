@@ -108,3 +108,22 @@
 .cs-suggest-item:hover {
     background: var(--background-modifier-hover);
 }
+
+/* ─── Mobile Floating Status ──────────────────────────────── */
+
+.cs-mobile-status {
+    position: fixed;
+    bottom: 56px;
+    right: 12px;
+    z-index: 100;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 8px;
+    border-radius: 12px;
+    background: var(--background-secondary);
+    border: 1px solid var(--background-modifier-border);
+    font-size: 11px;
+    opacity: 0.85;
+    pointer-events: none;
+}

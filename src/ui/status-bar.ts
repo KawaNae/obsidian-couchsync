@@ -1,4 +1,4 @@
-import type { Plugin } from "obsidian";
+import { Platform, type Plugin } from "obsidian";
 import type { SyncState } from "../db/replicator.ts";
 
 const STATE_LABELS: Record<SyncState, string> = {
@@ -18,23 +18,50 @@ const STATE_DOT_CLASS: Record<SyncState, string> = {
 };
 
 export class StatusBar {
-    private el: HTMLElement;
-    private dotEl: HTMLSpanElement;
-    private textEl: HTMLSpanElement;
+    // Desktop: status bar item
+    private desktopEl: HTMLElement | null = null;
+    private desktopDot: HTMLSpanElement | null = null;
+    private desktopText: HTMLSpanElement | null = null;
+
+    // Mobile: floating indicator
+    private mobileEl: HTMLElement | null = null;
+    private mobileDot: HTMLSpanElement | null = null;
+    private mobileText: HTMLSpanElement | null = null;
 
     constructor(plugin: Plugin) {
-        this.el = plugin.addStatusBarItem();
-        this.el.addClass("cs-status");
-
-        this.dotEl = this.el.createSpan({ cls: "cs-status__dot" });
-        this.textEl = this.el.createSpan();
+        if (Platform.isMobile) {
+            this.mobileEl = document.body.createDiv({ cls: "cs-mobile-status" });
+            this.mobileDot = this.mobileEl.createSpan({ cls: "cs-status__dot" });
+            this.mobileText = this.mobileEl.createSpan();
+        } else {
+            this.desktopEl = plugin.addStatusBarItem();
+            this.desktopEl.addClass("cs-status");
+            this.desktopDot = this.desktopEl.createSpan({ cls: "cs-status__dot" });
+            this.desktopText = this.desktopEl.createSpan();
+        }
 
         this.update("disconnected");
     }
 
     update(state: SyncState): void {
-        this.dotEl.className = "cs-status__dot";
-        this.dotEl.addClass(STATE_DOT_CLASS[state]);
-        this.textEl.setText(STATE_LABELS[state]);
+        const dotClass = STATE_DOT_CLASS[state];
+        const label = STATE_LABELS[state];
+
+        if (this.desktopDot && this.desktopText) {
+            this.desktopDot.className = "cs-status__dot";
+            this.desktopDot.addClass(dotClass);
+            this.desktopText.setText(label);
+        }
+
+        if (this.mobileDot && this.mobileText) {
+            this.mobileDot.className = "cs-status__dot";
+            this.mobileDot.addClass(dotClass);
+            this.mobileText.setText(label);
+        }
+    }
+
+    destroy(): void {
+        this.mobileEl?.remove();
+        this.mobileEl = null;
     }
 }
