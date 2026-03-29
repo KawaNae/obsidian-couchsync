@@ -109,9 +109,13 @@
     background: var(--background-modifier-hover);
 }
 
-/* ─── Mobile Status: shared base ──────────────────────────── */
+/* ─── Mobile Status (inside .mobile-navbar) ──────────────── */
 
 .cs-mobile-status {
+    position: absolute;
+    top: 0px;
+    right: -70px;
+    z-index: 1;
     display: flex;
     align-items: center;
     gap: 4px;
@@ -122,18 +126,4 @@
     font-size: 10px;
     opacity: 0.8;
     pointer-events: none;
-}
-
-/* Phone: anchored inside .mobile-navbar */
-body.is-phone .cs-mobile-status {
-    position: absolute;
-    top: 0px;
-    right: -70px;
-}
-
-/* Tablet (iPad): fixed bottom-right */
-body.is-mobile:not(.is-phone) .cs-mobile-status {
-    position: fixed;
-    bottom: 12px;
-    right: 12px;
 }
