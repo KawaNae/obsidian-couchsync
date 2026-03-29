@@ -15,7 +15,7 @@ interface ConnectionTabDeps {
 
 export function renderConnectionTab(el: HTMLElement, deps: ConnectionTabDeps): void {
     const settings = deps.getSettings();
-    const connectionLocked = settings.syncEnabled;
+    const connectionLocked = settings.setupComplete || settings.syncEnabled;
 
     // ── Step 1: Connection ──────────────────────────────────
     el.createEl("h3", { text: "Step 1: Connection" });

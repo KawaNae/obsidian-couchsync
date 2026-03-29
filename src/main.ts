@@ -118,7 +118,9 @@ export default class CouchSyncPlugin extends Plugin {
         progress.update("Scanning vault files...");
         await this.scanVaultToDb(progress);
         progress.update("Pushing to remote...");
-        const count = await this.replicator.pushToRemote();
+        const count = await this.replicator.pushToRemote((docId, n) => {
+            progress.update(`Pushing: ${docId} (${n})`);
+        });
         this.settings.setupComplete = true;
         await this.saveSettings();
         progress.done(`Init complete! Pushed ${count} docs to remote.`);
@@ -127,7 +129,9 @@ export default class CouchSyncPlugin extends Plugin {
     async cloneFromRemote(): Promise<void> {
         const progress = new ProgressNotice("Clone");
         progress.update("Pulling from remote...");
-        const count = await this.replicator.pullFromRemote();
+        const count = await this.replicator.pullFromRemote((docId, n) => {
+            progress.update(`Pulling: ${docId} (${n})`);
+        });
 
         const allFiles = await this.localDb.allFileDocs();
         progress.update(`Pulled ${count} docs. Writing ${allFiles.length} files...`);

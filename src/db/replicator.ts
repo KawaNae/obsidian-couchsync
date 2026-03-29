@@ -159,23 +159,57 @@ export class Replicator {
     }
 
     /** One-shot push: local → remote */
-    async pushToRemote(): Promise<number> {
+    async pushToRemote(onProgress?: (docId: string, count: number) => void): Promise<number> {
         const remoteUrl = this.getRemoteUrl();
         const remoteDb = new PouchDB<CouchSyncDoc>(remoteUrl, {});
         const db = this.localDb.getDb();
-        const result = await db.replicate.to(remoteDb, { batch_size: 100 });
-        await remoteDb.close();
-        return result.docs_written;
+        let total = 0;
+        return new Promise<number>((resolve, reject) => {
+            const replication = db.replicate.to(remoteDb, { batch_size: 100 });
+            replication.on("change", (info) => {
+                if (info.docs) {
+                    for (const doc of info.docs) {
+                        total++;
+                        onProgress?.(doc._id, total);
+                    }
+                }
+            });
+            replication.on("complete", async (info) => {
+                await remoteDb.close();
+                resolve(info.docs_written);
+            });
+            replication.on("error", async (err) => {
+                await remoteDb.close();
+                reject(err);
+            });
+        });
     }
 
     /** One-shot pull: remote → local */
-    async pullFromRemote(): Promise<number> {
+    async pullFromRemote(onProgress?: (docId: string, count: number) => void): Promise<number> {
         const remoteUrl = this.getRemoteUrl();
         const remoteDb = new PouchDB<CouchSyncDoc>(remoteUrl, {});
         const db = this.localDb.getDb();
-        const result = await db.replicate.from(remoteDb, { batch_size: 100 });
-        await remoteDb.close();
-        return result.docs_written;
+        let total = 0;
+        return new Promise<number>((resolve, reject) => {
+            const replication = db.replicate.from(remoteDb, { batch_size: 100 });
+            replication.on("change", (info) => {
+                if (info.docs) {
+                    for (const doc of info.docs) {
+                        total++;
+                        onProgress?.(doc._id, total);
+                    }
+                }
+            });
+            replication.on("complete", async (info) => {
+                await remoteDb.close();
+                resolve(info.docs_written);
+            });
+            replication.on("error", async (err) => {
+                await remoteDb.close();
+                reject(err);
+            });
+        });
     }
 
     /** Test connection to CouchDB. Returns null on success or error message. */
