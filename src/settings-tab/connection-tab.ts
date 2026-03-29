@@ -15,14 +15,14 @@ interface ConnectionTabDeps {
 
 export function renderConnectionTab(el: HTMLElement, deps: ConnectionTabDeps): void {
     const settings = deps.getSettings();
-    const connectionLocked = settings.setupComplete || settings.syncEnabled;
+    const connectionLocked = settings.setupComplete;
 
     // ── Step 1: Connection ──────────────────────────────────
     el.createEl("h3", { text: "Step 1: Connection" });
 
     if (connectionLocked) {
         el.createEl("p", {
-            text: "Disable sync to change connection settings.",
+            text: "Connection is locked. Use Apply to change connection settings.",
             cls: "setting-item-description",
         });
     }
@@ -34,7 +34,7 @@ export function renderConnectionTab(el: HTMLElement, deps: ConnectionTabDeps): v
             text.setPlaceholder("https://localhost:5984")
                 .setValue(settings.couchdbUri)
                 .onChange(async (value) => {
-                    await deps.updateSettings({ couchdbUri: value, connectionTested: false });
+                    await deps.updateSettings({ couchdbUri: value });
                 });
             text.setDisabled(connectionLocked);
         });
@@ -45,7 +45,7 @@ export function renderConnectionTab(el: HTMLElement, deps: ConnectionTabDeps): v
             text.setPlaceholder("admin")
                 .setValue(settings.couchdbUser)
                 .onChange(async (value) => {
-                    await deps.updateSettings({ couchdbUser: value, connectionTested: false });
+                    await deps.updateSettings({ couchdbUser: value });
                 });
             text.setDisabled(connectionLocked);
         });
@@ -56,7 +56,7 @@ export function renderConnectionTab(el: HTMLElement, deps: ConnectionTabDeps): v
             text.setPlaceholder("password")
                 .setValue(settings.couchdbPassword)
                 .onChange(async (value) => {
-                    await deps.updateSettings({ couchdbPassword: value, connectionTested: false });
+                    await deps.updateSettings({ couchdbPassword: value });
                 });
             text.inputEl.type = "password";
             text.setDisabled(connectionLocked);
@@ -68,10 +68,32 @@ export function renderConnectionTab(el: HTMLElement, deps: ConnectionTabDeps): v
             text.setPlaceholder("obsidian")
                 .setValue(settings.couchdbDbName)
                 .onChange(async (value) => {
-                    await deps.updateSettings({ couchdbDbName: value, connectionTested: false });
+                    await deps.updateSettings({ couchdbDbName: value });
                 });
             text.setDisabled(connectionLocked);
         });
+
+    // Apply button: reset connection state to allow re-configuration
+    if (connectionLocked) {
+        new Setting(el)
+            .setName("Change connection")
+            .setDesc("Reset connection to change settings. Stops sync if active.")
+            .addButton((btn) =>
+                btn
+                    .setButtonText("Apply")
+                    .setWarning()
+                    .onClick(async () => {
+                        deps.stopSync();
+                        await deps.updateSettings({
+                            connectionTested: false,
+                            setupComplete: false,
+                            syncEnabled: false,
+                        });
+                        new Notice("Connection reset. Configure and test again.", 3000);
+                        deps.refresh();
+                    })
+            );
+    }
 
     new Setting(el)
         .setName("Test Connection")
