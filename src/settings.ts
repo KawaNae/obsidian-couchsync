@@ -13,6 +13,7 @@ export interface CouchSyncSettings {
     enablePluginSync: boolean;
     deviceName: string;
     hiddenSyncIgnore: string;
+    pluginSyncList: Record<string, boolean>;
 
     // History
     historyRetentionDays: number;
@@ -42,6 +43,7 @@ export const DEFAULT_SETTINGS: CouchSyncSettings = {
     enablePluginSync: false,
     deviceName: "",
     hiddenSyncIgnore: "\\.git/",
+    pluginSyncList: {},
 
     historyRetentionDays: 30,
     historyDebounceMs: 5000,

@@ -1,9 +1,12 @@
 import { Setting } from "obsidian";
 import type { CouchSyncSettings } from "../settings.ts";
+import type { PluginSync } from "../sync/plugin-sync.ts";
 
 interface FilesTabDeps {
     getSettings: () => CouchSyncSettings;
     updateSettings: (patch: Partial<CouchSyncSettings>) => Promise<void>;
+    pluginSync: PluginSync;
+    refresh: () => void;
 }
 
 export function renderFilesTab(el: HTMLElement, deps: FilesTabDeps): void {
@@ -83,6 +86,7 @@ export function renderFilesTab(el: HTMLElement, deps: FilesTabDeps): void {
         .addToggle((toggle) =>
             toggle.setValue(settings.enablePluginSync).onChange(async (value) => {
                 await deps.updateSettings({ enablePluginSync: value });
+                deps.refresh();
             })
         );
 
@@ -97,4 +101,52 @@ export function renderFilesTab(el: HTMLElement, deps: FilesTabDeps): void {
                     await deps.updateSettings({ deviceName: value });
                 })
         );
+
+    // Plugin selection list (only when plugin sync is enabled)
+    if (settings.enablePluginSync) {
+        const listContainer = el.createDiv();
+
+        new Setting(listContainer)
+            .setName("Select plugins to sync")
+            .setDesc("Choose which plugins' settings to sync. If none selected, all are synced.")
+            .addButton((btn) =>
+                btn.setButtonText("Select All").onClick(async () => {
+                    const plugins = await deps.pluginSync.listInstalledPlugins();
+                    const list: Record<string, boolean> = {};
+                    for (const id of plugins) list[id] = true;
+                    await deps.updateSettings({ pluginSyncList: list });
+                    deps.refresh();
+                })
+            )
+            .addButton((btn) =>
+                btn.setButtonText("Deselect All").onClick(async () => {
+                    const plugins = await deps.pluginSync.listInstalledPlugins();
+                    const list: Record<string, boolean> = {};
+                    for (const id of plugins) list[id] = false;
+                    await deps.updateSettings({ pluginSyncList: list });
+                    deps.refresh();
+                })
+            );
+
+        // Load plugin list async
+        deps.pluginSync.listInstalledPlugins().then((plugins) => {
+            const currentList = { ...settings.pluginSyncList };
+            for (const pluginId of plugins) {
+                const isEnabled =
+                    Object.keys(currentList).length === 0
+                        ? true // Empty list = all enabled by default
+                        : currentList[pluginId] === true;
+
+                new Setting(listContainer)
+                    .setName(pluginId)
+                    .addToggle((toggle) =>
+                        toggle.setValue(isEnabled).onChange(async (value) => {
+                            const updated = { ...deps.getSettings().pluginSyncList };
+                            updated[pluginId] = value;
+                            await deps.updateSettings({ pluginSyncList: updated });
+                        })
+                    );
+            }
+        });
+    }
 }

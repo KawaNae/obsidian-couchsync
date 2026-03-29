@@ -11,9 +11,32 @@ export class PluginSync {
         private getSettings: () => CouchSyncSettings
     ) {}
 
-    /**
-     * Scan local plugin configs and store them in DB with this device's name.
-     */
+    /** List all installed plugin IDs by scanning .obsidian/plugins/ */
+    async listInstalledPlugins(): Promise<string[]> {
+        const adapter = this.app.vault.adapter;
+        const pluginsDir = ".obsidian/plugins";
+        const pluginIds: string[] = [];
+
+        try {
+            const listing = await adapter.list(pluginsDir);
+            for (const folder of listing.folders) {
+                const pluginId = folder.split("/").pop();
+                if (pluginId) pluginIds.push(pluginId);
+            }
+        } catch (e) {
+            console.error("CouchSync: Failed to list plugins:", e);
+        }
+        return pluginIds.sort();
+    }
+
+    /** Check if a plugin should be synced based on pluginSyncList */
+    private shouldSync(pluginId: string): boolean {
+        const list = this.getSettings().pluginSyncList;
+        // Empty list = sync all plugins
+        if (Object.keys(list).length === 0) return true;
+        return list[pluginId] === true;
+    }
+
     async scanAndSync(): Promise<number> {
         const settings = this.getSettings();
         if (!settings.enablePluginSync || !settings.deviceName) return 0;
@@ -27,8 +50,8 @@ export class PluginSync {
             for (const folder of listing.folders) {
                 const pluginId = folder.split("/").pop();
                 if (!pluginId) continue;
+                if (!this.shouldSync(pluginId)) continue;
 
-                // Sync manifest.json, main.js, styles.css, data.json
                 const configFiles = ["manifest.json", "data.json", "styles.css"];
                 for (const fileName of configFiles) {
                     const filePath = `${folder}/${fileName}`;
@@ -63,20 +86,12 @@ export class PluginSync {
         return synced;
     }
 
-    /**
-     * Apply a remote plugin config to local filesystem.
-     */
     async applyRemoteConfig(doc: PluginConfigDoc): Promise<void> {
         const settings = this.getSettings();
         if (!settings.enablePluginSync) return;
-
-        // Don't apply our own configs back
         if (doc.deviceName === settings.deviceName) return;
-
         if (doc.deleted) return;
 
-        // Extract plugin ID and filename from _id
-        // Format: "plugin:<pluginId>/<filename>"
         const idWithoutPrefix = doc._id.slice(DOC_PREFIX.PLUGIN.length);
         const slashIndex = idWithoutPrefix.indexOf("/");
         if (slashIndex === -1) return;
@@ -84,7 +99,7 @@ export class PluginSync {
         const pluginId = idWithoutPrefix.slice(0, slashIndex);
         const fileName = idWithoutPrefix.slice(slashIndex + 1);
 
-        // Only sync data.json (settings), not main.js or manifest.json
+        if (!this.shouldSync(pluginId)) return;
         if (fileName !== "data.json") return;
 
         const filePath = `.obsidian/plugins/${pluginId}/${fileName}`;
@@ -92,10 +107,7 @@ export class PluginSync {
 
         try {
             const dir = `.obsidian/plugins/${pluginId}`;
-            if (!(await adapter.exists(dir))) {
-                // Don't create plugin directories that don't exist locally
-                return;
-            }
+            if (!(await adapter.exists(dir))) return;
             await adapter.write(filePath, doc.data);
             console.log(`CouchSync: Applied plugin config for ${pluginId} from ${doc.deviceName}`);
         } catch (e) {

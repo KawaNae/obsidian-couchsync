@@ -9,7 +9,8 @@ import { ChangeTracker } from "./sync/change-tracker.ts";
 import { ConflictResolver } from "./conflict/conflict-resolver.ts";
 import { StatusBar } from "./ui/status-bar.ts";
 import { CouchSyncSettingTab } from "./settings-tab/index.ts";
-import { isFileDoc, isHiddenFileDoc, isPluginConfigDoc, type CouchSyncDoc, type FileDoc } from "./types.ts";
+import { isFileDoc, isHiddenFileDoc, isPluginConfigDoc, type CouchSyncDoc } from "./types.ts";
+import { showNotice } from "./ui/notices.ts";
 
 export default class CouchSyncPlugin extends Plugin {
     settings!: CouchSyncSettings;
@@ -18,7 +19,7 @@ export default class CouchSyncPlugin extends Plugin {
     conflictResolver!: ConflictResolver;
     private vaultSync!: VaultSync;
     private hiddenSync!: HiddenSync;
-    private pluginSync!: PluginSync;
+    pluginSync!: PluginSync;
     private changeTracker!: ChangeTracker;
     private statusBar!: StatusBar;
 
@@ -38,6 +39,7 @@ export default class CouchSyncPlugin extends Plugin {
 
         this.statusBar = new StatusBar(this);
         this.replicator.onStateChange((state) => this.statusBar.update(state));
+        this.replicator.onError((msg) => showNotice(msg, 8000));
 
         this.replicator.onChange((doc: CouchSyncDoc) => {
             if (isFileDoc(doc)) {
@@ -59,6 +61,21 @@ export default class CouchSyncPlugin extends Plugin {
             if (this.settings.syncEnabled && this.settings.setupComplete) {
                 this.changeTracker.start();
                 this.startSync();
+            }
+        });
+
+        // Reconnect when returning from background (mobile)
+        this.registerDomEvent(document, "visibilitychange", () => {
+            if (
+                document.visibilityState === "visible" &&
+                this.settings.syncEnabled &&
+                this.settings.setupComplete
+            ) {
+                const state = this.replicator.getState();
+                if (state === "disconnected" || state === "error") {
+                    this.replicator.resetRetries();
+                    this.startSync();
+                }
             }
         });
 

@@ -63,7 +63,11 @@ export class CouchSyncSettingTab extends PluginSettingTab {
 
         const filesPanel = panels.get("files");
         if (filesPanel) {
-            renderFilesTab(filesPanel, settingsDeps);
+            renderFilesTab(filesPanel, {
+                ...settingsDeps,
+                pluginSync: this.plugin.pluginSync,
+                refresh: () => this.display(),
+            });
         }
 
         const maintenancePanel = panels.get("maintenance");

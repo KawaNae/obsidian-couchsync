@@ -7,12 +7,19 @@ export type SyncState = "disconnected" | "connected" | "syncing" | "error" | "pa
 
 export type OnChangeHandler = (doc: CouchSyncDoc) => void;
 export type OnStateChangeHandler = (state: SyncState) => void;
+export type OnErrorHandler = (message: string) => void;
+
+const MAX_RETRIES = 3;
+const RETRY_DELAY_MS = 30000;
 
 export class Replicator {
     private sync: PouchDB.Replication.Sync<CouchSyncDoc> | null = null;
     private state: SyncState = "disconnected";
     private onChangeHandlers: OnChangeHandler[] = [];
     private onStateChangeHandlers: OnStateChangeHandler[] = [];
+    private onErrorHandlers: OnErrorHandler[] = [];
+    private retryCount = 0;
+    private retryTimer: ReturnType<typeof setTimeout> | null = null;
 
     constructor(
         private localDb: LocalDB,
@@ -31,11 +38,36 @@ export class Replicator {
         this.onStateChangeHandlers.push(handler);
     }
 
+    onError(handler: OnErrorHandler): void {
+        this.onErrorHandlers.push(handler);
+    }
+
     private setState(state: SyncState): void {
         this.state = state;
         for (const handler of this.onStateChangeHandlers) {
             handler(state);
         }
+    }
+
+    private emitError(message: string): void {
+        for (const handler of this.onErrorHandlers) {
+            handler(message);
+        }
+    }
+
+    private scheduleRetry(): void {
+        if (this.retryTimer) return;
+        if (this.retryCount >= MAX_RETRIES) {
+            this.emitError(`Sync failed ${MAX_RETRIES} times. Open Settings > Maintenance to reconnect.`);
+            return;
+        }
+        this.retryCount++;
+        this.emitError(`Sync error. Retrying in ${RETRY_DELAY_MS / 1000}s... (${this.retryCount}/${MAX_RETRIES})`);
+        this.retryTimer = setTimeout(() => {
+            this.retryTimer = null;
+            this.stop();
+            this.start();
+        }, RETRY_DELAY_MS);
     }
 
     private getRemoteUrl(): string {
@@ -82,7 +114,14 @@ export class Replicator {
         });
 
         this.sync.on("paused", (err) => {
-            this.setState(err ? "error" : "connected");
+            if (err) {
+                this.setState("error");
+                this.scheduleRetry();
+            } else {
+                // Caught up — reset retry count on success
+                this.retryCount = 0;
+                this.setState("connected");
+            }
         });
 
         this.sync.on("active", () => {
@@ -92,11 +131,13 @@ export class Replicator {
         this.sync.on("denied", (err) => {
             console.error("CouchSync: replication denied:", err);
             this.setState("error");
+            this.emitError("Sync denied: check CouchDB permissions.");
         });
 
         this.sync.on("error", (err) => {
             console.error("CouchSync: replication error:", err);
             this.setState("error");
+            this.scheduleRetry();
         });
 
         this.sync.on("complete", () => {
@@ -107,11 +148,20 @@ export class Replicator {
     }
 
     stop(): void {
+        if (this.retryTimer) {
+            clearTimeout(this.retryTimer);
+            this.retryTimer = null;
+        }
         if (this.sync) {
             this.sync.cancel();
             this.sync = null;
         }
         this.setState("disconnected");
+    }
+
+    /** Reset retry counter — call after manual reconnect */
+    resetRetries(): void {
+        this.retryCount = 0;
     }
 
     /** One-shot push: local → remote. Returns number of docs pushed. */
