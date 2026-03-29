@@ -23,26 +23,31 @@ export class StatusBar {
     private floatingEl: HTMLElement | null = null;
 
     constructor(plugin: Plugin) {
-        if (!Platform.isMobile) {
+        const isMobile = document.body.hasClass("is-mobile");
+        const isPhone = document.body.hasClass("is-phone");
+
+        if (!isMobile) {
             // Desktop: status bar
             const el = plugin.addStatusBarItem();
             el.addClass("cs-status");
             this.dotEl = el.createSpan({ cls: "cs-status__dot" });
             this.textEl = el.createSpan();
         } else {
-            // Mobile: phone or tablet
-            this.floatingEl = createDiv();
+            // Mobile (phone or tablet)
+            this.floatingEl = createDiv({ cls: "cs-mobile-status" });
             this.dotEl = this.floatingEl.createSpan({ cls: "cs-status__dot" });
             this.textEl = this.floatingEl.createSpan();
 
-            const navbar = document.querySelector(".mobile-navbar");
-            if (navbar) {
-                // Phone: anchor inside navbar
-                this.floatingEl.addClass("cs-mobile-status");
-                navbar.insertBefore(this.floatingEl, navbar.firstChild);
+            if (isPhone) {
+                // Phone: anchor inside .mobile-navbar
+                const navbar = document.querySelector(".mobile-navbar");
+                if (navbar) {
+                    navbar.insertBefore(this.floatingEl, navbar.firstChild);
+                } else {
+                    document.body.appendChild(this.floatingEl);
+                }
             } else {
-                // iPad: fixed bottom-right (no navbar, no status bar)
-                this.floatingEl.addClass("cs-mobile-status", "cs-mobile-status--tablet");
+                // Tablet (iPad): append to body, CSS handles fixed positioning
                 document.body.appendChild(this.floatingEl);
             }
         }
