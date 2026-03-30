@@ -1,8 +1,7 @@
 import type { ChunkDoc } from "../types.ts";
 import { DOC_PREFIX } from "../types.ts";
 
-const MAX_CHUNK_SIZE_TEXT = 1000; // characters
-const MAX_CHUNK_SIZE_BIN = 102400; // bytes (100KB)
+const MAX_CHUNK_SIZE = 100 * 1024; // 100KB in base64 characters
 
 let xxhash: { h64ToString: (input: string) => string } | null = null;
 
@@ -16,40 +15,6 @@ async function getXXHash() {
 export async function computeHash(data: string): Promise<string> {
     const h = await getXXHash();
     return h.h64ToString(data);
-}
-
-function splitText(content: string): string[] {
-    if (content.length <= MAX_CHUNK_SIZE_TEXT) {
-        return [content];
-    }
-    const lines = content.split("\n");
-    const chunks: string[] = [];
-    let current = "";
-
-    for (const line of lines) {
-        const candidate = current ? current + "\n" + line : line;
-        if (candidate.length > MAX_CHUNK_SIZE_TEXT && current.length > 0) {
-            chunks.push(current);
-            current = line;
-        } else {
-            current = candidate;
-        }
-    }
-    if (current.length > 0) {
-        chunks.push(current);
-    }
-    return chunks;
-}
-
-function splitBinary(base64: string): string[] {
-    if (base64.length <= MAX_CHUNK_SIZE_BIN) {
-        return [base64];
-    }
-    const chunks: string[] = [];
-    for (let i = 0; i < base64.length; i += MAX_CHUNK_SIZE_BIN) {
-        chunks.push(base64.slice(i, i + MAX_CHUNK_SIZE_BIN));
-    }
-    return chunks;
 }
 
 export function arrayBufferToBase64(buffer: ArrayBuffer): string {
@@ -70,18 +35,36 @@ export function base64ToArrayBuffer(base64: string): ArrayBuffer {
     return bytes.buffer;
 }
 
+function textToBase64(text: string): string {
+    const bytes = new TextEncoder().encode(text);
+    return arrayBufferToBase64(bytes.buffer);
+}
+
+function base64ToText(base64: string): string {
+    const buffer = base64ToArrayBuffer(base64);
+    return new TextDecoder().decode(buffer);
+}
+
+function splitBase64(base64: string): string[] {
+    if (base64.length <= MAX_CHUNK_SIZE) {
+        return [base64];
+    }
+    const chunks: string[] = [];
+    for (let i = 0; i < base64.length; i += MAX_CHUNK_SIZE) {
+        chunks.push(base64.slice(i, i + MAX_CHUNK_SIZE));
+    }
+    return chunks;
+}
+
 export async function splitIntoChunks(
     content: string | ArrayBuffer,
     isBinary: boolean
 ): Promise<ChunkDoc[]> {
-    let pieces: string[];
+    const base64 = isBinary
+        ? arrayBufferToBase64(content as ArrayBuffer)
+        : textToBase64(content as string);
 
-    if (isBinary) {
-        const base64 = arrayBufferToBase64(content as ArrayBuffer);
-        pieces = splitBinary(base64);
-    } else {
-        pieces = splitText(content as string);
-    }
+    const pieces = splitBase64(base64);
 
     const chunks: ChunkDoc[] = [];
     for (const piece of pieces) {
@@ -89,17 +72,17 @@ export async function splitIntoChunks(
         chunks.push({
             _id: `${DOC_PREFIX.CHUNK}${hash}`,
             type: "chunk",
-            data: isBinary ? piece : btoa(unescape(encodeURIComponent(piece))),
+            data: piece,
         });
     }
     return chunks;
 }
 
 export function joinChunks(chunks: ChunkDoc[], isBinary: boolean): string | ArrayBuffer {
+    const base64 = chunks.map((c) => c.data).join("");
     if (isBinary) {
-        const base64 = chunks.map((c) => c.data).join("");
         return base64ToArrayBuffer(base64);
     } else {
-        return chunks.map((c) => decodeURIComponent(escape(atob(c.data)))).join("");
+        return base64ToText(base64);
     }
 }
