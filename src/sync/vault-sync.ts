@@ -3,18 +3,7 @@ import type { LocalDB } from "../db/local-db.ts";
 import type { FileDoc } from "../types.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import { splitIntoChunks, joinChunks } from "../db/chunker.ts";
-
-const BINARY_EXTENSIONS = new Set([
-    "png", "jpg", "jpeg", "gif", "bmp", "svg", "webp",
-    "mp3", "wav", "ogg", "m4a", "flac",
-    "mp4", "webm", "ogv",
-    "pdf", "zip", "tar", "gz",
-]);
-
-function isBinaryFile(path: string): boolean {
-    const ext = path.split(".").pop()?.toLowerCase() ?? "";
-    return BINARY_EXTENSIONS.has(ext);
-}
+import { isBinaryFile } from "../utils/binary.ts";
 
 export class VaultSync {
     constructor(

@@ -103,6 +103,23 @@ export class LocalDB {
         return files;
     }
 
+    /** Mark all documents with given ID prefix as deleted. Returns deleted doc IDs. */
+    async deleteByPrefix(prefix: string): Promise<string[]> {
+        const result = await this.getDb().allDocs({
+            startkey: prefix,
+            endkey: prefix + "\ufff0",
+        });
+        if (result.rows.length === 0) return [];
+
+        const deletions = result.rows.map((row) => ({
+            _id: row.id,
+            _rev: row.value.rev,
+            _deleted: true,
+        }));
+        await this.getDb().bulkDocs(deletions as any);
+        return result.rows.map((row) => row.id);
+    }
+
     async destroy(): Promise<void> {
         if (this.db) {
             await this.db.destroy();

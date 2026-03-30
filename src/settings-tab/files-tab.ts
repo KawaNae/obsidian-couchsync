@@ -55,12 +55,56 @@ export function renderFilesTab(el: HTMLElement, deps: FilesTabDeps): void {
 
     // ── Config Sync ─────────────────────────────────────────
     el.createEl("h3", { text: "Config Sync" });
+
+    // ── Send: Init & Push (all .obsidian/) ──
     el.createEl("p", {
-        text: "Manually push/pull config files and plugin folders. Add paths below, then use Push or Pull.",
+        text: "Sends all .obsidian/ config to remote.",
         cls: "setting-item-description",
     });
 
-    // Current paths list
+    new Setting(el)
+        .setName("Init & Push")
+        .setDesc("Delete old config, re-scan .obsidian/, push to remote.")
+        .addButton((btn) =>
+            btn.setButtonText("Init & Push").setWarning().onClick(async () => {
+                btn.setButtonText("Initializing...");
+                btn.setDisabled(true);
+                try {
+                    const count = await deps.configSync.init();
+                    new Notice(`CouchSync: Config init — ${count} file(s) pushed.`);
+                } catch (e: any) {
+                    new Notice(`Init failed: ${e.message}`);
+                }
+                btn.setButtonText("Init & Push");
+                btn.setDisabled(false);
+            })
+        );
+
+    new Setting(el)
+        .setName("Push")
+        .setDesc("Scan .obsidian/ and push changes to remote.")
+        .addButton((btn) =>
+            btn.setButtonText("Push ↑").onClick(async () => {
+                btn.setButtonText("Pushing...");
+                btn.setDisabled(true);
+                try {
+                    const count = await deps.configSync.push();
+                    new Notice(`CouchSync: Pushed ${count} config file(s).`);
+                } catch (e: any) {
+                    new Notice(`Push failed: ${e.message}`);
+                }
+                btn.setButtonText("Push ↑");
+                btn.setDisabled(false);
+            })
+        );
+
+    // ── Receive: Pull (configSyncPaths only) ──
+    el.createEl("h4", { text: "Receive filter" });
+    el.createEl("p", {
+        text: "Pull writes only the paths below to this device.",
+        cls: "setting-item-description",
+    });
+
     const paths = settings.configSyncPaths;
     for (const path of paths) {
         new Setting(el)
@@ -111,24 +155,9 @@ export function renderFilesTab(el: HTMLElement, deps: FilesTabDeps): void {
         })
     );
 
-    // Push / Pull buttons
     new Setting(el)
-        .setName("Sync actions")
-        .setDesc(`${paths.length} path(s) configured`)
-        .addButton((btn) =>
-            btn.setButtonText("Push ↑").onClick(async () => {
-                btn.setButtonText("Pushing...");
-                btn.setDisabled(true);
-                try {
-                    const count = await deps.configSync.push();
-                    new Notice(`CouchSync: Pushed ${count} config file(s).`);
-                } catch (e: any) {
-                    new Notice(`Push failed: ${e.message}`);
-                }
-                btn.setButtonText("Push ↑");
-                btn.setDisabled(false);
-            })
-        )
+        .setName("Pull")
+        .setDesc(`Pull config from remote and write ${paths.length} path(s) to this device.`)
         .addButton((btn) =>
             btn.setButtonText("Pull ↓").onClick(async () => {
                 btn.setButtonText("Pulling...");
@@ -145,33 +174,101 @@ export function renderFilesTab(el: HTMLElement, deps: FilesTabDeps): void {
         );
 }
 
+/** Group raw paths into selectable files and folders at all hierarchy levels */
+function groupPaths(paths: string[]): { files: string[]; folders: string[] } {
+    const files: string[] = [];
+    const folderSet = new Set<string>();
+
+    for (const path of paths) {
+        const segments = path.split("/");
+        for (let depth = 1; depth < segments.length; depth++) {
+            folderSet.add(segments.slice(0, depth).join("/") + "/");
+        }
+        if (segments.length <= 2) {
+            files.push(path);
+        }
+    }
+
+    return { files: files.sort(), folders: [...folderSet].sort() };
+}
+
+let cachedRemotePaths: { files: string[]; folders: string[] } | null = null;
+
 async function loadSuggestions(suggestionsEl: HTMLElement, deps: FilesTabDeps): Promise<void> {
     suggestionsEl.empty();
     suggestionsEl.style.display = "block";
-
     const currentPaths = new Set(deps.getSettings().configSyncPaths);
 
-    // Common config files
-    const commonFiles = deps.configSync.getCommonConfigPaths();
-    suggestionsEl.createEl("div", { text: "── Common configs ──", cls: "cs-suggest-header" });
-    for (const path of commonFiles) {
-        if (currentPaths.has(path)) continue;
-        createSuggestionItem(suggestionsEl, path, deps);
+    if (!cachedRemotePaths) {
+        try {
+            const rawPaths = await deps.configSync.listRemotePaths();
+            cachedRemotePaths = groupPaths(rawPaths);
+        } catch {
+            cachedRemotePaths = null;
+        }
     }
 
-    // Plugin folders
+    if (cachedRemotePaths) {
+        renderRemoteSuggestions(suggestionsEl, cachedRemotePaths, currentPaths, deps);
+    } else {
+        await renderLocalFallback(suggestionsEl, currentPaths, deps);
+    }
+}
+
+function renderRemoteSuggestions(
+    el: HTMLElement,
+    remote: { files: string[]; folders: string[] },
+    currentPaths: Set<string>,
+    deps: FilesTabDeps,
+): void {
+    if (remote.files.length === 0 && remote.folders.length === 0) {
+        el.createEl("div", {
+            text: "No config found on remote. Run Init & Push first.",
+            cls: "cs-suggest-header",
+        });
+        return;
+    }
+
+    if (remote.files.length > 0) {
+        el.createEl("div", { text: "── Config files ──", cls: "cs-suggest-header" });
+        for (const file of remote.files) {
+            if (currentPaths.has(file)) continue;
+            createSuggestionItem(el, file, deps);
+        }
+    }
+
+    if (remote.folders.length > 0) {
+        el.createEl("div", { text: "── Folders ──", cls: "cs-suggest-header" });
+        for (const folder of remote.folders) {
+            if (currentPaths.has(folder)) continue;
+            createSuggestionItem(el, folder, deps);
+        }
+    }
+}
+
+async function renderLocalFallback(
+    el: HTMLElement,
+    currentPaths: Set<string>,
+    deps: FilesTabDeps,
+): void {
+    el.createEl("div", {
+        text: "── Remote unavailable — showing local ──",
+        cls: "cs-suggest-header",
+    });
+
+    const commonFiles = deps.configSync.getCommonConfigPaths();
+    for (const path of commonFiles) {
+        if (currentPaths.has(path)) continue;
+        createSuggestionItem(el, path, deps);
+    }
+
     try {
         const pluginFolders = await deps.configSync.listPluginFolders();
-        if (pluginFolders.length > 0) {
-            suggestionsEl.createEl("div", { text: "── Plugin folders ──", cls: "cs-suggest-header" });
-            for (const folder of pluginFolders) {
-                if (currentPaths.has(folder)) continue;
-                createSuggestionItem(suggestionsEl, folder, deps);
-            }
+        for (const folder of pluginFolders) {
+            if (currentPaths.has(folder)) continue;
+            createSuggestionItem(el, folder, deps);
         }
-    } catch (e) {
-        // ignore
-    }
+    } catch { /* ignore */ }
 }
 
 function createSuggestionItem(container: HTMLElement, path: string, deps: FilesTabDeps): void {

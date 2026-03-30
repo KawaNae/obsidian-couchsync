@@ -1,3 +1,5 @@
+export type ConnectionState = "editing" | "tested" | "setupDone" | "syncing";
+
 export interface CouchSyncSettings {
     // Connection
     couchdbUri: string;
@@ -26,9 +28,7 @@ export interface CouchSyncSettings {
     showVerboseLog: boolean;
 
     // Internal
-    connectionTested: boolean;
-    setupComplete: boolean;
-    syncEnabled: boolean;
+    connectionState: ConnectionState;
 }
 
 export const DEFAULT_SETTINGS: CouchSyncSettings = {
@@ -53,7 +53,5 @@ export const DEFAULT_SETTINGS: CouchSyncSettings = {
 
     showVerboseLog: false,
 
-    connectionTested: false,
-    setupComplete: false,
-    syncEnabled: false,
+    connectionState: "editing",
 };

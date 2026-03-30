@@ -3,6 +3,14 @@
  * BEM naming: cs-settings
  */
 
+/* ─── Unsaved Field Indicator ────────────────────────────── */
+
+.cs-pencil {
+    margin-right: 4px;
+    font-size: 0.85em;
+    opacity: 0.7;
+}
+
 .cs-settings .cs-settings__wrapper {
     display: flex;
     flex-direction: column;

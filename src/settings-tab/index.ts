@@ -1,12 +1,13 @@
 import { PluginSettingTab, type App } from "obsidian";
 import type CouchSyncPlugin from "../main.ts";
-import { renderConnectionTab } from "./connection-tab.ts";
+import { ConnectionTab } from "./connection-tab.ts";
 import { renderFilesTab } from "./files-tab.ts";
 import { renderMaintenanceTab } from "./maintenance-tab.ts";
 
 export class CouchSyncSettingTab extends PluginSettingTab {
     plugin: CouchSyncPlugin;
     private activeTabId = "connection";
+    private connectionTab: ConnectionTab | null = null;
 
     constructor(app: App, plugin: CouchSyncPlugin) {
         super(app, plugin);
@@ -61,17 +62,22 @@ export class CouchSyncSettingTab extends PluginSettingTab {
             },
         };
 
+        // ConnectionTab — instance persists across display() for draft state
+        const connectionDeps = {
+            ...settingsDeps,
+            replicator: this.plugin.replicator,
+            initVault: () => this.plugin.initVault(),
+            cloneFromRemote: () => this.plugin.cloneFromRemote(),
+            startSync: () => this.plugin.startSync(),
+            stopSync: () => this.plugin.stopSync(),
+            refresh: () => this.display(),
+        };
+        if (!this.connectionTab) {
+            this.connectionTab = new ConnectionTab(connectionDeps);
+        }
         const connectionPanel = panels.get("connection");
         if (connectionPanel) {
-            renderConnectionTab(connectionPanel, {
-                ...settingsDeps,
-                replicator: this.plugin.replicator,
-                initVault: () => this.plugin.initVault(),
-                cloneFromRemote: () => this.plugin.cloneFromRemote(),
-                startSync: () => this.plugin.startSync(),
-                stopSync: () => this.plugin.stopSync(),
-                refresh: () => this.display(),
-            });
+            this.connectionTab.render(connectionPanel);
         }
 
         const filesPanel = panels.get("files");
@@ -101,6 +107,10 @@ export class CouchSyncSettingTab extends PluginSettingTab {
 
         // Restore active tab (survives refresh)
         this.activateTab(wrapper, this.activeTabId);
+    }
+
+    hide(): void {
+        this.connectionTab?.resetDraft();
     }
 
     private activateTab(wrapper: HTMLElement, tabId: string): void {

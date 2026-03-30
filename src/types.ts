@@ -25,6 +25,7 @@ export interface ChunkDoc extends CouchSyncDocBase {
 export interface ConfigDoc extends CouchSyncDocBase {
     type: "config";
     data: string;
+    binary: boolean;
     mtime: number;
     size: number;
 }

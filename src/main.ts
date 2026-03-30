@@ -4,6 +4,7 @@ import { LocalDB } from "./db/local-db.ts";
 import { Replicator } from "./db/replicator.ts";
 import { VaultSync } from "./sync/vault-sync.ts";
 import { ConfigSync } from "./sync/config-sync.ts";
+import { SetupService } from "./sync/setup.ts";
 import { ChangeTracker } from "./sync/change-tracker.ts";
 import { ConflictResolver } from "./conflict/conflict-resolver.ts";
 import { StatusBar } from "./ui/status-bar.ts";
@@ -18,6 +19,7 @@ export default class CouchSyncPlugin extends Plugin {
     conflictResolver!: ConflictResolver;
     configSync!: ConfigSync;
     private vaultSync!: VaultSync;
+    private setupService!: SetupService;
     private changeTracker!: ChangeTracker;
     statusBar!: StatusBar;
 
@@ -31,6 +33,7 @@ export default class CouchSyncPlugin extends Plugin {
         this.replicator = new Replicator(this.localDb, () => this.settings);
         this.vaultSync = new VaultSync(this.app, this.localDb, () => this.settings);
         this.configSync = new ConfigSync(this.app, this.localDb, this.replicator, () => this.settings);
+        this.setupService = new SetupService(this.app, this.localDb, this.replicator, this.vaultSync);
         this.changeTracker = new ChangeTracker(this.app, this.vaultSync, () => this.settings);
         this.conflictResolver = new ConflictResolver(this.localDb);
 
@@ -52,7 +55,7 @@ export default class CouchSyncPlugin extends Plugin {
         this.addSettingTab(new CouchSyncSettingTab(this.app, this));
 
         this.app.workspace.onLayoutReady(() => {
-            if (this.settings.syncEnabled && this.settings.setupComplete) {
+            if (this.settings.connectionState === "syncing") {
                 this.changeTracker.start();
                 this.startSync();
             }
@@ -62,8 +65,7 @@ export default class CouchSyncPlugin extends Plugin {
         this.registerDomEvent(document, "visibilitychange", () => {
             if (
                 document.visibilityState === "visible" &&
-                this.settings.syncEnabled &&
-                this.settings.setupComplete
+                this.settings.connectionState === "syncing"
             ) {
                 const state = this.replicator.getState();
                 if (state === "disconnected" || state === "error") {
@@ -76,6 +78,15 @@ export default class CouchSyncPlugin extends Plugin {
             id: "couchsync-force-sync",
             name: "Force sync all files now",
             callback: () => this.scanVaultToDb(),
+        });
+
+        this.addCommand({
+            id: "couchsync-config-init",
+            name: "Init config sync (clean rebuild)",
+            callback: async () => {
+                const count = await this.configSync.init();
+                showNotice(`Config init: ${count} file(s) pushed.`);
+            },
         });
 
         this.addCommand({
@@ -105,7 +116,19 @@ export default class CouchSyncPlugin extends Plugin {
     }
 
     async loadSettings(): Promise<void> {
-        const data = await this.loadData();
+        const data = (await this.loadData()) ?? {};
+
+        // Migrate old boolean flags to connectionState enum
+        if (data.connectionState === undefined) {
+            if (data.syncEnabled) data.connectionState = "syncing";
+            else if (data.setupComplete) data.connectionState = "setupDone";
+            else if (data.connectionTested) data.connectionState = "tested";
+            else data.connectionState = "editing";
+            delete data.connectionTested;
+            delete data.setupComplete;
+            delete data.syncEnabled;
+        }
+
         this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
     }
 
@@ -115,43 +138,22 @@ export default class CouchSyncPlugin extends Plugin {
 
     async initVault(): Promise<void> {
         const progress = new ProgressNotice("Init");
-        progress.update("Scanning vault files...");
-        await this.scanVaultToDb(progress);
-        progress.update("Pushing to remote...");
-        const count = await this.replicator.pushToRemote((docId, n) => {
-            progress.update(`Pushing: ${docId} (${n})`);
-        });
-        this.settings.setupComplete = true;
+        const result = await this.setupService.init((msg) => progress.update(msg));
+        this.settings.connectionState = "setupDone";
         await this.saveSettings();
-        progress.done(`Init complete! Pushed ${count} docs to remote.`);
+        progress.done(`Init complete! ${result.vaultFiles} files, ${result.totalDocs} docs pushed.`);
     }
 
     async cloneFromRemote(): Promise<void> {
         const progress = new ProgressNotice("Clone");
-        progress.update("Pulling from remote...");
-        const count = await this.replicator.pullFromRemote((docId, n) => {
-            progress.update(`Pulling: ${docId} (${n})`);
-        });
-
-        const allFiles = await this.localDb.allFileDocs();
-        progress.update(`Pulled ${count} docs. Writing ${allFiles.length} files...`);
-        let written = 0;
-        for (const fileDoc of allFiles) {
-            try {
-                progress.update(`Writing: ${fileDoc._id} (${written + 1}/${allFiles.length})`);
-                await this.vaultSync.dbToFile(fileDoc);
-                written++;
-            } catch (e) {
-                console.error(`CouchSync: Failed to write ${fileDoc._id}:`, e);
-            }
-        }
-        this.settings.setupComplete = true;
+        const result = await this.setupService.clone((msg) => progress.update(msg));
+        this.settings.connectionState = "setupDone";
         await this.saveSettings();
-        progress.done(`Clone complete! Wrote ${written} files.`);
+        progress.done(`Clone complete! ${result.vaultFiles} files written.`);
     }
 
     async startSync(): Promise<void> {
-        if (!this.settings.setupComplete) return;
+        if (this.settings.connectionState !== "syncing") return;
         this.replicator.stop();
         this.replicator.start();
         this.changeTracker.start();

@@ -212,17 +212,114 @@ export class Replicator {
         });
     }
 
-    /** Test connection to CouchDB. Returns null on success or error message. */
-    async testConnection(): Promise<string | null> {
+    /** List remote document IDs matching a prefix (lightweight, no content fetched) */
+    async listRemoteByPrefix(prefix: string): Promise<string[]> {
+        const remoteUrl = this.getRemoteUrl();
+        const remoteDb = new PouchDB<CouchSyncDoc>(remoteUrl, {});
         try {
-            const remoteUrl = this.getRemoteUrl();
-            const remoteDb = new PouchDB(remoteUrl, {});
+            const result = await remoteDb.allDocs({
+                startkey: prefix,
+                endkey: prefix + "\ufff0",
+            });
+            return result.rows.map((row) => row.id);
+        } finally {
+            await remoteDb.close();
+        }
+    }
+
+    /** Push specific documents to remote by doc IDs */
+    async pushDocs(
+        docIds: string[],
+        onProgress?: (docId: string, count: number) => void,
+    ): Promise<number> {
+        if (docIds.length === 0) return 0;
+        const remoteUrl = this.getRemoteUrl();
+        const remoteDb = new PouchDB<CouchSyncDoc>(remoteUrl, {});
+        const db = this.localDb.getDb();
+        let total = 0;
+        return new Promise<number>((resolve, reject) => {
+            const replication = db.replicate.to(remoteDb, {
+                doc_ids: docIds,
+            } as any);
+            replication.on("change", (info) => {
+                if (info.docs) {
+                    for (const doc of info.docs) {
+                        total++;
+                        onProgress?.(doc._id, total);
+                    }
+                }
+            });
+            replication.on("complete", async (info) => {
+                await remoteDb.close();
+                resolve(info.docs_written);
+            });
+            replication.on("error", async (err) => {
+                await remoteDb.close();
+                reject(err);
+            });
+        });
+    }
+
+    /** Pull documents matching ID prefix from remote */
+    async pullByPrefix(prefix: string): Promise<number> {
+        const remoteUrl = this.getRemoteUrl();
+        const remoteDb = new PouchDB<CouchSyncDoc>(remoteUrl, {});
+        const db = this.localDb.getDb();
+
+        const result = await remoteDb.allDocs({
+            startkey: prefix,
+            endkey: prefix + "\ufff0",
+        });
+        const docIds = result.rows.map((row) => row.id);
+
+        if (docIds.length === 0) {
+            await remoteDb.close();
+            return 0;
+        }
+
+        return new Promise<number>((resolve, reject) => {
+            const replication = db.replicate.from(remoteDb, {
+                doc_ids: docIds,
+            } as any);
+            replication.on("complete", async (info) => {
+                await remoteDb.close();
+                resolve(info.docs_written);
+            });
+            replication.on("error", async (err) => {
+                await remoteDb.close();
+                reject(err);
+            });
+        });
+    }
+
+    /** Destroy the remote database (it will be auto-created on next push) */
+    async destroyRemote(): Promise<void> {
+        const remoteUrl = this.getRemoteUrl();
+        const remoteDb = new PouchDB(remoteUrl, {});
+        await remoteDb.destroy();
+    }
+
+    /** Test connection with explicit credentials (for unsaved draft values) */
+    async testConnectionWith(
+        uri: string, user: string, pass: string, db: string
+    ): Promise<string | null> {
+        try {
+            const url = new URL(uri);
+            url.pathname = url.pathname.replace(/\/$/, "") + "/" + db;
+            if (user) { url.username = user; url.password = pass; }
+            const remoteDb = new PouchDB(url.toString(), {});
             await remoteDb.info();
             await remoteDb.close();
             return null;
         } catch (e: any) {
             return e.message || "Connection failed";
         }
+    }
+
+    /** Test connection using saved settings */
+    async testConnection(): Promise<string | null> {
+        const s = this.getSettings();
+        return this.testConnectionWith(s.couchdbUri, s.couchdbUser, s.couchdbPassword, s.couchdbDbName);
     }
 
     private async checkHealth(): Promise<void> {
