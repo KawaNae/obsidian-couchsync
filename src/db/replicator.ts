@@ -20,6 +20,9 @@ export class Replicator {
     private healthTimer: ReturnType<typeof setInterval> | null = null;
     private boundOnOffline = () => this.handleOffline();
     private boundOnOnline = () => this.handleOnline();
+    private lastSyncedSeq: number | string = 0;
+    private lastRestartTime = 0;
+    private remoteDb: PouchDB.Database<CouchSyncDoc> | null = null;
 
     constructor(
         private localDb: LocalDB,
@@ -67,16 +70,25 @@ export class Replicator {
         return url.toString();
     }
 
+    /** Restart sync session (preserves PouchDB checkpoint, 5s cooldown) */
+    restart(): void {
+        const now = Date.now();
+        if (now - this.lastRestartTime < 5000) return;
+        this.lastRestartTime = now;
+        this.stop();
+        this.start();
+    }
+
     start(): void {
         if (this.sync) return;
 
         const remoteUrl = this.getRemoteUrl();
-        const remoteDb = new PouchDB<CouchSyncDoc>(remoteUrl, {
+        this.remoteDb = new PouchDB<CouchSyncDoc>(remoteUrl, {
             skip_setup: true,
         });
 
         const db = this.localDb.getDb();
-        this.sync = db.sync(remoteDb, {
+        this.sync = db.sync(this.remoteDb, {
             live: true,
             retry: true,
             batch_size: 50,
@@ -110,6 +122,7 @@ export class Replicator {
                 this.setState("error");
                 this.emitError("Sync paused: connection issue");
             } else {
+                this.updateLastSyncedSeq();
                 this.setState("connected");
             }
         });
@@ -154,6 +167,10 @@ export class Replicator {
         if (this.sync) {
             this.sync.cancel();
             this.sync = null;
+        }
+        if (this.remoteDb) {
+            this.remoteDb.close();
+            this.remoteDb = null;
         }
         this.setState("disconnected");
     }
@@ -322,12 +339,31 @@ export class Replicator {
         return this.testConnectionWith(s.couchdbUri, s.couchdbUser, s.couchdbPassword, s.couchdbDbName);
     }
 
+    private async updateLastSyncedSeq(): Promise<void> {
+        const info = await this.localDb.getDb().info();
+        this.lastSyncedSeq = info.update_seq;
+    }
+
     private async checkHealth(): Promise<void> {
         if (this.state !== "connected") return;
-        const err = await this.testConnection();
-        if (err) {
-            this.setState("disconnected");
-            this.emitError("Server unreachable");
+
+        try {
+            const info = await this.localDb.getDb().info();
+            const currentSeq = info.update_seq;
+
+            if (currentSeq !== this.lastSyncedSeq) {
+                console.log("CouchSync: Stalled sync detected, restarting session");
+                this.restart();
+                return;
+            }
+
+            const err = await this.testConnection();
+            if (err) {
+                console.log("CouchSync: Server unreachable, restarting session");
+                this.restart();
+            }
+        } catch (e) {
+            console.error("CouchSync: Health check error:", e);
         }
     }
 
@@ -339,9 +375,9 @@ export class Replicator {
     }
 
     private handleOnline(): void {
-        // PouchDB retry will auto-reconnect, just update status
-        if (this.state === "disconnected") {
-            this.setState("syncing");
+        if (this.state === "disconnected" || this.state === "error") {
+            console.log("CouchSync: Network online, restarting session");
+            this.restart();
         }
     }
 }

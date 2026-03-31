@@ -61,23 +61,27 @@ export default class CouchSyncPlugin extends Plugin {
             }
         });
 
-        // Reconnect when returning from background (mobile)
+        // Always restart sync on foreground return (mobile)
+        // PouchDB checkpoint prevents duplicate replication
         this.registerDomEvent(document, "visibilitychange", () => {
             if (
                 document.visibilityState === "visible" &&
                 this.settings.connectionState === "syncing"
             ) {
-                const state = this.replicator.getState();
-                if (state === "disconnected" || state === "error") {
-                    this.startSync();
-                }
+                this.replicator.restart();
             }
         });
 
         this.addCommand({
             id: "couchsync-force-sync",
             name: "Force sync all files now",
-            callback: () => this.scanVaultToDb(),
+            callback: async () => {
+                await this.scanVaultToDb();
+                if (this.settings.connectionState === "syncing") {
+                    this.replicator.restart();
+                }
+                showNotice("Force sync: scanning complete.");
+            },
         });
 
         this.addCommand({

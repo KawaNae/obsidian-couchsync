@@ -5,6 +5,7 @@ import type { CouchSyncSettings } from "../settings.ts";
 export class ChangeTracker {
     private timers = new Map<string, ReturnType<typeof setTimeout>>();
     private paused = false;
+    private pendingQueue: TFile[] = [];
     private eventRefs: ReturnType<App["vault"]["on"]>[] = [];
 
     constructor(
@@ -58,6 +59,7 @@ export class ChangeTracker {
             clearTimeout(timer);
         }
         this.timers.clear();
+        this.pendingQueue = [];
     }
 
     pause(): void {
@@ -66,10 +68,19 @@ export class ChangeTracker {
 
     resume(): void {
         this.paused = false;
+        const queued = this.pendingQueue.splice(0);
+        for (const file of queued) {
+            this.scheduleSync(file);
+        }
     }
 
     private scheduleSync(file: TFile): void {
-        if (this.paused) return;
+        if (this.paused) {
+            if (!this.pendingQueue.some((f) => f.path === file.path)) {
+                this.pendingQueue.push(file);
+            }
+            return;
+        }
 
         this.cancelPending(file.path);
 
