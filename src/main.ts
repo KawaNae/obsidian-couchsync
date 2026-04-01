@@ -103,15 +103,13 @@ export default class CouchSyncPlugin extends Plugin {
         });
 
         this.app.workspace.onLayoutReady(() => {
+            this.historyCapture.start();
             this.historyManager.startCleanup();
             if (this.settings.connectionState === "syncing") {
                 this.replicator.start();
                 this.replicator.onceIdle(() => {
                     this.changeTracker.start();
-                    this.historyCapture.start();
                 });
-            } else {
-                this.historyCapture.start();
             }
         });
 

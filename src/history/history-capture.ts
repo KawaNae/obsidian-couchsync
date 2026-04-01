@@ -3,6 +3,7 @@ import type { HistoryStorage } from "./storage.ts";
 import { DiffEngine, computeHash } from "./diff-engine.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import { minimatch } from "../utils/minimatch.ts";
+import { isBinaryFile } from "../utils/binary.ts";
 
 export class HistoryCapture {
     private debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -71,7 +72,8 @@ export class HistoryCapture {
     private isTargetFile(file: TAbstractFile): boolean {
         if (!("extension" in file)) return false;
         const tfile = file as TFile;
-        if (tfile.extension !== "md") return false;
+        if (isBinaryFile(tfile.path)) return false;
+        if (tfile.path.startsWith(".")) return false;
         const settings = this.getSettings();
         if (settings.historyExcludePatterns) {
             for (const pattern of settings.historyExcludePatterns) {
@@ -140,6 +142,7 @@ export class HistoryCapture {
 
             await this.storage.saveSnapshot(file.path, currentContent);
             this.lastCaptureTime.set(file.path, Date.now());
+            console.log(`CouchSync: History captured for ${file.path}`);
             this.onDiffSaved?.(file.path);
         } catch (e) {
             console.error("CouchSync: Failed to capture history:", e);
