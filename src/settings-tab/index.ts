@@ -2,6 +2,7 @@ import { PluginSettingTab, type App } from "obsidian";
 import type CouchSyncPlugin from "../main.ts";
 import { ConnectionTab } from "./connection-tab.ts";
 import { renderFilesTab } from "./files-tab.ts";
+import { renderHistoryTab } from "./history-tab.ts";
 import { renderMaintenanceTab } from "./maintenance-tab.ts";
 
 export class CouchSyncSettingTab extends PluginSettingTab {
@@ -33,6 +34,7 @@ export class CouchSyncSettingTab extends PluginSettingTab {
         const tabs = [
             { id: "connection", label: "Connection" },
             { id: "files", label: "Files" },
+            { id: "history", label: "History" },
             { id: "maintenance", label: "Maintenance" },
         ];
 
@@ -86,6 +88,14 @@ export class CouchSyncSettingTab extends PluginSettingTab {
                 ...settingsDeps,
                 configSync: this.plugin.configSync,
                 refresh: () => this.display(),
+            });
+        }
+
+        const historyPanel = panels.get("history");
+        if (historyPanel) {
+            renderHistoryTab(historyPanel, {
+                ...settingsDeps,
+                historyManager: this.plugin.historyManager,
             });
         }
 

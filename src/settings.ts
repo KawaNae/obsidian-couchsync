@@ -24,6 +24,9 @@ export interface CouchSyncSettings {
     mobileStatusBottom: number;
     mobileStatusOffset: number;
 
+    // History
+    historyExcludePatterns: string[];
+
     // Maintenance
     showVerboseLog: boolean;
 
@@ -50,6 +53,8 @@ export const DEFAULT_SETTINGS: CouchSyncSettings = {
     mobileStatusAlign: "left",
     mobileStatusBottom: 50,
     mobileStatusOffset: 8,
+
+    historyExcludePatterns: [],
 
     showVerboseLog: false,
 

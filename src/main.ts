@@ -11,6 +11,12 @@ import { StatusBar } from "./ui/status-bar.ts";
 import { CouchSyncSettingTab } from "./settings-tab/index.ts";
 import { isFileDoc, type CouchSyncDoc } from "./types.ts";
 import { showNotice, ProgressNotice } from "./ui/notices.ts";
+import { HistoryStorage } from "./history/storage.ts";
+import { HistoryCapture } from "./history/history-capture.ts";
+import { HistoryManager } from "./history/history-manager.ts";
+import { DiffHistoryView, VIEW_TYPE_DIFF_HISTORY } from "./ui/history-view.ts";
+import { isBinaryFile } from "./utils/binary.ts";
+import { joinChunks } from "./db/chunker.ts";
 
 export default class CouchSyncPlugin extends Plugin {
     settings!: CouchSyncSettings;
@@ -21,6 +27,9 @@ export default class CouchSyncPlugin extends Plugin {
     private vaultSync!: VaultSync;
     private setupService!: SetupService;
     private changeTracker!: ChangeTracker;
+    private historyStorage!: HistoryStorage;
+    private historyCapture!: HistoryCapture;
+    historyManager!: HistoryManager;
     statusBar!: StatusBar;
 
     async onload(): Promise<void> {
@@ -35,7 +44,27 @@ export default class CouchSyncPlugin extends Plugin {
         this.configSync = new ConfigSync(this.app, this.localDb, this.replicator, () => this.settings);
         this.setupService = new SetupService(this.app, this.localDb, this.replicator, this.vaultSync);
         this.changeTracker = new ChangeTracker(this.app, this.vaultSync, () => this.settings);
-        this.conflictResolver = new ConflictResolver(this.localDb);
+        this.historyStorage = new HistoryStorage(this.app.vault.getName());
+        this.historyCapture = new HistoryCapture(this.app, this.historyStorage, () => this.settings);
+        this.historyManager = new HistoryManager(
+            this.app.vault, this.historyStorage, this.historyCapture, () => this.settings,
+        );
+        this.conflictResolver = new ConflictResolver(
+            this.localDb,
+            async (filePath, winnerDoc, loserDoc) => {
+                if (isBinaryFile(filePath)) return;
+                try {
+                    const loserChunks = await this.localDb.getChunks(loserDoc.chunks);
+                    const loserContent = joinChunks(loserChunks, false) as string;
+                    const winnerChunks = await this.localDb.getChunks(winnerDoc.chunks);
+                    const winnerContent = joinChunks(winnerChunks, false) as string;
+                    await this.historyCapture.saveConflict(filePath, loserContent, winnerContent);
+                    showNotice(`Conflict resolved: ${filePath.split("/").pop()}. Losing version saved to history.`);
+                } catch (e) {
+                    console.error("CouchSync: Failed to save conflict to history:", e);
+                }
+            },
+        );
 
         this.statusBar = new StatusBar(this, () => this.settings);
         this.replicator.onStateChange((state) => this.statusBar.update(state));
@@ -45,8 +74,12 @@ export default class CouchSyncPlugin extends Plugin {
         this.replicator.onChange((doc: CouchSyncDoc) => {
             if (isFileDoc(doc)) {
                 this.changeTracker.pause();
+                this.historyCapture.pause();
                 this.vaultSync.dbToFile(doc).finally(() => {
-                    setTimeout(() => this.changeTracker.resume(), 500);
+                    setTimeout(() => {
+                        this.changeTracker.resume();
+                        this.historyCapture.resume();
+                    }, 500);
                 });
                 this.conflictResolver.resolveIfConflicted(doc);
             }
@@ -54,7 +87,24 @@ export default class CouchSyncPlugin extends Plugin {
 
         this.addSettingTab(new CouchSyncSettingTab(this.app, this));
 
+        this.registerView(VIEW_TYPE_DIFF_HISTORY, (leaf) => new DiffHistoryView(leaf, this));
+
+        this.addRibbonIcon("history", "Diff History", () => {
+            this.activateHistoryView();
+        });
+
+        this.addCommand({
+            id: "couchsync-show-history",
+            name: "Show file history",
+            callback: () => {
+                const file = this.app.workspace.getActiveFile();
+                if (file) this.showHistory(file.path);
+            },
+        });
+
         this.app.workspace.onLayoutReady(() => {
+            this.historyCapture.start();
+            this.historyManager.startCleanup();
             if (this.settings.connectionState === "syncing") {
                 this.changeTracker.start();
                 this.startSync();
@@ -114,8 +164,11 @@ export default class CouchSyncPlugin extends Plugin {
 
     async onunload(): Promise<void> {
         this.changeTracker?.stop();
+        this.historyCapture?.stop();
+        this.historyManager?.stopCleanup();
         this.replicator?.stop();
         this.statusBar?.destroy();
+        this.historyStorage?.close();
         await this.localDb?.close();
     }
 
@@ -186,6 +239,28 @@ export default class CouchSyncPlugin extends Plugin {
         }
         if (synced > 0) {
             console.log(`CouchSync: Scanned ${synced} files to local DB`);
+        }
+    }
+
+    async activateHistoryView(): Promise<void> {
+        const existing = this.app.workspace.getLeavesOfType(VIEW_TYPE_DIFF_HISTORY);
+        if (existing.length > 0) {
+            this.app.workspace.revealLeaf(existing[0]);
+            return;
+        }
+        const leaf = this.app.workspace.getRightLeaf(false);
+        if (leaf) {
+            await leaf.setViewState({ type: VIEW_TYPE_DIFF_HISTORY, active: true });
+            this.app.workspace.revealLeaf(leaf);
+        }
+    }
+
+    async showHistory(filePath: string): Promise<void> {
+        await this.activateHistoryView();
+        const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_DIFF_HISTORY);
+        if (leaves.length > 0) {
+            const view = leaves[0].view as DiffHistoryView;
+            await view.showFileHistory(filePath);
         }
     }
 }

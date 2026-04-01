@@ -11,6 +11,7 @@
     "author": "KawaNae",
     "license": "MIT",
     "devDependencies": {
+        "@types/diff-match-patch": "^1.0.36",
         "@types/node": "^24.10.13",
         "@types/pouchdb-browser": "^6.1.5",
         "builtin-modules": "5.0.0",
@@ -20,6 +21,8 @@
         "typescript": "5.9.3"
     },
     "dependencies": {
+        "dexie": "^4.4.2",
+        "diff-match-patch": "^1.0.5",
         "events": "^3.3.0",
         "pouchdb-browser": "^9.0.0",
         "xxhash-wasm-102": "npm:xxhash-wasm@^1.0.2"
