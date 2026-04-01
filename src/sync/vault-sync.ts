@@ -26,6 +26,14 @@ export class VaultSync {
         const chunks = await splitIntoChunks(content, binary);
         const chunkIds = chunks.map((c) => c._id);
 
+        // Skip if content unchanged (same chunk IDs = same content)
+        const existing = await this.db.getFileDoc(file.path);
+        if (existing &&
+            existing.chunks.length === chunkIds.length &&
+            existing.chunks.every((id, i) => id === chunkIds[i])) {
+            return;
+        }
+
         await this.db.bulkPut(chunks);
 
         const fileDoc: FileDoc = {

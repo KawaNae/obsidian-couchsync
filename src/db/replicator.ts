@@ -23,6 +23,8 @@ export class Replicator {
     private lastSyncedSeq: number | string = 0;
     private lastRestartTime = 0;
     private remoteDb: PouchDB.Database<CouchSyncDoc> | null = null;
+    private idleCallbacks: (() => void)[] = [];
+    private hasBeenIdle = false;
 
     constructor(
         private localDb: LocalDB,
@@ -43,6 +45,15 @@ export class Replicator {
 
     onError(handler: OnErrorHandler): void {
         this.onErrorHandlers.push(handler);
+    }
+
+    /** Register callback to fire once initial sync reaches idle state */
+    onceIdle(callback: () => void): void {
+        if (this.hasBeenIdle) {
+            callback();
+            return;
+        }
+        this.idleCallbacks.push(callback);
     }
 
     private setState(state: SyncState): void {
@@ -124,6 +135,11 @@ export class Replicator {
             } else {
                 this.updateLastSyncedSeq();
                 this.setState("connected");
+                if (!this.hasBeenIdle) {
+                    this.hasBeenIdle = true;
+                    for (const cb of this.idleCallbacks) cb();
+                    this.idleCallbacks = [];
+                }
             }
         });
 
@@ -172,6 +188,8 @@ export class Replicator {
             this.remoteDb.close();
             this.remoteDb = null;
         }
+        this.hasBeenIdle = false;
+        this.idleCallbacks = [];
         this.setState("disconnected");
     }
 
