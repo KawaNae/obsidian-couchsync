@@ -29,6 +29,7 @@ export default class CouchSyncPlugin extends Plugin {
     private changeTracker!: ChangeTracker;
     private historyStorage!: HistoryStorage;
     private historyCapture!: HistoryCapture;
+    private reconnecting = false;
     historyManager!: HistoryManager;
     statusBar!: StatusBar;
 
@@ -241,28 +242,35 @@ export default class CouchSyncPlugin extends Plugin {
         this.changeTracker.stop();
     }
 
-    private reconnectWithPullFirst(): void {
-        this.changeTracker.stop();
-        this.vaultSync.setPullInProgress(true);
+    private async reconnectWithPullFirst(): Promise<void> {
+        if (this.reconnecting) return;
+        this.reconnecting = true;
 
-        this.replicator.restart({
-            pullFirst: true,
-            onPulledDocs: async (docs) => {
-                this.changeTracker.pause();
-                this.historyCapture.pause();
-                for (const doc of docs) {
-                    if (isFileDoc(doc)) {
-                        await this.vaultSync.dbToFile(doc);
-                        this.conflictResolver.resolveIfConflicted(doc);
-                    }
+        this.changeTracker.stop();
+        this.historyCapture.pause();
+        this.vaultSync.setPullInProgress(true);
+        this.replicator.stop();
+
+        try {
+            const { docs } = await this.replicator.pullFromRemote();
+
+            for (const doc of docs) {
+                if (isFileDoc(doc)) {
+                    await this.vaultSync.dbToFile(doc);
+                    this.conflictResolver.resolveIfConflicted(doc);
                 }
-                this.vaultSync.setPullInProgress(false);
-                setTimeout(() => {
-                    this.changeTracker.start();
-                    this.historyCapture.resume();
-                }, 500);
-            },
-        });
+            }
+        } catch (e) {
+            console.error("CouchSync: Pull-first failed:", e);
+        }
+
+        this.vaultSync.setPullInProgress(false);
+        this.replicator.start();
+        setTimeout(() => {
+            this.changeTracker.start();
+            this.historyCapture.resume();
+            this.reconnecting = false;
+        }, 500);
     }
 
     private async scanVaultToDb(progress?: ProgressNotice): Promise<void> {

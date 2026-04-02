@@ -10,11 +10,6 @@ export type OnChangeHandler = (doc: CouchSyncDoc) => void;
 export type OnStateChangeHandler = (state: SyncState) => void;
 export type OnErrorHandler = (message: string) => void;
 
-export interface PullFirstOptions {
-    pullFirst: true;
-    onPulledDocs: (docs: CouchSyncDoc[]) => Promise<void>;
-}
-
 const HEALTH_CHECK_INTERVAL = 30000; // 30s
 
 export class Replicator {
@@ -99,61 +94,12 @@ export class Replicator {
     }
 
     /** Restart sync session (preserves PouchDB checkpoint, 5s cooldown) */
-    restart(options?: PullFirstOptions): void {
+    restart(): void {
         const now = Date.now();
         if (now - this.lastRestartTime < 5000) return;
         this.lastRestartTime = now;
         this.stop();
-        if (options?.pullFirst) {
-            this.startWithPullFirst(options.onPulledDocs);
-        } else {
-            this.start();
-        }
-    }
-
-    /** Pull-first start: one-shot pull → apply callback → bidirectional live sync */
-    private startWithPullFirst(onPulledDocs: (docs: CouchSyncDoc[]) => Promise<void>): void {
-        if (this.sync) return;
-        this.phase = "pulling";
-        this.setState("syncing");
-
-        const remoteUrl = this.getRemoteUrl();
-        const pullRemoteDb = new PouchDB<CouchSyncDoc>(remoteUrl, { skip_setup: true });
-        const db = this.localDb.getDb();
-        const pulledDocs: CouchSyncDoc[] = [];
-
-        const replication = db.replicate.from(pullRemoteDb, {
-            batch_size: 50,
-            batches_limit: 5,
-        });
-
-        replication.on("change", (info) => {
-            if (info.docs) {
-                for (const doc of info.docs) {
-                    pulledDocs.push(doc as unknown as CouchSyncDoc);
-                }
-            }
-        });
-
-        replication.on("complete", async () => {
-            await pullRemoteDb.close();
-            this.phase = "applying";
-            try {
-                await onPulledDocs(pulledDocs);
-            } catch (e) {
-                console.error("CouchSync: Error applying pulled docs:", e);
-            }
-            this.phase = "live";
-            this.start();
-        });
-
-        replication.on("error", async (err) => {
-            await pullRemoteDb.close();
-            this.phase = "idle";
-            console.error("CouchSync: Pull-first replication error:", err);
-            this.setState("error");
-            this.emitError("Pull-first sync failed: " + (err?.message || "unknown"));
-        });
+        this.start();
     }
 
     start(): void {
@@ -287,25 +233,29 @@ export class Replicator {
         });
     }
 
-    /** One-shot pull: remote → local */
-    async pullFromRemote(onProgress?: (docId: string, count: number) => void): Promise<number> {
+    /** One-shot pull: remote → local. Returns written count and pulled documents. */
+    async pullFromRemote(
+        onProgress?: (docId: string, count: number) => void,
+    ): Promise<{ written: number; docs: CouchSyncDoc[] }> {
         const remoteUrl = this.getRemoteUrl();
         const remoteDb = new PouchDB<CouchSyncDoc>(remoteUrl, {});
         const db = this.localDb.getDb();
         let total = 0;
-        return new Promise<number>((resolve, reject) => {
+        const docs: CouchSyncDoc[] = [];
+        return new Promise((resolve, reject) => {
             const replication = db.replicate.from(remoteDb, { batch_size: 100 });
             replication.on("change", (info) => {
                 if (info.docs) {
                     for (const doc of info.docs) {
                         total++;
+                        docs.push(doc as unknown as CouchSyncDoc);
                         onProgress?.(doc._id, total);
                     }
                 }
             });
             replication.on("complete", async (info) => {
                 await remoteDb.close();
-                resolve(info.docs_written);
+                resolve({ written: info.docs_written, docs });
             });
             replication.on("error", async (err) => {
                 await remoteDb.close();

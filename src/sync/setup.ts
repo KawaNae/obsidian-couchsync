@@ -46,7 +46,7 @@ export class SetupService {
             this.localDb.open();
 
             onProgress("Pulling from remote...");
-            const totalDocs = await this.replicator.pullFromRemote((docId, n) => {
+            const { written: totalDocs } = await this.replicator.pullFromRemote((docId, n) => {
                 onProgress(`Pulling: ${docId} (${n})`);
             });
 
