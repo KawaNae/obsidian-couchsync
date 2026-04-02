@@ -122,21 +122,23 @@ export default class CouchSyncPlugin extends Plugin {
             this.historyCapture.start();
             this.historyManager.startCleanup();
             if (this.settings.connectionState === "syncing") {
-                this.replicator.start();
-                this.replicator.onceIdle(() => {
-                    this.changeTracker.start();
-                });
+                this.reconnectWithPullFirst();
             }
         });
 
-        // Always restart sync on foreground return (mobile)
-        // PouchDB checkpoint prevents duplicate replication
+        // Pull-first restart on foreground return (mobile) and network reconnection
         this.registerDomEvent(document, "visibilitychange", () => {
             if (
                 document.visibilityState === "visible" &&
                 this.settings.connectionState === "syncing"
             ) {
-                this.replicator.restart();
+                this.reconnectWithPullFirst();
+            }
+        });
+
+        this.replicator.onReconnect(() => {
+            if (this.settings.connectionState === "syncing") {
+                this.reconnectWithPullFirst();
             }
         });
 
@@ -237,6 +239,30 @@ export default class CouchSyncPlugin extends Plugin {
     stopSync(): void {
         this.replicator.stop();
         this.changeTracker.stop();
+    }
+
+    private reconnectWithPullFirst(): void {
+        this.changeTracker.stop();
+        this.vaultSync.setPullInProgress(true);
+
+        this.replicator.restart({
+            pullFirst: true,
+            onPulledDocs: async (docs) => {
+                this.changeTracker.pause();
+                this.historyCapture.pause();
+                for (const doc of docs) {
+                    if (isFileDoc(doc)) {
+                        await this.vaultSync.dbToFile(doc);
+                        this.conflictResolver.resolveIfConflicted(doc);
+                    }
+                }
+                this.vaultSync.setPullInProgress(false);
+                setTimeout(() => {
+                    this.changeTracker.start();
+                    this.historyCapture.resume();
+                }, 500);
+            },
+        });
     }
 
     private async scanVaultToDb(progress?: ProgressNotice): Promise<void> {

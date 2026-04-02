@@ -4,10 +4,16 @@ import type { LocalDB } from "./local-db.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 
 export type SyncState = "disconnected" | "connected" | "syncing" | "error";
+export type SyncPhase = "idle" | "pulling" | "applying" | "live";
 
 export type OnChangeHandler = (doc: CouchSyncDoc) => void;
 export type OnStateChangeHandler = (state: SyncState) => void;
 export type OnErrorHandler = (message: string) => void;
+
+export interface PullFirstOptions {
+    pullFirst: true;
+    onPulledDocs: (docs: CouchSyncDoc[]) => Promise<void>;
+}
 
 const HEALTH_CHECK_INTERVAL = 30000; // 30s
 
@@ -25,6 +31,8 @@ export class Replicator {
     private remoteDb: PouchDB.Database<CouchSyncDoc> | null = null;
     private idleCallbacks: (() => void)[] = [];
     private hasBeenIdle = false;
+    private phase: SyncPhase = "idle";
+    private onReconnectHandlers: (() => void)[] = [];
 
     constructor(
         private localDb: LocalDB,
@@ -45,6 +53,15 @@ export class Replicator {
 
     onError(handler: OnErrorHandler): void {
         this.onErrorHandlers.push(handler);
+    }
+
+    getPhase(): SyncPhase {
+        return this.phase;
+    }
+
+    /** Register callback for network reconnection (called instead of direct restart) */
+    onReconnect(handler: () => void): void {
+        this.onReconnectHandlers.push(handler);
     }
 
     /** Register callback to fire once initial sync reaches idle state */
@@ -82,12 +99,61 @@ export class Replicator {
     }
 
     /** Restart sync session (preserves PouchDB checkpoint, 5s cooldown) */
-    restart(): void {
+    restart(options?: PullFirstOptions): void {
         const now = Date.now();
         if (now - this.lastRestartTime < 5000) return;
         this.lastRestartTime = now;
         this.stop();
-        this.start();
+        if (options?.pullFirst) {
+            this.startWithPullFirst(options.onPulledDocs);
+        } else {
+            this.start();
+        }
+    }
+
+    /** Pull-first start: one-shot pull → apply callback → bidirectional live sync */
+    private startWithPullFirst(onPulledDocs: (docs: CouchSyncDoc[]) => Promise<void>): void {
+        if (this.sync) return;
+        this.phase = "pulling";
+        this.setState("syncing");
+
+        const remoteUrl = this.getRemoteUrl();
+        const pullRemoteDb = new PouchDB<CouchSyncDoc>(remoteUrl, { skip_setup: true });
+        const db = this.localDb.getDb();
+        const pulledDocs: CouchSyncDoc[] = [];
+
+        const replication = db.replicate.from(pullRemoteDb, {
+            batch_size: 50,
+            batches_limit: 5,
+        });
+
+        replication.on("change", (info) => {
+            if (info.docs) {
+                for (const doc of info.docs) {
+                    pulledDocs.push(doc as unknown as CouchSyncDoc);
+                }
+            }
+        });
+
+        replication.on("complete", async () => {
+            await pullRemoteDb.close();
+            this.phase = "applying";
+            try {
+                await onPulledDocs(pulledDocs);
+            } catch (e) {
+                console.error("CouchSync: Error applying pulled docs:", e);
+            }
+            this.phase = "live";
+            this.start();
+        });
+
+        replication.on("error", async (err) => {
+            await pullRemoteDb.close();
+            this.phase = "idle";
+            console.error("CouchSync: Pull-first replication error:", err);
+            this.setState("error");
+            this.emitError("Pull-first sync failed: " + (err?.message || "unknown"));
+        });
     }
 
     start(): void {
@@ -190,6 +256,7 @@ export class Replicator {
         }
         this.hasBeenIdle = false;
         this.idleCallbacks = [];
+        this.phase = "idle";
         this.setState("disconnected");
     }
 
@@ -395,7 +462,13 @@ export class Replicator {
     private handleOnline(): void {
         if (this.state === "disconnected" || this.state === "error") {
             console.log("CouchSync: Network online, restarting session");
-            this.restart();
+            if (this.onReconnectHandlers.length > 0) {
+                for (const handler of this.onReconnectHandlers) {
+                    handler();
+                }
+            } else {
+                this.restart();
+            }
         }
     }
 }

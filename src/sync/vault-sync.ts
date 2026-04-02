@@ -6,13 +6,20 @@ import { splitIntoChunks, joinChunks } from "../db/chunker.ts";
 import { isBinaryFile } from "../utils/binary.ts";
 
 export class VaultSync {
+    private pullInProgress = false;
+
     constructor(
         private app: App,
         private db: LocalDB,
         private getSettings: () => CouchSyncSettings
     ) {}
 
+    setPullInProgress(value: boolean): void {
+        this.pullInProgress = value;
+    }
+
     async fileToDb(file: TFile): Promise<void> {
+        if (this.pullInProgress) return;
         const settings = this.getSettings();
         const sizeMB = file.stat.size / (1024 * 1024);
         if (sizeMB > settings.maxFileSizeMB) return;
