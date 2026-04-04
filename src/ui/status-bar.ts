@@ -43,13 +43,13 @@ export class StatusBar {
         this.update("disconnected");
     }
 
-    update(state: SyncState): void {
+    update(state: SyncState, detail?: string): void {
         if (this.dotEl) {
             this.dotEl.className = "cs-status__dot";
             this.dotEl.addClass(STATE_DOT_CLASS[state]);
         }
         if (this.textEl) {
-            this.textEl.setText(STATE_LABELS[state]);
+            this.textEl.setText(detail ?? STATE_LABELS[state]);
         }
     }
 

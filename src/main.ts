@@ -230,19 +230,31 @@ export default class CouchSyncPlugin extends Plugin {
         if (this.reconnecting) return;
         this.reconnecting = true;
 
+        this.statusBar.update("syncing", "Reconnecting...");
         this.changeTracker.stop();
         this.historyCapture.pause();
         this.vaultSync.setPullInProgress(true);
         this.replicator.stop();
 
         try {
-            const { docs } = await this.replicator.pullFromRemote();
+            this.statusBar.update("syncing", "Pulling...");
+            const { docs } = await this.replicator.pullFromRemote(
+                (_docId, count) => this.statusBar.update("syncing", `Pulling... (${count})`),
+            );
 
-            for (const doc of docs) {
-                if (isFileDoc(doc)) {
+            const fileDocs = docs.filter(isFileDoc);
+            if (fileDocs.length > 0) {
+                this.statusBar.update("syncing", "Applying...");
+                for (const doc of fileDocs) {
                     await this.vaultSync.dbToFile(doc);
                     this.conflictResolver.resolveIfConflicted(doc);
                 }
+                const names = fileDocs.map((d) => d._id.split("/").pop()).join(", ");
+                showNotice(
+                    fileDocs.length <= 10
+                        ? `Reconnected: pulled ${fileDocs.length} file(s): ${names}`
+                        : `Reconnected: pulled ${fileDocs.length} file(s)`,
+                );
             }
         } catch (e) {
             console.error("CouchSync: Pull-first failed:", e);

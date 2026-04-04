@@ -7,6 +7,15 @@ import path from "node:path";
 
 const prod = process.argv[2] === "production";
 
+const pad2 = (v) => String(v).padStart(2, "0");
+const formatBuildTime = (d) => {
+    const offsetMin = -d.getTimezoneOffset();
+    const sign = offsetMin >= 0 ? "+" : "-";
+    const abs = Math.abs(offsetMin);
+    return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}T${pad2(d.getHours())}:${pad2(d.getMinutes())} (UTC${sign}${pad2(Math.floor(abs / 60))}:${pad2(abs % 60)})`;
+};
+const buildTime = formatBuildTime(new Date());
+
 const manifestJson = JSON.parse(fs.readFileSync("./manifest.json") + "");
 const packageJson = JSON.parse(fs.readFileSync("./package.json") + "");
 
@@ -43,6 +52,7 @@ const context = await esbuild.context({
     define: {
         MANIFEST_VERSION: `"${manifestJson.version}"`,
         PACKAGE_VERSION: `"${packageJson.version}"`,
+        __BUILD_TIME__: JSON.stringify(buildTime),
         global: "window",
     },
     external: [

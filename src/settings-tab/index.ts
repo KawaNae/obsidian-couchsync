@@ -22,6 +22,17 @@ export class CouchSyncSettingTab extends PluginSettingTab {
 
         const wrapper = containerEl.createDiv({ cls: "cs-settings__wrapper" });
 
+        // Version & build info
+        const versionEl = wrapper.createDiv({ cls: "cs-settings__version" });
+        versionEl.createSpan({
+            text: `CouchSync v${this.plugin.manifest.version}`,
+            cls: "setting-item-description",
+        });
+        versionEl.createSpan({
+            text: ` — Built: ${typeof __BUILD_TIME__ !== "undefined" ? __BUILD_TIME__ : "unknown"}`,
+            cls: "setting-item-description",
+        });
+
         // Tab navigation — event delegation on nav parent
         const nav = wrapper.createDiv({ cls: "cs-settings__nav" });
         nav.addEventListener("click", (e) => {
