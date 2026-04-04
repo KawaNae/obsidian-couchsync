@@ -14,8 +14,6 @@ export class HistoryCapture {
     private paused = false;
     private diffEngine = new DiffEngine();
 
-    onDiffSaved?: (filePath: string) => void;
-
     constructor(
         private app: App,
         private storage: HistoryStorage,
@@ -143,7 +141,7 @@ export class HistoryCapture {
             await this.storage.saveSnapshot(file.path, currentContent);
             this.lastCaptureTime.set(file.path, Date.now());
             console.log(`CouchSync: History captured for ${file.path}`);
-            this.onDiffSaved?.(file.path);
+            (this.app.workspace as any).trigger("couchsync:diff-saved", file.path);
         } catch (e) {
             console.error("CouchSync: Failed to capture history:", e);
         }

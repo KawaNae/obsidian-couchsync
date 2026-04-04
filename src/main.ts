@@ -67,10 +67,6 @@ export default class CouchSyncPlugin extends Plugin {
             },
         );
 
-        this.historyCapture.onDiffSaved = (filePath) => {
-            this.refreshHistoryViewIfMatch(filePath);
-        };
-
         this.statusBar = new StatusBar(this, () => this.settings);
         this.replicator.onStateChange((state) => this.statusBar.update(state));
         this.replicator.onError((msg) => showNotice(msg, 8000));
@@ -93,18 +89,6 @@ export default class CouchSyncPlugin extends Plugin {
         this.addSettingTab(new CouchSyncSettingTab(this.app, this));
 
         this.registerView(VIEW_TYPE_DIFF_HISTORY, (leaf) => new DiffHistoryView(leaf, this));
-
-        this.registerEvent(
-            this.app.workspace.on("active-leaf-change", () => {
-                const file = this.app.workspace.getActiveFile();
-                if (file) {
-                    const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_DIFF_HISTORY);
-                    for (const leaf of leaves) {
-                        (leaf.view as DiffHistoryView).showFileHistory(file.path);
-                    }
-                }
-            }),
-        );
 
         this.addRibbonIcon("history", "Diff History", () => {
             this.activateHistoryView();
@@ -291,16 +275,6 @@ export default class CouchSyncPlugin extends Plugin {
         }
         if (synced > 0) {
             console.log(`CouchSync: Scanned ${synced} files to local DB`);
-        }
-    }
-
-    private refreshHistoryViewIfMatch(filePath: string): void {
-        const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_DIFF_HISTORY);
-        for (const leaf of leaves) {
-            const view = leaf.view as DiffHistoryView;
-            if (view.getCurrentFile() === filePath) {
-                view.showFileHistory(filePath);
-            }
         }
     }
 

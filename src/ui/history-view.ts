@@ -19,7 +19,31 @@ export class DiffHistoryView extends ItemView {
     getDisplayText(): string { return "Diff History"; }
     getIcon(): string { return "history"; }
 
-    async onOpen(): Promise<void> { this.renderEmpty(); }
+    async onOpen(): Promise<void> {
+        this.renderEmpty();
+
+        this.registerEvent(
+            this.app.workspace.on("active-leaf-change", () => {
+                const file = this.app.workspace.getActiveFile();
+                if (file) {
+                    this.showFileHistory(file.path);
+                }
+            }),
+        );
+
+        this.registerEvent(
+            (this.app.workspace as any).on("couchsync:diff-saved", (filePath: string) => {
+                if (this.currentFile === filePath) {
+                    this.showFileHistory(filePath);
+                }
+            }),
+        );
+
+        const file = this.app.workspace.getActiveFile();
+        if (file) {
+            await this.showFileHistory(file.path);
+        }
+    }
     async onClose(): Promise<void> { this.contentEl.empty(); }
 
     getCurrentFile(): string | null { return this.currentFile; }
