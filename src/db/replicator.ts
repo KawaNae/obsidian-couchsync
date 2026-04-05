@@ -28,6 +28,7 @@ export class Replicator {
     private hasBeenIdle = false;
     private phase: SyncPhase = "idle";
     private onReconnectHandlers: (() => void)[] = [];
+    private onPausedHandlers: (() => void)[] = [];
 
     constructor(
         private localDb: LocalDB,
@@ -57,6 +58,11 @@ export class Replicator {
     /** Register callback for network reconnection (called instead of direct restart) */
     onReconnect(handler: () => void): void {
         this.onReconnectHandlers.push(handler);
+    }
+
+    /** Register callback for sync paused (all batches transferred, caught up) */
+    onPaused(handler: () => void): void {
+        this.onPausedHandlers.push(handler);
     }
 
     /** Register callback to fire once initial sync reaches idle state */
@@ -151,6 +157,11 @@ export class Replicator {
                     this.hasBeenIdle = true;
                     for (const cb of this.idleCallbacks) cb();
                     this.idleCallbacks = [];
+                }
+                for (const handler of this.onPausedHandlers) {
+                    try { handler(); } catch (e) {
+                        console.error("CouchSync: onPaused handler error:", e);
+                    }
                 }
             }
         });
