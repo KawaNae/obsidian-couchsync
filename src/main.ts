@@ -36,6 +36,11 @@ export default class CouchSyncPlugin extends Plugin {
     async onload(): Promise<void> {
         await this.loadSettings();
 
+        if (!this.settings.deviceId) {
+            this.settings.deviceId = crypto.randomUUID();
+            await this.saveSettings();
+        }
+
         const dbName = `couchsync-${this.app.vault.getName()}`;
         this.localDb = new LocalDB(dbName);
         this.localDb.open();
@@ -72,17 +77,13 @@ export default class CouchSyncPlugin extends Plugin {
         this.replicator.onError((msg) => showNotice(msg, 8000));
 
         // Handle incoming remote changes — vault files only (config is manual pull)
+        // dbToFile() Safe Write prevents echo loops via content comparison,
+        // so pause/resume is no longer needed for echo prevention.
         this.replicator.onChange((doc: CouchSyncDoc) => {
             if (isFileDoc(doc)) {
-                this.changeTracker.pause();
-                this.historyCapture.pause();
-                this.vaultSync.dbToFile(doc).finally(() => {
-                    setTimeout(() => {
-                        this.changeTracker.resume();
-                        this.historyCapture.resume();
-                    }, 500);
-                });
-                this.conflictResolver.resolveIfConflicted(doc);
+                this.vaultSync.dbToFile(doc)
+                    .then(() => this.conflictResolver.resolveIfConflicted(doc))
+                    .catch((e) => console.error(`CouchSync: Failed to apply remote change for ${doc._id}:`, e));
             }
         });
 
@@ -262,11 +263,9 @@ export default class CouchSyncPlugin extends Plugin {
 
         this.vaultSync.setPullInProgress(false);
         this.replicator.start();
-        setTimeout(() => {
-            this.changeTracker.start();
-            this.historyCapture.resume();
-            this.reconnecting = false;
-        }, 500);
+        this.changeTracker.start();
+        this.historyCapture.resume();
+        this.reconnecting = false;
     }
 
     private async scanVaultToDb(progress?: ProgressNotice): Promise<void> {

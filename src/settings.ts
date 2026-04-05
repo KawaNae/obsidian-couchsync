@@ -32,6 +32,7 @@ export interface CouchSyncSettings {
 
     // Internal
     connectionState: ConnectionState;
+    deviceId: string;
 }
 
 export const DEFAULT_SETTINGS: CouchSyncSettings = {
@@ -59,4 +60,5 @@ export const DEFAULT_SETTINGS: CouchSyncSettings = {
     showVerboseLog: false,
 
     connectionState: "editing",
+    deviceId: "",
 };

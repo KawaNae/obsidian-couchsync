@@ -13,6 +13,12 @@ export interface FileDoc extends CouchSyncDocBase {
     ctime: number;
     size: number;
     deleted?: boolean;
+    /** Timestamp (Date.now()) when a user actually edited this file.
+     *  Set only by fileToDb(); never updated by dbToFile() relay.
+     *  Falls back to mtime for docs created before this field existed. */
+    editedAt?: number;
+    /** deviceId of the device that made the edit */
+    editedBy?: string;
 }
 
 /** A content chunk — fragment of a file */

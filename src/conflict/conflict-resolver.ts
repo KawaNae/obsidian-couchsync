@@ -23,15 +23,19 @@ export class ConflictResolver {
             try {
                 const conflicting = await db.get(doc._id, { rev: conflictRev }) as unknown as FileDoc;
 
-                // Determine winner (newer mtime) and loser
+                // Determine winner (newer editedAt, falling back to mtime) and loser
+                const winnerTime = winner.editedAt ?? winner.mtime;
+                const conflictTime = conflicting.editedAt ?? conflicting.mtime;
                 let loserDoc: FileDoc;
-                if (conflicting.mtime > winner.mtime) {
+                if (conflictTime > winnerTime) {
                     loserDoc = { ...winner };
                     winner.chunks = conflicting.chunks;
                     winner.mtime = conflicting.mtime;
                     winner.ctime = conflicting.ctime;
                     winner.size = conflicting.size;
                     winner.deleted = conflicting.deleted;
+                    winner.editedAt = conflicting.editedAt;
+                    winner.editedBy = conflicting.editedBy;
                 } else {
                     loserDoc = conflicting;
                 }
