@@ -79,12 +79,22 @@ export default class CouchSyncPlugin extends Plugin {
         // Handle incoming remote changes — vault files only (config is manual pull)
         // dbToFile() Safe Write prevents echo loops via content comparison,
         // so pause/resume is no longer needed for echo prevention.
+        // This is the "hint" path: applies immediately if chunks are ready,
+        // silently skips if not (reconcile on paused catches the rest).
         this.replicator.onChange((doc: CouchSyncDoc) => {
             if (isFileDoc(doc)) {
                 this.vaultSync.dbToFile(doc)
                     .then(() => this.conflictResolver.resolveIfConflicted(doc))
                     .catch((e) => console.error(`CouchSync: Failed to apply remote change for ${doc._id}:`, e));
             }
+        });
+
+        // Reconcile: after all batches transfer, apply any files whose chunks
+        // weren't ready when the onChange hint fired.
+        this.replicator.onPaused(() => {
+            this.vaultSync.reconcile()
+                .then((count) => { if (count > 0) console.log(`CouchSync: Reconciled ${count} file(s)`); })
+                .catch((e) => console.error("CouchSync: Reconcile failed:", e));
         });
 
         this.addSettingTab(new CouchSyncSettingTab(this.app, this));
@@ -262,6 +272,12 @@ export default class CouchSyncPlugin extends Plugin {
         }
 
         this.vaultSync.setPullInProgress(false);
+
+        const reconciled = await this.vaultSync.reconcile();
+        if (reconciled > 0) {
+            showNotice(`Reconciled ${reconciled} missing file(s)`);
+        }
+
         this.replicator.start();
         this.changeTracker.start();
         this.historyCapture.resume();

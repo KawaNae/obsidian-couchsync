@@ -171,6 +171,30 @@ export class VaultSync {
         return true;
     }
 
+    /**
+     * Reconcile: scan local PouchDB for FileDocs whose vault files are missing,
+     * and apply them if all chunks are available. This is the Apply layer's
+     * safety net — catches anything the event-driven onChange path missed
+     * (e.g., FileDoc arrived before its chunks during live sync).
+     */
+    async reconcile(): Promise<number> {
+        const allFileDocs = await this.db.allFileDocs();
+        let applied = 0;
+        for (const doc of allFileDocs) {
+            if (doc.deleted) continue;
+            if (!this.shouldSync(doc._id)) continue;
+            const existing = this.app.vault.getAbstractFileByPath(doc._id);
+            if (existing) continue;
+
+            const chunks = await this.db.getChunks(doc.chunks);
+            if (chunks.length !== doc.chunks.length) continue;
+
+            await this.dbToFile(doc);
+            applied++;
+        }
+        return applied;
+    }
+
     private async ensureParentDir(filePath: string): Promise<void> {
         const parts = filePath.split("/");
         if (parts.length <= 1) return;
