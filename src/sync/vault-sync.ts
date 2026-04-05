@@ -50,6 +50,8 @@ export class VaultSync {
             mtime: file.stat.mtime,
             ctime: file.stat.ctime,
             size: file.stat.size,
+            editedAt: Date.now(),
+            editedBy: this.getSettings().deviceId,
         };
         await this.db.put(fileDoc);
     }
@@ -63,7 +65,15 @@ export class VaultSync {
             return;
         }
 
+        const existing = this.app.vault.getAbstractFileByPath(fileDoc._id);
         const binary = isBinaryFile(fileDoc._id);
+
+        if (existing && "stat" in existing) {
+            const skip = await this.shouldSkipWrite(fileDoc, existing as TFile, binary);
+            if (skip) return;
+        }
+
+        // Apply remote content to vault
         const chunks = await this.db.getChunks(fileDoc.chunks);
 
         const chunkMap = new Map(chunks.map((c) => [c._id, c]));
@@ -77,7 +87,6 @@ export class VaultSync {
         }
 
         const content = joinChunks(orderedChunks, binary);
-        const existing = this.app.vault.getAbstractFileByPath(fileDoc._id);
 
         if (binary) {
             if (existing) {
@@ -94,6 +103,39 @@ export class VaultSync {
                 await this.app.vault.create(fileDoc._id, content as string);
             }
         }
+    }
+
+    /**
+     * Determines whether a remote doc write should be skipped.
+     * Step 1: Content comparison — skip if chunk IDs match (identical content).
+     * Step 2: Freshness comparison — skip if local mtime is newer than remote
+     *         editedAt (the actual user-edit timestamp, not relay mtime).
+     */
+    private async shouldSkipWrite(fileDoc: FileDoc, localFile: TFile, binary: boolean): Promise<boolean> {
+        // Step 1: Content comparison (chunk IDs)
+        const localContent = binary
+            ? await this.app.vault.readBinary(localFile)
+            : await this.app.vault.read(localFile);
+        const localChunks = await splitIntoChunks(localContent, binary);
+        const localChunkIds = localChunks.map((c) => c._id);
+
+        if (
+            localChunkIds.length === fileDoc.chunks.length &&
+            localChunkIds.every((id, i) => id === fileDoc.chunks[i])
+        ) {
+            console.debug(`CouchSync: dbToFile skipped (content identical): ${fileDoc._id}`);
+            return true;
+        }
+
+        // Step 2: Freshness comparison — editedAt is the user-edit timestamp
+        // (set only by fileToDb, never by relay), falling back to mtime for old docs.
+        const remoteEditedAt = fileDoc.editedAt ?? fileDoc.mtime;
+        if (localFile.stat.mtime > remoteEditedAt) {
+            console.debug(`CouchSync: dbToFile skipped (local fresher): ${fileDoc._id} local=${localFile.stat.mtime} remote=${remoteEditedAt}`);
+            return true;
+        }
+
+        return false;
     }
 
     async markDeleted(path: string): Promise<void> {
