@@ -4,6 +4,7 @@ import { ConnectionTab } from "./connection-tab.ts";
 import { renderFilesTab } from "./files-tab.ts";
 import { renderHistoryTab } from "./history-tab.ts";
 import { renderMaintenanceTab } from "./maintenance-tab.ts";
+import { renderStatusTab } from "./status-tab.ts";
 
 export class CouchSyncSettingTab extends PluginSettingTab {
     plugin: CouchSyncPlugin;
@@ -47,6 +48,7 @@ export class CouchSyncSettingTab extends PluginSettingTab {
             { id: "files", label: "Files" },
             { id: "history", label: "History" },
             { id: "maintenance", label: "Maintenance" },
+            { id: "status", label: "CouchDB" },
         ];
 
         // Content area
@@ -124,6 +126,11 @@ export class CouchSyncSettingTab extends PluginSettingTab {
                     app.plugins?.enablePlugin("obsidian-couchsync");
                 },
             });
+        }
+
+        const statusPanel = panels.get("status");
+        if (statusPanel) {
+            renderStatusTab(statusPanel, settingsDeps);
         }
 
         // Restore active tab (survives refresh)
