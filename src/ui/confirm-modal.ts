@@ -4,7 +4,13 @@ export class ConfirmModal extends Modal {
     private resolved = false;
     private resolve: (value: boolean) => void = () => {};
 
-    constructor(app: App, private title: string, private message: string) {
+    constructor(
+        app: App,
+        private title: string,
+        private message: string,
+        private confirmText = "Confirm",
+        private danger = false,
+    ) {
         super(app);
     }
 
@@ -14,16 +20,22 @@ export class ConfirmModal extends Modal {
         contentEl.createEl("p", { text: this.message });
 
         new Setting(contentEl)
-            .addButton((btn) => btn.setButtonText("Restore").setCta().onClick(() => {
-                this.resolved = true;
-                this.resolve(true);
-                this.close();
-            }))
-            .addButton((btn) => btn.setButtonText("Cancel").onClick(() => {
-                this.resolved = true;
-                this.resolve(false);
-                this.close();
-            }));
+            .addButton((btn) => {
+                btn.setButtonText(this.confirmText);
+                if (this.danger) btn.setWarning(); else btn.setCta();
+                btn.onClick(() => {
+                    this.resolved = true;
+                    this.resolve(true);
+                    this.close();
+                });
+            })
+            .addButton((btn) =>
+                btn.setButtonText("Cancel").onClick(() => {
+                    this.resolved = true;
+                    this.resolve(false);
+                    this.close();
+                })
+            );
     }
 
     onClose(): void {

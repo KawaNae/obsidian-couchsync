@@ -100,6 +100,7 @@ export class CouchSyncSettingTab extends PluginSettingTab {
             renderFilesTab(filesPanel, {
                 ...settingsDeps,
                 configSync: this.plugin.configSync,
+                app: this.app,
                 refresh: () => this.display(),
             });
         }
@@ -130,7 +131,11 @@ export class CouchSyncSettingTab extends PluginSettingTab {
 
         const statusPanel = panels.get("status");
         if (statusPanel) {
-            renderStatusTab(statusPanel, settingsDeps);
+            renderStatusTab(statusPanel, {
+                ...settingsDeps,
+                app: this.app,
+                refresh: () => this.display(),
+            });
         }
 
         // Restore active tab (survives refresh)
