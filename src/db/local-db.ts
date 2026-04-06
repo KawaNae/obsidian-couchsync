@@ -90,14 +90,20 @@ export class LocalDB {
     }
 
     async allFileDocs(): Promise<FileDoc[]> {
-        const result = await this.getDb().allDocs({ include_docs: true });
+        // Phase 1: fetch IDs only (no doc bodies) — avoids loading chunk data
+        const idResult = await this.getDb().allDocs();
+        const fileIds = idResult.rows
+            .filter((r) => !r.id.startsWith("chunk:") && !r.id.startsWith("config:") && !r.id.startsWith("_"))
+            .map((r) => r.id);
+        if (fileIds.length === 0) return [];
+
+        // Phase 2: load only the file docs by key
+        const docResult = await this.getDb().allDocs({ keys: fileIds, include_docs: true });
         const files: FileDoc[] = [];
-        for (const row of result.rows) {
+        for (const row of docResult.rows) {
             if ("doc" in row && row.doc) {
                 const doc = row.doc as unknown as CouchSyncDoc;
-                if (doc.type === "file") {
-                    files.push(doc as FileDoc);
-                }
+                if (doc.type === "file") files.push(doc as FileDoc);
             }
         }
         return files;
