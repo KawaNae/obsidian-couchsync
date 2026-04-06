@@ -1,4 +1,4 @@
-import { ItemView, WorkspaceLeaf, Notice } from "obsidian";
+import { ItemView, WorkspaceLeaf, Notice, setIcon } from "obsidian";
 import type CouchSyncPlugin from "../main.ts";
 import type { HistoryEntry } from "../history/types.ts";
 import { ConfirmModal } from "./confirm-modal.ts";
@@ -75,6 +75,7 @@ export class DiffHistoryView extends ItemView {
             group.createDiv({ cls: "diff-history-date-header", text: date });
 
             for (const entry of entries) {
+                const globalIndex = this.entries.indexOf(entry);
                 const row = group.createDiv({ cls: "diff-history-entry" });
                 row.createSpan({ cls: "diff-history-time", text: formatTime(entry.record.timestamp) });
 
@@ -86,12 +87,21 @@ export class DiffHistoryView extends ItemView {
                 if (entry.added > 0) summary.createSpan({ cls: "diff-history-additions", text: `+${entry.added}` });
                 if (entry.removed > 0) summary.createSpan({ cls: "diff-history-deletions", text: `-${entry.removed}` });
 
+                if ((entry.record.source ?? "local") === "sync") {
+                    const icon = row.createSpan({ cls: "diff-history-sync-icon", attr: { "aria-label": "from sync" } });
+                    setIcon(icon, "cloud-download");
+                }
+
                 const actions = row.createSpan({ cls: "diff-history-entry-actions" });
                 const diffBtn = actions.createEl("button", { cls: "diff-history-btn", text: "Diff" });
-                diffBtn.addEventListener("click", (e) => { e.stopPropagation(); this.onShowDiff(entry, this.entries.indexOf(entry)); });
+                diffBtn.addEventListener("click", (e) => { e.stopPropagation(); this.onShowDiff(entry, globalIndex); });
 
-                const restoreBtn = actions.createEl("button", { cls: "diff-history-btn", text: "Restore" });
-                restoreBtn.addEventListener("click", (e) => { e.stopPropagation(); this.onRestore(entry); });
+                // The top entry reflects the current on-disk state, so restoring
+                // to it is a no-op. Omit the button there to avoid UX confusion.
+                if (globalIndex > 0) {
+                    const restoreBtn = actions.createEl("button", { cls: "diff-history-btn", text: "Restore" });
+                    restoreBtn.addEventListener("click", (e) => { e.stopPropagation(); this.onRestore(entry); });
+                }
             }
         }
     }

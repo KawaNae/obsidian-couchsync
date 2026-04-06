@@ -1,5 +1,5 @@
 import Dexie, { type Table } from "dexie";
-import type { DiffRecord, FileSnapshot } from "./types.ts";
+import type { DiffRecord, FileSnapshot, HistorySource } from "./types.ts";
 
 class HistoryDB extends Dexie {
     diffs!: Table<DiffRecord, string>;
@@ -28,6 +28,7 @@ export class HistoryStorage {
         added: number,
         removed: number,
         conflict = false,
+        source: HistorySource = "local",
     ): Promise<void> {
         await this.db.diffs.add({
             filePath,
@@ -37,6 +38,8 @@ export class HistoryStorage {
             added,
             removed,
             conflict: conflict || undefined,
+            // Omit "local" to keep legacy rows and new local rows shape-identical.
+            source: source === "local" ? undefined : source,
         });
     }
 

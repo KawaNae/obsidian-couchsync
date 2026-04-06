@@ -2,6 +2,7 @@ import type { App, TFile } from "obsidian";
 import type { LocalDB } from "../db/local-db.ts";
 import type { FileDoc } from "../types.ts";
 import type { CouchSyncSettings } from "../settings.ts";
+import type { HistoryCapture } from "../history/history-capture.ts";
 import { splitIntoChunks, joinChunks } from "../db/chunker.ts";
 import { isBinaryFile } from "../utils/binary.ts";
 
@@ -11,12 +12,23 @@ export class VaultSync {
     private pullInProgress = false;
     private reconciling = false;
     private lastReconcileTime = 0;
+    private historyCapture: HistoryCapture | null = null;
 
     constructor(
         private app: App,
         private db: LocalDB,
         private getSettings: () => CouchSyncSettings
     ) {}
+
+    /**
+     * Inject HistoryCapture after construction to avoid circular wiring at
+     * plugin init time. Once set, dbToFile() records a history entry for
+     * every sync-driven vault write so the timeline reflects true state
+     * changes, not just local edits.
+     */
+    setHistoryCapture(historyCapture: HistoryCapture): void {
+        this.historyCapture = historyCapture;
+    }
 
     setPullInProgress(value: boolean): void {
         this.pullInProgress = value;
@@ -99,12 +111,23 @@ export class VaultSync {
                 await this.ensureParentDir(fileDoc._id);
                 await this.app.vault.createBinary(fileDoc._id, content as ArrayBuffer);
             }
+            // Binary files are excluded from history capture by isTargetFile().
         } else {
+            let writtenFile: TFile | null = null;
             if (existing) {
                 await this.app.vault.modify(existing as TFile, content as string);
+                writtenFile = existing as TFile;
             } else {
                 await this.ensureParentDir(fileDoc._id);
                 await this.app.vault.create(fileDoc._id, content as string);
+                const created = this.app.vault.getAbstractFileByPath(fileDoc._id);
+                if (created && "extension" in created) writtenFile = created as TFile;
+            }
+            // Record this sync-driven write as a history entry so the diff
+            // history view reflects the true timeline of file state changes,
+            // not just local edits.
+            if (writtenFile && this.historyCapture) {
+                await this.historyCapture.captureSyncWrite(writtenFile);
             }
         }
     }

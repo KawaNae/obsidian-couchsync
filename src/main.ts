@@ -52,6 +52,7 @@ export default class CouchSyncPlugin extends Plugin {
         this.changeTracker = new ChangeTracker(this.app, this.vaultSync, () => this.settings);
         this.historyStorage = new HistoryStorage(this.app.vault.getName());
         this.historyCapture = new HistoryCapture(this.app, this.historyStorage, () => this.settings);
+        this.vaultSync.setHistoryCapture(this.historyCapture);
         this.historyManager = new HistoryManager(
             this.app.vault, this.historyStorage, this.historyCapture, () => this.settings,
         );
@@ -243,7 +244,6 @@ export default class CouchSyncPlugin extends Plugin {
 
         this.statusBar.update("syncing", "Reconnecting...");
         this.changeTracker.stop();
-        this.historyCapture.pause();
         this.vaultSync.setPullInProgress(true);
         this.replicator.stop();
 
@@ -280,7 +280,6 @@ export default class CouchSyncPlugin extends Plugin {
 
         this.replicator.start();
         this.changeTracker.start();
-        this.historyCapture.resume();
         this.reconnecting = false;
     }
 

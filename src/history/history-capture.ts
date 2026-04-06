@@ -2,6 +2,7 @@ import type { App, TAbstractFile, TFile, EventRef } from "obsidian";
 import type { HistoryStorage } from "./storage.ts";
 import { DiffEngine, computeHash } from "./diff-engine.ts";
 import type { CouchSyncSettings } from "../settings.ts";
+import type { HistorySource } from "./types.ts";
 import { minimatch } from "../utils/minimatch.ts";
 import { isBinaryFile } from "../utils/binary.ts";
 
@@ -67,6 +68,17 @@ export class HistoryCapture {
         await this.storage.saveDiff(filePath, patch, hash, added, removed, true);
     }
 
+    /**
+     * Capture a history entry for a sync-driven write. Called by VaultSync
+     * after dbToFile() successfully writes remote content to the vault.
+     * Bypasses debounce/rate-limit (sync events are discrete, not continuous input)
+     * and tags the entry with source="sync".
+     */
+    async captureSyncWrite(file: TFile): Promise<void> {
+        if (!this.isTargetFile(file)) return;
+        await this.captureChange(file, "sync");
+    }
+
     private isTargetFile(file: TAbstractFile): boolean {
         if (!("extension" in file)) return false;
         const tfile = file as TFile;
@@ -120,27 +132,22 @@ export class HistoryCapture {
         }
     }
 
-    private async captureChange(file: TFile): Promise<void> {
+    private async captureChange(file: TFile, source: HistorySource = "local"): Promise<void> {
         try {
             const currentContent = await this.app.vault.cachedRead(file);
             const snapshot = await this.storage.getSnapshot(file.path);
 
-            if (snapshot) {
-                if (snapshot.content === currentContent) return;
-                const patches = this.diffEngine.computePatch(snapshot.content, currentContent);
-                const baseHash = await computeHash(snapshot.content);
-                const { added, removed } = this.diffEngine.computeLineDiff(snapshot.content, currentContent);
-                await this.storage.saveDiff(file.path, patches, baseHash, added, removed);
-            } else {
-                const patches = this.diffEngine.computePatch("", currentContent);
-                const baseHash = await computeHash("");
-                const { added, removed } = this.diffEngine.computeLineDiff("", currentContent);
-                await this.storage.saveDiff(file.path, patches, baseHash, added, removed);
-            }
+            const prevContent = snapshot?.content ?? "";
+            if (prevContent === currentContent) return;
+
+            const patches = this.diffEngine.computePatch(prevContent, currentContent);
+            const baseHash = await computeHash(prevContent);
+            const { added, removed } = this.diffEngine.computeLineDiff(prevContent, currentContent);
+            await this.storage.saveDiff(file.path, patches, baseHash, added, removed, false, source);
 
             await this.storage.saveSnapshot(file.path, currentContent);
             this.lastCaptureTime.set(file.path, Date.now());
-            console.log(`CouchSync: History captured for ${file.path}`);
+            console.log(`CouchSync: History captured for ${file.path} (${source})`);
             (this.app.workspace as any).trigger("couchsync:diff-saved", file.path);
         } catch (e) {
             console.error("CouchSync: Failed to capture history:", e);

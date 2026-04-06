@@ -47,16 +47,17 @@ export class DiffEngine {
     }
 
     computeLineDiff(oldText: string, newText: string): { added: number; removed: number } {
-        const { chars1, chars2, lineArray } = dmp.diff_linesToChars_(oldText, newText);
+        // Count lines in the char-encoded representation (each char = 1 line).
+        // This is exact regardless of trailing-newline presence, unlike counting
+        // "\n" occurrences in the restored text which under-counts edits to
+        // a file's last line when it has no trailing newline.
+        const { chars1, chars2 } = dmp.diff_linesToChars_(oldText, newText);
         const diffs = dmp.diff_main(chars1, chars2, false);
-        dmp.diff_charsToLines_(diffs, lineArray);
-        dmp.diff_cleanupSemantic(diffs);
         let added = 0;
         let removed = 0;
         for (const [op, text] of diffs) {
-            const lines = (text.match(/\n/g) || []).length;
-            if (op === DiffMatchPatch.DIFF_INSERT) added += lines;
-            else if (op === DiffMatchPatch.DIFF_DELETE) removed += lines;
+            if (op === DiffMatchPatch.DIFF_INSERT) added += text.length;
+            else if (op === DiffMatchPatch.DIFF_DELETE) removed += text.length;
         }
         return { added, removed };
     }
