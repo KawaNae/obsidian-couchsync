@@ -132,7 +132,7 @@ export class DiffHistoryView extends ItemView {
         const time = formatTime(entry.record.timestamp);
         const date = formatDate(entry.record.timestamp);
 
-        const confirmed = await new ConfirmModal(this.plugin.app, "Restore file", `Restore to ${date} ${time}?`).waitForResult();
+        const confirmed = await new ConfirmModal(this.plugin.app, "Restore file", `Restore to ${date} ${time}?`, "Restore").waitForResult();
         if (!confirmed) return;
 
         const success = await this.plugin.historyManager.restoreToPoint(this.currentFile, entry.record.timestamp);

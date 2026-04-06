@@ -258,7 +258,7 @@ export default class CouchSyncPlugin extends Plugin {
                 this.statusBar.update("syncing", "Applying...");
                 for (const doc of fileDocs) {
                     await this.vaultSync.dbToFile(doc);
-                    this.conflictResolver.resolveIfConflicted(doc);
+                    await this.conflictResolver.resolveIfConflicted(doc);
                 }
                 const names = fileDocs.map((d) => d._id.split("/").pop()).join(", ");
                 showNotice(
@@ -273,7 +273,7 @@ export default class CouchSyncPlugin extends Plugin {
 
         this.vaultSync.setPullInProgress(false);
 
-        const reconciled = await this.vaultSync.reconcile();
+        const reconciled = await this.vaultSync.reconcile(true);
         if (reconciled > 0) {
             showNotice(`Reconciled ${reconciled} missing file(s)`);
         }

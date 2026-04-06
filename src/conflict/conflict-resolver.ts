@@ -17,7 +17,8 @@ export class ConflictResolver {
         if (!isFileDoc(doc)) return false;
 
         const db = this.db.getDb();
-        const winner = doc as FileDoc;
+        // Clone to avoid mutating the caller's reference
+        const winner = { ...(doc as FileDoc) };
 
         for (const conflictRev of doc._conflicts) {
             try {

@@ -5,8 +5,12 @@ import type { CouchSyncSettings } from "../settings.ts";
 import { splitIntoChunks, joinChunks } from "../db/chunker.ts";
 import { isBinaryFile } from "../utils/binary.ts";
 
+const RECONCILE_MIN_INTERVAL = 30000; // 30s minimum between reconcile runs
+
 export class VaultSync {
     private pullInProgress = false;
+    private reconciling = false;
+    private lastReconcileTime = 0;
 
     constructor(
         private app: App,
@@ -127,8 +131,14 @@ export class VaultSync {
             return true;
         }
 
-        // Step 2: Freshness comparison — editedAt is the user-edit timestamp
-        // (set only by fileToDb, never by relay), falling back to mtime for old docs.
+        // Step 2: Freshness comparison
+        // editedAt = user-edit timestamp (set only by fileToDb, never by relay)
+        // localFile.stat.mtime = OS disk-write timestamp
+        // These are semantically different clocks. A relay device's mtime may be
+        // later than editedAt due to network/processing delay. This is safe under
+        // the "one device edits at a time" assumption because Step 1 (content
+        // comparison) catches identical content first; Step 2 only fires when
+        // content differs, meaning a real edit occurred.
         const remoteEditedAt = fileDoc.editedAt ?? fileDoc.mtime;
         if (localFile.stat.mtime > remoteEditedAt) {
             console.debug(`CouchSync: dbToFile skipped (local fresher): ${fileDoc._id} local=${localFile.stat.mtime} remote=${remoteEditedAt}`);
@@ -172,27 +182,48 @@ export class VaultSync {
     }
 
     /**
-     * Reconcile: scan local PouchDB for FileDocs whose vault files are missing,
-     * and apply them if all chunks are available. This is the Apply layer's
-     * safety net — catches anything the event-driven onChange path missed
-     * (e.g., FileDoc arrived before its chunks during live sync).
+     * Reconcile: scan local PouchDB for FileDocs that are missing or stale
+     * in the vault, and apply them if all chunks are available. This is the
+     * Apply layer's safety net — catches anything the event-driven onChange
+     * path missed (e.g., FileDoc arrived before its chunks during live sync,
+     * or dbToFile was interrupted).
+     *
+     * @param force - bypass the 30s throttle (used after reconnectWithPullFirst)
      */
-    async reconcile(): Promise<number> {
-        const allFileDocs = await this.db.allFileDocs();
-        let applied = 0;
-        for (const doc of allFileDocs) {
-            if (doc.deleted) continue;
-            if (!this.shouldSync(doc._id)) continue;
-            const existing = this.app.vault.getAbstractFileByPath(doc._id);
-            if (existing) continue;
+    async reconcile(force = false): Promise<number> {
+        if (this.reconciling) return 0;
+        const now = Date.now();
+        if (!force && now - this.lastReconcileTime < RECONCILE_MIN_INTERVAL) return 0;
+        this.reconciling = true;
+        this.lastReconcileTime = now;
+        try {
+            const allFileDocs = await this.db.allFileDocs();
+            let applied = 0;
+            for (const doc of allFileDocs) {
+                if (doc.deleted) continue;
+                if (!this.shouldSync(doc._id)) continue;
+                const existing = this.app.vault.getAbstractFileByPath(doc._id);
 
-            const chunks = await this.db.getChunks(doc.chunks);
-            if (chunks.length !== doc.chunks.length) continue;
-
-            await this.dbToFile(doc);
-            applied++;
+                if (!existing) {
+                    // File missing from vault — check chunk readiness, then apply
+                    const chunks = await this.db.getChunks(doc.chunks);
+                    if (chunks.length !== doc.chunks.length) continue;
+                    await this.dbToFile(doc);
+                    applied++;
+                } else if ("stat" in existing) {
+                    // File exists — check if content is stale
+                    const binary = isBinaryFile(doc._id);
+                    const skip = await this.shouldSkipWrite(doc, existing as TFile, binary);
+                    if (!skip) {
+                        await this.dbToFile(doc);
+                        applied++;
+                    }
+                }
+            }
+            return applied;
+        } finally {
+            this.reconciling = false;
         }
-        return applied;
     }
 
     private async ensureParentDir(filePath: string): Promise<void> {

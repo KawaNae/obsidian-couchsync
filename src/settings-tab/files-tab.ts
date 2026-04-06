@@ -1,4 +1,4 @@
-import { Notice, Setting } from "obsidian";
+import { type App, Notice, Setting } from "obsidian";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { ConfigSync } from "../sync/config-sync.ts";
 
@@ -6,6 +6,7 @@ interface FilesTabDeps {
     getSettings: () => CouchSyncSettings;
     updateSettings: (patch: Partial<CouchSyncSettings>) => Promise<void>;
     configSync: ConfigSync;
+    app: App;
     refresh: () => void;
 }
 
@@ -156,20 +157,23 @@ export function renderFilesTab(el: HTMLElement, deps: FilesTabDeps): void {
     );
 
     new Setting(el)
-        .setName("Pull")
-        .setDesc(`Pull config from remote and write ${paths.length} path(s) to this device.`)
+        .setName("Pull & Reload")
+        .setDesc(`Pull config from remote, write ${paths.length} path(s), then reload Obsidian.`)
         .addButton((btn) =>
-            btn.setButtonText("Pull ↓").onClick(async () => {
+            btn.setButtonText("Pull & Reload ↓").onClick(async () => {
                 btn.setButtonText("Pulling...");
                 btn.setDisabled(true);
                 try {
                     const count = await deps.configSync.pull();
-                    new Notice(`CouchSync: Pulled ${count} config file(s).`);
+                    new Notice(`CouchSync: Pulled ${count} config file(s). Reloading...`);
+                    setTimeout(() => {
+                        (deps.app as any).commands.executeCommandById("app:reload");
+                    }, 500);
                 } catch (e: any) {
                     new Notice(`Pull failed: ${e.message}`);
+                    btn.setButtonText("Pull & Reload ↓");
+                    btn.setDisabled(false);
                 }
-                btn.setButtonText("Pull ↓");
-                btn.setDisabled(false);
             })
         );
 }
