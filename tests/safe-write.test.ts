@@ -10,7 +10,7 @@ import type { FileDoc } from "../src/types.ts";
  */
 
 async function computeChunkIds(content: string): Promise<string[]> {
-    const chunks = await splitIntoChunks(content, false);
+    const chunks = await splitIntoChunks(new TextEncoder().encode(content).buffer);
     return chunks.map((c) => c._id);
 }
 

@@ -1,6 +1,15 @@
 // Use CJS entry directly — ESM entry's `export default` breaks in esbuild CJS output
 import PouchDB from "pouchdb-browser/lib/index.js";
 import type { CouchSyncDoc, FileDoc, ChunkDoc } from "../types.ts";
+import { DOC_PREFIX } from "../types.ts";
+
+/** Local-only catch-up scan cursor (not replicated). */
+export interface ScanCursor {
+    lastScanStartedAt: number;
+    lastScanCompletedAt: number;
+}
+
+const SCAN_CURSOR_ID = "_local/scan-cursor";
 
 export class LocalDB {
     private db: PouchDB.Database<CouchSyncDoc> | null = null;
@@ -75,6 +84,20 @@ export class LocalDB {
         return this.get<FileDoc>(path);
     }
 
+    /** Bulk fetch FileDocs by path. Missing paths are absent from the map. */
+    async getFileDocs(paths: string[]): Promise<Map<string, FileDoc>> {
+        const result = new Map<string, FileDoc>();
+        if (paths.length === 0) return result;
+        const rows = await this.getDb().allDocs({ keys: paths, include_docs: true });
+        for (const row of rows.rows) {
+            if ("doc" in row && row.doc) {
+                const doc = row.doc as unknown as CouchSyncDoc;
+                if (doc.type === "file") result.set(doc._id, doc as FileDoc);
+            }
+        }
+        return result;
+    }
+
     async getChunks(chunkIds: string[]): Promise<ChunkDoc[]> {
         const result = await this.getDb().allDocs({
             keys: chunkIds,
@@ -93,7 +116,11 @@ export class LocalDB {
         // Phase 1: fetch IDs only (no doc bodies) — avoids loading chunk data
         const idResult = await this.getDb().allDocs();
         const fileIds = idResult.rows
-            .filter((r) => !r.id.startsWith("chunk:") && !r.id.startsWith("config:") && !r.id.startsWith("_"))
+            .filter((r) =>
+                !r.id.startsWith(DOC_PREFIX.CHUNK) &&
+                !r.id.startsWith(DOC_PREFIX.CONFIG) &&
+                !r.id.startsWith("_"),
+            )
             .map((r) => r.id);
         if (fileIds.length === 0) return [];
 
@@ -124,6 +151,42 @@ export class LocalDB {
         }));
         await this.getDb().bulkDocs(deletions as any);
         return result.rows.map((row) => row.id);
+    }
+
+    /**
+     * Get a `_local/` doc. PouchDB's typed Database<CouchSyncDoc> rejects
+     * local doc IDs that aren't in the union, so we route through the
+     * untyped surface in one place.
+     */
+    private async localGet<T extends object>(id: string): Promise<(T & { _rev?: string }) | null> {
+        try {
+            return await (this.getDb() as PouchDB.Database<any>).get(id) as T & { _rev?: string };
+        } catch (e: any) {
+            if (e.status === 404) return null;
+            throw e;
+        }
+    }
+
+    private async localPut<T extends object>(id: string, body: T): Promise<void> {
+        const existing = await this.localGet<T>(id);
+        await (this.getDb() as PouchDB.Database<any>).put({
+            ...body,
+            _id: id,
+            _rev: existing?._rev,
+        });
+    }
+
+    async getScanCursor(): Promise<ScanCursor | null> {
+        const doc = await this.localGet<ScanCursor>(SCAN_CURSOR_ID);
+        if (!doc) return null;
+        return {
+            lastScanStartedAt: doc.lastScanStartedAt ?? 0,
+            lastScanCompletedAt: doc.lastScanCompletedAt ?? 0,
+        };
+    }
+
+    async putScanCursor(cursor: ScanCursor): Promise<void> {
+        await this.localPut(SCAN_CURSOR_ID, cursor);
     }
 
     async destroy(): Promise<void> {

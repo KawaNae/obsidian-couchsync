@@ -4,7 +4,6 @@ import type { FileDoc } from "../types.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { HistoryCapture } from "../history/history-capture.ts";
 import { splitIntoChunks, joinChunks } from "../db/chunker.ts";
-import { isBinaryFile } from "../utils/binary.ts";
 
 const RECONCILE_MIN_INTERVAL = 30000; // 30s minimum between reconcile runs
 
@@ -41,12 +40,8 @@ export class VaultSync {
         if (sizeMB > settings.maxFileSizeMB) return;
         if (!this.shouldSync(file.path)) return;
 
-        const binary = isBinaryFile(file.path);
-        const content = binary
-            ? await this.app.vault.readBinary(file)
-            : await this.app.vault.read(file);
-
-        const chunks = await splitIntoChunks(content, binary);
+        const content = await this.app.vault.readBinary(file);
+        const chunks = await splitIntoChunks(content);
         const chunkIds = chunks.map((c) => c._id);
 
         // Skip if content unchanged (same chunk IDs = same content)
@@ -82,10 +77,9 @@ export class VaultSync {
         }
 
         const existing = this.app.vault.getAbstractFileByPath(fileDoc._id);
-        const binary = isBinaryFile(fileDoc._id);
 
         if (existing && "stat" in existing) {
-            const skip = await this.shouldSkipWrite(fileDoc, existing as TFile, binary);
+            const skip = await this.shouldSkipWrite(fileDoc, existing as TFile);
             if (skip) return;
         }
 
@@ -102,33 +96,24 @@ export class VaultSync {
             return;
         }
 
-        const content = joinChunks(orderedChunks, binary);
+        const content = joinChunks(orderedChunks);
 
-        if (binary) {
-            if (existing) {
-                await this.app.vault.modifyBinary(existing as TFile, content as ArrayBuffer);
-            } else {
-                await this.ensureParentDir(fileDoc._id);
-                await this.app.vault.createBinary(fileDoc._id, content as ArrayBuffer);
-            }
-            // Binary files are excluded from history capture by isTargetFile().
+        let writtenFile: TFile | null = null;
+        if (existing) {
+            await this.app.vault.modifyBinary(existing as TFile, content);
+            writtenFile = existing as TFile;
         } else {
-            let writtenFile: TFile | null = null;
-            if (existing) {
-                await this.app.vault.modify(existing as TFile, content as string);
-                writtenFile = existing as TFile;
-            } else {
-                await this.ensureParentDir(fileDoc._id);
-                await this.app.vault.create(fileDoc._id, content as string);
-                const created = this.app.vault.getAbstractFileByPath(fileDoc._id);
-                if (created && "extension" in created) writtenFile = created as TFile;
-            }
-            // Record this sync-driven write as a history entry so the diff
-            // history view reflects the true timeline of file state changes,
-            // not just local edits.
-            if (writtenFile && this.historyCapture) {
-                await this.historyCapture.captureSyncWrite(writtenFile);
-            }
+            await this.ensureParentDir(fileDoc._id);
+            await this.app.vault.createBinary(fileDoc._id, content);
+            const created = this.app.vault.getAbstractFileByPath(fileDoc._id);
+            if (created && "extension" in created) writtenFile = created as TFile;
+        }
+
+        // Record this sync-driven write as a history entry. captureSyncWrite
+        // sniffs the bytes itself and skips non-text files, so we can call it
+        // unconditionally here.
+        if (writtenFile && this.historyCapture) {
+            await this.historyCapture.captureSyncWrite(writtenFile);
         }
     }
 
@@ -138,20 +123,21 @@ export class VaultSync {
      * Step 2: Freshness comparison — skip if local mtime is newer than remote
      *         editedAt (the actual user-edit timestamp, not relay mtime).
      */
-    private async shouldSkipWrite(fileDoc: FileDoc, localFile: TFile, binary: boolean): Promise<boolean> {
-        // Step 1: Content comparison (chunk IDs)
-        const localContent = binary
-            ? await this.app.vault.readBinary(localFile)
-            : await this.app.vault.read(localFile);
-        const localChunks = await splitIntoChunks(localContent, binary);
-        const localChunkIds = localChunks.map((c) => c._id);
+    private async shouldSkipWrite(fileDoc: FileDoc, localFile: TFile): Promise<boolean> {
+        // Step 1: Content comparison (chunk IDs). Size mismatch implies
+        // content mismatch, so we can skip the disk read + chunking entirely.
+        if (localFile.stat.size === fileDoc.size) {
+            const localContent = await this.app.vault.readBinary(localFile);
+            const localChunks = await splitIntoChunks(localContent);
+            const localChunkIds = localChunks.map((c) => c._id);
 
-        if (
-            localChunkIds.length === fileDoc.chunks.length &&
-            localChunkIds.every((id, i) => id === fileDoc.chunks[i])
-        ) {
-            console.debug(`CouchSync: dbToFile skipped (content identical): ${fileDoc._id}`);
-            return true;
+            if (
+                localChunkIds.length === fileDoc.chunks.length &&
+                localChunkIds.every((id, i) => id === fileDoc.chunks[i])
+            ) {
+                console.debug(`CouchSync: dbToFile skipped (content identical): ${fileDoc._id}`);
+                return true;
+            }
         }
 
         // Step 2: Freshness comparison
@@ -235,8 +221,7 @@ export class VaultSync {
                     applied++;
                 } else if ("stat" in existing) {
                     // File exists — check if content is stale
-                    const binary = isBinaryFile(doc._id);
-                    const skip = await this.shouldSkipWrite(doc, existing as TFile, binary);
+                    const skip = await this.shouldSkipWrite(doc, existing as TFile);
                     if (!skip) {
                         await this.dbToFile(doc);
                         applied++;

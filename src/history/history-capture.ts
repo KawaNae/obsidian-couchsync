@@ -4,7 +4,7 @@ import { DiffEngine, computeHash } from "./diff-engine.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { HistorySource } from "./types.ts";
 import { minimatch } from "../utils/minimatch.ts";
-import { isBinaryFile } from "../utils/binary.ts";
+import { isDiffableText } from "../utils/binary.ts";
 
 export class HistoryCapture {
     private debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -32,7 +32,24 @@ export class HistoryCapture {
         this.eventRefs.push(
             this.app.vault.on("rename", (file: TAbstractFile, oldPath: string) => {
                 if (!("extension" in file)) return;
+                this.lastCaptureTime.delete(oldPath);
                 this.storage.renamePath(oldPath, file.path);
+            }),
+        );
+
+        this.eventRefs.push(
+            this.app.vault.on("delete", (file: TAbstractFile) => {
+                this.lastCaptureTime.delete(file.path);
+                const timer = this.debounceTimers.get(file.path);
+                if (timer) {
+                    clearTimeout(timer);
+                    this.debounceTimers.delete(file.path);
+                }
+                const pending = this.pendingCapture.get(file.path);
+                if (pending) {
+                    clearTimeout(pending);
+                    this.pendingCapture.delete(file.path);
+                }
             }),
         );
     }
@@ -82,7 +99,8 @@ export class HistoryCapture {
     private isTargetFile(file: TAbstractFile): boolean {
         if (!("extension" in file)) return false;
         const tfile = file as TFile;
-        if (isBinaryFile(tfile.path)) return false;
+        // Binary detection happens in captureChange() to avoid sync I/O in
+        // the modify event handler.
         if (tfile.path.startsWith(".")) return false;
         const settings = this.getSettings();
         if (settings.historyExcludePatterns) {
@@ -134,7 +152,19 @@ export class HistoryCapture {
 
     private async captureChange(file: TFile, source: HistorySource = "local"): Promise<void> {
         try {
-            const currentContent = await this.app.vault.cachedRead(file);
+            // Local edits use cachedRead (memory-cached parsed text) for the
+            // typing hot path. Sync writes go through the byte-sniff path so
+            // binary files don't pollute history. We re-encode the cached
+            // string to validate it's diffable UTF-8 either way.
+            let currentContent: string;
+            if (source === "sync") {
+                const buffer = await this.app.vault.readBinary(file);
+                if (!isDiffableText(buffer)) return;
+                currentContent = new TextDecoder("utf-8").decode(buffer);
+            } else {
+                currentContent = await this.app.vault.cachedRead(file);
+                if (!isDiffableText(new TextEncoder().encode(currentContent))) return;
+            }
             const snapshot = await this.storage.getSnapshot(file.path);
 
             const prevContent = snapshot?.content ?? "";
