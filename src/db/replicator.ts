@@ -11,6 +11,7 @@ export type OnStateChangeHandler = (state: SyncState) => void;
 export type OnErrorHandler = (message: string) => void;
 
 const HEALTH_CHECK_INTERVAL = 30000; // 30s
+const RECENT_CHANGE_WINDOW_MS = 60000;
 
 export class Replicator {
     private sync: PouchDB.Replication.Sync<CouchSyncDoc> | null = null;
@@ -23,6 +24,7 @@ export class Replicator {
     private boundOnOnline = () => this.handleOnline();
     private lastSyncedSeq: number | string = 0;
     private lastRestartTime = 0;
+    private lastChangeAt = 0;
     private remoteDb: PouchDB.Database<CouchSyncDoc> | null = null;
     private idleCallbacks: (() => void)[] = [];
     private hasBeenIdle = false;
@@ -131,6 +133,7 @@ export class Replicator {
         } as any); // PouchDB types don't include timeout/heartbeat/back_off_function
 
         this.sync.on("change", (info) => {
+            this.lastChangeAt = Date.now();
             this.setState("syncing");
             if (info.direction === "pull" && info.change?.docs) {
                 for (const doc of info.change.docs) {
@@ -146,24 +149,13 @@ export class Replicator {
             }
         });
 
+        // PouchDB's event emitter doesn't await listeners; wrap async work in
+        // a non-async callback so rejections surface as logged errors instead
+        // of unhandled promise warnings.
         this.sync.on("paused", (err) => {
-            if (err) {
-                this.setState("error");
-                this.emitError("Sync paused: connection issue");
-            } else {
-                this.updateLastSyncedSeq();
-                this.setState("connected");
-                if (!this.hasBeenIdle) {
-                    this.hasBeenIdle = true;
-                    for (const cb of this.idleCallbacks) cb();
-                    this.idleCallbacks = [];
-                }
-                for (const handler of this.onPausedHandlers) {
-                    try { handler(); } catch (e) {
-                        console.error("CouchSync: onPaused handler error:", e);
-                    }
-                }
-            }
+            this.handlePaused(err).catch((e) =>
+                console.error("CouchSync: paused handler error:", e),
+            );
         });
 
         this.sync.on("active", () => {
@@ -379,8 +371,18 @@ export class Replicator {
         }
     }
 
-    /** Test connection using saved settings */
+    /** Test connection using saved settings. Reuses the live remote DB
+     *  instance when available so we don't allocate a fresh PouchDB on every
+     *  health probe. */
     async testConnection(): Promise<string | null> {
+        if (this.remoteDb) {
+            try {
+                await this.remoteDb.info();
+                return null;
+            } catch (e: any) {
+                return e.message || "Connection failed";
+            }
+        }
         const s = this.getSettings();
         return this.testConnectionWith(s.couchdbUri, s.couchdbUser, s.couchdbPassword, s.couchdbDbName);
     }
@@ -391,26 +393,73 @@ export class Replicator {
     }
 
     private async checkHealth(): Promise<void> {
-        if (this.state !== "connected") return;
+        if (this.state === "disconnected") return;
 
         try {
-            const info = await this.localDb.getDb().info();
-            const currentSeq = info.update_seq;
+            // Cheap path: when state is healthy and either local writes are
+            // moving or we saw a change recently, skip the network probe.
+            if (this.state === "connected" || this.state === "syncing") {
+                const info = await this.localDb.getDb().info();
+                const stalled = info.update_seq === this.lastSyncedSeq;
+                const recentChange = Date.now() - this.lastChangeAt < HEALTH_CHECK_INTERVAL;
+                if (!stalled || recentChange) return;
+            }
 
-            if (currentSeq !== this.lastSyncedSeq) {
-                console.log("CouchSync: Stalled sync detected, restarting session");
+            // Stalled or in error state — verify reachability over the wire.
+            if (!(await this.verifyReachable())) return;
+
+            if (this.state === "error") {
+                console.log("CouchSync: Server reachable again, restarting session");
                 this.restart();
                 return;
             }
-
-            const err = await this.testConnection();
-            if (err) {
-                console.log("CouchSync: Server unreachable, restarting session");
-                this.restart();
-            }
+            // Reachable but stalled (PouchDB bug #3714) — kick the session.
+            console.log("CouchSync: Stalled sync detected, restarting session");
+            this.restart();
         } catch (e) {
             console.error("CouchSync: Health check error:", e);
         }
+    }
+
+    private async handlePaused(err: unknown): Promise<void> {
+        if (err) {
+            this.setState("error");
+            this.emitError("Sync paused: connection issue");
+            return;
+        }
+        // PouchDB fires `paused` (without err) for genuine idle, but also for
+        // back-off retry waits. Trust the event only if we saw a real change
+        // recently; otherwise leave verification to the periodic health check.
+        const sinceLastChange = Date.now() - this.lastChangeAt;
+        if (sinceLastChange > RECENT_CHANGE_WINDOW_MS) {
+            if (!(await this.verifyReachable())) return;
+        }
+        this.updateLastSyncedSeq();
+        this.setState("connected");
+        if (!this.hasBeenIdle) {
+            this.hasBeenIdle = true;
+            for (const cb of this.idleCallbacks) cb();
+            this.idleCallbacks = [];
+        }
+        for (const handler of this.onPausedHandlers) {
+            try { handler(); } catch (e) {
+                console.error("CouchSync: onPaused handler error:", e);
+            }
+        }
+    }
+
+    /** Verify the server can be reached. Pins state="error" with a notice on
+     *  failure (without restarting); returns true if reachable. */
+    private async verifyReachable(): Promise<boolean> {
+        const err = await this.testConnection();
+        if (err) {
+            if (this.state !== "error") {
+                this.setState("error");
+                this.emitError(`Server unreachable: ${err}`);
+            }
+            return false;
+        }
+        return true;
     }
 
     private handleOffline(): void {

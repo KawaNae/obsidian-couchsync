@@ -53,15 +53,18 @@ class FakeLocalDb {
     }
 }
 
+type CompareResult = "identical" | "local-newer" | "remote-newer";
+
 interface FakeVaultSync {
     fileToDbCalls: string[];
     dbToFileCalls: string[];
     markDeletedCalls: string[];
-    skipResults: Map<string, boolean>;
+    /** Per-path comparison override. Default if absent: compare mtime vs editedAt. */
+    compareResults: Map<string, CompareResult>;
     fileToDb(file: { path: string }): Promise<void>;
     dbToFile(doc: FileDoc): Promise<void>;
     markDeleted(path: string): Promise<void>;
-    checkSkipWrite(doc: FileDoc, file: any): Promise<boolean>;
+    compareFileToDoc(doc: FileDoc, file: any): Promise<CompareResult>;
 }
 
 function makeVaultSync(): FakeVaultSync {
@@ -69,13 +72,16 @@ function makeVaultSync(): FakeVaultSync {
         fileToDbCalls: [],
         dbToFileCalls: [],
         markDeletedCalls: [],
-        skipResults: new Map(),
+        compareResults: new Map(),
         async fileToDb(file) { this.fileToDbCalls.push(file.path); },
         async dbToFile(doc) { this.dbToFileCalls.push(doc._id); },
         async markDeleted(path) { this.markDeletedCalls.push(path); },
-        async checkSkipWrite(doc, file) {
-            const v = this.skipResults.get(doc._id);
-            return v ?? false;
+        async compareFileToDoc(doc, _file) {
+            const override = this.compareResults.get(doc._id);
+            if (override === undefined) {
+                throw new Error(`test missing compareResults for ${doc._id}`);
+            }
+            return override;
         },
     };
 }
@@ -101,7 +107,7 @@ describe("Reconciler", () => {
             const h = setup([makeFile("a.md", 1000)]);
             h.db.fileDocs.set("a.md", makeDoc("a.md", { editedBy: SELF }));
             h.db.manifest = { paths: ["a.md"], updatedAt: 0 };
-            h.vaultSync.skipResults.set("a.md", true);
+            h.vaultSync.compareResults.set("a.md", "identical");
 
             const r = await h.reconciler.reconcile("manual");
             expect(r.inSync).toBe(1);
@@ -112,26 +118,42 @@ describe("Reconciler", () => {
     });
 
     describe("Case B: content differs", () => {
-        it("local-win when vault mtime > remote editedAt", async () => {
+        it("local-win when vault is newer", async () => {
             const h = setup([makeFile("a.md", 5000)]);
             h.db.fileDocs.set("a.md", makeDoc("a.md", { editedAt: 3000 }));
             h.db.manifest = { paths: ["a.md"], updatedAt: 0 };
-            h.vaultSync.skipResults.set("a.md", false);
+            h.vaultSync.compareResults.set("a.md", "local-newer");
 
             const r = await h.reconciler.reconcile("manual");
             expect(r.localWins).toEqual(["a.md"]);
             expect(h.vaultSync.fileToDbCalls).toEqual(["a.md"]);
         });
 
-        it("remote-win when remote editedAt > vault mtime", async () => {
+        it("remote-win when remote is newer", async () => {
             const h = setup([makeFile("a.md", 1000)]);
             h.db.fileDocs.set("a.md", makeDoc("a.md", { editedAt: 5000 }));
             h.db.manifest = { paths: ["a.md"], updatedAt: 0 };
-            h.vaultSync.skipResults.set("a.md", false);
+            h.vaultSync.compareResults.set("a.md", "remote-newer");
 
             const r = await h.reconciler.reconcile("manual");
             expect(r.remoteWins).toEqual(["a.md"]);
             expect(h.vaultSync.dbToFileCalls).toEqual(["a.md"]);
+        });
+
+        it("local-newer regression: edits during a long pull are pushed by reconcile", async () => {
+            // Reproduces the v0.9.0 bug: vault is newer (user edited during a
+            // long pull) but the old reconcile classified it as in-sync because
+            // the underlying skip predicate returned true for both "identical"
+            // and "vault newer" reasons. The 3-value compareFileToDoc fixes it.
+            const h = setup([makeFile("note.md", 9999)]);
+            h.db.fileDocs.set("note.md", makeDoc("note.md", { editedAt: 1000, editedBy: SELF }));
+            h.db.manifest = { paths: ["note.md"], updatedAt: 0 };
+            h.vaultSync.compareResults.set("note.md", "local-newer");
+
+            const r = await h.reconciler.reconcile("reconnect");
+            expect(r.localWins).toEqual(["note.md"]);
+            expect(r.inSync).toBe(0);
+            expect(h.vaultSync.fileToDbCalls).toEqual(["note.md"]);
         });
     });
 
@@ -228,7 +250,7 @@ describe("Reconciler", () => {
                 lastSeenUpdateSeq: 0,
             };
             h.db.manifest = { paths: ["a.md"], updatedAt: 0 };
-            h.vaultSync.skipResults.set("a.md", true);
+            h.vaultSync.compareResults.set("a.md", "identical");
             h.db.bumpSeq();
 
             const r = await h.reconciler.reconcile("paused");
@@ -299,7 +321,7 @@ describe("Reconciler", () => {
             }
             for (const f of files) h.db.fileDocs.set(f.path, makeDoc(f.path));
             h.db.manifest = { paths: manifestPaths, updatedAt: 0 };
-            for (const f of files) h.vaultSync.skipResults.set(f.path, true);
+            for (const f of files) h.vaultSync.compareResults.set(f.path, "identical");
 
             const r = await h.reconciler.reconcile("manual");
             expect(r.deleted.length).toBe(15);
@@ -321,8 +343,8 @@ describe("Reconciler", () => {
             const h = setup([makeFile("a.md", 1000), makeFile("b.md", 2000)]);
             h.db.fileDocs.set("a.md", makeDoc("a.md"));
             h.db.fileDocs.set("b.md", makeDoc("b.md"));
-            h.vaultSync.skipResults.set("a.md", true);
-            h.vaultSync.skipResults.set("b.md", true);
+            h.vaultSync.compareResults.set("a.md", "identical");
+            h.vaultSync.compareResults.set("b.md", "identical");
 
             await h.reconciler.reconcile("manual");
             expect(h.db.manifest).not.toBeNull();

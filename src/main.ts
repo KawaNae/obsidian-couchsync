@@ -6,7 +6,7 @@ import { VaultSync } from "./sync/vault-sync.ts";
 import { ConfigSync } from "./sync/config-sync.ts";
 import { SetupService } from "./sync/setup.ts";
 import { ChangeTracker } from "./sync/change-tracker.ts";
-import { Reconciler } from "./sync/reconciler.ts";
+import { Reconciler, type ReconcileReason } from "./sync/reconciler.ts";
 import { ConflictResolver } from "./conflict/conflict-resolver.ts";
 import { StatusBar } from "./ui/status-bar.ts";
 import { CouchSyncSettingTab } from "./settings-tab/index.ts";
@@ -33,7 +33,6 @@ export default class CouchSyncPlugin extends Plugin {
     private reconciler!: Reconciler;
     private historyStorage!: HistoryStorage;
     private historyCapture!: HistoryCapture;
-    private reconnecting = false;
     historyManager!: HistoryManager;
     statusBar!: StatusBar;
 
@@ -103,10 +102,7 @@ export default class CouchSyncPlugin extends Plugin {
 
         // Reconciler runs after every replication batch. The cursor + manifest
         // short-circuit makes the steady-state cost negligible.
-        this.replicator.onPaused(() => {
-            this.reconciler.reconcile("paused")
-                .catch((e) => console.error("CouchSync: Reconcile failed:", e));
-        });
+        this.replicator.onPaused(() => this.fireReconcile("paused"));
 
         this.addSettingTab(new CouchSyncSettingTab(this.app, this));
 
@@ -138,27 +134,30 @@ export default class CouchSyncPlugin extends Plugin {
             }
 
             if (this.settings.connectionState === "syncing") {
-                this.reconnectWithPullFirst();
-            } else {
-                this.reconciler.reconcile("onload").catch((e) =>
-                    console.error("CouchSync: onload reconcile failed:", e),
-                );
+                this.replicator.start();
+                this.changeTracker.start();
             }
+            // Always reconcile on load: initialises the manifest on first run
+            // and catches any drift accumulated while the plugin was offline.
+            this.fireReconcile("onload");
         });
 
-        // Pull-first restart on foreground return (mobile) and network reconnection.
+        // Mobile foreground return: live sync keeps running so we just need
+        // a reconcile pass to catch any vault edits made elsewhere.
         this.registerDomEvent(document, "visibilitychange", () => {
             if (
                 document.visibilityState === "visible" &&
                 this.settings.connectionState === "syncing"
             ) {
-                this.reconnectWithPullFirst();
+                this.fireReconcile("foreground");
             }
         });
 
+        // Network reconnection: replicator restarts itself; reconcile fills
+        // in anything live sync misses.
         this.replicator.onReconnect(() => {
             if (this.settings.connectionState === "syncing") {
-                this.reconnectWithPullFirst();
+                this.fireReconcile("reconnect");
             }
         });
 
@@ -287,9 +286,7 @@ export default class CouchSyncPlugin extends Plugin {
         this.replicator.stop();
         this.replicator.start();
         this.changeTracker.start();
-        this.reconciler.reconcile("startSync").catch((e) =>
-            console.error("CouchSync: startSync reconcile failed:", e),
-        );
+        this.fireReconcile("startSync");
     }
 
     stopSync(): void {
@@ -297,49 +294,10 @@ export default class CouchSyncPlugin extends Plugin {
         this.changeTracker.stop();
     }
 
-    private async reconnectWithPullFirst(): Promise<void> {
-        if (this.reconnecting) return;
-        this.reconnecting = true;
-
-        this.statusBar.update("syncing", "Reconnecting...");
-        this.changeTracker.stop();
-        this.vaultSync.setPullInProgress(true);
-        this.replicator.stop();
-
-        try {
-            this.statusBar.update("syncing", "Pulling...");
-            const { docs } = await this.replicator.pullFromRemote(
-                (_docId, count) => this.statusBar.update("syncing", `Pulling... (${count})`),
-            );
-
-            const fileDocs = docs.filter(isFileDoc);
-            if (fileDocs.length > 0) {
-                this.statusBar.update("syncing", "Applying...");
-                for (const doc of fileDocs) {
-                    await this.vaultSync.dbToFile(doc);
-                    await this.conflictResolver.resolveIfConflicted(doc);
-                }
-                const names = fileDocs.map((d) => d._id.split("/").pop()).join(", ");
-                showNotice(
-                    fileDocs.length <= 10
-                        ? `Reconnected: pulled ${fileDocs.length} file(s): ${names}`
-                        : `Reconnected: pulled ${fileDocs.length} file(s)`,
-                );
-            }
-        } catch (e) {
-            console.error("CouchSync: Pull-first failed:", e);
-        }
-
-        this.vaultSync.setPullInProgress(false);
-
-        // Single reconcile pass handles both directions: chunk arrival race
-        // recovery (case C/D restore), missed local edits (case C push),
-        // and deletes made during the disconnect (case D delete).
-        await this.reconciler.reconcile("reconnect");
-
-        this.replicator.start();
-        this.changeTracker.start();
-        this.reconnecting = false;
+    private fireReconcile(reason: ReconcileReason): void {
+        this.reconciler.reconcile(reason).catch((e) =>
+            console.error(`CouchSync: ${reason} reconcile failed:`, e),
+        );
     }
 
     async activateHistoryView(): Promise<void> {
