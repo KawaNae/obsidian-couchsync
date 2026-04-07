@@ -5,12 +5,8 @@ import type { CouchSyncSettings } from "../settings.ts";
 import type { HistoryCapture } from "../history/history-capture.ts";
 import { splitIntoChunks, joinChunks } from "../db/chunker.ts";
 
-const RECONCILE_MIN_INTERVAL = 30000; // 30s minimum between reconcile runs
-
 export class VaultSync {
     private pullInProgress = false;
-    private reconciling = false;
-    private lastReconcileTime = 0;
     private historyCapture: HistoryCapture | null = null;
 
     constructor(
@@ -79,7 +75,7 @@ export class VaultSync {
         const existing = this.app.vault.getAbstractFileByPath(fileDoc._id);
 
         if (existing && "stat" in existing) {
-            const skip = await this.shouldSkipWrite(fileDoc, existing as TFile);
+            const skip = await this.checkSkipWrite(fileDoc, existing as TFile);
             if (skip) return;
         }
 
@@ -118,12 +114,15 @@ export class VaultSync {
     }
 
     /**
-     * Determines whether a remote doc write should be skipped.
+     * Determines whether a remote doc write should be skipped. Used by both
+     * the live `dbToFile` path and the cold-path `Reconciler` for case A/B
+     * (vault and DB both have the file).
+     *
      * Step 1: Content comparison — skip if chunk IDs match (identical content).
      * Step 2: Freshness comparison — skip if local mtime is newer than remote
      *         editedAt (the actual user-edit timestamp, not relay mtime).
      */
-    private async shouldSkipWrite(fileDoc: FileDoc, localFile: TFile): Promise<boolean> {
+    async checkSkipWrite(fileDoc: FileDoc, localFile: TFile): Promise<boolean> {
         // Step 1: Content comparison (chunk IDs). Size mismatch implies
         // content mismatch, so we can skip the disk read + chunking entirely.
         if (localFile.stat.size === fileDoc.size) {
@@ -188,50 +187,6 @@ export class VaultSync {
             } catch { /* invalid regex, ignore nothing */ }
         }
         return true;
-    }
-
-    /**
-     * Reconcile: scan local PouchDB for FileDocs that are missing or stale
-     * in the vault, and apply them if all chunks are available. This is the
-     * Apply layer's safety net — catches anything the event-driven onChange
-     * path missed (e.g., FileDoc arrived before its chunks during live sync,
-     * or dbToFile was interrupted).
-     *
-     * @param force - bypass the 30s throttle (used after reconnectWithPullFirst)
-     */
-    async reconcile(force = false): Promise<number> {
-        if (this.reconciling) return 0;
-        const now = Date.now();
-        if (!force && now - this.lastReconcileTime < RECONCILE_MIN_INTERVAL) return 0;
-        this.reconciling = true;
-        this.lastReconcileTime = now;
-        try {
-            const allFileDocs = await this.db.allFileDocs();
-            let applied = 0;
-            for (const doc of allFileDocs) {
-                if (doc.deleted) continue;
-                if (!this.shouldSync(doc._id)) continue;
-                const existing = this.app.vault.getAbstractFileByPath(doc._id);
-
-                if (!existing) {
-                    // File missing from vault — check chunk readiness, then apply
-                    const chunks = await this.db.getChunks(doc.chunks);
-                    if (chunks.length !== doc.chunks.length) continue;
-                    await this.dbToFile(doc);
-                    applied++;
-                } else if ("stat" in existing) {
-                    // File exists — check if content is stale
-                    const skip = await this.shouldSkipWrite(doc, existing as TFile);
-                    if (!skip) {
-                        await this.dbToFile(doc);
-                        applied++;
-                    }
-                }
-            }
-            return applied;
-        } finally {
-            this.reconciling = false;
-        }
     }
 
     private async ensureParentDir(filePath: string): Promise<void> {
