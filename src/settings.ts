@@ -13,6 +13,10 @@ export interface CouchSyncSettings {
     maxFileSizeMB: number;
     configSyncPaths: string[];
 
+    // Sync timing
+    syncDebounceMs: number;
+    syncMinIntervalMs: number;
+
     // History
     historyRetentionDays: number;
     historyDebounceMs: number;
@@ -33,6 +37,8 @@ export interface CouchSyncSettings {
     // Internal
     connectionState: ConnectionState;
     deviceId: string;
+    /** Bumped on schema-changing releases. v0.8.0 = 2 (all-binary chunker). */
+    syncSchemaVersion: number;
 }
 
 export const DEFAULT_SETTINGS: CouchSyncSettings = {
@@ -45,6 +51,9 @@ export const DEFAULT_SETTINGS: CouchSyncSettings = {
     syncIgnore: "",
     maxFileSizeMB: 50,
     configSyncPaths: [],
+
+    syncDebounceMs: 2000,
+    syncMinIntervalMs: 0,
 
     historyRetentionDays: 30,
     historyDebounceMs: 5000,
@@ -61,4 +70,5 @@ export const DEFAULT_SETTINGS: CouchSyncSettings = {
 
     connectionState: "editing",
     deviceId: "",
+    syncSchemaVersion: 0,
 };

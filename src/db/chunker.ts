@@ -35,16 +35,6 @@ export function base64ToArrayBuffer(base64: string): ArrayBuffer {
     return bytes.buffer;
 }
 
-function textToBase64(text: string): string {
-    const bytes = new TextEncoder().encode(text);
-    return arrayBufferToBase64(bytes.buffer);
-}
-
-function base64ToText(base64: string): string {
-    const buffer = base64ToArrayBuffer(base64);
-    return new TextDecoder().decode(buffer);
-}
-
 function splitBase64(base64: string): string[] {
     if (base64.length <= MAX_CHUNK_SIZE) {
         return [base64];
@@ -56,14 +46,8 @@ function splitBase64(base64: string): string[] {
     return chunks;
 }
 
-export async function splitIntoChunks(
-    content: string | ArrayBuffer,
-    isBinary: boolean
-): Promise<ChunkDoc[]> {
-    const base64 = isBinary
-        ? arrayBufferToBase64(content as ArrayBuffer)
-        : textToBase64(content as string);
-
+export async function splitIntoChunks(content: ArrayBuffer): Promise<ChunkDoc[]> {
+    const base64 = arrayBufferToBase64(content);
     const pieces = splitBase64(base64);
 
     const chunks: ChunkDoc[] = [];
@@ -78,11 +62,7 @@ export async function splitIntoChunks(
     return chunks;
 }
 
-export function joinChunks(chunks: ChunkDoc[], isBinary: boolean): string | ArrayBuffer {
+export function joinChunks(chunks: ChunkDoc[]): ArrayBuffer {
     const base64 = chunks.map((c) => c.data).join("");
-    if (isBinary) {
-        return base64ToArrayBuffer(base64);
-    } else {
-        return base64ToText(base64);
-    }
+    return base64ToArrayBuffer(base64);
 }

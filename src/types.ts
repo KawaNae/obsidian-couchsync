@@ -30,7 +30,10 @@ export interface ChunkDoc extends CouchSyncDocBase {
 /** A config file (.obsidian/ settings, plugin data.json, etc.) */
 export interface ConfigDoc extends CouchSyncDocBase {
     type: "config";
+    /** Base64-encoded raw bytes. */
     data: string;
+    /** @deprecated Always true on new docs. Legacy docs with binary === false
+     *  store plain UTF-8 text in `data` (read-time backward compat). */
     binary: boolean;
     mtime: number;
     size: number;

@@ -185,6 +185,18 @@
     flex-shrink: 0;
 }
 
+.diff-history-sync-icon {
+    display: inline-flex;
+    align-items: center;
+    color: var(--text-muted);
+    margin-left: 4px;
+    flex-shrink: 0;
+}
+.diff-history-sync-icon .svg-icon {
+    width: 14px;
+    height: 14px;
+}
+
 .diff-history-entry-actions {
     display: flex;
     gap: 4px;

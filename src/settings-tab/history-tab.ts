@@ -11,6 +11,38 @@ interface HistoryTabDeps {
 export function renderHistoryTab(el: HTMLElement, deps: HistoryTabDeps): void {
     const settings = deps.getSettings();
 
+    el.createEl("h3", { text: "Sync Timing" });
+    el.createEl("p", {
+        text: "Controls when local edits are pushed to the remote. Increase the debounce on slow or metered connections.",
+        cls: "setting-item-description",
+    });
+
+    new Setting(el)
+        .setName("Sync debounce (seconds)")
+        .setDesc("Wait after the last edit before syncing the file.")
+        .addText((text) => text
+            .setValue(String(settings.syncDebounceMs / 1000))
+            .onChange(async (value) => {
+                const num = parseFloat(value);
+                if (!isNaN(num) && num >= 0) {
+                    await deps.updateSettings({ syncDebounceMs: Math.round(num * 1000) });
+                }
+            })
+        );
+
+    new Setting(el)
+        .setName("Sync minimum interval (seconds)")
+        .setDesc("Minimum time between consecutive syncs of the same file. 0 to disable.")
+        .addText((text) => text
+            .setValue(String(settings.syncMinIntervalMs / 1000))
+            .onChange(async (value) => {
+                const num = parseFloat(value);
+                if (!isNaN(num) && num >= 0) {
+                    await deps.updateSettings({ syncMinIntervalMs: Math.round(num * 1000) });
+                }
+            })
+        );
+
     el.createEl("h3", { text: "Diff History" });
 
     new Setting(el)

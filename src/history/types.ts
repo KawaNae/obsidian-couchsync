@@ -1,3 +1,5 @@
+export type HistorySource = "local" | "sync";
+
 export interface DiffRecord {
     id?: string;
     filePath: string;
@@ -7,6 +9,8 @@ export interface DiffRecord {
     added?: number;
     removed?: number;
     conflict?: boolean;
+    /** Origin of this entry. Undefined is treated as "local" for backward compat. */
+    source?: HistorySource;
 }
 
 export interface FileSnapshot {

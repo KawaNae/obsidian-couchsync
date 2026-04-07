@@ -5,7 +5,6 @@ import type { ConfigDoc } from "../types.ts";
 import { DOC_PREFIX } from "../types.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import { ProgressNotice } from "../ui/notices.ts";
-import { isBinaryFile } from "../utils/binary.ts";
 import { arrayBufferToBase64, base64ToArrayBuffer } from "../db/chunker.ts";
 
 export class ConfigSync {
@@ -99,20 +98,14 @@ export class ConfigSync {
                 const stat = await adapter.stat(file);
                 if (!stat || stat.size > ConfigSync.MAX_CONFIG_SIZE) continue;
 
-                const binary = isBinaryFile(file);
-                let data: string;
-                if (binary) {
-                    const buf = await adapter.readBinary(file);
-                    data = arrayBufferToBase64(buf);
-                } else {
-                    data = await adapter.read(file);
-                }
+                const buf = await adapter.readBinary(file);
+                const data = arrayBufferToBase64(buf);
 
                 const doc: ConfigDoc = {
                     _id: `${DOC_PREFIX.CONFIG}${file}`,
                     type: "config",
                     data,
-                    binary,
+                    binary: true,
                     mtime: stat.mtime,
                     size: stat.size,
                 };
@@ -161,11 +154,11 @@ export class ConfigSync {
             try {
                 onProgress?.(path, i + 1, entries.length);
                 await this.ensureDir(path);
-                if (binary) {
-                    await this.app.vault.adapter.writeBinary(path, base64ToArrayBuffer(data));
-                } else {
-                    await this.app.vault.adapter.write(path, data);
-                }
+                // Legacy docs (binary === false) stored UTF-8 text directly; re-encode.
+                const buf = binary
+                    ? base64ToArrayBuffer(data)
+                    : new TextEncoder().encode(data).buffer;
+                await this.app.vault.adapter.writeBinary(path, buf);
                 count++;
             } catch (e) {
                 console.error(`CouchSync: Failed to write config ${path}:`, e);

@@ -42,7 +42,7 @@ async function createFileDoc(
     content: string,
     mtime: number,
 ): Promise<FileDoc> {
-    const chunks = await splitIntoChunks(content, false);
+    const chunks = await splitIntoChunks(new TextEncoder().encode(content).buffer);
     for (const chunk of chunks) {
         await db.put(chunk);
     }
@@ -176,8 +176,8 @@ describe("chunk deduplication skip", () => {
 
     it("same content produces same chunk IDs so fileToDb can skip", async () => {
         const content = "same content";
-        const chunks1 = await splitIntoChunks(content, false);
-        const chunks2 = await splitIntoChunks(content, false);
+        const chunks1 = await splitIntoChunks(new TextEncoder().encode(content).buffer);
+        const chunks2 = await splitIntoChunks(new TextEncoder().encode(content).buffer);
 
         const ids1 = chunks1.map((c) => c._id);
         const ids2 = chunks2.map((c) => c._id);
@@ -197,8 +197,8 @@ describe("chunk deduplication skip", () => {
     });
 
     it("different content produces different chunk IDs", async () => {
-        const chunks1 = await splitIntoChunks("content A", false);
-        const chunks2 = await splitIntoChunks("content B", false);
+        const chunks1 = await splitIntoChunks(new TextEncoder().encode("content A").buffer);
+        const chunks2 = await splitIntoChunks(new TextEncoder().encode("content B").buffer);
 
         await createFileDoc(db, "test.md", "content A", 1000);
         const existing = await db.getFileDoc("test.md");

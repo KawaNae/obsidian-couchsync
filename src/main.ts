@@ -6,6 +6,7 @@ import { VaultSync } from "./sync/vault-sync.ts";
 import { ConfigSync } from "./sync/config-sync.ts";
 import { SetupService } from "./sync/setup.ts";
 import { ChangeTracker } from "./sync/change-tracker.ts";
+import { CatchUpScanner } from "./sync/catch-up.ts";
 import { ConflictResolver } from "./conflict/conflict-resolver.ts";
 import { StatusBar } from "./ui/status-bar.ts";
 import { CouchSyncSettingTab } from "./settings-tab/index.ts";
@@ -15,7 +16,7 @@ import { HistoryStorage } from "./history/storage.ts";
 import { HistoryCapture } from "./history/history-capture.ts";
 import { HistoryManager } from "./history/history-manager.ts";
 import { DiffHistoryView, VIEW_TYPE_DIFF_HISTORY } from "./ui/history-view.ts";
-import { isBinaryFile } from "./utils/binary.ts";
+import { isDiffableText } from "./utils/binary.ts";
 import { joinChunks } from "./db/chunker.ts";
 
 export default class CouchSyncPlugin extends Plugin {
@@ -27,6 +28,7 @@ export default class CouchSyncPlugin extends Plugin {
     private vaultSync!: VaultSync;
     private setupService!: SetupService;
     private changeTracker!: ChangeTracker;
+    private catchUp!: CatchUpScanner;
     private historyStorage!: HistoryStorage;
     private historyCapture!: HistoryCapture;
     private reconnecting = false;
@@ -52,19 +54,22 @@ export default class CouchSyncPlugin extends Plugin {
         this.changeTracker = new ChangeTracker(this.app, this.vaultSync, () => this.settings);
         this.historyStorage = new HistoryStorage(this.app.vault.getName());
         this.historyCapture = new HistoryCapture(this.app, this.historyStorage, () => this.settings);
+        this.vaultSync.setHistoryCapture(this.historyCapture);
         this.historyManager = new HistoryManager(
             this.app.vault, this.historyStorage, this.historyCapture, () => this.settings,
         );
         this.conflictResolver = new ConflictResolver(
             this.localDb,
             async (filePath, winnerDoc, loserDoc) => {
-                if (isBinaryFile(filePath)) return;
                 try {
                     const loserChunks = await this.localDb.getChunks(loserDoc.chunks);
-                    const loserContent = joinChunks(loserChunks, false) as string;
+                    const loserBuf = joinChunks(loserChunks);
+                    if (!isDiffableText(loserBuf)) return;
                     const winnerChunks = await this.localDb.getChunks(winnerDoc.chunks);
-                    const winnerContent = joinChunks(winnerChunks, false) as string;
-                    await this.historyCapture.saveConflict(filePath, loserContent, winnerContent);
+                    const winnerBuf = joinChunks(winnerChunks);
+                    if (!isDiffableText(winnerBuf)) return;
+                    const dec = new TextDecoder("utf-8");
+                    await this.historyCapture.saveConflict(filePath, dec.decode(loserBuf), dec.decode(winnerBuf));
                     showNotice(`Conflict resolved: ${filePath.split("/").pop()}. Losing version saved to history.`);
                 } catch (e) {
                     console.error("CouchSync: Failed to save conflict to history:", e);
@@ -75,6 +80,14 @@ export default class CouchSyncPlugin extends Plugin {
         this.statusBar = new StatusBar(this, () => this.settings);
         this.replicator.onStateChange((state) => this.statusBar.update(state));
         this.replicator.onError((msg) => showNotice(msg, 8000));
+
+        this.catchUp = new CatchUpScanner(
+            this.app,
+            this.localDb,
+            this.vaultSync,
+            this.statusBar,
+            (msg) => showNotice(msg),
+        );
 
         // Handle incoming remote changes — vault files only (config is manual pull)
         // dbToFile() Safe Write prevents echo loops via content comparison,
@@ -114,15 +127,30 @@ export default class CouchSyncPlugin extends Plugin {
             },
         });
 
-        this.app.workspace.onLayoutReady(() => {
+        this.app.workspace.onLayoutReady(async () => {
             this.historyCapture.start();
             this.historyManager.startCleanup();
+
+            // Force re-chunk all files via the all-binary path on first run.
+            if (this.settings.syncSchemaVersion < 2) {
+                await this.localDb.putScanCursor({ lastScanStartedAt: 0, lastScanCompletedAt: 0 });
+                this.settings.syncSchemaVersion = 2;
+                await this.saveSettings();
+                console.log("CouchSync: upgraded sync schema to v2 (all-binary)");
+            }
+
             if (this.settings.connectionState === "syncing") {
                 this.reconnectWithPullFirst();
+            } else {
+                this.catchUp.scan("onload").catch((e) =>
+                    console.error("CouchSync: onload catch-up failed:", e),
+                );
             }
         });
 
-        // Pull-first restart on foreground return (mobile) and network reconnection
+        // Pull-first restart on foreground return (mobile) and network reconnection.
+        // reconnectWithPullFirst itself triggers a catch-up scan at the end,
+        // so we don't need a separate foreground call here.
         this.registerDomEvent(document, "visibilitychange", () => {
             if (
                 document.visibilityState === "visible" &&
@@ -142,11 +170,11 @@ export default class CouchSyncPlugin extends Plugin {
             id: "couchsync-force-sync",
             name: "Force sync all files now",
             callback: async () => {
-                await this.scanVaultToDb();
+                const synced = await this.catchUp.scan("manual");
                 if (this.settings.connectionState === "syncing") {
                     this.replicator.restart();
                 }
-                showNotice("Force sync: scanning complete.");
+                showNotice(`Force sync: ${synced} file(s) synced.`);
             },
         });
 
@@ -230,6 +258,10 @@ export default class CouchSyncPlugin extends Plugin {
         this.replicator.stop();
         this.replicator.start();
         this.changeTracker.start();
+        // Catch up on edits made while sync was off. Background, non-blocking.
+        this.catchUp.scan("startSync").catch((e) =>
+            console.error("CouchSync: startSync catch-up failed:", e),
+        );
     }
 
     stopSync(): void {
@@ -243,7 +275,6 @@ export default class CouchSyncPlugin extends Plugin {
 
         this.statusBar.update("syncing", "Reconnecting...");
         this.changeTracker.stop();
-        this.historyCapture.pause();
         this.vaultSync.setPullInProgress(true);
         this.replicator.stop();
 
@@ -280,29 +311,13 @@ export default class CouchSyncPlugin extends Plugin {
 
         this.replicator.start();
         this.changeTracker.start();
-        this.historyCapture.resume();
         this.reconnecting = false;
-    }
 
-    private async scanVaultToDb(progress?: ProgressNotice): Promise<void> {
-        const files = this.app.vault.getFiles();
-        let synced = 0;
-        for (let i = 0; i < files.length; i++) {
-            const file = files[i];
-            try {
-                const existing = await this.localDb.getFileDoc(file.path);
-                if (!existing || existing.mtime < file.stat.mtime) {
-                    progress?.update(`Scanning: ${file.path} (${i + 1}/${files.length})`);
-                    await this.vaultSync.fileToDb(file);
-                    synced++;
-                }
-            } catch (e) {
-                console.error(`CouchSync: Failed to scan ${file.path}:`, e);
-            }
-        }
-        if (synced > 0) {
-            console.log(`CouchSync: Scanned ${synced} files to local DB`);
-        }
+        // After pull + reconcile complete, catch up on local edits the plugin
+        // missed during disconnection (sync OFF, plugin disabled, app closed).
+        this.catchUp.scan("reconnect").catch((e) =>
+            console.error("CouchSync: reconnect catch-up failed:", e),
+        );
     }
 
     async activateHistoryView(): Promise<void> {
