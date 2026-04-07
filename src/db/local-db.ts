@@ -7,9 +7,23 @@ import { DOC_PREFIX } from "../types.ts";
 export interface ScanCursor {
     lastScanStartedAt: number;
     lastScanCompletedAt: number;
+    /** PouchDB update_seq seen at the end of the last scan. Reconciler uses
+     *  this for an O(1) "did anything change in the DB?" check. */
+    lastSeenUpdateSeq?: string | number;
+}
+
+/**
+ * Snapshot of vault file paths this device has seen. Compared against the
+ * current vault state during reconcile() to distinguish "deleted on this
+ * device" from "newly arrived from another device".
+ */
+export interface VaultManifest {
+    paths: string[];
+    updatedAt: number;
 }
 
 const SCAN_CURSOR_ID = "_local/scan-cursor";
+const VAULT_MANIFEST_ID = "_local/vault-manifest";
 
 export class LocalDB {
     private db: PouchDB.Database<CouchSyncDoc> | null = null;
@@ -182,11 +196,25 @@ export class LocalDB {
         return {
             lastScanStartedAt: doc.lastScanStartedAt ?? 0,
             lastScanCompletedAt: doc.lastScanCompletedAt ?? 0,
+            lastSeenUpdateSeq: doc.lastSeenUpdateSeq,
         };
     }
 
     async putScanCursor(cursor: ScanCursor): Promise<void> {
         await this.localPut(SCAN_CURSOR_ID, cursor);
+    }
+
+    async getVaultManifest(): Promise<VaultManifest | null> {
+        const doc = await this.localGet<VaultManifest>(VAULT_MANIFEST_ID);
+        if (!doc) return null;
+        return {
+            paths: doc.paths ?? [],
+            updatedAt: doc.updatedAt ?? 0,
+        };
+    }
+
+    async putVaultManifest(manifest: VaultManifest): Promise<void> {
+        await this.localPut(VAULT_MANIFEST_ID, manifest);
     }
 
     async destroy(): Promise<void> {

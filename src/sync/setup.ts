@@ -2,6 +2,7 @@ import type { App } from "obsidian";
 import type { LocalDB } from "../db/local-db.ts";
 import type { Replicator } from "../db/replicator.ts";
 import type { VaultSync } from "./vault-sync.ts";
+import type { Reconciler } from "./reconciler.ts";
 
 export interface SetupResult {
     vaultFiles: number;
@@ -14,6 +15,7 @@ export class SetupService {
         private localDb: LocalDB,
         private replicator: Replicator,
         private vaultSync: VaultSync,
+        private reconciler: Reconciler,
     ) {}
 
     /** Init: clean slate (local + remote) → scan vault → push */
@@ -33,6 +35,10 @@ export class SetupService {
             const totalDocs = await this.replicator.pushToRemote((docId, n) => {
                 onProgress(`Pushing: ${docId} (${n})`);
             });
+
+            // Initialise manifest + cursor for the new vault state.
+            onProgress("Reconciling...");
+            await this.reconciler.reconcile("setup");
 
             return { vaultFiles, totalDocs };
         });
@@ -62,6 +68,11 @@ export class SetupService {
                     console.error(`CouchSync: Failed to write ${fileDoc._id}:`, e);
                 }
             }
+
+            // Reconcile resolves any leftover drift (vault contained files
+            // before clone, chunk arrival races, etc.) and seeds the manifest.
+            onProgress("Reconciling...");
+            await this.reconciler.reconcile("setup");
 
             return { vaultFiles, totalDocs };
         });
