@@ -1,6 +1,6 @@
 import type { App } from "obsidian";
 import type { LocalDB, VaultManifest } from "../db/local-db.ts";
-import type { VaultSync } from "./vault-sync.ts";
+import type { VaultSync, CompareResult } from "./vault-sync.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { FileDoc } from "../types.ts";
 
@@ -12,6 +12,7 @@ export type ReconcileReason =
     | "startSync"
     | "reconnect"
     | "paused"
+    | "foreground"
     | "setup"
     | "manual"
     | "manual-repair";
@@ -183,21 +184,16 @@ export class Reconciler {
 
             // Case A/B: both vault and DB have an alive entry
             if (file && doc && !doc.deleted) {
-                let skip: boolean;
+                let cmp: CompareResult;
                 try {
-                    skip = await this.vaultSync.checkSkipWrite(doc, file);
+                    cmp = await this.vaultSync.compareFileToDoc(doc, file);
                 } catch (e) {
                     console.error(`CouchSync: reconcile compare failed for ${path}:`, e);
                     continue;
                 }
-                if (skip) {
+                if (cmp === "identical") {
                     report.inSync++;
-                    continue;
-                }
-
-                // Content differs. Newer wins by editedAt (falls back to mtime).
-                const remoteEditedAt = doc.editedAt ?? doc.mtime;
-                if (file.stat.mtime > remoteEditedAt) {
+                } else if (cmp === "local-newer") {
                     if (await this.tryStep(path, "push", () => this.vaultSync.fileToDb(file), mode)) {
                         report.localWins.push(path);
                     }

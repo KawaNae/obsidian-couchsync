@@ -5,8 +5,15 @@ import type { CouchSyncSettings } from "../settings.ts";
 import type { HistoryCapture } from "../history/history-capture.ts";
 import { splitIntoChunks, joinChunks } from "../db/chunker.ts";
 
+/**
+ * Result of comparing a vault file against a DB file doc.
+ *  - identical:    same chunk IDs → no action needed
+ *  - local-newer:  vault edit is newer than the DB doc → push (case B local-win)
+ *  - remote-newer: DB doc is newer than the vault file → pull (case B remote-win)
+ */
+export type CompareResult = "identical" | "local-newer" | "remote-newer";
+
 export class VaultSync {
-    private pullInProgress = false;
     private historyCapture: HistoryCapture | null = null;
 
     constructor(
@@ -25,12 +32,7 @@ export class VaultSync {
         this.historyCapture = historyCapture;
     }
 
-    setPullInProgress(value: boolean): void {
-        this.pullInProgress = value;
-    }
-
     async fileToDb(file: TFile): Promise<void> {
-        if (this.pullInProgress) return;
         const settings = this.getSettings();
         const sizeMB = file.stat.size / (1024 * 1024);
         if (sizeMB > settings.maxFileSizeMB) return;
@@ -75,8 +77,8 @@ export class VaultSync {
         const existing = this.app.vault.getAbstractFileByPath(fileDoc._id);
 
         if (existing && "stat" in existing) {
-            const skip = await this.checkSkipWrite(fileDoc, existing as TFile);
-            if (skip) return;
+            const cmp = await this.compareFileToDoc(fileDoc, existing as TFile);
+            if (cmp !== "remote-newer") return;
         }
 
         // Apply remote content to vault
@@ -114,46 +116,28 @@ export class VaultSync {
     }
 
     /**
-     * Determines whether a remote doc write should be skipped. Used by both
-     * the live `dbToFile` path and the cold-path `Reconciler` for case A/B
-     * (vault and DB both have the file).
+     * Compare a local vault file against a remote/DB file doc.
      *
-     * Step 1: Content comparison — skip if chunk IDs match (identical content).
-     * Step 2: Freshness comparison — skip if local mtime is newer than remote
-     *         editedAt (the actual user-edit timestamp, not relay mtime).
+     * Step 1: Content — chunk IDs match → identical
+     * Step 2: Freshness — local mtime vs editedAt (the user-edit timestamp,
+     *         not the relay mtime that gets laundered through intermediates)
+     *
+     * `dbToFile` and the Reconciler both branch on this 3-value result.
      */
-    async checkSkipWrite(fileDoc: FileDoc, localFile: TFile): Promise<boolean> {
-        // Step 1: Content comparison (chunk IDs). Size mismatch implies
-        // content mismatch, so we can skip the disk read + chunking entirely.
+    async compareFileToDoc(fileDoc: FileDoc, localFile: TFile): Promise<CompareResult> {
         if (localFile.stat.size === fileDoc.size) {
             const localContent = await this.app.vault.readBinary(localFile);
             const localChunks = await splitIntoChunks(localContent);
             const localChunkIds = localChunks.map((c) => c._id);
-
             if (
                 localChunkIds.length === fileDoc.chunks.length &&
                 localChunkIds.every((id, i) => id === fileDoc.chunks[i])
             ) {
-                console.debug(`CouchSync: dbToFile skipped (content identical): ${fileDoc._id}`);
-                return true;
+                return "identical";
             }
         }
-
-        // Step 2: Freshness comparison
-        // editedAt = user-edit timestamp (set only by fileToDb, never by relay)
-        // localFile.stat.mtime = OS disk-write timestamp
-        // These are semantically different clocks. A relay device's mtime may be
-        // later than editedAt due to network/processing delay. This is safe under
-        // the "one device edits at a time" assumption because Step 1 (content
-        // comparison) catches identical content first; Step 2 only fires when
-        // content differs, meaning a real edit occurred.
         const remoteEditedAt = fileDoc.editedAt ?? fileDoc.mtime;
-        if (localFile.stat.mtime > remoteEditedAt) {
-            console.debug(`CouchSync: dbToFile skipped (local fresher): ${fileDoc._id} local=${localFile.stat.mtime} remote=${remoteEditedAt}`);
-            return true;
-        }
-
-        return false;
+        return localFile.stat.mtime > remoteEditedAt ? "local-newer" : "remote-newer";
     }
 
     async markDeleted(path: string): Promise<void> {
