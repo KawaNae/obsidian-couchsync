@@ -13,6 +13,7 @@ data.json
 .vscode
 .idea
 *.iml
+.claude/
 
 # Environment
 .env
