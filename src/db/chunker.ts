@@ -17,16 +17,44 @@ export async function computeHash(data: string): Promise<string> {
     return h.h64ToString(data);
 }
 
+// Feature detection for the ES2024 base64 APIs. Obsidian Electron (desktop)
+// and iOS 18.2+ have them; older iPads need the fallback path.
+const HAS_NATIVE_BASE64 =
+    typeof (Uint8Array.prototype as unknown as { toBase64?: () => string }).toBase64 === "function" &&
+    typeof (Uint8Array as unknown as { fromBase64?: (s: string) => Uint8Array }).fromBase64 === "function";
+
 export function arrayBufferToBase64(buffer: ArrayBuffer): string {
     const bytes = new Uint8Array(buffer);
+    if (HAS_NATIVE_BASE64) {
+        return (bytes as unknown as { toBase64: () => string }).toBase64();
+    }
+    return arrayBufferToBase64Fallback(bytes);
+}
+
+export function base64ToArrayBuffer(base64: string): ArrayBuffer {
+    if (HAS_NATIVE_BASE64) {
+        const bytes = (Uint8Array as unknown as { fromBase64: (s: string) => Uint8Array })
+            .fromBase64(base64);
+        return bytes.buffer as ArrayBuffer;
+    }
+    return base64ToArrayBufferFallback(base64);
+}
+
+// Exported so tests can exercise the fallback path explicitly, regardless of
+// whether the running Node/browser ships the native API.
+export function arrayBufferToBase64Fallback(bytes: Uint8Array): string {
+    // 0x8000 keeps well under the call-stack limit for String.fromCharCode.apply
+    // while still amortising the btoa call across large chunks.
+    const CHUNK = 0x8000;
     let binary = "";
-    for (let i = 0; i < bytes.byteLength; i++) {
-        binary += String.fromCharCode(bytes[i]);
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+        const slice = bytes.subarray(i, i + CHUNK);
+        binary += String.fromCharCode.apply(null, slice as unknown as number[]);
     }
     return btoa(binary);
 }
 
-export function base64ToArrayBuffer(base64: string): ArrayBuffer {
+export function base64ToArrayBufferFallback(base64: string): ArrayBuffer {
     const binary = atob(base64);
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) {

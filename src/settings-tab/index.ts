@@ -100,6 +100,7 @@ export class CouchSyncSettingTab extends PluginSettingTab {
             renderFilesTab(filesPanel, {
                 ...settingsDeps,
                 configSync: this.plugin.configSync,
+                localDb: this.plugin.localDb,
                 app: this.app,
                 refresh: () => this.display(),
             });

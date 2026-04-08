@@ -24,59 +24,71 @@ export class ConfigSync {
     /** Init: delete all config docs → scan .obsidian/ → push to remote */
     async init(): Promise<number> {
         const progress = new ProgressNotice("Config Init");
+        try {
+            progress.update("Deleting old config docs...");
+            const deletedIds = await this.db.deleteByPrefix(DOC_PREFIX.CONFIG);
 
-        progress.update("Deleting old config docs...");
-        const deletedIds = await this.db.deleteByPrefix(DOC_PREFIX.CONFIG);
-
-        const scanned = await this.scan((path, i, total) => {
-            progress.update(`Scanning: ${path} (${i}/${total})`);
-        });
-
-        const currentIds = await this.allDocIds();
-        const affectedIds = [...new Set([...deletedIds, ...currentIds])];
-
-        if (affectedIds.length > 0) {
-            await this.replicator.pushDocs(affectedIds, (docId, n) => {
-                progress.update(`Pushing: ${docId} (${n}/${affectedIds.length})`);
+            const scanned = await this.scan((path, i, total) => {
+                progress.update(`Scanning: ${path} (${i}/${total})`);
             });
-        }
 
-        progress.done(`Config init: deleted ${deletedIds.length}, pushed ${scanned} file(s).`);
-        return scanned;
+            const currentIds = await this.allDocIds();
+            const affectedIds = [...new Set([...deletedIds, ...currentIds])];
+
+            if (affectedIds.length > 0) {
+                await this.replicator.pushDocs(affectedIds, (docId, n) => {
+                    progress.update(`Pushing: ${docId} (${n}/${affectedIds.length})`);
+                });
+            }
+
+            progress.done(`Config init: deleted ${deletedIds.length}, pushed ${scanned} file(s).`);
+            return scanned;
+        } catch (e: any) {
+            progress.fail(`Config init failed: ${e?.message ?? e}`);
+            throw e;
+        }
     }
 
     /** Push: scan .obsidian/ → push config docs to remote */
     async push(): Promise<number> {
         const progress = new ProgressNotice("Config Push");
-
-        const scanned = await this.scan((path, i, total) => {
-            progress.update(`Scanning: ${path} (${i}/${total})`);
-        });
-
-        const docIds = await this.allDocIds();
-        if (docIds.length > 0) {
-            await this.replicator.pushDocs(docIds, (docId, n) => {
-                progress.update(`Pushing: ${docId} (${n}/${docIds.length})`);
+        try {
+            const scanned = await this.scan((path, i, total) => {
+                progress.update(`Scanning: ${path} (${i}/${total})`);
             });
-        }
 
-        progress.done(`Pushed ${scanned} config file(s).`);
-        return scanned;
+            const docIds = await this.allDocIds();
+            if (docIds.length > 0) {
+                await this.replicator.pushDocs(docIds, (docId, n) => {
+                    progress.update(`Pushing: ${docId} (${n}/${docIds.length})`);
+                });
+            }
+
+            progress.done(`Pushed ${scanned} config file(s).`);
+            return scanned;
+        } catch (e: any) {
+            progress.fail(`Config push failed: ${e?.message ?? e}`);
+            throw e;
+        }
     }
 
     /** Pull: pull config docs from remote → write configSyncPaths to filesystem */
     async pull(): Promise<number> {
         const progress = new ProgressNotice("Config Pull");
+        try {
+            progress.update("Pulling config from remote...");
+            await this.replicator.pullByPrefix(DOC_PREFIX.CONFIG);
 
-        progress.update("Pulling config from remote...");
-        await this.replicator.pullByPrefix(DOC_PREFIX.CONFIG);
+            const written = await this.write((path, i, total) => {
+                progress.update(`Writing: ${path} (${i}/${total})`);
+            });
 
-        const written = await this.write((path, i, total) => {
-            progress.update(`Writing: ${path} (${i}/${total})`);
-        });
-
-        progress.done(`Pulled ${written} config file(s).`);
-        return written;
+            progress.done(`Pulled ${written} config file(s).`);
+            return written;
+        } catch (e: any) {
+            progress.fail(`Config pull failed: ${e?.message ?? e}`);
+            throw e;
+        }
     }
 
     // ── Low-level operations ───────────────────────────

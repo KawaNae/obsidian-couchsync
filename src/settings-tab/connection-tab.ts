@@ -148,11 +148,12 @@ export class ConnectionTab {
                         btn.setButtonText("Pushing...");
                         btn.setDisabled(true);
                         try {
+                            // initVault() owns the full notice lifecycle —
+                            // progress, done, and fail — so this catch just
+                            // re-enables the button.
                             await this.deps.initVault();
-                            new Notice("Init complete!", 5000);
                             this.deps.refresh();
-                        } catch (e: any) {
-                            new Notice(`Init failed: ${e.message}`, 8000);
+                        } catch {
                             btn.setButtonText("Init");
                             btn.setDisabled(false);
                         }
@@ -171,10 +172,8 @@ export class ConnectionTab {
                         btn.setDisabled(true);
                         try {
                             await this.deps.cloneFromRemote();
-                            new Notice("Clone complete!", 5000);
                             this.deps.refresh();
-                        } catch (e: any) {
-                            new Notice(`Clone failed: ${e.message}`, 8000);
+                        } catch {
                             btn.setButtonText("Clone");
                             btn.setDisabled(false);
                         }
@@ -198,14 +197,14 @@ export class ConnectionTab {
                     .setValue(state === "syncing")
                     .setDisabled(!syncToggleEnabled)
                     .onChange(async (value) => {
+                        // Sync start/stop is visible in the status bar dot and
+                        // label — no toast needed.
                         if (value) {
                             await this.deps.updateSettings({ connectionState: "syncing" });
                             await this.deps.startSync();
-                            new Notice("Live sync started.", 3000);
                         } else {
                             this.deps.stopSync();
                             await this.deps.updateSettings({ connectionState: "setupDone" });
-                            new Notice("Live sync stopped.", 3000);
                         }
                         this.deps.refresh();
                     })
@@ -263,6 +262,8 @@ export class ConnectionTab {
     }
 
     private async handleApply(): Promise<void> {
+        // Silent save — the Apply button disappearing and the tab re-rendering
+        // into its "tested" state is feedback enough.
         await this.deps.updateSettings({
             couchdbUri: this.draft.uri,
             couchdbUser: this.draft.user,
@@ -271,7 +272,6 @@ export class ConnectionTab {
             connectionState: "tested",
         });
         this.testPassed = false;
-        new Notice("Connection settings saved.", 3000);
         this.deps.refresh();
     }
 }

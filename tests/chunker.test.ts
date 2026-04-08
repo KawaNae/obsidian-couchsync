@@ -4,6 +4,8 @@ import {
     joinChunks,
     arrayBufferToBase64,
     base64ToArrayBuffer,
+    arrayBufferToBase64Fallback,
+    base64ToArrayBufferFallback,
 } from "../src/db/chunker.ts";
 
 const enc = new TextEncoder();
@@ -89,5 +91,28 @@ describe("base64 utilities", () => {
         const base64 = arrayBufferToBase64(bytes.buffer);
         const result = new Uint8Array(base64ToArrayBuffer(base64));
         expect(result).toEqual(bytes);
+    });
+
+    it("fallback roundtrip on small input", () => {
+        const bytes = new Uint8Array([0, 1, 2, 127, 128, 255, 42]);
+        const base64 = arrayBufferToBase64Fallback(bytes);
+        const result = new Uint8Array(base64ToArrayBufferFallback(base64));
+        expect(result).toEqual(bytes);
+    });
+
+    it("fallback roundtrip crosses 0x8000 chunk boundary", () => {
+        // 200 KB with a deterministic byte pattern — exercises multiple
+        // String.fromCharCode.apply slices in the fallback encoder.
+        const size = 200 * 1024;
+        const bytes = new Uint8Array(size);
+        for (let i = 0; i < size; i++) bytes[i] = (i * 31 + 7) & 0xff;
+        const base64 = arrayBufferToBase64Fallback(bytes);
+        const result = new Uint8Array(base64ToArrayBufferFallback(base64));
+        expect(result).toEqual(bytes);
+    });
+
+    it("fallback matches main function output", () => {
+        const bytes = new Uint8Array([0xEF, 0xBB, 0xBF, 0, 255, 128, 1]);
+        expect(arrayBufferToBase64Fallback(bytes)).toBe(arrayBufferToBase64(bytes.buffer));
     });
 });
