@@ -1,6 +1,14 @@
 import { type App, Modal, Notice, Setting } from "obsidian";
 import type { CouchSyncSettings } from "../settings.ts";
+import type { Replicator } from "../db/replicator.ts";
 import { ConfirmModal } from "../ui/confirm-modal.ts";
+
+/** Thrown internally when a fetch gets 401/403, so callers can abort. */
+class AuthError extends Error {
+    constructor(public status: number, reason: string) {
+        super(reason);
+    }
+}
 
 class TypeToConfirmModal extends Modal {
     private resolved = false;
@@ -64,6 +72,7 @@ class TypeToConfirmModal extends Modal {
 
 interface StatusTabDeps {
     getSettings: () => CouchSyncSettings;
+    replicator: Replicator;
     app: App;
     refresh: () => void;
 }
@@ -97,26 +106,29 @@ function formatTimestamp(ms: number): string {
 async function getLastUpdateTime(
     baseUri: string, user: string, pass: string, dbName: string,
 ): Promise<number | null> {
+    const url = `${baseUri}/${encodeURIComponent(dbName)}/_changes?descending=true&limit=20&include_docs=true`;
+    let data: any;
     try {
-        const url = `${baseUri}/${encodeURIComponent(dbName)}/_changes?descending=true&limit=20&include_docs=true`;
-        const data = await fetchJson(url, user, pass);
-        let fallbackMtime: number | null = null;
-        for (const result of data.results ?? []) {
-            const doc = result.doc;
-            if (!doc) continue;
-            // Prefer CouchSync FileDoc (editedAt > mtime)
-            if (doc.type === "file" && !doc.deleted) {
-                return doc.editedAt ?? doc.mtime ?? null;
-            }
-            // Fallback: any doc with mtime (e.g. LiveSync "plain"/"leaf")
-            if (!fallbackMtime && typeof doc.mtime === "number") {
-                fallbackMtime = doc.mtime;
-            }
-        }
-        return fallbackMtime;
-    } catch {
+        data = await fetchJson(url, user, pass);
+    } catch (e) {
+        // Let AuthError bubble up so callers can latch and abort.
+        if (e instanceof AuthError) throw e;
         return null;
     }
+    let fallbackMtime: number | null = null;
+    for (const result of data.results ?? []) {
+        const doc = result.doc;
+        if (!doc) continue;
+        // Prefer CouchSync FileDoc (editedAt > mtime)
+        if (doc.type === "file" && !doc.deleted) {
+            return doc.editedAt ?? doc.mtime ?? null;
+        }
+        // Fallback: any doc with mtime (e.g. LiveSync "plain"/"leaf")
+        if (!fallbackMtime && typeof doc.mtime === "number") {
+            fallbackMtime = doc.mtime;
+        }
+    }
+    return fallbackMtime;
 }
 
 async function fetchJson(url: string, user: string, pass: string): Promise<any> {
@@ -125,6 +137,16 @@ async function fetchJson(url: string, user: string, pass: string): Promise<any> 
         headers["Authorization"] = "Basic " + btoa(`${user}:${pass}`);
     }
     const res = await fetch(url, { headers });
+    if (res.status === 401 || res.status === 403) {
+        // Parse the CouchDB reason body if present so the latch message is
+        // actionable ("Account is temporarily locked..." etc.).
+        let reason = res.statusText;
+        try {
+            const body = await res.json();
+            if (body?.reason) reason = body.reason;
+        } catch { /* ignore */ }
+        throw new AuthError(res.status, reason);
+    }
     if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
     return res.json();
 }
@@ -153,6 +175,14 @@ export function renderStatusTab(el: HTMLElement, deps: StatusTabDeps): void {
         return;
     }
 
+    // Bail out early if a prior 401/403 latched the auth-blocked flag.
+    // Otherwise opening this tab fires a dozen parallel fetches that each
+    // add a failed-login strike and trip CouchDB's brute-force lockout.
+    if (deps.replicator.isAuthBlocked()) {
+        renderAuthBlocked(el, deps);
+        return;
+    }
+
     el.createEl("h3", { text: "Server" });
     const serverSection = el.createDiv();
     serverSection.createEl("p", { text: "Loading...", cls: "setting-item-description" });
@@ -163,13 +193,45 @@ export function renderStatusTab(el: HTMLElement, deps: StatusTabDeps): void {
 
     const { couchdbUser: user, couchdbPassword: pass, couchdbDbName } = settings;
 
-    loadServerInfo(serverSection, baseUri, user, pass);
-    loadDatabases(dbSection, baseUri, user, pass, couchdbDbName, deps);
+    // Serialize: server info first. If auth fails there, abort before
+    // triggering loadDatabases' N-way fetch burst.
+    (async () => {
+        const ok = await loadServerInfo(serverSection, baseUri, user, pass, deps);
+        if (!ok) {
+            dbSection.empty();
+            dbSection.createEl("p", {
+                text: "Skipped — authentication failed.",
+                cls: "setting-item-description mod-warning",
+            });
+            return;
+        }
+        await loadDatabases(dbSection, baseUri, user, pass, couchdbDbName, deps);
+    })();
 }
 
+function renderAuthBlocked(el: HTMLElement, deps: StatusTabDeps): void {
+    el.createEl("h3", { text: "Authentication error" });
+    el.createEl("p", {
+        text:
+            "CouchSync stopped contacting the server because credentials were " +
+            "rejected. Update them in the Connection tab, then retry here.",
+        cls: "setting-item-description mod-warning",
+    });
+    new Setting(el)
+        .setName("Retry")
+        .setDesc("Clear the auth-blocked flag and try loading server info again.")
+        .addButton((btn) =>
+            btn.setButtonText("Retry").onClick(() => {
+                deps.replicator.clearAuthError();
+                deps.refresh();
+            }),
+        );
+}
+
+/** @returns true on success, false if the request failed (auth or other). */
 async function loadServerInfo(
-    el: HTMLElement, baseUri: string, user: string, pass: string,
-): Promise<void> {
+    el: HTMLElement, baseUri: string, user: string, pass: string, deps: StatusTabDeps,
+): Promise<boolean> {
     try {
         const info: ServerInfo = await fetchJson(baseUri, user, pass);
         el.empty();
@@ -180,12 +242,22 @@ async function loadServerInfo(
         if (info.features?.length > 0) {
             new Setting(el).setName("Features").setDesc(info.features.join(", "));
         }
+        return true;
     } catch (e: any) {
         el.empty();
-        el.createEl("p", {
-            text: `Failed to connect: ${e.message}`,
-            cls: "setting-item-description mod-warning",
-        });
+        if (e instanceof AuthError) {
+            deps.replicator.markAuthError(e.status, e.message);
+            el.createEl("p", {
+                text: `Authentication failed (${e.status}): ${e.message}`,
+                cls: "setting-item-description mod-warning",
+            });
+        } else {
+            el.createEl("p", {
+                text: `Failed to connect: ${e.message}`,
+                cls: "setting-item-description mod-warning",
+            });
+        }
+        return false;
     }
 }
 
@@ -197,20 +269,41 @@ async function loadDatabases(
         const allDbs: string[] = await fetchJson(`${baseUri}/_all_dbs`, user, pass);
         const userDbs = allDbs.filter((name) => !name.startsWith("_"));
 
-        const [infos, lastUpdates] = await Promise.all([
-            Promise.all(
-                userDbs.map(async (name): Promise<DbInfo | null> => {
-                    try {
-                        return await fetchJson(`${baseUri}/${encodeURIComponent(name)}`, user, pass);
-                    } catch {
-                        return null;
-                    }
-                }),
-            ),
-            Promise.all(
-                userDbs.map((name) => getLastUpdateTime(baseUri, user, pass, name)),
-            ),
-        ]);
+        // Serialize per-db fetches. If any one of them hits 401/403 we stop
+        // immediately — otherwise a stale-credential state would burst out
+        // N*2 failing requests and trip the server's brute-force lockout.
+        const infos: (DbInfo | null)[] = [];
+        const lastUpdates: (number | null)[] = [];
+        for (const name of userDbs) {
+            try {
+                infos.push(await fetchJson(`${baseUri}/${encodeURIComponent(name)}`, user, pass));
+            } catch (e) {
+                if (e instanceof AuthError) {
+                    deps.replicator.markAuthError(e.status, e.message);
+                    el.empty();
+                    el.createEl("p", {
+                        text: `Authentication failed (${e.status}): ${e.message}`,
+                        cls: "setting-item-description mod-warning",
+                    });
+                    return;
+                }
+                infos.push(null);
+            }
+            try {
+                lastUpdates.push(await getLastUpdateTime(baseUri, user, pass, name));
+            } catch (e) {
+                if (e instanceof AuthError) {
+                    deps.replicator.markAuthError(e.status, e.message);
+                    el.empty();
+                    el.createEl("p", {
+                        text: `Authentication failed (${e.status}): ${e.message}`,
+                        cls: "setting-item-description mod-warning",
+                    });
+                    return;
+                }
+                lastUpdates.push(null);
+            }
+        }
 
         el.empty();
 
@@ -257,10 +350,18 @@ async function loadDatabases(
         }
     } catch (e: any) {
         el.empty();
-        el.createEl("p", {
-            text: `Failed to list databases: ${e.message}`,
-            cls: "setting-item-description mod-warning",
-        });
+        if (e instanceof AuthError) {
+            deps.replicator.markAuthError(e.status, e.message);
+            el.createEl("p", {
+                text: `Authentication failed (${e.status}): ${e.message}`,
+                cls: "setting-item-description mod-warning",
+            });
+        } else {
+            el.createEl("p", {
+                text: `Failed to list databases: ${e.message}`,
+                cls: "setting-item-description mod-warning",
+            });
+        }
     }
 }
 

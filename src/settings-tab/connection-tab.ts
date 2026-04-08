@@ -256,6 +256,10 @@ export class ConnectionTab {
             new Notice(`Connection failed: ${error}`, 8000);
         } else {
             this.testPassed = true;
+            // A successful Test means the draft credentials work — clear
+            // any latched auth-blocked flag so Status / Files tabs resume
+            // auto-fetch once these credentials are applied.
+            this.deps.replicator.clearAuthError();
             new Notice("Connection successful!", 3000);
         }
         this.deps.refresh();

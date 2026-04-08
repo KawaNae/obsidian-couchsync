@@ -101,6 +101,7 @@ export class CouchSyncSettingTab extends PluginSettingTab {
                 ...settingsDeps,
                 configSync: this.plugin.configSync,
                 localDb: this.plugin.localDb,
+                replicator: this.plugin.replicator,
                 app: this.app,
                 refresh: () => this.display(),
             });
@@ -134,6 +135,7 @@ export class CouchSyncSettingTab extends PluginSettingTab {
         if (statusPanel) {
             renderStatusTab(statusPanel, {
                 ...settingsDeps,
+                replicator: this.plugin.replicator,
                 app: this.app,
                 refresh: () => this.display(),
             });
