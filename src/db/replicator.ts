@@ -25,6 +25,13 @@ export class Replicator {
     private lastSyncedSeq: number | string = 0;
     private lastRestartTime = 0;
     private lastChangeAt = 0;
+    /**
+     * Latched on 401/403 to stop retry storms. Cleared only when the user
+     * explicitly starts sync again (which implies they've updated
+     * credentials). Health checks, reconnect handlers, and paused-event
+     * restarts all no-op while this is true.
+     */
+    private authError = false;
     private remoteDb: PouchDB.Database<CouchSyncDoc> | null = null;
     private idleCallbacks: (() => void)[] = [];
     private hasBeenIdle = false;
@@ -55,6 +62,11 @@ export class Replicator {
 
     getPhase(): SyncPhase {
         return this.phase;
+    }
+
+    /** Timestamp (ms) of the most recent sync change event, or 0 if never. */
+    getLastChangeAt(): number {
+        return this.lastChangeAt;
     }
 
     /** Register callback for network reconnection (called instead of direct restart) */
@@ -103,6 +115,7 @@ export class Replicator {
 
     /** Restart sync session (preserves PouchDB checkpoint, 5s cooldown) */
     restart(): void {
+        if (this.authError) return;
         const now = Date.now();
         if (now - this.lastRestartTime < 5000) return;
         this.lastRestartTime = now;
@@ -112,6 +125,9 @@ export class Replicator {
 
     start(): void {
         if (this.sync) return;
+        // An explicit start() call means the user is trying again — assume
+        // they've fixed their credentials and allow retries from here on.
+        this.authError = false;
 
         const remoteUrl = this.getRemoteUrl();
         this.remoteDb = new PouchDB<CouchSyncDoc>(remoteUrl, {
@@ -170,6 +186,20 @@ export class Replicator {
 
         this.sync.on("error", (err) => {
             console.error("CouchSync: replication error:", err);
+            // 401/403 is a permanent credential failure. Stop the retry loop
+            // so PouchDB doesn't keep hammering the server forever.
+            if (err?.status === 401 || err?.status === 403) {
+                this.authError = true;
+                this.setState("error");
+                this.emitError(
+                    `Authentication failed (${err.status}). Check your CouchDB credentials.`,
+                );
+                if (this.sync) {
+                    this.sync.cancel();
+                    this.sync = null;
+                }
+                return;
+            }
             this.setState("error");
             this.emitError("Sync error: " + (err?.message || "unknown"));
         });
@@ -394,6 +424,7 @@ export class Replicator {
 
     private async checkHealth(): Promise<void> {
         if (this.state === "disconnected") return;
+        if (this.authError) return;
 
         try {
             // Cheap path: when state is healthy and either local writes are
@@ -470,6 +501,7 @@ export class Replicator {
     }
 
     private handleOnline(): void {
+        if (this.authError) return;
         if (this.state === "disconnected" || this.state === "error") {
             console.log("CouchSync: Network online, restarting session");
             if (this.onReconnectHandlers.length > 0) {

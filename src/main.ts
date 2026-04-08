@@ -51,7 +51,7 @@ export default class CouchSyncPlugin extends Plugin {
         this.replicator = new Replicator(this.localDb, () => this.settings);
         this.vaultSync = new VaultSync(this.app, this.localDb, () => this.settings);
         this.configSync = new ConfigSync(this.app, this.localDb, this.replicator, () => this.settings);
-        this.statusBar = new StatusBar(this, () => this.settings);
+        this.statusBar = new StatusBar(this, () => this.settings, () => this.replicator.getLastChangeAt());
         this.replicator.onStateChange((state) => this.statusBar.update(state));
         this.replicator.onError((msg) => showNotice(msg, 8000));
         this.reconciler = new Reconciler(
@@ -206,12 +206,14 @@ export default class CouchSyncPlugin extends Plugin {
             },
         });
 
+        // Config sync commands: each configSync.* call already owns a
+        // ProgressNotice that summarises the result in its done() — the
+        // command callbacks just invoke them and swallow the return value.
         this.addCommand({
             id: "couchsync-config-init",
             name: "Init config sync (clean rebuild)",
             callback: async () => {
-                const count = await this.configSync.init();
-                showNotice(`Config init: ${count} file(s) pushed.`);
+                await this.configSync.init();
             },
         });
 
@@ -219,8 +221,7 @@ export default class CouchSyncPlugin extends Plugin {
             id: "couchsync-config-push",
             name: "Push config files to remote",
             callback: async () => {
-                const count = await this.configSync.push();
-                showNotice(`Pushed ${count} config file(s).`);
+                await this.configSync.push();
             },
         });
 
@@ -228,8 +229,7 @@ export default class CouchSyncPlugin extends Plugin {
             id: "couchsync-config-pull",
             name: "Pull config files from remote",
             callback: async () => {
-                const count = await this.configSync.pull();
-                showNotice(`Pulled ${count} config file(s).`);
+                await this.configSync.pull();
             },
         });
     }
@@ -239,6 +239,7 @@ export default class CouchSyncPlugin extends Plugin {
         this.historyCapture?.stop();
         this.historyManager?.stopCleanup();
         this.replicator?.stop();
+        this.reconciler?.destroy();
         this.statusBar?.destroy();
         this.historyStorage?.close();
         await this.localDb?.close();
@@ -267,18 +268,28 @@ export default class CouchSyncPlugin extends Plugin {
 
     async initVault(): Promise<void> {
         const progress = new ProgressNotice("Init");
-        const result = await this.setupService.init((msg) => progress.update(msg));
-        this.settings.connectionState = "setupDone";
-        await this.saveSettings();
-        progress.done(`Init complete! ${result.vaultFiles} files, ${result.totalDocs} docs pushed.`);
+        try {
+            const result = await this.setupService.init((msg) => progress.update(msg));
+            this.settings.connectionState = "setupDone";
+            await this.saveSettings();
+            progress.done(`Init complete! ${result.vaultFiles} files, ${result.totalDocs} docs pushed.`);
+        } catch (e: any) {
+            progress.fail(`Init failed: ${e?.message ?? e}`);
+            throw e;
+        }
     }
 
     async cloneFromRemote(): Promise<void> {
         const progress = new ProgressNotice("Clone");
-        const result = await this.setupService.clone((msg) => progress.update(msg));
-        this.settings.connectionState = "setupDone";
-        await this.saveSettings();
-        progress.done(`Clone complete! ${result.vaultFiles} files written.`);
+        try {
+            const result = await this.setupService.clone((msg) => progress.update(msg));
+            this.settings.connectionState = "setupDone";
+            await this.saveSettings();
+            progress.done(`Clone complete! ${result.vaultFiles} files written.`);
+        } catch (e: any) {
+            progress.fail(`Clone failed: ${e?.message ?? e}`);
+            throw e;
+        }
     }
 
     async startSync(): Promise<void> {

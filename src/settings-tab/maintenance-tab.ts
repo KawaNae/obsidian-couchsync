@@ -99,9 +99,10 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
         .setDesc("Stop and restart the replication connection.")
         .addButton((btn) =>
             btn.setButtonText("Restart").onClick(() => {
+                // Status bar reflects the restart (disconnected → syncing
+                // → connected) — no toast needed.
                 deps.replicator.stop();
                 deps.replicator.start();
-                new Notice("CouchSync: Sync restarted.");
             })
         );
 

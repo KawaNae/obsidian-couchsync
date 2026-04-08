@@ -24,6 +24,16 @@ export interface VaultManifest {
 
 const SCAN_CURSOR_ID = "_local/scan-cursor";
 const VAULT_MANIFEST_ID = "_local/vault-manifest";
+const SKIPPED_FILES_ID = "_local/skipped-files";
+
+/**
+ * Files that fileToDb() refused to push because they exceeded
+ * `maxFileSizeMB`. Persisted so the settings tab can surface them and the
+ * user can decide whether to raise the limit.
+ */
+export interface SkippedFilesDoc {
+    files: Record<string, { sizeMB: number; skippedAt: number }>;
+}
 
 export class LocalDB {
     private db: PouchDB.Database<CouchSyncDoc> | null = null;
@@ -215,6 +225,15 @@ export class LocalDB {
 
     async putVaultManifest(manifest: VaultManifest): Promise<void> {
         await this.localPut(VAULT_MANIFEST_ID, manifest);
+    }
+
+    async getSkippedFiles(): Promise<SkippedFilesDoc> {
+        const doc = await this.localGet<SkippedFilesDoc>(SKIPPED_FILES_ID);
+        return { files: doc?.files ?? {} };
+    }
+
+    async putSkippedFiles(doc: SkippedFilesDoc): Promise<void> {
+        await this.localPut(SKIPPED_FILES_ID, doc);
     }
 
     async destroy(): Promise<void> {

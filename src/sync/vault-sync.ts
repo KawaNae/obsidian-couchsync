@@ -4,6 +4,7 @@ import type { FileDoc } from "../types.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { HistoryCapture } from "../history/history-capture.ts";
 import { splitIntoChunks, joinChunks } from "../db/chunker.ts";
+import { showNotice } from "../ui/notices.ts";
 
 /**
  * Result of comparing a vault file against a DB file doc.
@@ -15,6 +16,13 @@ export type CompareResult = "identical" | "local-newer" | "remote-newer";
 
 export class VaultSync {
     private historyCapture: HistoryCapture | null = null;
+    /**
+     * In-memory mirror of `_local/skipped-files` paths. Initialised lazily on
+     * the first `fileToDb` that might touch it, then kept in sync with the
+     * doc. Lets the hot path skip a PouchDB read on every successful file
+     * sync (which is ~every file edit via ChangeTracker).
+     */
+    private skippedPaths: Set<string> | null = null;
 
     constructor(
         private app: App,
@@ -35,8 +43,17 @@ export class VaultSync {
     async fileToDb(file: TFile): Promise<void> {
         const settings = this.getSettings();
         const sizeMB = file.stat.size / (1024 * 1024);
-        if (sizeMB > settings.maxFileSizeMB) return;
+        if (sizeMB > settings.maxFileSizeMB) {
+            await this.recordSkipped(file.path, sizeMB, settings.maxFileSizeMB);
+            return;
+        }
         if (!this.shouldSync(file.path)) return;
+
+        // Only hit the DB if this path was previously skipped. In steady
+        // state the cache is an empty set and this costs one Set.has().
+        if (await this.wasSkipped(file.path)) {
+            await this.forgetSkipped(file.path);
+        }
 
         const content = await this.app.vault.readBinary(file);
         const chunks = await splitIntoChunks(content);
@@ -152,6 +169,49 @@ export class VaultSync {
     async handleRename(file: TFile, oldPath: string): Promise<void> {
         await this.markDeleted(oldPath);
         await this.fileToDb(file);
+    }
+
+    /** Lazily populate the skipped-paths cache from the persisted doc. */
+    private async loadSkippedCache(): Promise<Set<string>> {
+        if (this.skippedPaths) return this.skippedPaths;
+        const doc = await this.db.getSkippedFiles();
+        this.skippedPaths = new Set(Object.keys(doc.files));
+        return this.skippedPaths;
+    }
+
+    private async wasSkipped(path: string): Promise<boolean> {
+        const cache = await this.loadSkippedCache();
+        return cache.has(path);
+    }
+
+    /**
+     * Remember a file the size limit rejected, and notify the user only the
+     * first time (or when the size noticeably changes). Notice spam is avoided
+     * by keying the dedup on path + rounded sizeMB.
+     */
+    private async recordSkipped(path: string, sizeMB: number, limitMB: number): Promise<void> {
+        const doc = await this.db.getSkippedFiles();
+        const existing = doc.files[path];
+        const roundedSize = Math.round(sizeMB * 10) / 10;
+        const isNew = !existing || Math.round(existing.sizeMB * 10) / 10 !== roundedSize;
+        doc.files[path] = { sizeMB: roundedSize, skippedAt: Date.now() };
+        await this.db.putSkippedFiles(doc);
+        (await this.loadSkippedCache()).add(path);
+        if (isNew) {
+            showNotice(
+                `Skipped "${path}" — ${roundedSize} MB exceeds ${limitMB} MB limit. ` +
+                    `Raise the limit in settings to sync it.`,
+                8000,
+            );
+        }
+    }
+
+    private async forgetSkipped(path: string): Promise<void> {
+        const doc = await this.db.getSkippedFiles();
+        if (!(path in doc.files)) return;
+        delete doc.files[path];
+        await this.db.putSkippedFiles(doc);
+        this.skippedPaths?.delete(path);
     }
 
     private shouldSync(path: string): boolean {

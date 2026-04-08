@@ -7,6 +7,22 @@ import type { FileDoc } from "../types.ts";
 const CLOCK_SKEW_MARGIN_MS = 5000;
 const LARGE_DELETE_RATIO = 0.1;
 
+/**
+ * Reasons the user triggered directly — for these, a toast notice makes
+ * sense because the user is watching for feedback. Automatic triggers
+ * (paused, foreground, reconnect, onload) are silent except when they pick
+ * up an unusually large batch.
+ */
+const MANUAL_REASONS: ReadonlySet<ReconcileReason> = new Set([
+    "startSync",
+    "manual",
+    "manual-repair",
+    "setup",
+]);
+
+const AUTO_NOTIFY_THRESHOLD = 5;
+const AUTO_NOTIFY_DEBOUNCE_MS = 5000;
+
 export type ReconcileReason =
     | "onload"
     | "startSync"
@@ -80,6 +96,8 @@ export function totalDiscrepancies(report: ReconcileReport): number {
  */
 export class Reconciler {
     private currentRun: Promise<ReconcileReport> | null = null;
+    private autoPendingTotal = 0;
+    private autoPendingTimer: ReturnType<typeof setTimeout> | null = null;
 
     constructor(
         private app: App,
@@ -91,6 +109,15 @@ export class Reconciler {
 
     isRunning(): boolean {
         return this.currentRun !== null;
+    }
+
+    /** Cancel any pending auto-notify debounce. Call from plugin unload. */
+    destroy(): void {
+        if (this.autoPendingTimer) {
+            clearTimeout(this.autoPendingTimer);
+            this.autoPendingTimer = null;
+        }
+        this.autoPendingTotal = 0;
     }
 
     async reconcile(
@@ -236,11 +263,32 @@ export class Reconciler {
                     `deleted=${report.deleted.length} localWins=${report.localWins.length}`,
             );
             if (mode === "apply") {
-                this.notify(`Reconcile: ${total} change(s) applied`);
+                if (MANUAL_REASONS.has(reason)) {
+                    // User-driven: always confirm with a toast.
+                    this.notify(`Reconcile: ${total} change(s) applied`);
+                } else if (total >= AUTO_NOTIFY_THRESHOLD) {
+                    // Automatic trigger with a non-trivial batch: debounce
+                    // across adjacent cycles so a burst of edits produces a
+                    // single summary notice instead of one per pause.
+                    this.scheduleAutoNotify(total);
+                }
+                // Small automatic batches: console log only, no toast.
             }
         }
 
         return report;
+    }
+
+    private scheduleAutoNotify(total: number): void {
+        this.autoPendingTotal += total;
+        if (this.autoPendingTimer) clearTimeout(this.autoPendingTimer);
+        this.autoPendingTimer = setTimeout(() => {
+            if (this.autoPendingTotal > 0) {
+                this.notify(`Reconcile: ${this.autoPendingTotal} change(s) applied`);
+            }
+            this.autoPendingTotal = 0;
+            this.autoPendingTimer = null;
+        }, AUTO_NOTIFY_DEBOUNCE_MS);
     }
 
     /**

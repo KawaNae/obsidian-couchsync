@@ -29,4 +29,14 @@ export class ProgressNotice {
         this.notice.hide();
         new Notice(`CouchSync: ${summary}`, durationMs);
     }
+
+    /**
+     * Dismiss the progress notice and surface an error toast. Use instead
+     * of done() from a catch block so the user sees a single failure notice
+     * rather than a hung progress bar plus a second error notice.
+     */
+    fail(message: string, durationMs: number = 10000): void {
+        this.notice.hide();
+        new Notice(`CouchSync Error: ${message}`, durationMs);
+    }
 }

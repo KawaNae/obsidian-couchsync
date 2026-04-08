@@ -1,11 +1,13 @@
 import { type App, Notice, Setting } from "obsidian";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { ConfigSync } from "../sync/config-sync.ts";
+import type { LocalDB } from "../db/local-db.ts";
 
 interface FilesTabDeps {
     getSettings: () => CouchSyncSettings;
     updateSettings: (patch: Partial<CouchSyncSettings>) => Promise<void>;
     configSync: ConfigSync;
+    localDb: LocalDB;
     app: App;
     refresh: () => void;
 }
@@ -42,17 +44,22 @@ export function renderFilesTab(el: HTMLElement, deps: FilesTabDeps): void {
 
     new Setting(el)
         .setName("Max file size (MB)")
-        .setDesc("Files larger than this will not be synced.")
+        .setDesc("Files larger than this will not be synced. Set to 0 to skip all files (useful for testing).")
         .addText((text) =>
             text
                 .setValue(String(settings.maxFileSizeMB))
                 .onChange(async (value) => {
-                    const num = parseInt(value, 10);
-                    if (!isNaN(num) && num > 0) {
+                    // parseFloat so fractional values like 0.5 work, and
+                    // accept 0 as a valid "skip everything" setting.
+                    const num = parseFloat(value);
+                    if (!isNaN(num) && num >= 0) {
                         await deps.updateSettings({ maxFileSizeMB: num });
                     }
                 })
         );
+
+    // ── Skipped large files ─────────────────────────────────
+    renderSkippedFiles(el, deps);
 
     // ── Config Sync ─────────────────────────────────────────
     el.createEl("h3", { text: "Config Sync" });
@@ -70,12 +77,9 @@ export function renderFilesTab(el: HTMLElement, deps: FilesTabDeps): void {
             btn.setButtonText("Init & Push").setWarning().onClick(async () => {
                 btn.setButtonText("Initializing...");
                 btn.setDisabled(true);
-                try {
-                    const count = await deps.configSync.init();
-                    new Notice(`CouchSync: Config init — ${count} file(s) pushed.`);
-                } catch (e: any) {
-                    new Notice(`Init failed: ${e.message}`);
-                }
+                // configSync.init() owns its own progress/done/fail
+                // notices — success and failure are both surfaced there.
+                try { await deps.configSync.init(); } catch { /* handled */ }
                 btn.setButtonText("Init & Push");
                 btn.setDisabled(false);
             })
@@ -88,12 +92,7 @@ export function renderFilesTab(el: HTMLElement, deps: FilesTabDeps): void {
             btn.setButtonText("Push ↑").onClick(async () => {
                 btn.setButtonText("Pushing...");
                 btn.setDisabled(true);
-                try {
-                    const count = await deps.configSync.push();
-                    new Notice(`CouchSync: Pushed ${count} config file(s).`);
-                } catch (e: any) {
-                    new Notice(`Push failed: ${e.message}`);
-                }
+                try { await deps.configSync.push(); } catch { /* handled in ProgressNotice */ }
                 btn.setButtonText("Push ↑");
                 btn.setDisabled(false);
             })
@@ -164,18 +163,77 @@ export function renderFilesTab(el: HTMLElement, deps: FilesTabDeps): void {
                 btn.setButtonText("Pulling...");
                 btn.setDisabled(true);
                 try {
-                    const count = await deps.configSync.pull();
-                    new Notice(`CouchSync: Pulled ${count} config file(s). Reloading...`);
+                    // configSync.pull() owns its own progress/done/fail.
+                    // The "reloading" hint is unique to this code path.
+                    await deps.configSync.pull();
+                    new Notice("CouchSync: Reloading Obsidian...");
                     setTimeout(() => {
                         (deps.app as any).commands.executeCommandById("app:reload");
                     }, 500);
-                } catch (e: any) {
-                    new Notice(`Pull failed: ${e.message}`);
+                } catch {
                     btn.setButtonText("Pull & Reload ↓");
                     btn.setDisabled(false);
                 }
             })
         );
+}
+
+/**
+ * Render the "Skipped large files" section. Async — it fetches the
+ * `_local/skipped-files` doc and populates a container inline so it doesn't
+ * block the rest of the tab render.
+ */
+function renderSkippedFiles(el: HTMLElement, deps: FilesTabDeps): void {
+    const container = el.createDiv();
+    container.createEl("h3", { text: "Skipped large files" });
+    container.createEl("p", {
+        text:
+            "These files exceeded the size limit and were not synced. " +
+            "Raise the limit above, then edit or save the file to re-sync it.",
+        cls: "setting-item-description",
+    });
+
+    const list = container.createDiv();
+    list.createEl("div", { text: "Loading...", cls: "setting-item-description" });
+
+    void (async () => {
+        const doc = await deps.localDb.getSkippedFiles();
+        const entries = Object.entries(doc.files).sort((a, b) => b[1].sizeMB - a[1].sizeMB);
+        list.empty();
+
+        if (entries.length === 0) {
+            list.createEl("div", {
+                text: "No skipped files.",
+                cls: "setting-item-description",
+            });
+            return;
+        }
+
+        for (const [path, info] of entries) {
+            new Setting(list)
+                .setName(path)
+                .setDesc(`${info.sizeMB} MB — skipped ${formatAge(info.skippedAt)}`)
+                .addButton((btn) =>
+                    btn
+                        .setButtonText("Forget")
+                        .setTooltip("Remove from this list without syncing")
+                        .onClick(async () => {
+                            const current = await deps.localDb.getSkippedFiles();
+                            delete current.files[path];
+                            await deps.localDb.putSkippedFiles(current);
+                            deps.refresh();
+                        }),
+                );
+        }
+    })();
+}
+
+function formatAge(timestamp: number): string {
+    const diffSec = Math.floor((Date.now() - timestamp) / 1000);
+    if (diffSec < 60) return "just now";
+    if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m ago`;
+    if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h ago`;
+    return `${Math.floor(diffSec / 86400)}d ago`;
 }
 
 /** Group raw paths into selectable files and folders at all hierarchy levels */

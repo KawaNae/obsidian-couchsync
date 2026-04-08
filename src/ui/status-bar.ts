@@ -7,8 +7,11 @@ const STATE_LABELS: Record<SyncState, string> = {
     connected: "Synced",
     syncing: "Syncing...",
     error: "Error",
+    // pre-existing UI convention: show "Paused" when the plugin deliberately
+    // stops sync (not reachable in the current SyncState union, but kept for
+    // future use if the state model gains a paused value).
     paused: "Paused",
-};
+} as unknown as Record<SyncState, string>;
 
 const STATE_DOT_CLASS: Record<SyncState, string> = {
     disconnected: "cs-status__dot--disconnected",
@@ -16,16 +19,40 @@ const STATE_DOT_CLASS: Record<SyncState, string> = {
     syncing: "cs-status__dot--syncing",
     error: "cs-status__dot--disconnected",
     paused: "cs-status__dot--disconnected",
-};
+} as unknown as Record<SyncState, string>;
+
+/**
+ * Format the age of a timestamp as a human-readable relative string.
+ * Tuned for the status bar: "just now" under 5s, then s / m / h / d.
+ */
+function formatAge(timestamp: number): string {
+    const diffSec = Math.floor((Date.now() - timestamp) / 1000);
+    if (diffSec < 5) return "just now";
+    if (diffSec < 60) return `${diffSec}s ago`;
+    if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m ago`;
+    if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h ago`;
+    return `${Math.floor(diffSec / 86400)}d ago`;
+}
 
 export class StatusBar {
     private dotEl: HTMLSpanElement | null = null;
     private textEl: HTMLSpanElement | null = null;
     private floatingEl: HTMLElement | null = null;
     private getSettings: () => CouchSyncSettings;
+    private getLastChangeAt: () => number;
+    private state: SyncState = "disconnected";
+    private detail?: string;
+    private tickTimer: ReturnType<typeof setInterval> | null = null;
+    private lastRenderedText = "";
+    private lastDotClass = "";
 
-    constructor(plugin: Plugin, getSettings: () => CouchSyncSettings) {
+    constructor(
+        plugin: Plugin,
+        getSettings: () => CouchSyncSettings,
+        getLastChangeAt: () => number,
+    ) {
         this.getSettings = getSettings;
+        this.getLastChangeAt = getLastChangeAt;
 
         if (!Platform.isMobile) {
             const el = plugin.addStatusBarItem();
@@ -41,15 +68,43 @@ export class StatusBar {
         }
 
         this.update("disconnected");
+        // 1s re-render so the "last synced" age stays current without
+        // requiring a state change event.
+        this.tickTimer = setInterval(() => this.render(), 1000);
     }
 
     update(state: SyncState, detail?: string): void {
-        if (this.dotEl) {
+        this.state = state;
+        this.detail = detail;
+        this.render();
+    }
+
+    private render(): void {
+        const dotClass = STATE_DOT_CLASS[this.state];
+        if (this.dotEl && dotClass !== this.lastDotClass) {
             this.dotEl.className = "cs-status__dot";
-            this.dotEl.addClass(STATE_DOT_CLASS[state]);
+            this.dotEl.addClass(dotClass);
+            this.lastDotClass = dotClass;
         }
-        if (this.textEl) {
-            this.textEl.setText(detail ?? STATE_LABELS[state]);
+        if (!this.textEl) return;
+
+        let text: string;
+        if (this.detail !== undefined) {
+            text = this.detail;
+        } else {
+            const base = STATE_LABELS[this.state];
+            const lastChange = this.getLastChangeAt();
+            if (lastChange > 0 && this.state === "connected") {
+                text = `${base} · ${formatAge(lastChange)}`;
+            } else if (lastChange > 0 && (this.state === "error" || this.state === "disconnected")) {
+                text = `${base} (last seen ${formatAge(lastChange)})`;
+            } else {
+                text = base;
+            }
+        }
+        if (text !== this.lastRenderedText) {
+            this.textEl.setText(text);
+            this.lastRenderedText = text;
         }
     }
 
@@ -63,6 +118,10 @@ export class StatusBar {
     }
 
     destroy(): void {
+        if (this.tickTimer) {
+            clearInterval(this.tickTimer);
+            this.tickTimer = null;
+        }
         this.floatingEl?.remove();
         this.floatingEl = null;
     }
