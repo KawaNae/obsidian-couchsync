@@ -2,12 +2,14 @@ import { type App, Notice, Setting } from "obsidian";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { ConfigSync } from "../sync/config-sync.ts";
 import type { LocalDB } from "../db/local-db.ts";
+import type { Replicator } from "../db/replicator.ts";
 
 interface FilesTabDeps {
     getSettings: () => CouchSyncSettings;
     updateSettings: (patch: Partial<CouchSyncSettings>) => Promise<void>;
     configSync: ConfigSync;
     localDb: LocalDB;
+    replicator: Replicator;
     app: App;
     refresh: () => void;
 }
@@ -261,11 +263,19 @@ async function loadSuggestions(suggestionsEl: HTMLElement, deps: FilesTabDeps): 
     suggestionsEl.style.display = "block";
     const currentPaths = new Set(deps.getSettings().configSyncPaths);
 
-    if (!cachedRemotePaths) {
+    // Respect the auth latch: when credentials are known-bad, don't touch
+    // the remote — each extra failed login strike feeds the server's
+    // brute-force lockout. Fall through to the local plugin folder scan.
+    if (!cachedRemotePaths && !deps.replicator.isAuthBlocked()) {
         try {
             const rawPaths = await deps.configSync.listRemotePaths();
             cachedRemotePaths = groupPaths(rawPaths);
-        } catch {
+        } catch (e: any) {
+            // If PouchDB surfaced a 401/403 here, latch it so subsequent
+            // opens of this tab also skip the remote call.
+            if (e?.status === 401 || e?.status === 403) {
+                deps.replicator.markAuthError(e.status, e.message ?? "Auth failed");
+            }
             cachedRemotePaths = null;
         }
     }

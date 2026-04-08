@@ -69,6 +69,40 @@ export class Replicator {
         return this.lastChangeAt;
     }
 
+    /**
+     * True while credentials are known to be rejected by the server. All
+     * network-facing code paths (sync, settings-tab fetches, suggestion
+     * lookups) should check this before issuing requests to avoid tripping
+     * CouchDB's brute-force lockout with a burst of 401s.
+     */
+    isAuthBlocked(): boolean {
+        return this.authError;
+    }
+
+    /**
+     * Latch the auth-blocked flag from outside the replicator (e.g. from
+     * Settings tab fetches that get 401/403). Emits the error so existing
+     * onError consumers see it, and pins state to "error".
+     */
+    markAuthError(status: number, reason?: string): void {
+        if (this.authError) return;
+        this.authError = true;
+        this.setState("error");
+        this.emitError(
+            `Authentication failed (${status})${reason ? ": " + reason : ""}. ` +
+                `Update credentials in the Connection tab.`,
+        );
+        if (this.sync) {
+            this.sync.cancel();
+            this.sync = null;
+        }
+    }
+
+    /** Clear the auth-blocked flag. Call after a successful Test button. */
+    clearAuthError(): void {
+        this.authError = false;
+    }
+
     /** Register callback for network reconnection (called instead of direct restart) */
     onReconnect(handler: () => void): void {
         this.onReconnectHandlers.push(handler);
