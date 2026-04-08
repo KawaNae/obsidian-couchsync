@@ -1,20 +1,40 @@
-node_modules/
+# Whitelist .gitignore: deny everything by default, opt in explicitly.
+# Any new file or directory created in the project root is ignored unless
+# listed below. This is defense-in-depth against accidental commits of
+# editor state, secrets, build output, etc.
+#
+# When adding a new tracked file/dir at the repo root, add a matching
+# `!/<path>` line here.
 
-# Build output
+# Deny everything at the repo root.
+/*
+
+# Allow the whitelist itself and the top-level source/test/docs trees.
+!/.gitignore
+!/.github/
+!/src/
+!/tests/
+!/docs/
+
+# Allow top-level project metadata and config files.
+!/LICENSE
+!/README.md
+!/package.json
+!/package-lock.json
+!/tsconfig.json
+!/esbuild.config.mjs
+!/vitest.config.ts
+!/manifest.json
+!/styles.css
+
+# Re-apply blacklist entries for things that WOULD otherwise be allowed
+# inside the whitelisted trees above (build artefacts, runtime data,
+# per-machine settings, secrets).
+node_modules/
 main.js
 *.js.map
 meta.json
 meta-*.json
-
-# Obsidian
 data.json
-
-# IDE
-.vscode
-.idea
-*.iml
-.claude/
-
-# Environment
 .env
 *.local
