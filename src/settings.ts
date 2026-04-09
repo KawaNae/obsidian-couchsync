@@ -37,8 +37,14 @@ export interface CouchSyncSettings {
     // Internal
     connectionState: ConnectionState;
     deviceId: string;
-    /** Bumped on schema-changing releases. v0.8.0 = 2 (all-binary chunker). */
-    syncSchemaVersion: number;
+    /**
+     * Fingerprint of the Obsidian installation this vault was last opened on.
+     * Compared against `localStorage["couchsync.installMarker"]` at startup —
+     * a mismatch means the vault (and its data.json) was copied to a new
+     * install, so `deviceId` must be regenerated to preserve Vector Clock
+     * uniqueness across peers. See main.ts onload for the check.
+     */
+    lastInstallMarker?: string;
 }
 
 export const DEFAULT_SETTINGS: CouchSyncSettings = {
@@ -70,5 +76,4 @@ export const DEFAULT_SETTINGS: CouchSyncSettings = {
 
     connectionState: "editing",
     deviceId: "",
-    syncSchemaVersion: 0,
 };

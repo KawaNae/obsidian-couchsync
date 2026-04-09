@@ -8,6 +8,8 @@ import { SetupService } from "./sync/setup.ts";
 import { ChangeTracker } from "./sync/change-tracker.ts";
 import { Reconciler, type ReconcileReason } from "./sync/reconciler.ts";
 import { ConflictResolver } from "./conflict/conflict-resolver.ts";
+import { checkInstallMarker } from "./sync/install-marker.ts";
+import { filePathFromId } from "./types/doc-id.ts";
 import { StatusBar } from "./ui/status-bar.ts";
 import { CouchSyncSettingTab } from "./settings-tab/index.ts";
 import { isFileDoc, type CouchSyncDoc } from "./types.ts";
@@ -44,6 +46,32 @@ export default class CouchSyncPlugin extends Plugin {
             await this.saveSettings();
         }
 
+        // Install-marker check: detects when the vault has been copied to
+        // a new Obsidian installation (deviceId travels with data.json,
+        // which would otherwise violate Vector Clock uniqueness).
+        {
+            const result = checkInstallMarker({
+                lastInstallMarker: this.settings.lastInstallMarker,
+                currentDeviceId: this.settings.deviceId,
+                storage: {
+                    get: (k) => window.localStorage.getItem(k),
+                    set: (k, v) => window.localStorage.setItem(k, v),
+                },
+                generateUuid: () => crypto.randomUUID(),
+            });
+            if (result.regenerated) {
+                showNotice(
+                    `CouchSync: vault opened on a new installation. Device identity ` +
+                        `regenerated (was ${result.previousDeviceId?.slice(0, 8)}, ` +
+                        `now ${result.nextDeviceId.slice(0, 8)}).`,
+                    10000,
+                );
+            }
+            this.settings.deviceId = result.nextDeviceId;
+            this.settings.lastInstallMarker = result.nextInstallMarker;
+            await this.saveSettings();
+        }
+
         const dbName = `couchsync-${this.app.vault.getName()}`;
         this.localDb = new LocalDB(dbName);
         this.localDb.open();
@@ -65,6 +93,7 @@ export default class CouchSyncPlugin extends Plugin {
             this.app, this.localDb, this.replicator, this.vaultSync, this.reconciler,
         );
         this.changeTracker = new ChangeTracker(this.app, this.vaultSync, () => this.settings);
+        this.vaultSync.setChangeTracker(this.changeTracker);
         this.historyStorage = new HistoryStorage(this.app.vault.getName());
         this.historyCapture = new HistoryCapture(this.app, this.historyStorage, () => this.settings);
         this.vaultSync.setHistoryCapture(this.historyCapture);
@@ -73,22 +102,62 @@ export default class CouchSyncPlugin extends Plugin {
         );
         this.conflictResolver = new ConflictResolver(
             this.localDb,
-            async (filePath, winnerDoc, loserDoc) => {
+            async (filePath, winnerDoc, loserDocs) => {
                 try {
-                    const loserChunks = await this.localDb.getChunks(loserDoc.chunks);
-                    const loserBuf = joinChunks(loserChunks);
-                    if (!isDiffableText(loserBuf)) return;
                     const winnerChunks = await this.localDb.getChunks(winnerDoc.chunks);
                     const winnerBuf = joinChunks(winnerChunks);
                     if (!isDiffableText(winnerBuf)) return;
                     const dec = new TextDecoder("utf-8");
-                    await this.historyCapture.saveConflict(filePath, dec.decode(loserBuf), dec.decode(winnerBuf));
-                    showNotice(`Conflict resolved: ${filePath.split("/").pop()}. Losing version saved to history.`);
+                    const winnerText = dec.decode(winnerBuf);
+                    for (const loser of loserDocs) {
+                        const loserChunks = await this.localDb.getChunks(loser.chunks);
+                        const loserBuf = joinChunks(loserChunks);
+                        if (!isDiffableText(loserBuf)) continue;
+                        await this.historyCapture.saveConflict(
+                            filePath,
+                            dec.decode(loserBuf),
+                            winnerText,
+                        );
+                    }
+                    showNotice(
+                        `Conflict auto-resolved: ${filePath.split("/").pop()}. Losing version(s) saved to history.`,
+                    );
                 } catch (e) {
                     console.error("CouchSync: Failed to save conflict to history:", e);
                 }
             },
         );
+        // Concurrent (VC-incomparable) conflicts need human judgment. For
+        // now we raise a persistent Notice directing the user to history;
+        // a Side-by-side diff modal is planned for the v2 design's Phase 3
+        // work. Critically, we do NOT silently pick a winner.
+        this.conflictResolver.setOnConcurrent(async (filePath, revisions) => {
+            console.warn(
+                `CouchSync: concurrent edit on ${filePath} — ${revisions.length} revisions, none dominate`,
+            );
+            // Persist every revision as a history entry so the user can
+            // recover any version manually.
+            try {
+                const dec = new TextDecoder("utf-8");
+                for (const rev of revisions) {
+                    const chunks = await this.localDb.getChunks(rev.chunks);
+                    const buf = joinChunks(chunks);
+                    if (!isDiffableText(buf)) continue;
+                    await this.historyCapture.saveConflict(
+                        filePath,
+                        dec.decode(buf),
+                        dec.decode(buf),
+                    );
+                }
+            } catch (e) {
+                console.error("CouchSync: Failed to persist concurrent-conflict history:", e);
+            }
+            showNotice(
+                `CouchSync: concurrent edit on ${filePath.split("/").pop()} — ` +
+                    "check Diff History and manually reconcile. No version has been silently dropped.",
+                15000,
+            );
+        });
 
         // Live remote → vault hint path. Reconciler.reconcile("paused") below
         // is the safety net that catches anything dbToFile missed.
@@ -96,7 +165,10 @@ export default class CouchSyncPlugin extends Plugin {
             if (isFileDoc(doc)) {
                 this.vaultSync.dbToFile(doc)
                     .then(() => this.conflictResolver.resolveIfConflicted(doc))
-                    .catch((e) => console.error(`CouchSync: Failed to apply remote change for ${doc._id}:`, e));
+                    .catch((e) => console.error(
+                        `CouchSync: Failed to apply remote change for ${filePathFromId(doc._id)}:`,
+                        e,
+                    ));
             }
         });
 
@@ -125,12 +197,29 @@ export default class CouchSyncPlugin extends Plugin {
             this.historyCapture.start();
             this.historyManager.startCleanup();
 
-            // Force re-chunk all files via the all-binary path on first run.
-            if (this.settings.syncSchemaVersion < 2) {
-                await this.localDb.putScanCursor({ lastScanStartedAt: 0, lastScanCompletedAt: 0 });
-                this.settings.syncSchemaVersion = 2;
-                await this.saveSettings();
-                console.log("CouchSync: upgraded sync schema to v2 (all-binary)");
+            // Schema guard. Any FileDoc without a `vclock` is
+            // a v0.9.x-or-earlier artefact. Starting replication against
+            // such a database would corrupt ordering because the new
+            // ConflictResolver assumes every rev carries a clock. Block
+            // sync until the user rebuilds from the Maintenance tab.
+            try {
+                const legacyId = await this.localDb.findLegacyFileDoc();
+                if (legacyId) {
+                    showNotice(
+                        `CouchSync: old schema detected (${legacyId}). Open Settings → Maintenance → ` +
+                            "Rebuild Local DB (or Fetch from Remote) to migrate. Sync is paused until then.",
+                        15000,
+                    );
+                    console.warn(
+                        `CouchSync: blocking replicator.start() — legacy FileDoc without vclock: ${legacyId}`,
+                    );
+                    // Fall through to reconcile so the UI still reflects
+                    // vault state, but do NOT start replication.
+                    this.fireReconcile("onload");
+                    return;
+                }
+            } catch (e) {
+                console.error("CouchSync: schema guard probe failed:", e);
             }
 
             if (this.settings.connectionState === "syncing") {

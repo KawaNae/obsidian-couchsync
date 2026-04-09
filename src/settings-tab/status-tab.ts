@@ -119,9 +119,10 @@ async function getLastUpdateTime(
     for (const result of data.results ?? []) {
         const doc = result.doc;
         if (!doc) continue;
-        // Prefer CouchSync FileDoc (editedAt > mtime)
+        // CouchSync FileDoc — mtime is the recorded file timestamp at the
+        // last sync point (ordering lives in vclock, not consulted here).
         if (doc.type === "file" && !doc.deleted) {
-            return doc.editedAt ?? doc.mtime ?? null;
+            return doc.mtime ?? null;
         }
         // Fallback: any doc with mtime (e.g. LiveSync "plain"/"leaf")
         if (!fallbackMtime && typeof doc.mtime === "number") {
