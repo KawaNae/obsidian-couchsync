@@ -14,6 +14,16 @@ obsidian-couchsyncはobsidian-livesyncのフォークだが、サブモジュー
 
 ---
 
+## ストレージ構造
+
+CouchSync は **vault DB と config DB を物理的に分離** する。これは「異なる共有スコープのデータは異なる replication boundary を持つ」という原則の具体化：
+- **Vault DB** (`couchdbDbName`): 全デバイスで共有する vault の中身。FileDoc + ChunkDoc のみ
+- **Config DB(s)** (`couchdbConfigDbName`): デバイスのプール（mobile / desktop など）ごとに独立可能な `.obsidian/` 設定。ConfigDoc のみ
+
+1 つの CouchDB サーバー上で `obsidian-dev` (vault) + `obsidian-dev-config-mobile` + `obsidian-dev-config-desktop` を並列に持てる。各デバイスは vault DB には必ず接続し、config DB は自分の pool 名を選ぶ。`couchdbConfigDbName === ""` で config sync 機能を完全に無効化できる。
+
+CouchDB credentials（URI / User / Password）は両 DB で共有する。同一サーバー前提。
+
 ## ドキュメントフォーマット
 
 ### ID 体系（統一）
@@ -21,13 +31,15 @@ obsidian-couchsyncはobsidian-livesyncのフォークだが、サブモジュー
 すべての replicated ドキュメントは `<kind>:<payload>` 形式のプレフィックス付き `_id` を持つ。PouchDB 予約の `_local/<name>` は尊重し、それ以外に bare な `_id` は存在しない。生成・判定・パースは `src/types/doc-id.ts` の単一モジュールに集約し、呼び出し側は生の `startsWith` / `slice` を使ってはならない。
 
 ```
-file:<vaultPath>      FileDoc    例: file:notes/hello.md
-chunk:<xxhash64>      ChunkDoc   例: chunk:a1b2c3d4...
-config:<vaultPath>    ConfigDoc  例: config:.obsidian/appearance.json
+file:<vaultPath>      FileDoc    例: file:notes/hello.md          (vault DB)
+chunk:<xxhash64>      ChunkDoc   例: chunk:a1b2c3d4...            (vault DB)
+config:<vaultPath>    ConfigDoc  例: config:.obsidian/appearance.json  (config DB)
 _local/<name>         PouchDB reserved（非レプリケート）
 ```
 
 3 プレフィックスは lexicographically disjoint（`chunk:` < `config:` < `file:`）。`allDocs({ startkey, endkey })` で種別ごとの range query が成立する。
+
+**不変条件**：vault DB には `config:*` doc が存在してはならず、config DB には `file:*` / `chunk:*` doc が存在してはならない。起動時の schema guard が両方向で検証する。
 
 ### VectorClock（因果順序）
 ```typescript
@@ -82,11 +94,17 @@ interface ConfigDoc {
 ### ローカル専用メタデータ
 
 `_local/<name>` プレフィックスの PouchDB 予約空間に置く。複製されない：
-- `_local/scan-cursor` — Reconciler の fast-path で使う前回スキャン情報
-- `_local/vault-manifest` — 削除検出用の vault パス集合スナップショット
-- `_local/skipped-files` — `maxFileSizeMB` を超えて同期除外されたファイル一覧
+- `_local/scan-cursor` — Reconciler の fast-path で使う前回スキャン情報（vault DB のみ）
+- `_local/vault-manifest` — 削除検出用の vault パス集合スナップショット（vault DB のみ）
+- `_local/skipped-files` — `maxFileSizeMB` を超えて同期除外されたファイル一覧（vault DB のみ）
 
 `deviceId` は PouchDB ではなく Obsidian の `data.json` (plugin settings) に保存する。専用の `_local` ドキュメントは持たない。
+
+### Local PouchDB instances
+
+各 vault に対して 2 つの local PouchDB instance を持つ（IndexedDB 内で別ストア）：
+- `couchsync-${vaultName}` — vault DB のローカルレプリカ
+- `couchsync-${vaultName}-config-${configDbName}` — config DB のローカルレプリカ。`configDbName` を含めることで pool 切り替え時に自然に新しいローカル DB が作られる
 
 ---
 
@@ -101,19 +119,20 @@ src/
 ├── settings.ts                — Settings interface + defaults
 ├── settings-tab/
 │   ├── index.ts               — SettingTab (task-viewerタブパターン)
-│   ├── connection-tab.ts      — CouchDB接続設定 + テスト
-│   ├── files-tab.ts           — フィルタ・Hidden/Plugin設定
+│   ├── vault-sync-tab.ts      — Vault sync 設定 (Connection + Setup + Live Sync + Filters)
+│   ├── config-sync-tab.ts     — Config sync 設定 (Connection + Operations)、vault と並列の step UI
 │   ├── history-tab.ts         — 履歴保持期間・ストレージ設定
 │   └── maintenance-tab.ts     — トラブルシュート・リセット
 ├── db/
-│   ├── local-db.ts            — PouchDB初期化・CRUD
-│   ├── replicator.ts          — CouchDB Liveレプリケーション
+│   ├── local-db.ts            — Vault PouchDB 初期化・CRUD（FileDoc + ChunkDoc）
+│   ├── config-local-db.ts     — Config PouchDB 初期化・CRUD（ConfigDoc 専用）
+│   ├── remote-couch.ts        — URL+認証情報を取る stateless な remote 操作 helper
+│   ├── replicator.ts          — Vault DB の CouchDB Live レプリケーション (live sync 専用)
 │   ├── chunker.ts             — ファイル→チャンク分割・結合
 │   └── gc.ts                  — 未参照チャンクGC
 ├── sync/
 │   ├── vault-sync.ts          — Vaultファイル ↔ DB
-│   ├── hidden-sync.ts         — .obsidian/ ファイル同期
-│   ├── plugin-sync.ts         — プラグイン設定同期
+│   ├── config-sync.ts         — .obsidian/ ↔ Config DB（scan-based、live sync 無し）
 │   └── change-tracker.ts      — ファイル変更検知・デバウンス
 ├── history/
 │   ├── history-db.ts          — Dexie DB (diff/snapshot保存)

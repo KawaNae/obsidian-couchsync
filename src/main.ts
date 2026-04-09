@@ -1,6 +1,8 @@
 import { Plugin } from "obsidian";
+import PouchDB from "pouchdb-browser/lib/index.js";
 import { type CouchSyncSettings, DEFAULT_SETTINGS } from "./settings.ts";
 import { LocalDB } from "./db/local-db.ts";
+import { ConfigLocalDB } from "./db/config-local-db.ts";
 import { Replicator } from "./db/replicator.ts";
 import { VaultSync } from "./sync/vault-sync.ts";
 import { ConfigSync } from "./sync/config-sync.ts";
@@ -26,8 +28,14 @@ import { joinChunks } from "./db/chunker.ts";
 export default class CouchSyncPlugin extends Plugin {
     settings!: CouchSyncSettings;
     localDb!: LocalDB;
+    /** Null when `couchdbConfigDbName === ""` (config sync disabled) */
+    configLocalDb: ConfigLocalDB | null = null;
+    /** Holds the underlying PouchDB so we can destroy it on unload */
+    private configPouch: PouchDB.Database | null = null;
     replicator!: Replicator;
     conflictResolver!: ConflictResolver;
+    /** Null when config sync is disabled */
+    configConflictResolver: ConflictResolver | null = null;
     configSync!: ConfigSync;
     private vaultSync!: VaultSync;
     private setupService!: SetupService;
@@ -72,13 +80,33 @@ export default class CouchSyncPlugin extends Plugin {
             await this.saveSettings();
         }
 
-        const dbName = `couchsync-${this.app.vault.getName()}`;
+        const vaultName = this.app.vault.getName();
+        const dbName = `couchsync-${vaultName}`;
         this.localDb = new LocalDB(dbName);
         this.localDb.open();
 
+        // Open the config-side local PouchDB only when the user has set
+        // a config DB name. The local store is keyed by both vault name
+        // and config DB name so switching device pools (e.g. mobile ↔
+        // desktop) creates a fresh local store rather than mixing.
+        if (this.settings.couchdbConfigDbName) {
+            const configLocalName =
+                `couchsync-${vaultName}-config-${this.settings.couchdbConfigDbName}`;
+            this.configPouch = new PouchDB(configLocalName, {
+                auto_compaction: true,
+                revs_limit: 20,
+            });
+            this.configLocalDb = new ConfigLocalDB(this.configPouch as any);
+        }
+
         this.replicator = new Replicator(this.localDb, () => this.settings);
         this.vaultSync = new VaultSync(this.app, this.localDb, () => this.settings);
-        this.configSync = new ConfigSync(this.app, this.localDb, this.replicator, () => this.settings);
+        // ConfigSync needs *some* ConfigLocalDB even when sync is disabled,
+        // so we satisfy the type with a stand-in pointing at the vault DB.
+        // The runtime guard `isConfigured()` blocks all DB I/O before it
+        // could touch the wrong store.
+        const configDbForSync = this.configLocalDb ?? new ConfigLocalDB(this.localDb.getDb());
+        this.configSync = new ConfigSync(this.app, configDbForSync, this.replicator, () => this.settings);
         this.statusBar = new StatusBar(this, () => this.settings, () => this.replicator.getLastChangeAt());
         this.replicator.onStateChange((state) => this.statusBar.update(state));
         this.replicator.onError((msg) => showNotice(msg, 8000));
@@ -101,8 +129,13 @@ export default class CouchSyncPlugin extends Plugin {
             this.app.vault, this.historyStorage, this.historyCapture, () => this.settings,
         );
         this.conflictResolver = new ConflictResolver(
-            this.localDb,
+            () => this.localDb.getDb(),
             async (filePath, winnerDoc, loserDocs) => {
+                // ConflictResolver passes us either FileDoc or ConfigDoc;
+                // history capture only knows about file content, so we
+                // narrow to FileDoc here. ConfigDoc auto-resolutions
+                // are silently logged via the resolver's console.log.
+                if (!("chunks" in winnerDoc)) return;
                 try {
                     const winnerChunks = await this.localDb.getChunks(winnerDoc.chunks);
                     const winnerBuf = joinChunks(winnerChunks);
@@ -110,6 +143,7 @@ export default class CouchSyncPlugin extends Plugin {
                     const dec = new TextDecoder("utf-8");
                     const winnerText = dec.decode(winnerBuf);
                     for (const loser of loserDocs) {
+                        if (!("chunks" in loser)) continue;
                         const loserChunks = await this.localDb.getChunks(loser.chunks);
                         const loserBuf = joinChunks(loserChunks);
                         if (!isDiffableText(loserBuf)) continue;
@@ -136,10 +170,11 @@ export default class CouchSyncPlugin extends Plugin {
                 `CouchSync: concurrent edit on ${filePath} — ${revisions.length} revisions, none dominate`,
             );
             // Persist every revision as a history entry so the user can
-            // recover any version manually.
+            // recover any version manually. Only FileDocs have chunks.
             try {
                 const dec = new TextDecoder("utf-8");
                 for (const rev of revisions) {
+                    if (!("chunks" in rev)) continue;
                     const chunks = await this.localDb.getChunks(rev.chunks);
                     const buf = joinChunks(chunks);
                     if (!isDiffableText(buf)) continue;
@@ -158,6 +193,33 @@ export default class CouchSyncPlugin extends Plugin {
                 15000,
             );
         });
+
+        // Config-side conflict resolver (only when config sync is enabled)
+        if (this.configLocalDb) {
+            const configDbRef = this.configLocalDb;
+            this.configConflictResolver = new ConflictResolver(
+                () => configDbRef.getDb(),
+                async (configPath, winnerDoc, _loserDocs) => {
+                    // ConfigDoc auto-resolution: log + Notice. History
+                    // capture is text-oriented (vault notes), so we don't
+                    // try to push binary config blobs into Dexie.
+                    showNotice(
+                        `Config conflict auto-resolved: ${configPath.split("/").pop()}.`,
+                        5000,
+                    );
+                },
+            );
+            this.configConflictResolver.setOnConcurrent(async (configPath, revisions) => {
+                console.warn(
+                    `CouchSync: concurrent config edit on ${configPath} — ${revisions.length} revisions, none dominate`,
+                );
+                showNotice(
+                    `CouchSync: concurrent config edit on ${configPath.split("/").pop()} — ` +
+                        "manual resolution needed. The config DB conflict tree is preserved.",
+                    15000,
+                );
+            });
+        }
 
         // Live remote → vault hint path. Reconciler.reconcile("paused") below
         // is the safety net that catches anything dbToFile missed.
@@ -197,26 +259,51 @@ export default class CouchSyncPlugin extends Plugin {
             this.historyCapture.start();
             this.historyManager.startCleanup();
 
-            // Schema guard. Any FileDoc without a `vclock` is
-            // a v0.9.x-or-earlier artefact. Starting replication against
-            // such a database would corrupt ordering because the new
-            // ConflictResolver assumes every rev carries a clock. Block
-            // sync until the user rebuilds from the Maintenance tab.
+            // Schema guard. Two checks:
+            //
+            //   1. The vault DB must NOT contain bare-path docs, missing
+            //      vclock FileDocs, or `config:*` orphans (the latter
+            //      indicates a pre-v0.11.0 DB where configs lived in
+            //      the vault store and need migration).
+            //   2. The config DB (if configured) must NOT contain
+            //      non-config docs or vclock-less ConfigDocs.
+            //
+            // If either check fails we block replicator.start() and tell
+            // the user to use the Maintenance tab to migrate / rebuild.
             try {
-                const legacyId = await this.localDb.findLegacyFileDoc();
-                if (legacyId) {
-                    showNotice(
-                        `CouchSync: old schema detected (${legacyId}). Open Settings → Maintenance → ` +
-                            "Rebuild Local DB (or Fetch from Remote) to migrate. Sync is paused until then.",
-                        15000,
-                    );
+                const vaultLegacy = await this.localDb.findLegacyVaultDoc();
+                if (vaultLegacy) {
+                    const isConfigOrphan = vaultLegacy.startsWith("config:");
+                    const message = isConfigOrphan
+                        ? `CouchSync: legacy config doc found in vault DB (${vaultLegacy}). ` +
+                            "Open Settings → Maintenance → Clean up legacy configs from vault DB " +
+                            "after running Config Init in Config Sync. Sync is paused until then."
+                        : `CouchSync: old schema detected in vault DB (${vaultLegacy}). ` +
+                            "Open Settings → Maintenance → Delete local vault database, " +
+                            "then re-run Init or Clone. Sync is paused until then.";
+                    showNotice(message, 15000);
                     console.warn(
-                        `CouchSync: blocking replicator.start() — legacy FileDoc without vclock: ${legacyId}`,
+                        `CouchSync: blocking replicator.start() — legacy vault doc: ${vaultLegacy}`,
                     );
-                    // Fall through to reconcile so the UI still reflects
-                    // vault state, but do NOT start replication.
                     this.fireReconcile("onload");
                     return;
+                }
+
+                if (this.configLocalDb) {
+                    const configLegacy = await this.configLocalDb.findLegacyConfigDoc();
+                    if (configLegacy) {
+                        showNotice(
+                            `CouchSync: old schema detected in config DB (${configLegacy}). ` +
+                                "Open Settings → Maintenance → Delete local config database, " +
+                                "then re-run Config Init or Pull. Sync is paused until then.",
+                            15000,
+                        );
+                        console.warn(
+                            `CouchSync: blocking replicator.start() — legacy config doc: ${configLegacy}`,
+                        );
+                        this.fireReconcile("onload");
+                        return;
+                    }
                 }
             } catch (e) {
                 console.error("CouchSync: schema guard probe failed:", e);
@@ -332,6 +419,15 @@ export default class CouchSyncPlugin extends Plugin {
         this.statusBar?.destroy();
         this.historyStorage?.close();
         await this.localDb?.close();
+        if (this.configPouch) {
+            try {
+                await this.configPouch.close();
+            } catch (e) {
+                console.error("CouchSync: failed to close config local DB:", e);
+            }
+            this.configPouch = null;
+            this.configLocalDb = null;
+        }
     }
 
     async loadSettings(): Promise<void> {

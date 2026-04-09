@@ -72,23 +72,20 @@ export class LocalDB {
     }
 
     /**
-     * Probe for documents that don't conform to the current schema.
-     * Returns the `_id` of the first offender, or null if the database
-     * is empty / fully current. Used by plugin startup to gate the
-     * replicator until the user rebuilds via Maintenance.
+     * Probe the **vault** database for non-conforming documents. Returns
+     * the `_id` of the first offender, or null if the store is empty /
+     * fully current. Used by plugin startup to gate the replicator until
+     * the user rebuilds via Maintenance.
      *
-     * Detection covers three schema breaks that were shipped together:
-     *   - **Bare-path FileDoc** (pre ID-redesign): `_id` lacks the
-     *     `file:` / `chunk:` / `config:` / `_` prefix entirely.
-     *   - **Missing vclock** (pre Vector Clock): any FileDoc whose
-     *     `vclock` is absent or empty.
-     *   - **Legacy `binary` field** (pre all-binary ConfigDoc): any
-     *     ConfigDoc still carrying the deprecated `binary` boolean.
-     *
-     * Cost: one allDocs() page; doc bodies only loaded when a
-     * candidate id needs verification.
+     * In v0.11.0+ the vault DB is supposed to contain ONLY file:/chunk:/_
+     * documents. ConfigDocs migrated to a separate database. Detection:
+     *   - **Bare-path doc** (pre ID-redesign): `_id` lacks any known prefix
+     *   - **`config:*` orphan** (pre config-DB-split): any ConfigDoc still
+     *     living in the vault DB — these need to be migrated and cleaned
+     *     up via the Maintenance "Clean up legacy configs" button
+     *   - **FileDoc missing vclock** (pre Vector Clock)
      */
-    async findLegacyFileDoc(): Promise<string | null> {
+    async findLegacyVaultDoc(): Promise<string | null> {
         const idResult = await this.getDb().allDocs({ limit: 200 });
         for (const row of idResult.rows) {
             // PouchDB-reserved (_local, _design) — never legacy.
@@ -96,6 +93,9 @@ export class LocalDB {
 
             // Any replicated-space id without a known prefix is legacy.
             if (!isReplicatedDocId(row.id)) return row.id;
+
+            // ConfigDocs do not belong in the vault DB anymore (v0.11.0+).
+            if (isConfigDocId(row.id)) return row.id;
 
             if (isFileDocId(row.id)) {
                 try {
@@ -110,20 +110,43 @@ export class LocalDB {
                 }
             }
 
-            if (isConfigDocId(row.id)) {
-                try {
-                    const doc = (await this.getDb().get(row.id)) as unknown as Record<string, unknown>;
-                    if ("binary" in doc) return row.id;
-                    return null;
-                } catch {
-                    continue;
-                }
-            }
-
             // Chunks don't carry schema-breaking fields today; skip.
             if (isChunkDocId(row.id)) continue;
         }
         return null;
+    }
+
+    /**
+     * @deprecated Renamed to {@link findLegacyVaultDoc} in v0.11.0 — kept
+     * as a thin alias so any external caller (or stale doc) doesn't
+     * silently break. New code should call findLegacyVaultDoc directly.
+     */
+    async findLegacyFileDoc(): Promise<string | null> {
+        return this.findLegacyVaultDoc();
+    }
+
+    /**
+     * Delete every document with a given `_id` prefix from the vault DB.
+     * Used by Maintenance "Clean up legacy configs from vault DB" to
+     * remove `config:*` orphans after the v0.11.0 migration.
+     *
+     * Returns the IDs of the deleted documents (handy for telling the
+     * user how many were affected). Replication will propagate the
+     * tombstones to the remote vault DB on the next sync cycle.
+     */
+    async deleteAllByPrefix(prefix: string): Promise<string[]> {
+        const result = await this.getDb().allDocs({
+            startkey: prefix,
+            endkey: prefix + "\ufff0",
+        });
+        if (result.rows.length === 0) return [];
+        const tombstones = result.rows.map((row) => ({
+            _id: row.id,
+            _rev: row.value.rev,
+            _deleted: true,
+        }));
+        await this.getDb().bulkDocs(tombstones as any);
+        return result.rows.map((row) => row.id);
     }
 
     async get<T extends CouchSyncDoc>(id: string): Promise<T | null> {

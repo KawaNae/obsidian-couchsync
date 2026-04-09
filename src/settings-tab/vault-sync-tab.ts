@@ -1,11 +1,28 @@
-import { Notice, Setting, type ButtonComponent } from "obsidian";
+/**
+ * Vault Sync settings tab.
+ *
+ * Renamed from `connection-tab.ts` in v0.11.0 as part of splitting config
+ * sync into its own tab. Owns the vault-side connection (URI / user /
+ * password / vault DB name), the Init/Clone setup actions, the live sync
+ * toggle, and (Step 4) the vault file filters that used to live in the
+ * standalone Files tab.
+ *
+ * Why merge filters into this tab? They control which vault files are
+ * eligible for sync — they're a property of vault sync, not a separate
+ * concept. Putting them under Vault Sync's Step 4 keeps the mental model
+ * tight: "everything that controls vault sync lives here".
+ */
+import { type App, Notice, Setting, type ButtonComponent } from "obsidian";
 import type { ConnectionState, CouchSyncSettings } from "../settings.ts";
 import type { Replicator } from "../db/replicator.ts";
+import type { LocalDB } from "../db/local-db.ts";
 
-export interface ConnectionTabDeps {
+export interface VaultSyncTabDeps {
+    app: App;
     getSettings: () => CouchSyncSettings;
     updateSettings: (patch: Partial<CouchSyncSettings>) => Promise<void>;
     replicator: Replicator;
+    localDb: LocalDB;
     initVault: () => Promise<void>;
     cloneFromRemote: () => Promise<void>;
     startSync: () => Promise<void>;
@@ -20,7 +37,7 @@ interface Draft {
     db: string;
 }
 
-export class ConnectionTab {
+export class VaultSyncTab {
     private draft: Draft;
     private testPassed = false;
 
@@ -29,7 +46,7 @@ export class ConnectionTab {
     private applyBtn: ButtonComponent | null = null;
     private applyDesc: HTMLElement | null = null;
 
-    constructor(private deps: ConnectionTabDeps) {
+    constructor(private deps: VaultSyncTabDeps) {
         this.draft = this.savedToDraft();
     }
 
@@ -93,7 +110,7 @@ export class ConnectionTab {
         this.renderField(el, "Server URI", "uri", "https://localhost:5984", locked);
         this.renderField(el, "Username", "user", "admin", locked);
         this.renderField(el, "Password", "pass", "password", locked, true);
-        this.renderField(el, "Database Name", "db", "obsidian", locked);
+        this.renderField(el, "Vault Database Name", "db", "obsidian", locked);
 
         new Setting(el)
             .setName("Test Connection")
@@ -209,6 +226,58 @@ export class ConnectionTab {
                         this.deps.refresh();
                     })
             );
+
+        // ── Step 4: Filters (vault file inclusion / exclusion) ─
+        el.createEl("h3", { text: "Step 4: Filters" });
+        el.createEl("p", {
+            text:
+                "Control which vault files are eligible for sync. " +
+                "These settings only affect this device — peers may have different filters.",
+            cls: "setting-item-description",
+        });
+
+        const settings = this.deps.getSettings();
+
+        new Setting(el)
+            .setName("Sync filter (RegExp)")
+            .setDesc("Only sync files matching this pattern. Leave empty to sync all.")
+            .addText((text) =>
+                text
+                    .setPlaceholder(".*\\.md$")
+                    .setValue(settings.syncFilter)
+                    .onChange(async (value) => {
+                        await this.deps.updateSettings({ syncFilter: value });
+                    })
+            );
+
+        new Setting(el)
+            .setName("Ignore filter (RegExp)")
+            .setDesc("Skip files matching this pattern.")
+            .addText((text) =>
+                text
+                    .setPlaceholder("node_modules|^\\.trash")
+                    .setValue(settings.syncIgnore)
+                    .onChange(async (value) => {
+                        await this.deps.updateSettings({ syncIgnore: value });
+                    })
+            );
+
+        new Setting(el)
+            .setName("Max file size (MB)")
+            .setDesc("Files larger than this will not be synced. Set to 0 to skip all files (useful for testing).")
+            .addText((text) =>
+                text
+                    .setValue(String(settings.maxFileSizeMB))
+                    .onChange(async (value) => {
+                        const num = parseFloat(value);
+                        if (!isNaN(num) && num >= 0) {
+                            await this.deps.updateSettings({ maxFileSizeMB: num });
+                        }
+                    })
+            );
+
+        // ── Skipped large files ─────────────────────────────────
+        renderSkippedFiles(el, this.deps);
     }
 
     private renderField(
@@ -221,7 +290,6 @@ export class ConnectionTab {
     ): void {
         const setting = new Setting(el).setName(name);
 
-        // Pencil icon — always created, visibility toggled in-place
         const nameEl = setting.settingEl.querySelector(".setting-item-name");
         if (nameEl) {
             const pencil = nameEl.createSpan({ cls: "cs-pencil", text: "✏️" });
@@ -256,9 +324,6 @@ export class ConnectionTab {
             new Notice(`Connection failed: ${error}`, 8000);
         } else {
             this.testPassed = true;
-            // A successful Test means the draft credentials work — clear
-            // any latched auth-blocked flag so Status / Files tabs resume
-            // auto-fetch once these credentials are applied.
             this.deps.replicator.clearAuthError();
             new Notice("Connection successful!", 3000);
         }
@@ -266,8 +331,6 @@ export class ConnectionTab {
     }
 
     private async handleApply(): Promise<void> {
-        // Silent save — the Apply button disappearing and the tab re-rendering
-        // into its "tested" state is feedback enough.
         await this.deps.updateSettings({
             couchdbUri: this.draft.uri,
             couchdbUser: this.draft.user,
@@ -278,4 +341,63 @@ export class ConnectionTab {
         this.testPassed = false;
         this.deps.refresh();
     }
+}
+
+/**
+ * Render the "Skipped large files" section. Async — fetches the
+ * `_local/skipped-files` doc and populates a container inline so it
+ * doesn't block the rest of the tab render. Migrated from files-tab.ts
+ * unchanged in v0.11.0.
+ */
+function renderSkippedFiles(el: HTMLElement, deps: VaultSyncTabDeps): void {
+    const container = el.createDiv();
+    container.createEl("h3", { text: "Skipped large files" });
+    container.createEl("p", {
+        text:
+            "These files exceeded the size limit and were not synced. " +
+            "Raise the limit above, then edit or save the file to re-sync it.",
+        cls: "setting-item-description",
+    });
+
+    const list = container.createDiv();
+    list.createEl("div", { text: "Loading...", cls: "setting-item-description" });
+
+    void (async () => {
+        const doc = await deps.localDb.getSkippedFiles();
+        const entries = Object.entries(doc.files).sort((a, b) => b[1].sizeMB - a[1].sizeMB);
+        list.empty();
+
+        if (entries.length === 0) {
+            list.createEl("div", {
+                text: "No skipped files.",
+                cls: "setting-item-description",
+            });
+            return;
+        }
+
+        for (const [path, info] of entries) {
+            new Setting(list)
+                .setName(path)
+                .setDesc(`${info.sizeMB} MB — skipped ${formatAge(info.skippedAt)}`)
+                .addButton((btn) =>
+                    btn
+                        .setButtonText("Forget")
+                        .setTooltip("Remove from this list without syncing")
+                        .onClick(async () => {
+                            const current = await deps.localDb.getSkippedFiles();
+                            delete current.files[path];
+                            await deps.localDb.putSkippedFiles(current);
+                            deps.refresh();
+                        }),
+                );
+        }
+    })();
+}
+
+function formatAge(timestamp: number): string {
+    const diffSec = Math.floor((Date.now() - timestamp) / 1000);
+    if (diffSec < 60) return "just now";
+    if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m ago`;
+    if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h ago`;
+    return `${Math.floor(diffSec / 86400)}d ago`;
 }

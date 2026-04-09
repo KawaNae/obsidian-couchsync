@@ -1,15 +1,16 @@
 import { PluginSettingTab, type App } from "obsidian";
 import type CouchSyncPlugin from "../main.ts";
-import { ConnectionTab } from "./connection-tab.ts";
-import { renderFilesTab } from "./files-tab.ts";
+import { VaultSyncTab } from "./vault-sync-tab.ts";
+import { ConfigSyncTab } from "./config-sync-tab.ts";
 import { renderHistoryTab } from "./history-tab.ts";
 import { renderMaintenanceTab } from "./maintenance-tab.ts";
 import { renderStatusTab } from "./status-tab.ts";
 
 export class CouchSyncSettingTab extends PluginSettingTab {
     plugin: CouchSyncPlugin;
-    private activeTabId = "connection";
-    private connectionTab: ConnectionTab | null = null;
+    private activeTabId = "vault-sync";
+    private vaultSyncTab: VaultSyncTab | null = null;
+    private configSyncTab: ConfigSyncTab | null = null;
 
     constructor(app: App, plugin: CouchSyncPlugin) {
         super(app, plugin);
@@ -44,8 +45,8 @@ export class CouchSyncSettingTab extends PluginSettingTab {
         });
 
         const tabs = [
-            { id: "connection", label: "Connection" },
-            { id: "files", label: "Files" },
+            { id: "vault-sync", label: "Vault Sync" },
+            { id: "config-sync", label: "Config Sync" },
             { id: "history", label: "History" },
             { id: "maintenance", label: "Maintenance" },
             { id: "status", label: "CouchDB" },
@@ -77,34 +78,40 @@ export class CouchSyncSettingTab extends PluginSettingTab {
             },
         };
 
-        // ConnectionTab — instance persists across display() for draft state
-        const connectionDeps = {
+        // VaultSyncTab — instance persists across display() for draft state
+        const vaultSyncDeps = {
             ...settingsDeps,
+            app: this.app,
             replicator: this.plugin.replicator,
+            localDb: this.plugin.localDb,
             initVault: () => this.plugin.initVault(),
             cloneFromRemote: () => this.plugin.cloneFromRemote(),
             startSync: () => this.plugin.startSync(),
             stopSync: () => this.plugin.stopSync(),
             refresh: () => this.display(),
         };
-        if (!this.connectionTab) {
-            this.connectionTab = new ConnectionTab(connectionDeps);
+        if (!this.vaultSyncTab) {
+            this.vaultSyncTab = new VaultSyncTab(vaultSyncDeps);
         }
-        const connectionPanel = panels.get("connection");
-        if (connectionPanel) {
-            this.connectionTab.render(connectionPanel);
+        const vaultSyncPanel = panels.get("vault-sync");
+        if (vaultSyncPanel) {
+            this.vaultSyncTab.render(vaultSyncPanel);
         }
 
-        const filesPanel = panels.get("files");
-        if (filesPanel) {
-            renderFilesTab(filesPanel, {
-                ...settingsDeps,
-                configSync: this.plugin.configSync,
-                localDb: this.plugin.localDb,
-                replicator: this.plugin.replicator,
-                app: this.app,
-                refresh: () => this.display(),
-            });
+        // ConfigSyncTab — also persists across display() for draft state
+        const configSyncDeps = {
+            ...settingsDeps,
+            app: this.app,
+            configSync: this.plugin.configSync,
+            replicator: this.plugin.replicator,
+            refresh: () => this.display(),
+        };
+        if (!this.configSyncTab) {
+            this.configSyncTab = new ConfigSyncTab(configSyncDeps);
+        }
+        const configSyncPanel = panels.get("config-sync");
+        if (configSyncPanel) {
+            this.configSyncTab.render(configSyncPanel);
         }
 
         const historyPanel = panels.get("history");
@@ -120,8 +127,10 @@ export class CouchSyncSettingTab extends PluginSettingTab {
             renderMaintenanceTab(maintenancePanel, {
                 ...settingsDeps,
                 localDb: this.plugin.localDb,
+                configLocalDb: this.plugin.configLocalDb,
                 replicator: this.plugin.replicator,
                 conflictResolver: this.plugin.conflictResolver,
+                configConflictResolver: this.plugin.configConflictResolver,
                 statusBar: this.plugin.statusBar,
                 onRestart: () => {
                     const app = this.plugin.app as any;
@@ -146,7 +155,8 @@ export class CouchSyncSettingTab extends PluginSettingTab {
     }
 
     hide(): void {
-        this.connectionTab?.resetDraft();
+        this.vaultSyncTab?.resetDraft();
+        this.configSyncTab?.resetDraft();
     }
 
     private activateTab(wrapper: HTMLElement, tabId: string): void {

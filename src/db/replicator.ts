@@ -2,6 +2,7 @@ import PouchDB from "pouchdb-browser/lib/index.js";
 import type { CouchSyncDoc } from "../types.ts";
 import type { LocalDB } from "./local-db.ts";
 import type { CouchSyncSettings } from "../settings.ts";
+import * as remoteCouch from "./remote-couch.ts";
 
 export type SyncState = "disconnected" | "connected" | "syncing" | "error";
 export type SyncPhase = "idle" | "pulling" | "applying" | "live";
@@ -273,149 +274,40 @@ export class Replicator {
         this.setState("disconnected");
     }
 
-    /** One-shot push: local → remote */
+    /**
+     * One-shot push of the entire vault local DB to the vault remote.
+     * Used by SetupService.init() and similar bootstrap flows. Generic
+     * push/pull/list helpers live in `remote-couch` and are called
+     * directly by ConfigSync against its own remote.
+     */
     async pushToRemote(onProgress?: (docId: string, count: number) => void): Promise<number> {
         const remoteUrl = this.getRemoteUrl();
         const remoteDb = new PouchDB<CouchSyncDoc>(remoteUrl, {});
-        const db = this.localDb.getDb();
-        let total = 0;
-        return new Promise<number>((resolve, reject) => {
-            const replication = db.replicate.to(remoteDb, { batch_size: 100 });
-            replication.on("change", (info) => {
-                if (info.docs) {
-                    for (const doc of info.docs) {
-                        total++;
-                        onProgress?.(doc._id, total);
-                    }
-                }
-            });
-            replication.on("complete", async (info) => {
-                await remoteDb.close();
-                resolve(info.docs_written);
-            });
-            replication.on("error", async (err) => {
-                await remoteDb.close();
-                reject(err);
-            });
-        });
-    }
-
-    /** One-shot pull: remote → local. Returns written count and pulled documents. */
-    async pullFromRemote(
-        onProgress?: (docId: string, count: number) => void,
-    ): Promise<{ written: number; docs: CouchSyncDoc[] }> {
-        const remoteUrl = this.getRemoteUrl();
-        const remoteDb = new PouchDB<CouchSyncDoc>(remoteUrl, {});
-        const db = this.localDb.getDb();
-        let total = 0;
-        const docs: CouchSyncDoc[] = [];
-        return new Promise((resolve, reject) => {
-            const replication = db.replicate.from(remoteDb, { batch_size: 100 });
-            replication.on("change", (info) => {
-                if (info.docs) {
-                    for (const doc of info.docs) {
-                        total++;
-                        docs.push(doc as unknown as CouchSyncDoc);
-                        onProgress?.(doc._id, total);
-                    }
-                }
-            });
-            replication.on("complete", async (info) => {
-                await remoteDb.close();
-                resolve({ written: info.docs_written, docs });
-            });
-            replication.on("error", async (err) => {
-                await remoteDb.close();
-                reject(err);
-            });
-        });
-    }
-
-    /** List remote document IDs matching a prefix (lightweight, no content fetched) */
-    async listRemoteByPrefix(prefix: string): Promise<string[]> {
-        const remoteUrl = this.getRemoteUrl();
-        const remoteDb = new PouchDB<CouchSyncDoc>(remoteUrl, {});
         try {
-            const result = await remoteDb.allDocs({
-                startkey: prefix,
-                endkey: prefix + "\ufff0",
-            });
-            return result.rows.map((row) => row.id);
+            return await remoteCouch.pushAll(this.localDb.getDb(), remoteDb, onProgress);
         } finally {
             await remoteDb.close();
         }
     }
 
-    /** Push specific documents to remote by doc IDs */
-    async pushDocs(
-        docIds: string[],
+    /** One-shot pull of the entire vault remote → local. */
+    async pullFromRemote(
         onProgress?: (docId: string, count: number) => void,
-    ): Promise<number> {
-        if (docIds.length === 0) return 0;
+    ): Promise<{ written: number; docs: CouchSyncDoc[] }> {
         const remoteUrl = this.getRemoteUrl();
         const remoteDb = new PouchDB<CouchSyncDoc>(remoteUrl, {});
-        const db = this.localDb.getDb();
-        let total = 0;
-        return new Promise<number>((resolve, reject) => {
-            const replication = db.replicate.to(remoteDb, {
-                doc_ids: docIds,
-            } as any);
-            replication.on("change", (info) => {
-                if (info.docs) {
-                    for (const doc of info.docs) {
-                        total++;
-                        onProgress?.(doc._id, total);
-                    }
-                }
-            });
-            replication.on("complete", async (info) => {
-                await remoteDb.close();
-                resolve(info.docs_written);
-            });
-            replication.on("error", async (err) => {
-                await remoteDb.close();
-                reject(err);
-            });
-        });
-    }
-
-    /** Pull documents matching ID prefix from remote */
-    async pullByPrefix(prefix: string): Promise<number> {
-        const remoteUrl = this.getRemoteUrl();
-        const remoteDb = new PouchDB<CouchSyncDoc>(remoteUrl, {});
-        const db = this.localDb.getDb();
-
-        const result = await remoteDb.allDocs({
-            startkey: prefix,
-            endkey: prefix + "\ufff0",
-        });
-        const docIds = result.rows.map((row) => row.id);
-
-        if (docIds.length === 0) {
+        try {
+            return await remoteCouch.pullAll(this.localDb.getDb(), remoteDb, onProgress);
+        } finally {
             await remoteDb.close();
-            return 0;
         }
-
-        return new Promise<number>((resolve, reject) => {
-            const replication = db.replicate.from(remoteDb, {
-                doc_ids: docIds,
-            } as any);
-            replication.on("complete", async (info) => {
-                await remoteDb.close();
-                resolve(info.docs_written);
-            });
-            replication.on("error", async (err) => {
-                await remoteDb.close();
-                reject(err);
-            });
-        });
     }
 
-    /** Destroy the remote database (it will be auto-created on next push) */
+    /** Destroy the vault remote database (auto-recreated on next push). */
     async destroyRemote(): Promise<void> {
         const remoteUrl = this.getRemoteUrl();
-        const remoteDb = new PouchDB(remoteUrl, {});
-        await remoteDb.destroy();
+        const remoteDb = new PouchDB<CouchSyncDoc>(remoteUrl, {});
+        await remoteCouch.destroyRemote(remoteDb);
     }
 
     /** Test connection with explicit credentials (for unsaved draft values) */

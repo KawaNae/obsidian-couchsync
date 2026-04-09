@@ -97,7 +97,7 @@ describe("VC integration — two peers over in-memory replication", () => {
         await dbB.getDb().replicate.to(dbA.getDb());
 
         const onConcurrent = vi.fn();
-        const resolver = new ConflictResolver(dbA as any);
+        const resolver = new ConflictResolver(() => dbA.getDb() as any);
         resolver.setOnConcurrent(onConcurrent);
 
         const resolved = await resolver.scanConflicts();
@@ -124,7 +124,7 @@ describe("VC integration — two peers over in-memory replication", () => {
         await dbA.getDb().replicate.to(dbB.getDb());
         await dbB.getDb().replicate.to(dbA.getDb());
 
-        const resolver = new ConflictResolver(dbA as any);
+        const resolver = new ConflictResolver(() => dbA.getDb() as any);
         const onConcurrent = vi.fn();
         resolver.setOnConcurrent(onConcurrent);
 
@@ -170,7 +170,7 @@ describe("VC integration — two peers over in-memory replication", () => {
         const doc = (await dbA.getDb().get(lieId, { conflicts: true })) as any;
         expect(doc._conflicts?.length).toBeGreaterThan(0);
 
-        const resolver = new ConflictResolver(dbA as any);
+        const resolver = new ConflictResolver(() => dbA.getDb() as any);
         const resolved = await resolver.resolveIfConflicted(doc);
         expect(resolved).toBe(true);
 
@@ -273,7 +273,7 @@ describe("VC integration — two peers over in-memory replication", () => {
         );
         const current = (await dbA.getDb().get(makeFileId("edge.md"), { conflicts: true })) as any;
 
-        const resolver = new ConflictResolver(dbA as any);
+        const resolver = new ConflictResolver(() => dbA.getDb() as any);
         const onConcurrent = vi.fn();
         resolver.setOnConcurrent(onConcurrent);
 

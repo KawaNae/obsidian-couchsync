@@ -61,6 +61,14 @@ export interface ChunkDoc extends CouchSyncDocBase {
  *
  *  `_id` is `"config:" + vaultPath` — always constructed via `makeConfigId`.
  *  Config sync is scan-based (explicit rescan/write, not continuous watch).
+ *
+ *  Lives in a SEPARATE PouchDB (`ConfigLocalDB`) and a separate remote
+ *  CouchDB (`couchdbConfigDbName`) — see v0.11.0 design. The vault DB
+ *  must NOT contain `config:*` docs; the config DB must NOT contain
+ *  anything else.
+ *
+ *  Like FileDoc, ordering between concurrent edits within the same
+ *  config pool is decided by `vclock` — never by mtime.
  */
 export interface ConfigDoc extends CouchSyncDocBase {
     type: "config";
@@ -68,6 +76,8 @@ export interface ConfigDoc extends CouchSyncDocBase {
     data: string;
     mtime: number;
     size: number;
+    /** Causal order. Required on all writes. */
+    vclock: VectorClock;
 }
 
 /** Union of all document types stored in PouchDB */

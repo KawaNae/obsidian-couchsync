@@ -15,6 +15,7 @@
 !/src/
 !/tests/
 !/docs/
+!/scripts/
 
 # Allow top-level project metadata and config files.
 !/LICENSE
@@ -37,4 +38,6 @@ meta.json
 meta-*.json
 data.json
 .env
+.env.*
+!scripts/.env.example
 *.local
