@@ -4,6 +4,7 @@ import memoryAdapter from "pouchdb-adapter-memory";
 import { splitIntoChunks } from "../src/db/chunker.ts";
 import { ConflictResolver } from "../src/conflict/conflict-resolver.ts";
 import type { FileDoc, CouchSyncDoc } from "../src/types.ts";
+import { makeFileId } from "../src/types/doc-id.ts";
 
 PouchDB.plugin(memoryAdapter);
 
@@ -27,8 +28,10 @@ function createLocalDB(name: string) {
                 .filter((r): r is any => "doc" in r && r.doc != null)
                 .map((r) => r.doc);
         },
+        // Mirrors production LocalDB.getFileDoc: takes a bare vault path
+        // and wraps with makeFileId internally.
         getFileDoc: async (path: string) => {
-            try { return (await db.get(path)) as FileDoc; }
+            try { return (await db.get(makeFileId(path))) as FileDoc; }
             catch { return null; }
         },
         close: () => db.close(),
@@ -41,18 +44,20 @@ async function createFileDoc(
     path: string,
     content: string,
     mtime: number,
+    vclock: Record<string, number> = { test: 1 },
 ): Promise<FileDoc> {
     const chunks = await splitIntoChunks(new TextEncoder().encode(content).buffer);
     for (const chunk of chunks) {
         await db.put(chunk);
     }
     const fileDoc: FileDoc = {
-        _id: path,
+        _id: makeFileId(path),
         type: "file",
         chunks: chunks.map((c) => c._id),
         mtime,
         ctime: mtime,
         size: content.length,
+        vclock,
     };
     await db.put(fileDoc);
     return fileDoc;
@@ -99,57 +104,57 @@ describe("PouchDB replication", () => {
         await db2.getDb().replicate.to(db1.getDb());
 
         // Check for conflicts on db1
-        const doc = await db1.getDb().get("note.md", { conflicts: true });
+        const doc = await db1.getDb().get(makeFileId("note.md"), { conflicts: true });
         expect(doc._conflicts).toBeDefined();
         expect(doc._conflicts!.length).toBeGreaterThan(0);
     });
 
-    it("ConflictResolver picks newer mtime as winner", async () => {
-        // Setup conflict
-        await createFileDoc(db1, "note.md", "original", 1000);
+    it("ConflictResolver picks the VC-dominator as winner (ignoring mtime)", async () => {
+        // Build a scenario where mtime DISAGREES with VC to prove the
+        // resolver trusts vector clocks, not timestamps. The "old edit"
+        // side has a HIGHER mtime but a DOMINATED vclock. A mtime-based
+        // resolver would pick it wrongly; the VC resolver must not.
+        await createFileDoc(db1, "note.md", "original", 1000, { A: 1 });
         await db1.getDb().replicate.to(db2.getDb());
 
-        await createFileDoc(db1, "note.md", "old edit", 2000);
-        await createFileDoc(db2, "note.md", "new edit", 5000);
+        await createFileDoc(db1, "note.md", "old edit (wrong)", 9999, { A: 2 });
+        await createFileDoc(db2, "note.md", "new edit (right)", 1, { A: 3 });
 
         await db1.getDb().replicate.to(db2.getDb());
         await db2.getDb().replicate.to(db1.getDb());
 
-        // Get doc with conflicts
-        const doc = await db1.getDb().get("note.md", { conflicts: true }) as unknown as CouchSyncDoc;
+        const doc = await db1.getDb().get(makeFileId("note.md"), { conflicts: true }) as unknown as CouchSyncDoc;
 
-        // Resolve
         const resolver = new ConflictResolver(db1 as any);
         const resolved = await resolver.resolveIfConflicted(doc);
         expect(resolved).toBe(true);
 
-        // Winner should have mtime 5000 (newer)
+        // Winner should have vclock A:3 regardless of mtime
         const result = await db1.getFileDoc("note.md");
-        expect(result!.mtime).toBe(5000);
+        expect(result!.vclock).toEqual({ A: 3 });
     });
 
-    it("ConflictResolver calls onConflictResolved with winner and loser", async () => {
-        // Setup conflict
-        await createFileDoc(db1, "note.md", "original", 1000);
+    it("ConflictResolver calls onAutoResolved with winner and losers for dominated conflicts", async () => {
+        await createFileDoc(db1, "note.md", "original", 1000, { A: 1 });
         await db1.getDb().replicate.to(db2.getDb());
 
-        await createFileDoc(db1, "note.md", "old edit", 2000);
-        await createFileDoc(db2, "note.md", "new edit", 5000);
+        await createFileDoc(db1, "note.md", "loser", 2000, { A: 2 });
+        await createFileDoc(db2, "note.md", "winner", 5000, { A: 3 });
 
         await db1.getDb().replicate.to(db2.getDb());
         await db2.getDb().replicate.to(db1.getDb());
 
-        const doc = await db1.getDb().get("note.md", { conflicts: true }) as unknown as CouchSyncDoc;
+        const doc = await db1.getDb().get(makeFileId("note.md"), { conflicts: true }) as unknown as CouchSyncDoc;
 
-        let callbackArgs: { filePath: string; winnerMtime: number; loserMtime: number } | null = null;
+        let callbackArgs: { filePath: string; winnerVC: any; loserCount: number } | null = null;
 
         const resolver = new ConflictResolver(
             db1 as any,
-            async (filePath, winner, loser) => {
+            async (filePath, winner, losers) => {
                 callbackArgs = {
                     filePath,
-                    winnerMtime: winner.mtime,
-                    loserMtime: loser.mtime,
+                    winnerVC: winner.vclock,
+                    loserCount: losers.length,
                 };
             },
         );
@@ -158,8 +163,32 @@ describe("PouchDB replication", () => {
 
         expect(callbackArgs).not.toBeNull();
         expect(callbackArgs!.filePath).toBe("note.md");
-        expect(callbackArgs!.winnerMtime).toBe(5000);
-        expect(callbackArgs!.loserMtime).toBe(2000);
+        expect(callbackArgs!.winnerVC).toEqual({ A: 3 });
+        expect(callbackArgs!.loserCount).toBeGreaterThanOrEqual(1);
+    });
+
+    it("ConflictResolver raises onConcurrent callback when VCs are incomparable", async () => {
+        await createFileDoc(db1, "note.md", "original", 1000, { A: 1 });
+        await db1.getDb().replicate.to(db2.getDb());
+
+        // Device A and B each bump only their own key — pure concurrent edits.
+        await createFileDoc(db1, "note.md", "A's edit", 2000, { A: 2, B: 0 });
+        await createFileDoc(db2, "note.md", "B's edit", 2000, { A: 0, B: 1 });
+
+        await db1.getDb().replicate.to(db2.getDb());
+        await db2.getDb().replicate.to(db1.getDb());
+
+        const doc = await db1.getDb().get(makeFileId("note.md"), { conflicts: true }) as unknown as CouchSyncDoc;
+
+        const concurrentCalls: string[] = [];
+        const resolver = new ConflictResolver(db1 as any);
+        resolver.setOnConcurrent((path) => {
+            concurrentCalls.push(path);
+        });
+
+        const resolved = await resolver.resolveIfConflicted(doc);
+        expect(resolved).toBe(false);
+        expect(concurrentCalls).toContain("note.md");
     });
 });
 

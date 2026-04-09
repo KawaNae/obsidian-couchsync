@@ -3,6 +3,23 @@ import type { LocalDB } from "../db/local-db.ts";
 import type { Replicator } from "../db/replicator.ts";
 import type { VaultSync } from "./vault-sync.ts";
 import type { Reconciler } from "./reconciler.ts";
+import { filePathFromId, parseDocId } from "../types/doc-id.ts";
+
+/**
+ * Format a doc `_id` for progress display. Files show their vault path,
+ * chunks show a truncated hash, configs show their config path. Keeps
+ * the replicator's progress callbacks unopinionated (they pass the raw
+ * `_id`) while still giving users meaningful text in the notice.
+ */
+function formatDocIdForProgress(id: string): string {
+    const parsed = parseDocId(id);
+    switch (parsed.kind) {
+        case "file":   return parsed.path;
+        case "config": return parsed.path;
+        case "chunk":  return `chunk ${parsed.hash.slice(0, 8)}`;
+        default:       return id;
+    }
+}
 
 export interface SetupResult {
     vaultFiles: number;
@@ -33,7 +50,7 @@ export class SetupService {
 
             onProgress("Pushing to remote...");
             const totalDocs = await this.replicator.pushToRemote((docId, n) => {
-                onProgress(`Pushing: ${docId} (${n})`);
+                onProgress(`Pushing: ${formatDocIdForProgress(docId)} (${n})`);
             });
 
             // Initialise manifest + cursor for the new vault state.
@@ -53,19 +70,20 @@ export class SetupService {
 
             onProgress("Pulling from remote...");
             const { written: totalDocs } = await this.replicator.pullFromRemote((docId, n) => {
-                onProgress(`Pulling: ${docId} (${n})`);
+                onProgress(`Pulling: ${formatDocIdForProgress(docId)} (${n})`);
             });
 
             const allFiles = await this.localDb.allFileDocs();
             onProgress(`Writing ${allFiles.length} vault files...`);
             let vaultFiles = 0;
             for (const fileDoc of allFiles) {
+                const vaultPath = filePathFromId(fileDoc._id);
                 try {
-                    onProgress(`Writing: ${fileDoc._id} (${vaultFiles + 1}/${allFiles.length})`);
+                    onProgress(`Writing: ${vaultPath} (${vaultFiles + 1}/${allFiles.length})`);
                     await this.vaultSync.dbToFile(fileDoc);
                     vaultFiles++;
                 } catch (e) {
-                    console.error(`CouchSync: Failed to write ${fileDoc._id}:`, e);
+                    console.error(`CouchSync: Failed to write ${vaultPath}:`, e);
                 }
             }
 

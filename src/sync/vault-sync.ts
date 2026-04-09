@@ -3,19 +3,31 @@ import type { LocalDB } from "../db/local-db.ts";
 import type { FileDoc } from "../types.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { HistoryCapture } from "../history/history-capture.ts";
+import type { ChangeTracker } from "./change-tracker.ts";
 import { splitIntoChunks, joinChunks } from "../db/chunker.ts";
 import { showNotice } from "../ui/notices.ts";
+import { incrementVC } from "./vector-clock.ts";
+import { makeFileId, filePathFromId } from "../types/doc-id.ts";
 
 /**
- * Result of comparing a vault file against a DB file doc.
- *  - identical:    same chunk IDs → no action needed
- *  - local-newer:  vault edit is newer than the DB doc → push (case B local-win)
- *  - remote-newer: DB doc is newer than the vault file → pull (case B remote-win)
+ * Result of comparing a vault file against its local DB record.
+ *
+ * This answers *local drift* ("has the vault diverged from what the DB
+ * thinks?"), NOT cross-device ordering. Cross-device ordering lives in
+ * Vector Clocks and is decided by ConflictResolver against PouchDB's
+ * _conflicts tree. Here, `doc.mtime` is the file's mtime at the moment
+ * of the last fileToDb/dbToFile for this path — a purely local signal
+ * that's safe to compare against `file.stat.mtime`.
+ *
+ *  - identical:       chunk IDs match → no action needed
+ *  - local-unpushed:  chunks differ, vault mtime newer → push
+ *  - remote-pending:  chunks differ, DB mtime newer  → pull
  */
-export type CompareResult = "identical" | "local-newer" | "remote-newer";
+export type CompareResult = "identical" | "local-unpushed" | "remote-pending";
 
 export class VaultSync {
     private historyCapture: HistoryCapture | null = null;
+    private changeTracker: ChangeTracker | null = null;
     /**
      * In-memory mirror of `_local/skipped-files` paths. Initialised lazily on
      * the first `fileToDb` that might touch it, then kept in sync with the
@@ -38,6 +50,15 @@ export class VaultSync {
      */
     setHistoryCapture(historyCapture: HistoryCapture): void {
         this.historyCapture = historyCapture;
+    }
+
+    /**
+     * Inject the ChangeTracker so dbToFile() can mark sync-driven writes as
+     * self-inflicted. Without this wiring, every remote pull would re-enter
+     * fileToDb via Obsidian's modify event and echo back to the peer.
+     */
+    setChangeTracker(changeTracker: ChangeTracker): void {
+        this.changeTracker = changeTracker;
     }
 
     async fileToDb(file: TFile): Promise<void> {
@@ -69,33 +90,42 @@ export class VaultSync {
 
         await this.db.bulkPut(chunks);
 
+        const deviceId = this.getSettings().deviceId;
         const fileDoc: FileDoc = {
-            _id: file.path,
+            _id: makeFileId(file.path),
             type: "file",
             chunks: chunkIds,
             mtime: file.stat.mtime,
             ctime: file.stat.ctime,
             size: file.stat.size,
-            editedAt: Date.now(),
-            editedBy: this.getSettings().deviceId,
+            vclock: incrementVC(existing?.vclock, deviceId),
         };
         await this.db.put(fileDoc);
     }
 
     async dbToFile(fileDoc: FileDoc): Promise<void> {
+        // fileDoc._id is "file:<vaultPath>"; vault operations need the bare
+        // path. Extract it once at the top so the rest of the body isn't
+        // littered with slice() calls.
+        const vaultPath = filePathFromId(fileDoc._id);
+
         if (fileDoc.deleted) {
-            const existing = this.app.vault.getAbstractFileByPath(fileDoc._id);
+            const existing = this.app.vault.getAbstractFileByPath(vaultPath);
             if (existing) {
+                this.changeTracker?.ignoreDelete(vaultPath);
                 await this.app.vault.delete(existing);
             }
             return;
         }
 
-        const existing = this.app.vault.getAbstractFileByPath(fileDoc._id);
+        const existing = this.app.vault.getAbstractFileByPath(vaultPath);
 
         if (existing && "stat" in existing) {
             const cmp = await this.compareFileToDoc(fileDoc, existing as TFile);
-            if (cmp !== "remote-newer") return;
+            // Skip if identical or if the vault has unpushed local edits
+            // ChangeTracker will catch. Only overwrite when the remote doc
+            // is ahead of what the local vault currently holds.
+            if (cmp !== "remote-pending") return;
         }
 
         // Apply remote content to vault
@@ -107,21 +137,33 @@ export class VaultSync {
             .filter((c): c is NonNullable<typeof c> => c != null);
 
         if (orderedChunks.length !== fileDoc.chunks.length) {
-            console.warn(`CouchSync: Missing chunks for ${fileDoc._id}`);
+            console.warn(`CouchSync: Missing chunks for ${vaultPath}`);
             return;
         }
 
         const content = joinChunks(orderedChunks);
 
+        // Mark the upcoming write as sync-driven so ChangeTracker drops the
+        // resulting modify event instead of echoing it back into fileToDb.
+        // clearIgnore in the finally block handles the no-op write case.
+        this.changeTracker?.ignoreWrite(vaultPath);
+
         let writtenFile: TFile | null = null;
-        if (existing) {
-            await this.app.vault.modifyBinary(existing as TFile, content);
-            writtenFile = existing as TFile;
-        } else {
-            await this.ensureParentDir(fileDoc._id);
-            await this.app.vault.createBinary(fileDoc._id, content);
-            const created = this.app.vault.getAbstractFileByPath(fileDoc._id);
-            if (created && "extension" in created) writtenFile = created as TFile;
+        try {
+            if (existing) {
+                await this.app.vault.modifyBinary(existing as TFile, content);
+                writtenFile = existing as TFile;
+            } else {
+                await this.ensureParentDir(vaultPath);
+                await this.app.vault.createBinary(vaultPath, content);
+                const created = this.app.vault.getAbstractFileByPath(vaultPath);
+                if (created && "extension" in created) writtenFile = created as TFile;
+            }
+        } finally {
+            // If the modify event never fired (e.g. the write was a no-op
+            // because content matched), drop the stale fingerprint so a
+            // later unrelated edit isn't silently ignored.
+            this.changeTracker?.clearIgnore(vaultPath);
         }
 
         // Record this sync-driven write as a history entry. captureSyncWrite
@@ -133,13 +175,17 @@ export class VaultSync {
     }
 
     /**
-     * Compare a local vault file against a remote/DB file doc.
+     * Compare a vault file against its local DB record to detect drift.
      *
-     * Step 1: Content — chunk IDs match → identical
-     * Step 2: Freshness — local mtime vs editedAt (the user-edit timestamp,
-     *         not the relay mtime that gets laundered through intermediates)
+     * Step 1 — chunk equality: if every chunk ID matches, the content is
+     * identical and no further comparison is needed.
      *
-     * `dbToFile` and the Reconciler both branch on this 3-value result.
+     * Step 2 — mtime comparison as a *local* signal: `fileDoc.mtime` is
+     * the vault file's mtime at the moment of the last fileToDb/dbToFile
+     * for this path. Comparing it against the vault file's current
+     * `stat.mtime` answers "has anything touched this file locally since
+     * we last synced it?". This is NOT cross-device ordering (VCs do
+     * that); it's purely local filesystem drift detection.
      */
     async compareFileToDoc(fileDoc: FileDoc, localFile: TFile): Promise<CompareResult> {
         if (localFile.stat.size === fileDoc.size) {
@@ -153,8 +199,7 @@ export class VaultSync {
                 return "identical";
             }
         }
-        const remoteEditedAt = fileDoc.editedAt ?? fileDoc.mtime;
-        return localFile.stat.mtime > remoteEditedAt ? "local-newer" : "remote-newer";
+        return localFile.stat.mtime > fileDoc.mtime ? "local-unpushed" : "remote-pending";
     }
 
     async markDeleted(path: string): Promise<void> {
@@ -162,6 +207,7 @@ export class VaultSync {
         if (existing) {
             existing.deleted = true;
             existing.mtime = Date.now();
+            existing.vclock = incrementVC(existing.vclock, this.getSettings().deviceId);
             await this.db.put(existing);
         }
     }

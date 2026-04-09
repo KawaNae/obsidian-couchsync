@@ -16,65 +16,77 @@ obsidian-couchsyncはobsidian-livesyncのフォークだが、サブモジュー
 
 ## ドキュメントフォーマット
 
+### ID 体系（統一）
+
+すべての replicated ドキュメントは `<kind>:<payload>` 形式のプレフィックス付き `_id` を持つ。PouchDB 予約の `_local/<name>` は尊重し、それ以外に bare な `_id` は存在しない。生成・判定・パースは `src/types/doc-id.ts` の単一モジュールに集約し、呼び出し側は生の `startsWith` / `slice` を使ってはならない。
+
+```
+file:<vaultPath>      FileDoc    例: file:notes/hello.md
+chunk:<xxhash64>      ChunkDoc   例: chunk:a1b2c3d4...
+config:<vaultPath>    ConfigDoc  例: config:.obsidian/appearance.json
+_local/<name>         PouchDB reserved（非レプリケート）
+```
+
+3 プレフィックスは lexicographically disjoint（`chunk:` < `config:` < `file:`）。`allDocs({ startkey, endkey })` で種別ごとの range query が成立する。
+
+### VectorClock（因果順序）
+```typescript
+type VectorClock = Record<string, number>; // deviceId → logical counter
+```
+すべての replicated ドキュメントは `vclock` を必須で持つ。順序判定は Vector Clock のみで行い、`mtime` / `ctime` は表示用メタデータとしてのみ保持する（last-write-wins には使わない）。
+
 ### FileDoc（ノート・画像・添付ファイル）
 ```typescript
 interface FileDoc {
-  _id: string;              // ファイルパス "notes/hello.md"
+  _id: string;              // makeFileId(path) = "file:<vaultPath>"
   _rev?: string;
   type: "file";
   chunks: string[];         // ["chunk:<hash1>", "chunk:<hash2>"]
-  mtime: number;
-  ctime: number;
+  mtime: number;            // 表示用のみ。順序付けには使わない
+  ctime: number;            // 表示用のみ
   size: number;
   deleted?: boolean;
+  vclock: VectorClock;      // 因果順序。必須
 }
 ```
 
 ### ChunkDoc（ファイルの断片）
 ```typescript
 interface ChunkDoc {
-  _id: string;              // "chunk:<hash>"
+  _id: string;              // makeChunkId(hash) = "chunk:<hash>"
   _rev?: string;
   type: "chunk";
   data: string;             // base64
 }
 ```
 
-### HiddenFileDoc（.obsidian/配下）
+### ConfigDoc（`.obsidian/` 配下のファイル）
+
+`.obsidian/` 配下のテーマ・スニペット・プラグイン設定を含む、vault 直下のドット始まり領域を扱う。scan-based sync（常駐監視ではなく明示的な rescan/write）。
+
 ```typescript
-interface HiddenFileDoc {
-  _id: string;              // "hidden:<path>"
+interface ConfigDoc {
+  _id: string;              // makeConfigId(path) = "config:<vaultPath>"
   _rev?: string;
-  type: "hidden";
-  data: string;
-  mtime: number;
+  type: "config";
+  data: string;             // base64
+  mtime: number;            // 表示用のみ
   size: number;
   deleted?: boolean;
+  vclock: VectorClock;      // 必須
 }
 ```
 
-### PluginConfigDoc（プラグイン設定）
-```typescript
-interface PluginConfigDoc {
-  _id: string;              // "plugin:<pluginId>/<filename>"
-  _rev?: string;
-  type: "plugin-config";
-  data: string;
-  mtime: number;
-  deviceName: string;
-  deleted?: boolean;
-}
-```
+> **設計メモ**: 初期案では `HiddenFileDoc` と `PluginConfigDoc` を分離する構想があったが、両者とも「vault 直下のドット始まりファイルを base64 で保存」という同一ストレージ形状のため `ConfigDoc` に統合した。将来プラグイン設定固有の振る舞い（deviceName 付与など）が必要になった時点で専用の doc type を切り出す。
 
-### SyncMetaDoc（ローカル専用メタデータ）
-```typescript
-interface SyncMetaDoc {
-  _id: "_local/sync-meta";
-  deviceId: string;
-  deviceName: string;
-  lastSync: number;
-}
-```
+### ローカル専用メタデータ
+
+`_local/<name>` プレフィックスの PouchDB 予約空間に置く。複製されない：
+- `_local/scan-cursor` — Reconciler の fast-path で使う前回スキャン情報
+- `_local/vault-manifest` — 削除検出用の vault パス集合スナップショット
+- `_local/skipped-files` — `maxFileSizeMB` を超えて同期除外されたファイル一覧
+
+`deviceId` は PouchDB ではなく Obsidian の `data.json` (plugin settings) に保存する。専用の `_local` ドキュメントは持たない。
 
 ---
 
@@ -84,6 +96,8 @@ interface SyncMetaDoc {
 src/
 ├── main.ts                    — Plugin entry, サービス初期化
 ├── types.ts                   — 全ドキュメント型・共通型
+├── types/
+│   └── doc-id.ts              — _id 生成・判定・パースの単一 source of truth
 ├── settings.ts                — Settings interface + defaults
 ├── settings-tab/
 │   ├── index.ts               — SettingTab (task-viewerタブパターン)
@@ -201,13 +215,24 @@ vault-sync.fileToDb() 内で:
 
 ## コンフリクト解決
 
-### 自動解決（デフォルト）
-- mtime が新しい方を採用
-- 同じmtime → _rev が大きい方を採用
+### Vector Clock による因果判定
+
+全ドキュメントは `vclock: VectorClock`（`Record<deviceId, counter>`）を持ち、書き込みごとに当該デバイスの counter を increment する。2 つの revision を比較する関数 `compareVC(a, b)` は以下のいずれかを返す：
+
+- `equal` — 完全一致
+- `dominates` — a が b を包含（`a ≥ b` かつ少なくとも 1 つ `>`）
+- `dominated` — b が a を包含
+- `concurrent` — 比較不能（並行編集）
+
+### 自動解決
+- `dominates` / `dominated`: 勝者を一意に決められるため安全に採用
+- 敗者側 revision は PouchDB の conflict ツリーから除去
+- `mtime` 比較は一切行わない（クロックスキュー・遅延耐性のため）
 
 ### 手動解決
-- conflict-modal で Side-by-side 差分表示
-- 「Local」「Remote」「マージ（結合）」の3択
+- `concurrent` の場合のみ conflict-modal を開く
+- Side-by-side 差分表示で「Local」「Remote」「マージ（結合）」の 3 択
+- 解決時は両辺の VC を `mergeVC` で統合した上で当該デバイスの counter を increment → 単一書き込みが両辺を dominate するため再発生しない
 - Notice でコンフリクト発生を通知、モーダルで解決
 
 ---

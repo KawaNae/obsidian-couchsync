@@ -9,6 +9,18 @@ export class ChangeTracker {
     private paused = false;
     private pendingQueue: TFile[] = [];
     private eventRefs: ReturnType<App["vault"]["on"]>[] = [];
+    /**
+     * Paths whose next `modify` / `create` event should be treated as a
+     * sync-driven echo and dropped. VaultSync.dbToFile registers the path
+     * before calling vault.modifyBinary; Obsidian fires the resulting modify
+     * event synchronously during the write, so by the time modifyBinary's
+     * promise resolves the token has already been consumed. If the event
+     * never fires (e.g. the write was a no-op), dbToFile's finally block
+     * clears the stale token to avoid suppressing a later user edit.
+     */
+    private pendingWriteIgnores = new Set<string>();
+    /** Paths whose next `delete` event should be treated as sync-driven. */
+    private pendingDeleteIgnores = new Set<string>();
 
     constructor(
         private app: App,
@@ -20,6 +32,7 @@ export class ChangeTracker {
         this.eventRefs.push(
             this.app.vault.on("modify", (file) => {
                 if (file instanceof Object && "path" in file && "stat" in file) {
+                    if (this.pendingWriteIgnores.delete(file.path)) return;
                     this.scheduleSync(file as TFile);
                 }
             })
@@ -28,6 +41,7 @@ export class ChangeTracker {
         this.eventRefs.push(
             this.app.vault.on("create", (file) => {
                 if (file instanceof Object && "stat" in file) {
+                    if (this.pendingWriteIgnores.delete((file as TFile).path)) return;
                     this.scheduleSync(file as TFile);
                 }
             })
@@ -37,6 +51,7 @@ export class ChangeTracker {
             this.app.vault.on("delete", (file) => {
                 this.cancelPending(file.path);
                 this.lastSyncTime.delete(file.path);
+                if (this.pendingDeleteIgnores.delete(file.path)) return;
                 if (!this.paused) {
                     this.vaultSync.markDeleted(file.path);
                 }
@@ -76,6 +91,26 @@ export class ChangeTracker {
         for (const file of queued) {
             this.scheduleSync(file);
         }
+    }
+
+    /**
+     * Mark the next `modify` / `create` event on `path` as sync-driven so
+     * the change handler drops it instead of enqueuing a push. Callers MUST
+     * pair this with clearIgnore() in a finally block to avoid leaking a
+     * stale token when the write is a no-op (content unchanged, no event).
+     */
+    ignoreWrite(path: string): void {
+        this.pendingWriteIgnores.add(path);
+    }
+
+    /** Register that the next `delete` event on `path` is sync-driven. */
+    ignoreDelete(path: string): void {
+        this.pendingDeleteIgnores.add(path);
+    }
+
+    /** Drop any pending write ignore for `path`. Safe to call redundantly. */
+    clearIgnore(path: string): void {
+        this.pendingWriteIgnores.delete(path);
     }
 
     private scheduleSync(file: TFile): void {

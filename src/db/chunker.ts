@@ -1,5 +1,5 @@
 import type { ChunkDoc } from "../types.ts";
-import { DOC_PREFIX } from "../types.ts";
+import { makeChunkId } from "../types/doc-id.ts";
 
 const MAX_CHUNK_SIZE = 100 * 1024; // 100KB in base64 characters
 
@@ -82,7 +82,7 @@ export async function splitIntoChunks(content: ArrayBuffer): Promise<ChunkDoc[]>
     for (const piece of pieces) {
         const hash = await computeHash(piece);
         chunks.push({
-            _id: `${DOC_PREFIX.CHUNK}${hash}`,
+            _id: makeChunkId(hash),
             type: "chunk",
             data: piece,
         });

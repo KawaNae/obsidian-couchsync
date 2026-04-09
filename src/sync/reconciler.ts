@@ -3,7 +3,15 @@ import type { LocalDB, VaultManifest } from "../db/local-db.ts";
 import type { VaultSync, CompareResult } from "./vault-sync.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { FileDoc } from "../types.ts";
+import { latestDevice } from "./vector-clock.ts";
+import { filePathFromId } from "../types/doc-id.ts";
 
+/**
+ * Margin absorbing local filesystem clock jitter when asking "has any vault
+ * file been touched since the last scan?". This is *local* drift detection,
+ * not cross-device ordering — the latter is handled entirely by Vector
+ * Clocks in ConflictResolver.
+ */
 const CLOCK_SKEW_MARGIN_MS = 5000;
 const LARGE_DELETE_RATIO = 0.1;
 
@@ -85,7 +93,7 @@ export function totalDiscrepancies(report: ReconcileReport): number {
  *
  * Combines what was previously split between CatchUpScanner (vault → DB) and
  * VaultSync.reconcile (DB → vault), and adds delete detection (case D) using
- * a vault manifest plus the editedBy field.
+ * a vault manifest plus the vclock's latest-writer device.
  *
  * Triggered on plugin load, sync toggle, network reconnect, init/clone
  * completion, replicator pause, and the manual verify-consistency command.
@@ -169,9 +177,14 @@ export class Reconciler {
         }
 
         // Slow path: scan the union of vault and DB and process every path.
+        // Both maps MUST be keyed by bare vault path. `FileDoc._id` carries
+        // a "file:" prefix after the ID redesign, so we strip it here via
+        // filePathFromId — keying dbByPath raw would put the two maps in
+        // disjoint key spaces and cause every file to be mis-classified
+        // as both "push" and "delete" (the 227-file regression bug).
         const vaultByPath = new Map(vaultFiles.map((f) => [f.path, f]));
         const dbDocs = await this.localDb.allFileDocs();
-        const dbByPath = new Map(dbDocs.map((d) => [d._id, d]));
+        const dbByPath = new Map(dbDocs.map((d) => [filePathFromId(d._id), d]));
         const allPaths = new Set<string>([...vaultByPath.keys(), ...dbByPath.keys()]);
         const deviceId = this.getSettings().deviceId;
 
@@ -220,7 +233,7 @@ export class Reconciler {
                 }
                 if (cmp === "identical") {
                     report.inSync++;
-                } else if (cmp === "local-newer") {
+                } else if (cmp === "local-unpushed") {
                     if (await this.tryStep(path, "push", () => this.vaultSync.fileToDb(file), mode)) {
                         report.localWins.push(path);
                     }
@@ -315,10 +328,13 @@ export class Reconciler {
     /**
      * Hybrid rule for "vault doesn't have it × DB alive":
      *
-     *   editedBy === self                        → this device deleted it
-     *   editedBy !== self & path in manifest     → this device once had it, now removed → deleted
-     *   editedBy !== self & path not in manifest → another device created it, never seen here → restore
-     *   manifest === null (first run)            → always restore (safe side)
+     *   last-writer === self                         → this device deleted it
+     *   last-writer !== self & path in manifest      → this device once had it, now removed → deleted
+     *   last-writer !== self & path not in manifest  → another device created it, never seen here → restore
+     *   manifest === null (first run)                → always restore (safe side)
+     *
+     * "last-writer" is derived from the doc's vclock — the device whose
+     * counter is highest is the one that made the most recent write.
      */
     private classifyMissingFromVault(
         doc: FileDoc,
@@ -326,8 +342,10 @@ export class Reconciler {
         manifestPaths: Set<string> | null,
     ): "delete" | "restore" {
         if (manifestPaths === null) return "restore";
-        if (doc.editedBy && doc.editedBy === deviceId) return "delete";
-        if (manifestPaths.has(doc._id)) return "delete";
+        const lastWriter = latestDevice(doc.vclock ?? {});
+        if (lastWriter === deviceId) return "delete";
+        // Manifest stores bare vault paths; doc._id is "file:<path>".
+        if (manifestPaths.has(filePathFromId(doc._id))) return "delete";
         return "restore";
     }
 }

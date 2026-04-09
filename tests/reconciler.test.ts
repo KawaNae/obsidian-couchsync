@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { Reconciler, totalDiscrepancies } from "../src/sync/reconciler.ts";
 import type { ScanCursor, VaultManifest } from "../src/db/local-db.ts";
 import type { FileDoc } from "../src/types.ts";
+import { makeFileId, filePathFromId } from "../src/types/doc-id.ts";
 
 const SELF = "device-self";
 const OTHER = "device-other";
@@ -15,19 +16,31 @@ function makeFile(path: string, mtime: number, size = 100): FakeFile {
     return { path, stat: { mtime, ctime: mtime, size } };
 }
 
+/**
+ * Build a FileDoc for tests in the PRODUCTION shape: `_id` is always
+ * `"file:" + path`. Test fixtures that assert or key on vault paths
+ * continue to use the bare path — it's only the stored document
+ * that carries the prefix, mirroring what `LocalDB.allFileDocs()`
+ * returns in production.
+ *
+ * `lastWriter` becomes the only key in the vclock (counter 1), so
+ * reconciler.classifyMissingFromVault sees it as the latest-writing
+ * device — functionally equivalent to the old `editedBy` field but
+ * using the VC as the source of truth.
+ */
 function makeDoc(
     path: string,
-    overrides: Partial<FileDoc> & { editedBy?: string; deleted?: boolean } = {},
+    overrides: Partial<FileDoc> & { lastWriter?: string; deleted?: boolean } = {},
 ): FileDoc {
+    const lastWriter = overrides.lastWriter ?? SELF;
     return {
-        _id: path,
+        _id: makeFileId(path),
         type: "file",
-        chunks: ["chunk:abc"],
+        chunks: overrides.chunks ?? ["chunk:abc"],
         mtime: overrides.mtime ?? 1000,
         ctime: 1000,
         size: overrides.size ?? 100,
-        editedAt: overrides.editedAt ?? 1000,
-        editedBy: overrides.editedBy ?? SELF,
+        vclock: overrides.vclock ?? { [lastWriter]: 1 },
         deleted: overrides.deleted,
     };
 }
@@ -53,13 +66,13 @@ class FakeLocalDb {
     }
 }
 
-type CompareResult = "identical" | "local-newer" | "remote-newer";
+type CompareResult = "identical" | "local-unpushed" | "remote-pending";
 
 interface FakeVaultSync {
     fileToDbCalls: string[];
     dbToFileCalls: string[];
     markDeletedCalls: string[];
-    /** Per-path comparison override. Default if absent: compare mtime vs editedAt. */
+    /** Per-path comparison override. Tests must set this explicitly. */
     compareResults: Map<string, CompareResult>;
     fileToDb(file: { path: string }): Promise<void>;
     dbToFile(doc: FileDoc): Promise<void>;
@@ -74,12 +87,17 @@ function makeVaultSync(): FakeVaultSync {
         markDeletedCalls: [],
         compareResults: new Map(),
         async fileToDb(file) { this.fileToDbCalls.push(file.path); },
-        async dbToFile(doc) { this.dbToFileCalls.push(doc._id); },
+        // Record the bare vault path (not the prefixed _id) so tests can
+        // keep asserting `expect(dbToFileCalls).toEqual(["a.md"])`.
+        async dbToFile(doc) { this.dbToFileCalls.push(filePathFromId(doc._id)); },
         async markDeleted(path) { this.markDeletedCalls.push(path); },
         async compareFileToDoc(doc, _file) {
-            const override = this.compareResults.get(doc._id);
+            // Fake honours compareResults keyed by vault path — extract
+            // from the prefixed _id to match how tests register overrides.
+            const key = filePathFromId(doc._id);
+            const override = this.compareResults.get(key);
             if (override === undefined) {
-                throw new Error(`test missing compareResults for ${doc._id}`);
+                throw new Error(`test missing compareResults for ${key}`);
             }
             return override;
         },
@@ -105,7 +123,7 @@ describe("Reconciler", () => {
     describe("Case A: vault & DB match", () => {
         it("does nothing when content is identical", async () => {
             const h = setup([makeFile("a.md", 1000)]);
-            h.db.fileDocs.set("a.md", makeDoc("a.md", { editedBy: SELF }));
+            h.db.fileDocs.set("a.md", makeDoc("a.md", { lastWriter: SELF }));
             h.db.manifest = { paths: ["a.md"], updatedAt: 0 };
             h.vaultSync.compareResults.set("a.md", "identical");
 
@@ -120,9 +138,9 @@ describe("Reconciler", () => {
     describe("Case B: content differs", () => {
         it("local-win when vault is newer", async () => {
             const h = setup([makeFile("a.md", 5000)]);
-            h.db.fileDocs.set("a.md", makeDoc("a.md", { editedAt: 3000 }));
+            h.db.fileDocs.set("a.md", makeDoc("a.md", { mtime: 3000 }));
             h.db.manifest = { paths: ["a.md"], updatedAt: 0 };
-            h.vaultSync.compareResults.set("a.md", "local-newer");
+            h.vaultSync.compareResults.set("a.md", "local-unpushed");
 
             const r = await h.reconciler.reconcile("manual");
             expect(r.localWins).toEqual(["a.md"]);
@@ -131,9 +149,9 @@ describe("Reconciler", () => {
 
         it("remote-win when remote is newer", async () => {
             const h = setup([makeFile("a.md", 1000)]);
-            h.db.fileDocs.set("a.md", makeDoc("a.md", { editedAt: 5000 }));
+            h.db.fileDocs.set("a.md", makeDoc("a.md", { mtime: 5000 }));
             h.db.manifest = { paths: ["a.md"], updatedAt: 0 };
-            h.vaultSync.compareResults.set("a.md", "remote-newer");
+            h.vaultSync.compareResults.set("a.md", "remote-pending");
 
             const r = await h.reconciler.reconcile("manual");
             expect(r.remoteWins).toEqual(["a.md"]);
@@ -146,9 +164,9 @@ describe("Reconciler", () => {
             // the underlying skip predicate returned true for both "identical"
             // and "vault newer" reasons. The 3-value compareFileToDoc fixes it.
             const h = setup([makeFile("note.md", 9999)]);
-            h.db.fileDocs.set("note.md", makeDoc("note.md", { editedAt: 1000, editedBy: SELF }));
+            h.db.fileDocs.set("note.md", makeDoc("note.md", { mtime: 1000, lastWriter: SELF }));
             h.db.manifest = { paths: ["note.md"], updatedAt: 0 };
-            h.vaultSync.compareResults.set("note.md", "local-newer");
+            h.vaultSync.compareResults.set("note.md", "local-unpushed");
 
             const r = await h.reconciler.reconcile("reconnect");
             expect(r.localWins).toEqual(["note.md"]);
@@ -177,7 +195,7 @@ describe("Reconciler", () => {
     describe("Case D: vault missing, DB alive (the main bug fix)", () => {
         it("deletes when editedBy === self", async () => {
             const h = setup([]);
-            h.db.fileDocs.set("a.md", makeDoc("a.md", { editedBy: SELF }));
+            h.db.fileDocs.set("a.md", makeDoc("a.md", { lastWriter: SELF }));
             h.db.manifest = { paths: ["a.md"], updatedAt: 0 };
             const r = await h.reconciler.reconcile("manual");
             expect(r.deleted).toEqual(["a.md"]);
@@ -186,7 +204,7 @@ describe("Reconciler", () => {
 
         it("deletes when editedBy === other but manifest had the path", async () => {
             const h = setup([]);
-            h.db.fileDocs.set("a.md", makeDoc("a.md", { editedBy: OTHER }));
+            h.db.fileDocs.set("a.md", makeDoc("a.md", { lastWriter: OTHER }));
             h.db.manifest = { paths: ["a.md"], updatedAt: 0 };
             const r = await h.reconciler.reconcile("manual");
             expect(r.deleted).toEqual(["a.md"]);
@@ -194,7 +212,7 @@ describe("Reconciler", () => {
 
         it("restores when editedBy === other AND manifest didn't have the path", async () => {
             const h = setup([]);
-            h.db.fileDocs.set("a.md", makeDoc("a.md", { editedBy: OTHER }));
+            h.db.fileDocs.set("a.md", makeDoc("a.md", { lastWriter: OTHER }));
             h.db.manifest = { paths: [], updatedAt: 0 };
             const r = await h.reconciler.reconcile("manual");
             expect(r.restored).toEqual(["a.md"]);
@@ -204,7 +222,7 @@ describe("Reconciler", () => {
 
         it("manifest null falls back to restore (safe side, R1)", async () => {
             const h = setup([]);
-            h.db.fileDocs.set("a.md", makeDoc("a.md", { editedBy: SELF }));
+            h.db.fileDocs.set("a.md", makeDoc("a.md", { lastWriter: SELF }));
             // No manifest set
             const r = await h.reconciler.reconcile("manual");
             expect(r.restored).toEqual(["a.md"]);
@@ -260,7 +278,7 @@ describe("Reconciler", () => {
 
         it("does not short-circuit when manifest doesn't match vault (delete pending)", async () => {
             const h = setup([]);
-            h.db.fileDocs.set("a.md", makeDoc("a.md", { editedBy: SELF }));
+            h.db.fileDocs.set("a.md", makeDoc("a.md", { lastWriter: SELF }));
             h.db.cursor = {
                 lastScanStartedAt: Date.now() + 60_000,
                 lastScanCompletedAt: Date.now() + 60_000,
@@ -277,7 +295,7 @@ describe("Reconciler", () => {
     describe("modes", () => {
         it("report mode does not apply changes", async () => {
             const h = setup([makeFile("new.md", 1000)]);
-            h.db.fileDocs.set("old.md", makeDoc("old.md", { editedBy: SELF }));
+            h.db.fileDocs.set("old.md", makeDoc("old.md", { lastWriter: SELF }));
             h.db.manifest = { paths: ["old.md"], updatedAt: 0 };
 
             const r = await h.reconciler.reconcile("manual", { mode: "report" });
@@ -316,7 +334,7 @@ describe("Reconciler", () => {
             const manifestPaths = files.map((f) => f.path);
             for (let i = 0; i < 15; i++) {
                 const p = `gone-${i}.md`;
-                h.db.fileDocs.set(p, makeDoc(p, { editedBy: SELF }));
+                h.db.fileDocs.set(p, makeDoc(p, { lastWriter: SELF }));
                 manifestPaths.push(p);
             }
             for (const f of files) h.db.fileDocs.set(f.path, makeDoc(f.path));
@@ -349,6 +367,64 @@ describe("Reconciler", () => {
             await h.reconciler.reconcile("manual");
             expect(h.db.manifest).not.toBeNull();
             expect(new Set(h.db.manifest!.paths)).toEqual(new Set(["a.md", "b.md"]));
+        });
+    });
+
+    /**
+     * Regression test for the 227-file "push AND delete" bug.
+     *
+     * Background: after the ID redesign, `LocalDB.allFileDocs()` returns
+     * FileDocs whose `_id` is `"file:" + vaultPath`. The reconciler used
+     * to key its `dbByPath` map directly by `d._id`, which no longer
+     * matches `vaultByPath` keys (bare vault paths). The result was that
+     * every file got counted twice — once as Case C (push, missing from
+     * DB) and once as Case D (delete, missing from vault).
+     *
+     * This test drives the reconciler with docs in the PRODUCTION shape
+     * (`_id: makeFileId(path)`) and asserts that a fully-synced vault
+     * requires zero changes.
+     */
+    describe("regression: prefixed FileDoc._id (production shape)", () => {
+        it("zero changes when vault, DB (prefixed _ids) and manifest all align", async () => {
+            // Simulate production: same N files in vault, DB, and manifest.
+            const N = 227;
+            const files: FakeFile[] = [];
+            for (let i = 0; i < N; i++) files.push(makeFile(`notes/f-${i}.md`, 1000));
+            const h = setup(files);
+
+            // Production writes FileDocs with prefixed _ids. The fake
+            // LocalDB is keyed by bare path internally (mirroring
+            // LocalDB.getFileDoc(path)) but the STORED FileDoc carries
+            // the prefixed _id — which is what `allFileDocs()` yields.
+            for (const f of files) {
+                const doc: FileDoc = {
+                    _id: makeFileId(f.path),
+                    type: "file",
+                    chunks: ["chunk:abc"],
+                    mtime: 1000,
+                    ctime: 1000,
+                    size: 100,
+                    vclock: { [SELF]: 1 },
+                };
+                h.db.fileDocs.set(f.path, doc);
+                h.vaultSync.compareResults.set(f.path, "identical");
+            }
+            h.db.manifest = { paths: files.map((f) => f.path), updatedAt: 0 };
+
+            const r = await h.reconciler.reconcile("manual");
+
+            // No churn: every file is already in sync.
+            expect(r.pushed).toEqual([]);
+            expect(r.deleted).toEqual([]);
+            expect(r.localWins).toEqual([]);
+            expect(r.remoteWins).toEqual([]);
+            expect(r.restored).toEqual([]);
+            expect(r.inSync).toBe(N);
+            expect(totalDiscrepancies(r)).toBe(0);
+
+            // And — the safety net assertion: no "Large deletion detected"
+            // notification, which is what alerted us to the original bug.
+            expect(h.notifyCalls.some((m) => m.includes("Large deletion"))).toBe(false);
         });
     });
 });

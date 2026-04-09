@@ -1,7 +1,14 @@
 // Use CJS entry directly — ESM entry's `export default` breaks in esbuild CJS output
 import PouchDB from "pouchdb-browser/lib/index.js";
 import type { CouchSyncDoc, FileDoc, ChunkDoc } from "../types.ts";
-import { DOC_PREFIX } from "../types.ts";
+import {
+    ID_RANGE,
+    makeFileId,
+    isFileDocId,
+    isChunkDocId,
+    isConfigDocId,
+    isReplicatedDocId,
+} from "../types/doc-id.ts";
 
 /** Local-only catch-up scan cursor (not replicated). */
 export interface ScanCursor {
@@ -64,6 +71,61 @@ export class LocalDB {
         return this.db;
     }
 
+    /**
+     * Probe for documents that don't conform to the current schema.
+     * Returns the `_id` of the first offender, or null if the database
+     * is empty / fully current. Used by plugin startup to gate the
+     * replicator until the user rebuilds via Maintenance.
+     *
+     * Detection covers three schema breaks that were shipped together:
+     *   - **Bare-path FileDoc** (pre ID-redesign): `_id` lacks the
+     *     `file:` / `chunk:` / `config:` / `_` prefix entirely.
+     *   - **Missing vclock** (pre Vector Clock): any FileDoc whose
+     *     `vclock` is absent or empty.
+     *   - **Legacy `binary` field** (pre all-binary ConfigDoc): any
+     *     ConfigDoc still carrying the deprecated `binary` boolean.
+     *
+     * Cost: one allDocs() page; doc bodies only loaded when a
+     * candidate id needs verification.
+     */
+    async findLegacyFileDoc(): Promise<string | null> {
+        const idResult = await this.getDb().allDocs({ limit: 200 });
+        for (const row of idResult.rows) {
+            // PouchDB-reserved (_local, _design) — never legacy.
+            if (row.id.startsWith("_")) continue;
+
+            // Any replicated-space id without a known prefix is legacy.
+            if (!isReplicatedDocId(row.id)) return row.id;
+
+            if (isFileDocId(row.id)) {
+                try {
+                    const doc = (await this.getDb().get(row.id)) as unknown as FileDoc;
+                    if (doc.type !== "file") continue;
+                    if (!doc.vclock || Object.keys(doc.vclock).length === 0) {
+                        return row.id;
+                    }
+                    return null; // first valid FileDoc → schema is current
+                } catch {
+                    continue;
+                }
+            }
+
+            if (isConfigDocId(row.id)) {
+                try {
+                    const doc = (await this.getDb().get(row.id)) as unknown as Record<string, unknown>;
+                    if ("binary" in doc) return row.id;
+                    return null;
+                } catch {
+                    continue;
+                }
+            }
+
+            // Chunks don't carry schema-breaking fields today; skip.
+            if (isChunkDocId(row.id)) continue;
+        }
+        return null;
+    }
+
     async get<T extends CouchSyncDoc>(id: string): Promise<T | null> {
         try {
             return (await this.getDb().get(id)) as T;
@@ -105,18 +167,24 @@ export class LocalDB {
     }
 
     async getFileDoc(path: string): Promise<FileDoc | null> {
-        return this.get<FileDoc>(path);
+        return this.get<FileDoc>(makeFileId(path));
     }
 
-    /** Bulk fetch FileDocs by path. Missing paths are absent from the map. */
+    /** Bulk fetch FileDocs by path. Missing paths are absent from the map.
+     *
+     *  Returns a map keyed by **vault path** (not doc `_id`) so callers
+     *  can look up by the natural identifier.
+     */
     async getFileDocs(paths: string[]): Promise<Map<string, FileDoc>> {
         const result = new Map<string, FileDoc>();
         if (paths.length === 0) return result;
-        const rows = await this.getDb().allDocs({ keys: paths, include_docs: true });
-        for (const row of rows.rows) {
+        const ids = paths.map((p) => makeFileId(p));
+        const rows = await this.getDb().allDocs({ keys: ids, include_docs: true });
+        for (let i = 0; i < rows.rows.length; i++) {
+            const row = rows.rows[i];
             if ("doc" in row && row.doc) {
                 const doc = row.doc as unknown as CouchSyncDoc;
-                if (doc.type === "file") result.set(doc._id, doc as FileDoc);
+                if (doc.type === "file") result.set(paths[i], doc as FileDoc);
             }
         }
         return result;
@@ -137,21 +205,15 @@ export class LocalDB {
     }
 
     async allFileDocs(): Promise<FileDoc[]> {
-        // Phase 1: fetch IDs only (no doc bodies) — avoids loading chunk data
-        const idResult = await this.getDb().allDocs();
-        const fileIds = idResult.rows
-            .filter((r) =>
-                !r.id.startsWith(DOC_PREFIX.CHUNK) &&
-                !r.id.startsWith(DOC_PREFIX.CONFIG) &&
-                !r.id.startsWith("_"),
-            )
-            .map((r) => r.id);
-        if (fileIds.length === 0) return [];
-
-        // Phase 2: load only the file docs by key
-        const docResult = await this.getDb().allDocs({ keys: fileIds, include_docs: true });
+        // Single range query — no two-phase scan now that FileDoc has
+        // a "file:" prefix and is disjoint from chunks/config/_local.
+        const result = await this.getDb().allDocs({
+            startkey: ID_RANGE.file.startkey,
+            endkey: ID_RANGE.file.endkey,
+            include_docs: true,
+        });
         const files: FileDoc[] = [];
-        for (const row of docResult.rows) {
+        for (const row of result.rows) {
             if ("doc" in row && row.doc) {
                 const doc = row.doc as unknown as CouchSyncDoc;
                 if (doc.type === "file") files.push(doc as FileDoc);

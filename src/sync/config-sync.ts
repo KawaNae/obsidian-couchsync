@@ -2,7 +2,12 @@ import type { App } from "obsidian";
 import type { LocalDB } from "../db/local-db.ts";
 import type { Replicator } from "../db/replicator.ts";
 import type { ConfigDoc } from "../types.ts";
-import { DOC_PREFIX } from "../types.ts";
+import {
+    DOC_ID,
+    ID_RANGE,
+    makeConfigId,
+    configPathFromId,
+} from "../types/doc-id.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import { ProgressNotice } from "../ui/notices.ts";
 import { arrayBufferToBase64, base64ToArrayBuffer } from "../db/chunker.ts";
@@ -26,7 +31,7 @@ export class ConfigSync {
         const progress = new ProgressNotice("Config Init");
         try {
             progress.update("Deleting old config docs...");
-            const deletedIds = await this.db.deleteByPrefix(DOC_PREFIX.CONFIG);
+            const deletedIds = await this.db.deleteByPrefix(DOC_ID.CONFIG);
 
             const scanned = await this.scan((path, i, total) => {
                 progress.update(`Scanning: ${path} (${i}/${total})`);
@@ -37,7 +42,7 @@ export class ConfigSync {
 
             if (affectedIds.length > 0) {
                 await this.replicator.pushDocs(affectedIds, (docId, n) => {
-                    progress.update(`Pushing: ${docId} (${n}/${affectedIds.length})`);
+                    progress.update(`Pushing: ${configPathFromId(docId)} (${n}/${affectedIds.length})`);
                 });
             }
 
@@ -60,7 +65,7 @@ export class ConfigSync {
             const docIds = await this.allDocIds();
             if (docIds.length > 0) {
                 await this.replicator.pushDocs(docIds, (docId, n) => {
-                    progress.update(`Pushing: ${docId} (${n}/${docIds.length})`);
+                    progress.update(`Pushing: ${configPathFromId(docId)} (${n}/${docIds.length})`);
                 });
             }
 
@@ -77,7 +82,7 @@ export class ConfigSync {
         const progress = new ProgressNotice("Config Pull");
         try {
             progress.update("Pulling config from remote...");
-            await this.replicator.pullByPrefix(DOC_PREFIX.CONFIG);
+            await this.replicator.pullByPrefix(DOC_ID.CONFIG);
 
             const written = await this.write((path, i, total) => {
                 progress.update(`Writing: ${path} (${i}/${total})`);
@@ -114,10 +119,9 @@ export class ConfigSync {
                 const data = arrayBufferToBase64(buf);
 
                 const doc: ConfigDoc = {
-                    _id: `${DOC_PREFIX.CONFIG}${file}`,
+                    _id: makeConfigId(file),
                     type: "config",
                     data,
-                    binary: true,
                     mtime: stat.mtime,
                     size: stat.size,
                 };
@@ -135,10 +139,13 @@ export class ConfigSync {
         const paths = this.getSettings().configSyncPaths;
         if (paths.length === 0) return 0;
 
-        const entries: { path: string; data: string; binary: boolean }[] = [];
+        const entries: { path: string; data: string }[] = [];
         for (const p of paths) {
             if (p.endsWith("/")) {
-                const prefix = `${DOC_PREFIX.CONFIG}${p.replace(/\/$/, "")}/`;
+                // Prefix-range scan for everything under the folder, scoped
+                // within the config: range so we never collide with other
+                // doc kinds.
+                const prefix = makeConfigId(p.replace(/\/$/, "") + "/");
                 const result = await this.db.getDb().allDocs({
                     startkey: prefix,
                     endkey: prefix + "\ufff0",
@@ -149,27 +156,24 @@ export class ConfigSync {
                     const doc = row.doc as unknown as ConfigDoc;
                     if (doc.type !== "config") continue;
                     entries.push({
-                        path: doc._id.slice(DOC_PREFIX.CONFIG.length),
+                        path: configPathFromId(doc._id),
                         data: doc.data,
-                        binary: doc.binary ?? false,
                     });
                 }
             } else {
-                const doc = await this.db.get<ConfigDoc>(`${DOC_PREFIX.CONFIG}${p}`);
-                if (doc) entries.push({ path: p, data: doc.data, binary: doc.binary ?? false });
+                const doc = await this.db.get<ConfigDoc>(makeConfigId(p));
+                if (doc) entries.push({ path: p, data: doc.data });
             }
         }
 
         let count = 0;
         for (let i = 0; i < entries.length; i++) {
-            const { path, data, binary } = entries[i];
+            const { path, data } = entries[i];
             try {
                 onProgress?.(path, i + 1, entries.length);
                 await this.ensureDir(path);
-                // Legacy docs (binary === false) stored UTF-8 text directly; re-encode.
-                const buf = binary
-                    ? base64ToArrayBuffer(data)
-                    : new TextEncoder().encode(data).buffer;
+                // ConfigDoc is always base64-encoded binary; decode verbatim.
+                const buf = base64ToArrayBuffer(data);
                 await this.app.vault.adapter.writeBinary(path, buf);
                 count++;
             } catch (e) {
@@ -183,8 +187,8 @@ export class ConfigSync {
 
     /** List config file paths available on remote */
     async listRemotePaths(): Promise<string[]> {
-        const docIds = await this.replicator.listRemoteByPrefix(DOC_PREFIX.CONFIG);
-        return docIds.map((id) => id.slice(DOC_PREFIX.CONFIG.length));
+        const docIds = await this.replicator.listRemoteByPrefix(DOC_ID.CONFIG);
+        return docIds.map(configPathFromId);
     }
 
     /** List installed plugin folder paths (fallback when remote unavailable) */
@@ -217,8 +221,8 @@ export class ConfigSync {
 
     private async allDocIds(): Promise<string[]> {
         const result = await this.db.getDb().allDocs({
-            startkey: DOC_PREFIX.CONFIG,
-            endkey: DOC_PREFIX.CONFIG + "\ufff0",
+            startkey: ID_RANGE.config.startkey,
+            endkey: ID_RANGE.config.endkey,
         });
         return result.rows.map((row) => row.id);
     }

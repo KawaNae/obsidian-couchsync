@@ -79,13 +79,17 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
 
     new Setting(el)
         .setName("Resolve all conflicts")
-        .setDesc("Auto-resolve all conflicted documents (newer version wins).")
+        .setDesc(
+            "Scan the database for conflicted documents and auto-resolve those " +
+                "whose Vector Clocks determine a causal winner. Concurrent edits (no " +
+                "dominator) are left for manual resolution via Diff History.",
+        )
         .addButton((btn) =>
             btn.setButtonText("Resolve").onClick(async () => {
                 btn.setButtonText("Resolving...");
                 btn.setDisabled(true);
-                const count = await deps.conflictResolver.resolveAllConflicts();
-                new Notice(`CouchSync: Resolved ${count} conflict(s).`);
+                const count = await deps.conflictResolver.scanConflicts();
+                new Notice(`CouchSync: Auto-resolved ${count} conflict(s).`);
                 btn.setButtonText("Resolve");
                 btn.setDisabled(false);
             })

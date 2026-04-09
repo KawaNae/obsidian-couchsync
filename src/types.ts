@@ -1,3 +1,27 @@
+import type { VectorClock } from "./sync/vector-clock.ts";
+export type { VectorClock } from "./sync/vector-clock.ts";
+
+// Re-export the ID helpers from the centralised module so existing imports
+// of `../types` stay ergonomic. New code should import from "./types/doc-id"
+// directly when it only needs ID helpers.
+export {
+    DOC_ID,
+    ID_RANGE,
+    makeFileId,
+    makeChunkId,
+    makeConfigId,
+    isFileDocId,
+    isChunkDocId,
+    isConfigDocId,
+    isLocalDocId,
+    isReplicatedDocId,
+    filePathFromId,
+    chunkHashFromId,
+    configPathFromId,
+    parseDocId,
+} from "./types/doc-id.ts";
+export type { DocKind, ParsedDocId } from "./types/doc-id.ts";
+
 /** Base fields shared by all CouchSync documents */
 interface CouchSyncDocBase {
     _id: string;
@@ -5,7 +29,13 @@ interface CouchSyncDocBase {
     _conflicts?: string[];
 }
 
-/** A vault file (note, image, attachment) stored as chunks */
+/** A vault file (note, image, attachment) stored as chunks.
+ *
+ *  `_id` is `"file:" + vaultPath` — always constructed via `makeFileId`.
+ *  Ordering is determined solely by `vclock` (Vector Clock over deviceIds).
+ *  `mtime` / `ctime` are preserved for display but MUST NOT be used for
+ *  freshness comparison — that role belongs to `vclock` exclusively.
+ */
 export interface FileDoc extends CouchSyncDocBase {
     type: "file";
     chunks: string[];
@@ -13,49 +43,35 @@ export interface FileDoc extends CouchSyncDocBase {
     ctime: number;
     size: number;
     deleted?: boolean;
-    /** Timestamp (Date.now()) when a user actually edited this file.
-     *  Set only by fileToDb(); never updated by dbToFile() relay.
-     *  Falls back to mtime for docs created before this field existed. */
-    editedAt?: number;
-    /** deviceId of the device that made the edit */
-    editedBy?: string;
+    /** Causal order. Required on all writes. */
+    vclock: VectorClock;
 }
 
-/** A content chunk — fragment of a file */
+/** A content chunk — fragment of a file.
+ *
+ *  `_id` is `"chunk:" + xxhash64(content)` — always constructed via
+ *  `makeChunkId`. Chunks are content-addressed and shared across files.
+ */
 export interface ChunkDoc extends CouchSyncDocBase {
     type: "chunk";
     data: string; // base64-encoded content
 }
 
-/** A config file (.obsidian/ settings, plugin data.json, etc.) */
+/** A config file (`.obsidian/` settings, plugin data.json, theme CSS, etc).
+ *
+ *  `_id` is `"config:" + vaultPath` — always constructed via `makeConfigId`.
+ *  Config sync is scan-based (explicit rescan/write, not continuous watch).
+ */
 export interface ConfigDoc extends CouchSyncDocBase {
     type: "config";
-    /** Base64-encoded raw bytes. */
+    /** Base64-encoded raw bytes. Always binary-safe. */
     data: string;
-    /** @deprecated Always true on new docs. Legacy docs with binary === false
-     *  store plain UTF-8 text in `data` (read-time backward compat). */
-    binary: boolean;
     mtime: number;
     size: number;
 }
 
-/** Local-only sync metadata (not replicated) */
-export interface SyncMetaDoc {
-    _id: "_local/sync-meta";
-    _rev?: string;
-    deviceId: string;
-    deviceName: string;
-    lastSync: number;
-}
-
 /** Union of all document types stored in PouchDB */
 export type CouchSyncDoc = FileDoc | ChunkDoc | ConfigDoc;
-
-/** Prefix constants for document IDs */
-export const DOC_PREFIX = {
-    CHUNK: "chunk:",
-    CONFIG: "config:",
-} as const;
 
 export function isFileDoc(doc: CouchSyncDoc): doc is FileDoc {
     return doc.type === "file";
