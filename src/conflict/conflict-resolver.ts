@@ -1,13 +1,13 @@
-import type { LocalDB } from "../db/local-db.ts";
-import type { CouchSyncDoc, FileDoc } from "../types.ts";
-import { isFileDoc } from "../types.ts";
+/// <reference types="pouchdb-browser" />
+import type { CouchSyncDoc, FileDoc, ConfigDoc } from "../types.ts";
+import { isFileDoc, isConfigDoc } from "../types.ts";
 import { compareVC, findDominator } from "../sync/vector-clock.ts";
-import { filePathFromId } from "../types/doc-id.ts";
+import { filePathFromId, configPathFromId } from "../types/doc-id.ts";
 
 /**
  * Resolves PouchDB conflict trees using Vector Clock causality.
  *
- * For each conflicting FileDoc:
+ * For each conflicting FileDoc or ConfigDoc:
  *  1. Fetch every conflicting revision.
  *  2. If one revision causally dominates (or equals) every other, it is a
  *     safe auto-resolution — the dominated revisions are removed and the
@@ -21,16 +21,29 @@ import { filePathFromId } from "../types/doc-id.ts";
  * Physical timestamps (mtime, editedAt) are never consulted — that was the
  * old behavior and it silently dropped writes under clock skew / network
  * delay. Now the only source of truth for ordering is the vclock field.
+ *
+ * ## Two-instance pattern (v0.11.0+)
+ *
+ * The same class is instantiated twice in production: once for the vault
+ * DB (resolves FileDoc conflicts) and once for the config DB (resolves
+ * ConfigDoc conflicts). The constructor takes a `getDb()` accessor so
+ * each instance points at its own PouchDB. The dispatch in
+ * `resolveIfConflicted` accepts both doc kinds and extracts the
+ * user-facing vault path appropriately.
  */
+
+/** A doc that ConflictResolver can process. Both kinds carry a vclock. */
+type ResolvableDoc = FileDoc | ConfigDoc;
 
 /**
  * Fired when a conflict tree is causally concurrent (no dominator).
- * The `vaultPath` argument is the bare vault path, NOT the PouchDB _id —
- * safe to forward directly to history capture, UI notices, modals, etc.
+ * The `vaultPath` argument is the bare vault path (for FileDoc) or the
+ * `.obsidian/...` path (for ConfigDoc), NOT the PouchDB _id — safe to
+ * forward directly to history capture, UI notices, modals, etc.
  */
 export type OnConcurrentConflict = (
     vaultPath: string,
-    revisions: FileDoc[],
+    revisions: ResolvableDoc[],
 ) => void | Promise<void>;
 
 /**
@@ -40,15 +53,34 @@ export type OnConcurrentConflict = (
  */
 export type OnAutoResolved = (
     vaultPath: string,
-    winner: FileDoc,
-    losers: FileDoc[],
+    winner: ResolvableDoc,
+    losers: ResolvableDoc[],
 ) => void | Promise<void>;
+
+/**
+ * Extract the user-facing path from a doc id. Throws for unknown id
+ * shapes — that should never happen because we filter by `isFileDoc ||
+ * isConfigDoc` before calling, and the schema guard rejects bare ids.
+ */
+function extractVaultPath(id: string): string {
+    if (id.startsWith("file:")) return filePathFromId(id);
+    if (id.startsWith("config:")) return configPathFromId(id);
+    throw new Error(`extractVaultPath: unknown id shape: ${id}`);
+}
 
 export class ConflictResolver {
     private onConcurrent: OnConcurrentConflict | null = null;
 
+    /**
+     * @param getDb     Returns the PouchDB instance to scan/resolve against.
+     *                  Vault use: `() => localDb.getDb()`.
+     *                  Config use: `() => configLocalDb.getDb()`.
+     * @param onAutoResolved Optional callback fired after a safe
+     *                  auto-resolution. Receives the bare vault path,
+     *                  the winning revision, and the superseded losers.
+     */
     constructor(
-        private db: LocalDB,
+        private getDb: () => PouchDB.Database<CouchSyncDoc>,
         private onAutoResolved: OnAutoResolved | null = null,
     ) {}
 
@@ -63,23 +95,23 @@ export class ConflictResolver {
     /**
      * Inspect `doc` for PouchDB conflicts and resolve them if possible.
      * Returns true if the conflict was auto-resolved, false if no conflict
-     * existed, was a non-file doc, or required human resolution.
+     * existed, was an unsupported doc type, or required human resolution.
      */
     async resolveIfConflicted(doc: CouchSyncDoc): Promise<boolean> {
         if (!doc._conflicts || doc._conflicts.length === 0) return false;
-        if (!isFileDoc(doc)) return false;
+        if (!isFileDoc(doc) && !isConfigDoc(doc)) return false;
 
         // Extract the vault path once so every downstream callback and
         // log line reports the user-meaningful path instead of the
         // prefixed PouchDB id. PouchDB operations (get/put/remove) still
         // use the raw `doc._id` since that's what they index on.
-        const vaultPath = filePathFromId(doc._id);
-        const db = this.db.getDb();
-        const winnerRev = (doc as FileDoc)._rev;
-        const revisions: FileDoc[] = [doc as FileDoc];
+        const vaultPath = extractVaultPath(doc._id);
+        const db = this.getDb();
+        const winnerRev = doc._rev;
+        const revisions: ResolvableDoc[] = [doc as ResolvableDoc];
         for (const rev of doc._conflicts) {
             try {
-                const r = (await db.get(doc._id, { rev })) as unknown as FileDoc;
+                const r = (await db.get(doc._id, { rev })) as unknown as ResolvableDoc;
                 revisions.push(r);
             } catch (e) {
                 console.error(
@@ -97,15 +129,15 @@ export class ConflictResolver {
                 // Replace the current winner's content with the dominator's
                 // while keeping the current rev chain so PouchDB accepts
                 // it as an update.
-                const merged: FileDoc = {
+                const merged = {
                     ...dominator,
                     _id: doc._id,
                     _rev: winnerRev,
-                };
+                } as ResolvableDoc;
                 delete (merged as { _conflicts?: unknown })._conflicts;
-                await db.put(merged);
+                await db.put(merged as unknown as CouchSyncDoc);
             }
-            const losers: FileDoc[] = [];
+            const losers: ResolvableDoc[] = [];
             for (const rev of revisions) {
                 if (rev._rev === winnerRev) continue;
                 losers.push(rev);
@@ -152,7 +184,7 @@ export class ConflictResolver {
      * as soon as PouchDB sync materialises them.
      */
     async scanConflicts(): Promise<number> {
-        const db = this.db.getDb();
+        const db = this.getDb();
         const result = await db.allDocs({
             include_docs: true,
             conflicts: true,
@@ -170,6 +202,9 @@ export class ConflictResolver {
 }
 
 /** Test helper exported for unit tests. Not part of the public API. */
-export function _compareVCForTest(a: FileDoc, b: FileDoc): ReturnType<typeof compareVC> {
+export function _compareVCForTest(
+    a: ResolvableDoc,
+    b: ResolvableDoc,
+): ReturnType<typeof compareVC> {
     return compareVC(a.vclock ?? {}, b.vclock ?? {});
 }

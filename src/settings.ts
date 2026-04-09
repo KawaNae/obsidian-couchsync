@@ -1,11 +1,22 @@
 export type ConnectionState = "editing" | "tested" | "setupDone" | "syncing";
 
 export interface CouchSyncSettings {
-    // Connection
+    // Connection (shared between vault and config sync)
     couchdbUri: string;
     couchdbUser: string;
     couchdbPassword: string;
+    /** Vault database name — holds FileDoc + ChunkDoc */
     couchdbDbName: string;
+    /**
+     * Config database name (v0.11.0+) — holds ConfigDoc only.
+     *
+     * Empty string disables config sync entirely. Distinct values across
+     * device pools (e.g. `obsidian-dev-config-mobile` vs `-desktop`) let
+     * a vault be shared while `.obsidian/` configurations stay independent.
+     * Lives on the same CouchDB server as the vault DB — credentials are
+     * shared with vault sync.
+     */
+    couchdbConfigDbName: string;
 
     // Files
     syncFilter: string;
@@ -52,6 +63,7 @@ export const DEFAULT_SETTINGS: CouchSyncSettings = {
     couchdbUser: "",
     couchdbPassword: "",
     couchdbDbName: "obsidian",
+    couchdbConfigDbName: "",
 
     syncFilter: "",
     syncIgnore: "",

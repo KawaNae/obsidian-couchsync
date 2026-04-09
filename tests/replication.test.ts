@@ -125,7 +125,7 @@ describe("PouchDB replication", () => {
 
         const doc = await db1.getDb().get(makeFileId("note.md"), { conflicts: true }) as unknown as CouchSyncDoc;
 
-        const resolver = new ConflictResolver(db1 as any);
+        const resolver = new ConflictResolver(() => db1.getDb() as any);
         const resolved = await resolver.resolveIfConflicted(doc);
         expect(resolved).toBe(true);
 
@@ -149,7 +149,7 @@ describe("PouchDB replication", () => {
         let callbackArgs: { filePath: string; winnerVC: any; loserCount: number } | null = null;
 
         const resolver = new ConflictResolver(
-            db1 as any,
+            () => db1.getDb() as any,
             async (filePath, winner, losers) => {
                 callbackArgs = {
                     filePath,
@@ -181,7 +181,7 @@ describe("PouchDB replication", () => {
         const doc = await db1.getDb().get(makeFileId("note.md"), { conflicts: true }) as unknown as CouchSyncDoc;
 
         const concurrentCalls: string[] = [];
-        const resolver = new ConflictResolver(db1 as any);
+        const resolver = new ConflictResolver(() => db1.getDb() as any);
         resolver.setOnConcurrent((path) => {
             concurrentCalls.push(path);
         });
