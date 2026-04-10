@@ -74,7 +74,7 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
 
     new Setting(el)
         .setName("Verbose logging")
-        .setDesc("Show detailed sync logs in the console.")
+        .setDesc("Show detailed sync logs in the console and reconnect notifications.")
         .addToggle((toggle) =>
             toggle.setValue(settings.showVerboseLog).onChange(async (value) => {
                 await deps.updateSettings({ showVerboseLog: value });
@@ -178,11 +178,16 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
 
     new Setting(el)
         .setName("Restart sync")
-        .setDesc("Stop and restart the replication connection.")
+        .setDesc(
+            "Stop and restart the replication connection. Honours the auth " +
+                "latch and 5s cool-down (same as the gateway).",
+        )
         .addButton((btn) =>
-            btn.setButtonText("Restart").onClick(() => {
-                deps.replicator.stop();
-                deps.replicator.start();
+            btn.setButtonText("Restart").onClick(async () => {
+                // Funnel through the gateway so this button can never
+                // bypass the auth latch or cool-down. The "manual"
+                // reason maps to restart-now in any non-latched state.
+                await deps.replicator.requestReconnect("manual");
             })
         );
 

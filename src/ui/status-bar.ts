@@ -4,22 +4,19 @@ import type { CouchSyncSettings } from "../settings.ts";
 
 const STATE_LABELS: Record<SyncState, string> = {
     disconnected: "Disconnected",
-    connected: "Synced",
+    connected: "Connected",
     syncing: "Syncing...",
+    reconnecting: "Reconnecting...",
     error: "Error",
-    // pre-existing UI convention: show "Paused" when the plugin deliberately
-    // stops sync (not reachable in the current SyncState union, but kept for
-    // future use if the state model gains a paused value).
-    paused: "Paused",
-} as unknown as Record<SyncState, string>;
+};
 
 const STATE_DOT_CLASS: Record<SyncState, string> = {
     disconnected: "cs-status__dot--disconnected",
     connected: "cs-status__dot--connected",
     syncing: "cs-status__dot--syncing",
+    reconnecting: "cs-status__dot--reconnecting",
     error: "cs-status__dot--disconnected",
-    paused: "cs-status__dot--disconnected",
-} as unknown as Record<SyncState, string>;
+};
 
 /**
  * Format the age of a timestamp as a human-readable relative string.

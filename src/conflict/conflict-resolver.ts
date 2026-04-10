@@ -3,6 +3,7 @@ import type { CouchSyncDoc, FileDoc, ConfigDoc } from "../types.ts";
 import { isFileDoc, isConfigDoc } from "../types.ts";
 import { compareVC, findDominator } from "../sync/vector-clock.ts";
 import { filePathFromId, configPathFromId } from "../types/doc-id.ts";
+import { logVerbose } from "../ui/log.ts";
 
 /**
  * Resolves PouchDB conflict trees using Vector Clock causality.
@@ -160,8 +161,8 @@ export class ConflictResolver {
                     );
                 }
             }
-            console.log(
-                `CouchSync: auto-resolved ${doc._conflicts.length} conflict(s) for ${vaultPath}`,
+            logVerbose(
+                `auto-resolved ${doc._conflicts.length} conflict(s) for ${vaultPath}`,
             );
             return true;
         }

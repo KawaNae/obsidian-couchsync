@@ -1,4 +1,4 @@
-import { Plugin } from "obsidian";
+import { Platform, Plugin } from "obsidian";
 import PouchDB from "pouchdb-browser/lib/index.js";
 import { type CouchSyncSettings, DEFAULT_SETTINGS } from "./settings.ts";
 import { LocalDB } from "./db/local-db.ts";
@@ -13,6 +13,7 @@ import { ConflictResolver } from "./conflict/conflict-resolver.ts";
 import { checkInstallMarker } from "./sync/install-marker.ts";
 import { filePathFromId } from "./types/doc-id.ts";
 import { StatusBar } from "./ui/status-bar.ts";
+import { initLog } from "./ui/log.ts";
 import { CouchSyncSettingTab } from "./settings-tab/index.ts";
 import { isFileDoc, type CouchSyncDoc } from "./types.ts";
 import { showNotice, ProgressNotice } from "./ui/notices.ts";
@@ -99,7 +100,8 @@ export default class CouchSyncPlugin extends Plugin {
             this.configLocalDb = new ConfigLocalDB(this.configPouch as any);
         }
 
-        this.replicator = new Replicator(this.localDb, () => this.settings);
+        initLog(() => this.settings, showNotice);
+        this.replicator = new Replicator(this.localDb, () => this.settings, Platform.isMobile);
         this.vaultSync = new VaultSync(this.app, this.localDb, () => this.settings);
         // ConfigSync needs *some* ConfigLocalDB even when sync is disabled,
         // so we satisfy the type with a stand-in pointing at the vault DB.
@@ -318,8 +320,10 @@ export default class CouchSyncPlugin extends Plugin {
             this.fireReconcile("onload");
         });
 
-        // Mobile foreground return: live sync keeps running so we just need
-        // a reconcile pass to catch any vault edits made elsewhere.
+        // Foreground return: Replicator handles reconnect internally
+        // (via handleVisibilityChange registered in start()). Reconcile
+        // runs independently — it catches local vault ↔ local DB drift
+        // regardless of whether the sync session was restarted.
         this.registerDomEvent(document, "visibilitychange", () => {
             if (
                 document.visibilityState === "visible" &&
@@ -329,8 +333,9 @@ export default class CouchSyncPlugin extends Plugin {
             }
         });
 
-        // Network reconnection: replicator restarts itself; reconcile fills
-        // in anything live sync misses.
+        // Reconcile on network reconnection — runs independently of the
+        // gateway's sync decision. Even if the gateway skipped the restart
+        // (cool-down, auth latch), drift may have accumulated.
         this.replicator.onReconnect(() => {
             if (this.settings.connectionState === "syncing") {
                 this.fireReconcile("reconnect");
@@ -343,7 +348,10 @@ export default class CouchSyncPlugin extends Plugin {
             callback: async () => {
                 const report = await this.reconciler.reconcile("manual");
                 if (this.settings.connectionState === "syncing") {
-                    this.replicator.restart();
+                    // Funnel through the gateway so this command honours
+                    // the auth latch and cool-down like every other
+                    // reconnect path.
+                    await this.replicator.requestReconnect("manual");
                 }
                 const total =
                     report.pushed.length +
@@ -406,6 +414,36 @@ export default class CouchSyncPlugin extends Plugin {
             name: "Pull config files from remote",
             callback: async () => {
                 await this.configSync.pull();
+            },
+        });
+
+        // Manual reconnect — surfaces the gateway's "manual" reason via
+        // Command Palette so users can recover from any disconnected /
+        // error state without opening Settings → Maintenance. Especially
+        // useful on mobile when the visibilitychange path didn't fire
+        // (e.g. the app was already foregrounded but the server was
+        // briefly unavailable).
+        this.addCommand({
+            id: "couchsync-reconnect",
+            name: "Reconnect sync",
+            callback: async () => {
+                if (this.replicator.isAuthBlocked()) {
+                    showNotice(
+                        "CouchSync: auth is blocked. Update credentials in " +
+                            "Vault Sync (Step 1) before reconnecting.",
+                        8000,
+                    );
+                    return;
+                }
+                if (this.settings.connectionState !== "syncing") {
+                    showNotice(
+                        "CouchSync: enable Live Sync in Vault Sync (Step 3) first.",
+                        5000,
+                    );
+                    return;
+                }
+                await this.replicator.requestReconnect("manual");
+                showNotice("CouchSync: reconnect requested.", 3000);
             },
         });
     }

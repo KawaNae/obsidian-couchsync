@@ -3,8 +3,13 @@ import type { CouchSyncDoc } from "../types.ts";
 import type { LocalDB } from "./local-db.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import * as remoteCouch from "./remote-couch.ts";
+import { decideReconnect, type ReconnectReason, type SyncState } from "./reconnect-policy.ts";
+import { logVerbose, logNotice } from "../ui/log.ts";
 
-export type SyncState = "disconnected" | "connected" | "syncing" | "error";
+// Re-export so existing imports of `SyncState` from "./replicator" keep
+// working. The canonical home is `reconnect-policy.ts` because it's the
+// only module that needs to be importable from node tests.
+export type { SyncState, ReconnectReason } from "./reconnect-policy.ts";
 export type SyncPhase = "idle" | "pulling" | "applying" | "live";
 
 export type OnChangeHandler = (doc: CouchSyncDoc) => void;
@@ -23,6 +28,9 @@ export class Replicator {
     private healthTimer: ReturnType<typeof setInterval> | null = null;
     private boundOnOffline = () => this.handleOffline();
     private boundOnOnline = () => this.handleOnline();
+    private boundOnVisibility = () =>
+        this.handleVisibilityChange(document.visibilityState === "visible");
+    private backgroundedAt = 0;
     private lastSyncedSeq: number | string = 0;
     private lastRestartTime = 0;
     private lastChangeAt = 0;
@@ -39,10 +47,14 @@ export class Replicator {
     private phase: SyncPhase = "idle";
     private onReconnectHandlers: (() => void)[] = [];
     private onPausedHandlers: (() => void)[] = [];
+    /** Incremented on every teardown so async handlers (handlePaused)
+     *  can detect their sync session was replaced mid-flight. */
+    private syncEpoch = 0;
 
     constructor(
         private localDb: LocalDB,
-        private getSettings: () => CouchSyncSettings
+        private getSettings: () => CouchSyncSettings,
+        private isMobile: boolean = false,
     ) {}
 
     getState(): SyncState {
@@ -94,6 +106,7 @@ export class Replicator {
                 `Update credentials in the Connection tab.`,
         );
         if (this.sync) {
+            (this.sync as any).removeAllListeners();
             this.sync.cancel();
             this.sync = null;
         }
@@ -148,14 +161,96 @@ export class Replicator {
         return url.toString();
     }
 
-    /** Restart sync session (preserves PouchDB checkpoint, 5s cooldown) */
-    restart(): void {
-        if (this.authError) return;
-        const now = Date.now();
-        if (now - this.lastRestartTime < 5000) return;
-        this.lastRestartTime = now;
-        this.stop();
+    /**
+     * Internal cleanup: cancel sync, remove listeners, close remote DB.
+     * Shared by stop() and restart(). Does NOT emit a state change —
+     * the caller decides what state to transition to.
+     */
+    private teardown(): void {
+        this.syncEpoch++;
+        if (this.healthTimer) {
+            clearInterval(this.healthTimer);
+            this.healthTimer = null;
+        }
+        window.removeEventListener("offline", this.boundOnOffline);
+        window.removeEventListener("online", this.boundOnOnline);
+        document.removeEventListener("visibilitychange", this.boundOnVisibility);
+        if (this.sync) {
+            // Remove listeners BEFORE cancel — cancel() triggers a
+            // `complete` event asynchronously. Without this, the stale
+            // handler would fire setState("disconnected") and override
+            // the reconnecting/syncing state set by restart().
+            (this.sync as any).removeAllListeners();
+            this.sync.cancel();
+            this.sync = null;
+        }
+        if (this.remoteDb) {
+            this.remoteDb.close();
+            this.remoteDb = null;
+        }
+        this.hasBeenIdle = false;
+        this.idleCallbacks = [];
+        this.phase = "idle";
+    }
+
+    /**
+     * Restart sync session (preserves PouchDB checkpoint).
+     *
+     * Uses teardown() instead of stop() so we don't emit a transient
+     * "disconnected" state — the status bar shows "Reconnecting..."
+     * (set by requestReconnect) until start() transitions to "syncing".
+     */
+    private restart(): void {
+        this.lastRestartTime = Date.now();
+        this.teardown();
         this.start();
+    }
+
+    /**
+     * Single entry point for every reconnect request. Funnels:
+     *
+     *   - window.online                       → "network-online"
+     *   - mobile/desktop visibilitychange     → "app-foreground"
+     *   - 30s health check timer (dead state) → "periodic-tick"
+     *   - 30s health check timer (stalled)    → "stalled"
+     *   - Command Palette / Maintenance btn   → "manual"
+     *
+     * The policy decision is delegated to `decideReconnect()` (a pure
+     * function in reconnect-policy.ts that's unit-tested separately).
+     * This method only:
+     *   1. Reads current Replicator state
+     *   2. Calls the policy
+     *   3. Acts on the returned decision (skip / restart / verify-then-restart)
+     *
+     * That makes adding a new trigger trivial: just call this method
+     * with a fresh `ReconnectReason`. No risk of bypassing the auth
+     * latch, the cool-down, or any state-specific guard.
+     */
+    async requestReconnect(reason: ReconnectReason): Promise<void> {
+        const decision = decideReconnect({
+            state: this.state,
+            reason,
+            authError: this.authError,
+            coolDownActive: Date.now() - this.lastRestartTime < 5000,
+        });
+
+        logVerbose(`reconnect: reason=${reason} state=${this.state} → ${decision}`);
+
+        if (decision === "skip") return;
+
+        if (decision === "verify-then-restart") {
+            this.setState("reconnecting");
+            if (await this.verifyReachable()) {
+                logNotice(`Reconnect (${reason}): restarting`);
+                this.restart();
+            }
+            return;
+        }
+
+        // restart-now
+        this.setState("reconnecting");
+        logNotice(`Reconnect (${reason}): restarting`);
+        this.restart();
     }
 
     start(): void {
@@ -230,6 +325,7 @@ export class Replicator {
                     `Authentication failed (${err.status}). Check your CouchDB credentials.`,
                 );
                 if (this.sync) {
+                    (this.sync as any).removeAllListeners();
                     this.sync.cancel();
                     this.sync = null;
                 }
@@ -246,31 +342,16 @@ export class Replicator {
         // Health check: detect silent disconnections (PouchDB bug #3714)
         this.healthTimer = setInterval(() => this.checkHealth(), HEALTH_CHECK_INTERVAL);
 
-        // Network state listeners for immediate detection
+        // Environment state listeners for immediate detection
         window.addEventListener("offline", this.boundOnOffline);
         window.addEventListener("online", this.boundOnOnline);
+        document.addEventListener("visibilitychange", this.boundOnVisibility);
 
         this.setState("syncing");
     }
 
     stop(): void {
-        if (this.healthTimer) {
-            clearInterval(this.healthTimer);
-            this.healthTimer = null;
-        }
-        window.removeEventListener("offline", this.boundOnOffline);
-        window.removeEventListener("online", this.boundOnOnline);
-        if (this.sync) {
-            this.sync.cancel();
-            this.sync = null;
-        }
-        if (this.remoteDb) {
-            this.remoteDb.close();
-            this.remoteDb = null;
-        }
-        this.hasBeenIdle = false;
-        this.idleCallbacks = [];
-        this.phase = "idle";
+        this.teardown();
         this.setState("disconnected");
     }
 
@@ -349,36 +430,45 @@ export class Replicator {
     }
 
     private async checkHealth(): Promise<void> {
-        if (this.state === "disconnected") return;
         if (this.authError) return;
 
         try {
-            // Cheap path: when state is healthy and either local writes are
-            // moving or we saw a change recently, skip the network probe.
-            if (this.state === "connected" || this.state === "syncing") {
+            // Connected (idle/long-poll): PouchDB's own timeout (30s) and
+            // heartbeat (10s) detect dead sockets. Stall check is not
+            // needed because update_seq not moving is normal when the
+            // vault is quiet. Silent socket death during background is
+            // caught by app-resume; network changes by network-online.
+            //
+            // Reconnecting: restart is already in progress, don't interfere.
+            if (this.state === "connected" || this.state === "reconnecting") return;
+
+            // Syncing (active transfer): if update_seq hasn't moved and
+            // no change event fired recently, the transfer is stuck.
+            if (this.state === "syncing") {
                 const info = await this.localDb.getDb().info();
                 const stalled = info.update_seq === this.lastSyncedSeq;
                 const recentChange = Date.now() - this.lastChangeAt < HEALTH_CHECK_INTERVAL;
-                if (!stalled || recentChange) return;
-            }
-
-            // Stalled or in error state — verify reachability over the wire.
-            if (!(await this.verifyReachable())) return;
-
-            if (this.state === "error") {
-                console.log("CouchSync: Server reachable again, restarting session");
-                this.restart();
+                if (stalled && !recentChange) {
+                    logVerbose(`health: syncing stall detected (seq=${info.update_seq})`);
+                    await this.requestReconnect("stalled");
+                }
                 return;
             }
-            // Reachable but stalled (PouchDB bug #3714) — kick the session.
-            console.log("CouchSync: Stalled sync detected, restarting session");
-            this.restart();
+
+            // Inactive session (disconnected/error): try to recover via
+            // the gateway. The "periodic-tick" reason routes through
+            // verify-then-restart so we don't hammer a still-down server.
+            if (this.state === "disconnected" || this.state === "error") {
+                await this.requestReconnect("periodic-tick");
+            }
         } catch (e) {
             console.error("CouchSync: Health check error:", e);
         }
     }
 
     private async handlePaused(err: unknown): Promise<void> {
+        const epoch = this.syncEpoch;
+
         if (err) {
             this.setState("error");
             this.emitError("Sync paused: connection issue");
@@ -391,6 +481,10 @@ export class Replicator {
         if (sinceLastChange > RECENT_CHANGE_WINDOW_MS) {
             if (!(await this.verifyReachable())) return;
         }
+        // Sync session was replaced while we were awaiting — discard
+        // this stale callback to avoid overwriting the new session's state.
+        if (this.syncEpoch !== epoch) return;
+
         this.updateLastSyncedSeq();
         this.setState("connected");
         if (!this.hasBeenIdle) {
@@ -419,6 +513,31 @@ export class Replicator {
         return true;
     }
 
+    /**
+     * Called on every visibilitychange event. Tracks how long the app was
+     * hidden and decides whether to use "app-foreground" (brief hide,
+     * trust the session) or "app-resume" (long hide or mobile, verify
+     * because the socket may have been silently killed by the OS).
+     *
+     * Symmetric with handleOnline/handleOffline — Replicator owns the
+     * full set of environment-change handlers.
+     */
+    private handleVisibilityChange(visible: boolean): void {
+        if (!visible) {
+            this.backgroundedAt = Date.now();
+            return;
+        }
+        const hiddenMs = this.backgroundedAt
+            ? Date.now() - this.backgroundedAt
+            : 0;
+        this.backgroundedAt = 0;
+        const reason: ReconnectReason =
+            this.isMobile || hiddenMs >= 30_000
+                ? "app-resume"
+                : "app-foreground";
+        void this.requestReconnect(reason);
+    }
+
     private handleOffline(): void {
         if (this.state === "connected" || this.state === "syncing") {
             this.setState("disconnected");
@@ -427,15 +546,18 @@ export class Replicator {
     }
 
     private handleOnline(): void {
-        if (this.authError) return;
+        // Funnel through the gateway. The gateway handles auth latch,
+        // cool-down, and the state-aware decision; we only need to
+        // also fire the onReconnect handlers (used by main.ts to
+        // trigger a reconcile pass after the live session resumes).
+        void this.requestReconnect("network-online");
         if (this.state === "disconnected" || this.state === "error") {
-            console.log("CouchSync: Network online, restarting session");
-            if (this.onReconnectHandlers.length > 0) {
-                for (const handler of this.onReconnectHandlers) {
+            for (const handler of this.onReconnectHandlers) {
+                try {
                     handler();
+                } catch (e) {
+                    console.error("CouchSync: onReconnect handler error:", e);
                 }
-            } else {
-                this.restart();
             }
         }
     }
