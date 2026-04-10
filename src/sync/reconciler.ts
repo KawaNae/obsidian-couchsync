@@ -5,6 +5,7 @@ import type { CouchSyncSettings } from "../settings.ts";
 import type { FileDoc } from "../types.ts";
 import { latestDevice } from "./vector-clock.ts";
 import { filePathFromId } from "../types/doc-id.ts";
+import { logVerbose } from "../ui/log.ts";
 
 /**
  * Margin absorbing local filesystem clock jitter when asking "has any vault
@@ -188,8 +189,8 @@ export class Reconciler {
         const allPaths = new Set<string>([...vaultByPath.keys(), ...dbByPath.keys()]);
         const deviceId = this.getSettings().deviceId;
 
-        console.log(
-            `CouchSync: reconcile (${reason}, ${mode}) — ${vaultByPath.size} vault, ${dbByPath.size} db, manifest=${manifestPaths?.size ?? "null"}`,
+        logVerbose(
+            `reconcile (${reason}, ${mode}) — ${vaultByPath.size} vault, ${dbByPath.size} db, manifest=${manifestPaths?.size ?? "null"}`,
         );
 
         for (const path of allPaths) {
@@ -270,8 +271,8 @@ export class Reconciler {
 
         const total = totalDiscrepancies(report);
         if (total > 0) {
-            console.log(
-                `CouchSync: reconcile (${reason}) — ${total} change(s): ` +
+            logVerbose(
+                `reconcile (${reason}) — ${total} change(s): ` +
                     `pushed=${report.pushed.length} pulled=${report.remoteWins.length + report.restored.length} ` +
                     `deleted=${report.deleted.length} localWins=${report.localWins.length}`,
             );

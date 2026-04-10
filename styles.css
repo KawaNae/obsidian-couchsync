@@ -90,6 +90,14 @@
 .cs-status__dot--connected { background: var(--text-success); }
 .cs-status__dot--disconnected { background: var(--text-error); }
 .cs-status__dot--syncing { background: var(--text-warning); }
+.cs-status__dot--reconnecting {
+    background: var(--text-warning);
+    animation: cs-pulse 1.5s ease-in-out infinite;
+}
+@keyframes cs-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+}
 
 /* ─── Config Sync Suggestions ─────────────────────────────── */
 
