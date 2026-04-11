@@ -3,13 +3,24 @@ import type { CouchSyncDoc } from "../types.ts";
 import type { LocalDB } from "./local-db.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import * as remoteCouch from "./remote-couch.ts";
-import { decideReconnect, type ReconnectReason, type SyncState } from "./reconnect-policy.ts";
+import {
+    decideReconnect,
+    type ReconnectReason,
+    type SyncState,
+    type SyncErrorDetail,
+    type SyncErrorKind,
+} from "./reconnect-policy.ts";
 import { logVerbose, logNotice } from "../ui/log.ts";
 
 // Re-export so existing imports of `SyncState` from "./replicator" keep
 // working. The canonical home is `reconnect-policy.ts` because it's the
 // only module that needs to be importable from node tests.
-export type { SyncState, ReconnectReason } from "./reconnect-policy.ts";
+export type {
+    SyncState,
+    ReconnectReason,
+    SyncErrorDetail,
+    SyncErrorKind,
+} from "./reconnect-policy.ts";
 export type SyncPhase = "idle" | "pulling" | "applying" | "live";
 
 export type OnChangeHandler = (doc: CouchSyncDoc) => void;
@@ -17,6 +28,22 @@ export type OnStateChangeHandler = (state: SyncState) => void;
 export type OnErrorHandler = (message: string) => void;
 
 const HEALTH_CHECK_INTERVAL = 30000; // 30s
+const CATCHUP_IDLE_TIMEOUT_MS = 60000; // abort catchup after 60s of no progress
+const PROBE_TIMEOUT_MS = 5000; // fresh-HTTP probe in checkHealth()
+
+/** Build identifier, logged at start(). Lets us verify on mobile that a
+ *  deployed plugin update actually reached the device (Obsidian Sync can
+ *  lag or silently fail). Bump when shipping behavioral changes. */
+const BUILD_TAG = "probe-based-health-2026-04-12";
+
+/** How long to keep a transient error in `reconnecting` state before
+ *  escalating to hard `error`. PouchDB's `retry:true` normally recovers
+ *  well within this window, so most transient hiccups stay invisible. */
+const TRANSIENT_ESCALATION_MS = 10_000;
+
+/** Backoff delays used after escalation into hard error state. Capped at
+ *  the last entry — a permanently-down server is polled every 30s. */
+const ERROR_RETRY_DELAYS_MS: readonly number[] = [2_000, 5_000, 10_000, 20_000, 30_000];
 
 export class Replicator {
     private sync: PouchDB.Replication.Sync<CouchSyncDoc> | null = null;
@@ -30,9 +57,54 @@ export class Replicator {
     private boundOnVisibility = () =>
         this.handleVisibilityChange(document.visibilityState === "visible");
     private backgroundedAt = 0;
-    private lastSyncedSeq: number | string = 0;
     private lastRestartTime = 0;
-    private lastChangeAt = 0;
+    /** Wall-clock time of the most recent proof the session is healthy.
+     *  Updated from two sources only: catchup completion, and a successful
+     *  `remoteDb.info()` probe in `checkHealth()`. Both are fresh HTTP
+     *  round-trips, so asymmetric network faults (e.g. Tailscale down
+     *  mid-session) can't spoof health via stale PouchDB events. Status
+     *  bar displays this as "X ago"; survives teardown so disconnected/
+     *  error states can still show "(last seen X ago)". */
+    private lastHealthyAt = 0;
+    /** Dedup for concurrent bringUpSession() calls — any parallel invoker
+     *  awaits the same in-flight Promise instead of spawning a second
+     *  catchup. Cleared on teardown so a subsequent start() after stop()
+     *  kicks off a fresh session. */
+    private bringUpPromise: Promise<void> | null = null;
+    /** Live handle on the running catchup replication so teardown() can
+     *  cancel it. Cleared when the replication settles. */
+    private activeCatchup: PouchDB.Replication.Replication<CouchSyncDoc> | null = null;
+    /** Guards against double-attach of env listeners across restarts. */
+    private envListenersAttached = false;
+
+    /** Detail of the current hard error, if state === "error". Null otherwise.
+     *  Exposed via getLastErrorDetail() so the status bar can render
+     *  `Error (401)` / `Error (timeout)` labels without needing the
+     *  ephemeral Notice. */
+    private lastErrorDetail: SyncErrorDetail | null = null;
+
+    /** Armed on transient live-sync errors. If nothing recovers within
+     *  TRANSIENT_ESCALATION_MS, the transient state is promoted to a
+     *  hard error. Cleared on any successful state transition. */
+    private transientErrorTimer: ReturnType<typeof setTimeout> | null = null;
+
+    /** Schedules the next backoff retry while in hard-error state.
+     *  Replaces `checkHealth`'s error-state polling — one source of
+     *  truth for retry cadence. */
+    private errorRetryTimer: ReturnType<typeof setTimeout> | null = null;
+
+    /** Single-flight latch for `probeHealth()`. Rapid-fire change events
+     *  (e.g. multi-file save) would otherwise spawn a probe per event;
+     *  the latch lets them share one in-flight round-trip. */
+    private probeInFlight = false;
+
+    /** Index into ERROR_RETRY_DELAYS_MS. Incremented on each retry,
+     *  reset on successful transition to syncing/connected. */
+    private errorRetryStep = 0;
+
+    /** Latch so we emit at most one warning Notice per `denied` storm.
+     *  Reset on teardown/stop so a fresh session can warn again. */
+    private deniedWarningEmitted = false;
     /**
      * Latched on 401/403 to stop retry storms. Cleared only when the user
      * explicitly starts sync again (which implies they've updated
@@ -76,9 +148,16 @@ export class Replicator {
         return this.phase;
     }
 
-    /** Timestamp (ms) of the most recent sync change event, or 0 if never. */
-    getLastChangeAt(): number {
-        return this.lastChangeAt;
+    /** Timestamp (ms) of the most recent proof the session was healthy,
+     *  or 0 if never. Used by the status bar for "X ago" display. */
+    getLastHealthyAt(): number {
+        return this.lastHealthyAt;
+    }
+
+    /** Detail of the current hard error, or null if not in error state.
+     *  Status bar uses this to format labels like `Error (401)`. */
+    getLastErrorDetail(): SyncErrorDetail | null {
+        return this.lastErrorDetail;
     }
 
     /**
@@ -98,17 +177,13 @@ export class Replicator {
      */
     markAuthError(status: number, reason?: string): void {
         if (this.authError) return;
-        this.authError = true;
-        this.setState("error");
-        this.emitError(
-            `Authentication failed (${status})${reason ? ": " + reason : ""}. ` +
+        this.enterHardError({
+            kind: "auth",
+            code: status,
+            message:
+                `Authentication failed (${status})${reason ? ": " + reason : ""}. ` +
                 `Update credentials in the Connection tab.`,
-        );
-        if (this.sync) {
-            (this.sync as any).removeAllListeners();
-            this.sync.cancel();
-            this.sync = null;
-        }
+        });
     }
 
     /** Clear the auth-blocked flag. Call after a successful Test button. */
@@ -135,9 +210,32 @@ export class Replicator {
         this.idleCallbacks.push(callback);
     }
 
-    private setState(state: SyncState): void {
-        if (this.state === state) return;
+    private setState(state: SyncState, errorDetail?: SyncErrorDetail): void {
+        // Always allow re-emit for error state so a kind change (e.g.
+        // network → timeout on subsequent retries) reaches the UI.
+        if (this.state === state && state !== "error") return;
+
+        const wasError = this.state === "error";
         this.state = state;
+
+        if (state === "error") {
+            this.lastErrorDetail = errorDetail ?? null;
+        } else {
+            this.lastErrorDetail = null;
+            // Recovering out of error: cancel any running backoff retry
+            // and reset the step so the next failure starts fresh at 2s.
+            if (wasError && (state === "syncing" || state === "connected")) {
+                this.resetErrorRecovery();
+            }
+            // Any non-error state cancels a pending transient escalation:
+            // if we reach syncing/connected the sync is healthy, and if
+            // we explicitly move to disconnected/reconnecting the caller
+            // already decided what to do.
+            if (state !== "reconnecting") {
+                this.clearTransientErrorTimer();
+            }
+        }
+
         for (const handler of this.onStateChangeHandlers) {
             handler(state);
         }
@@ -161,19 +259,22 @@ export class Replicator {
     }
 
     /**
-     * Internal cleanup: cancel sync, remove listeners, close remote DB.
-     * Shared by stop() and restart(). Does NOT emit a state change —
-     * the caller decides what state to transition to.
+     * Session-internal cleanup: cancel the running sync + catchup, close
+     * remote DB, drop session-scoped state. Does NOT touch env listeners
+     * or the health timer — those are owned by the user-driven lifecycle
+     * (start/stop) so they survive restart() and span catchup too.
+     *
+     * Does NOT emit a state change — the caller decides.
      */
     private teardown(): void {
         this.syncEpoch++;
-        if (this.healthTimer) {
-            clearInterval(this.healthTimer);
-            this.healthTimer = null;
+        // Invalidate dedup so a future start() spawns a fresh catchup
+        // instead of awaiting the (now being torn down) one.
+        this.bringUpPromise = null;
+        if (this.activeCatchup) {
+            try { this.activeCatchup.cancel(); } catch { /* ignore */ }
+            this.activeCatchup = null;
         }
-        window.removeEventListener("offline", this.boundOnOffline);
-        window.removeEventListener("online", this.boundOnOnline);
-        document.removeEventListener("visibilitychange", this.boundOnVisibility);
         if (this.sync) {
             // Remove listeners BEFORE cancel — cancel() triggers a
             // `complete` event asynchronously. Without this, the stale
@@ -190,19 +291,194 @@ export class Replicator {
         this.hasBeenIdle = false;
         this.idleCallbacks = [];
         this.phase = "idle";
-        // Reset so the next session doesn't carry a stale timestamp into
-        // UI ("5h ago" after a fresh reconnect) or into handlePaused heuristics.
-        this.lastChangeAt = 0;
+        this.deniedWarningEmitted = false;
+        // lastHealthyAt intentionally NOT reset: the status bar should
+        // keep showing "(last seen X ago)" in disconnected/error states
+        // until a fresh session produces a newer timestamp.
+        // lastErrorDetail likewise survives — the caller (stop/restart)
+        // chooses what state to transition to and whether to clear it.
+    }
+
+    private attachEnvListeners(): void {
+        if (this.envListenersAttached) return;
+        window.addEventListener("offline", this.boundOnOffline);
+        window.addEventListener("online", this.boundOnOnline);
+        document.addEventListener("visibilitychange", this.boundOnVisibility);
+        this.envListenersAttached = true;
+    }
+
+    private detachEnvListeners(): void {
+        if (!this.envListenersAttached) return;
+        window.removeEventListener("offline", this.boundOnOffline);
+        window.removeEventListener("online", this.boundOnOnline);
+        document.removeEventListener("visibilitychange", this.boundOnVisibility);
+        this.envListenersAttached = false;
+    }
+
+    private startHealthTimer(): void {
+        if (this.healthTimer) return;
+        this.healthTimer = setInterval(() => this.checkHealth(), HEALTH_CHECK_INTERVAL);
+    }
+
+    private stopHealthTimer(): void {
+        if (!this.healthTimer) return;
+        clearInterval(this.healthTimer);
+        this.healthTimer = null;
+    }
+
+    /**
+     * Classify a PouchDB/fetch error into a SyncErrorDetail. Lifted out of
+     * the individual error sites so all paths get consistent labels.
+     *
+     * Priority:
+     *   1. HTTP status (most reliable signal): 401/403 → auth, 5xx → server
+     *   2. Message substring for timeout / network idioms
+     *   3. Fallback: unknown
+     */
+    private classifyError(err: any): SyncErrorDetail {
+        const code: number | undefined = typeof err?.status === "number" ? err.status : undefined;
+        const rawMessage: string = (err?.message ?? (err && String(err)) ?? "unknown").toString();
+
+        if (code === 401 || code === 403) {
+            return {
+                kind: "auth",
+                code,
+                message: `Authentication failed (${code}). Check your CouchDB credentials.`,
+            };
+        }
+        if (typeof code === "number" && code >= 500) {
+            return {
+                kind: "server",
+                code,
+                message: `Server error (${code}): ${rawMessage}`,
+            };
+        }
+        if (/timed?[\s_-]?out|timeout/i.test(rawMessage)) {
+            return { kind: "timeout", code, message: rawMessage };
+        }
+        if (/network|fetch|econn|enotfound|getaddrinfo|failed to fetch|dns|unreachable|offline/i.test(rawMessage)) {
+            return { kind: "network", code, message: rawMessage };
+        }
+        return { kind: "unknown", code, message: rawMessage };
+    }
+
+    /**
+     * Soft error path. PouchDB's `retry:true` is already working on it
+     * behind the scenes; we keep the UI honest by staying in
+     * `reconnecting`, and give it TRANSIENT_ESCALATION_MS to recover
+     * before emitting a user-visible error.
+     *
+     * If a subsequent change/active/paused(ok) event arrives first, the
+     * state transition to syncing/connected will clear the timer and the
+     * whole blip is invisible.
+     *
+     * Auth errors are exempt — they never self-recover, so they escalate
+     * immediately.
+     */
+    private handleTransientError(err: any): void {
+        const detail = this.classifyError(err);
+        logVerbose(
+            `transient error: kind=${detail.kind} code=${detail.code ?? "-"} msg=${detail.message}`,
+        );
+
+        if (detail.kind === "auth") {
+            this.enterHardError(detail);
+            return;
+        }
+
+        if (this.state !== "reconnecting") {
+            this.setState("reconnecting");
+        }
+        if (this.transientErrorTimer) clearTimeout(this.transientErrorTimer);
+        this.transientErrorTimer = setTimeout(() => {
+            this.transientErrorTimer = null;
+            // If PouchDB has already recovered, state is syncing/connected
+            // and this escalation is a no-op.
+            if (this.state === "reconnecting") {
+                logVerbose(`transient escalated to hard error after ${TRANSIENT_ESCALATION_MS}ms`);
+                this.enterHardError(detail);
+            }
+        }, TRANSIENT_ESCALATION_MS);
+    }
+
+    /**
+     * Hard error path. Fires a one-shot Notice, pins state="error" with
+     * the classified detail, and — unless it's an auth latch — kicks off
+     * the dedicated backoff retry timer.
+     */
+    private enterHardError(detail: SyncErrorDetail): void {
+        this.clearTransientErrorTimer();
+        this.setState("error", detail);
+        this.emitError(detail.message);
+
+        if (detail.kind === "auth") {
+            // Latch: no auto-retry. User must fix credentials and
+            // explicitly call start() again.
+            this.authError = true;
+            if (this.sync) {
+                (this.sync as any).removeAllListeners();
+                this.sync.cancel();
+                this.sync = null;
+            }
+            this.stopErrorRetryTimer();
+            return;
+        }
+
+        this.scheduleErrorRetry();
+    }
+
+    private scheduleErrorRetry(): void {
+        if (this.errorRetryTimer) clearTimeout(this.errorRetryTimer);
+        const idx = Math.min(this.errorRetryStep, ERROR_RETRY_DELAYS_MS.length - 1);
+        const delay = ERROR_RETRY_DELAYS_MS[idx];
+        logVerbose(`error retry scheduled in ${delay}ms (step ${this.errorRetryStep})`);
+        this.errorRetryTimer = setTimeout(async () => {
+            this.errorRetryTimer = null;
+            this.errorRetryStep++;
+            // Funnel through the gateway so the auth latch etc. still apply.
+            try {
+                await this.requestReconnect("retry-backoff");
+            } catch (e) {
+                console.error("CouchSync: retry reconnect failed:", e);
+            }
+            // Self-chain: if the retry didn't recover us, schedule the
+            // next backoff step. Successful recovery calls
+            // resetErrorRecovery() via setState() and leaves state !==
+            // "error", so we naturally stop here.
+            if (this.state === "error") {
+                this.scheduleErrorRetry();
+            }
+        }, delay);
+    }
+
+    private stopErrorRetryTimer(): void {
+        if (!this.errorRetryTimer) return;
+        clearTimeout(this.errorRetryTimer);
+        this.errorRetryTimer = null;
+    }
+
+    private clearTransientErrorTimer(): void {
+        if (!this.transientErrorTimer) return;
+        clearTimeout(this.transientErrorTimer);
+        this.transientErrorTimer = null;
+    }
+
+    /** Clean up everything related to error recovery. Called on
+     *  successful transition out of error, on teardown, and on stop. */
+    private resetErrorRecovery(): void {
+        this.errorRetryStep = 0;
+        this.stopErrorRetryTimer();
+        this.clearTransientErrorTimer();
     }
 
     /**
      * Restart sync session (preserves PouchDB checkpoint).
      *
      * Goes through bringUpSession() so the new live sync is gated on a
-     * one-shot catchup pull completing. This prevents the "false connected"
-     * state where PouchDB fires `paused` on a fresh session before actually
-     * pulling remote changes — which would leave the device diverged until
-     * manual intervention.
+     * one-shot catchup pull completing. env listeners and health timer
+     * survive the restart (owned by start/stop, not teardown), so catchup
+     * itself is observable — if the app backgrounds or the health tick
+     * fires mid-catchup, those paths still run.
      */
     private async restart(): Promise<void> {
         this.lastRestartTime = Date.now();
@@ -258,30 +534,53 @@ export class Replicator {
     }
 
     /**
-     * Entry point for bringing up a session (initial start or after restart).
-     * Same pipeline for both so there's a single path to reason about.
+     * Public lifecycle entry. Attaches env listeners and the health timer
+     * once per user-driven lifecycle, then kicks off a session.
      *
-     *   prepareRemoteDb → setState("reconnecting") → catchupPull (await) →
-     *   assign this.remoteDb → startLiveSync → setState("syncing")
-     *
-     * The catchup pull is the key difference from the previous design:
-     * it's a one-shot db.replicate.from() that resolves only when the local
-     * DB has pulled every pending doc from the remote. Without it, the
-     * subsequent live sync's `paused` event can fire spuriously before any
-     * batch has been processed, leaving the device falsely "connected".
+     * The session pipeline — prepareRemoteDb → setState("reconnecting") →
+     * catchupPull (await) → startLiveSync → setState("syncing"/"connected") —
+     * is also used by restart(). The catchup pull is the key to avoiding
+     * "false connected" state: the subsequent live sync's `paused` event
+     * is only trusted after catchup has drained pending remote changes.
      */
     async start(): Promise<void> {
         if (this.sync) return;
+        logVerbose(`replicator start (build=${BUILD_TAG})`);
         // An explicit start() call means the user is trying again — assume
         // they've fixed their credentials and allow retries from here on.
         this.authError = false;
+        this.attachEnvListeners();
+        this.startHealthTimer();
         await this.bringUpSession();
     }
 
-    private async bringUpSession(): Promise<void> {
-        if (this.sync) return;
-        if (this.authError) return;
+    stop(): void {
+        this.detachEnvListeners();
+        this.stopHealthTimer();
+        this.resetErrorRecovery();
+        this.teardown();
+        this.setState("disconnected");
+    }
 
+    /**
+     * Dedup wrapper. Concurrent callers (e.g. start() from onload while
+     * a periodic-tick reconnect is also in flight) share the same
+     * in-flight Promise instead of spawning a second catchup.
+     */
+    private bringUpSession(): Promise<void> {
+        if (this.bringUpPromise) return this.bringUpPromise;
+        if (this.sync) return Promise.resolve();
+        if (this.authError) return Promise.resolve();
+        const p = this.doBringUpSession().finally(() => {
+            // Only clear if still ours — teardown() may have already
+            // null'd this to invalidate dedup for a new start() cycle.
+            if (this.bringUpPromise === p) this.bringUpPromise = null;
+        });
+        this.bringUpPromise = p;
+        return p;
+    }
+
+    private async doBringUpSession(): Promise<void> {
         const myEpoch = this.syncEpoch;
         const remoteDb = this.prepareRemoteDb();
         this.setState("reconnecting");
@@ -289,26 +588,26 @@ export class Replicator {
         try {
             await this.catchupPull(remoteDb);
         } catch (e: any) {
-            if (e?.status === 401 || e?.status === 403) {
-                this.authError = true;
-                this.setState("error");
-                this.emitError(
-                    `Authentication failed (${e.status}). Check your CouchDB credentials.`,
-                );
-            } else {
-                this.setState("error");
-                this.emitError("Catchup failed: " + (e?.message ?? "unknown"));
-            }
             remoteDb.close();
+            // Cancellation via teardown() shows up as an error — that's
+            // not a user-visible failure, the new session (if any) will
+            // set its own state.
+            if (this.syncEpoch !== myEpoch) return;
+            // catchup is a one-shot: the internal idle timeout has already
+            // given it 60s. Escalate straight to hard error, no transient
+            // soft path.
+            this.enterHardError(this.classifyError(e));
             return;
         }
 
-        // Another teardown happened during our await — discard this session.
+        // Another teardown happened during catchup — discard this session.
         if (this.syncEpoch !== myEpoch) {
             remoteDb.close();
             return;
         }
 
+        // Catchup just proved the session is in a known-good state.
+        this.lastHealthyAt = Date.now();
         this.remoteDb = remoteDb;
         this.startLiveSync();
     }
@@ -321,27 +620,60 @@ export class Replicator {
     }
 
     /**
-     * One-shot pull replication. Resolves on `complete`, rejects on `error`.
-     * Uses the shared PouchDB checkpoint so a fresh catchup after restart
-     * picks up exactly where the previous session left off (no re-download).
+     * One-shot pull replication with an idle-based timeout.
+     *
+     * PouchDB's `replicate.from()` fires a `change` event per batch; we
+     * use that as a progress signal. If 60s pass with no progress, we
+     * cancel the replication and reject — preventing the "stuck in
+     * Reconnecting..." state when a mobile socket silently dies mid-catchup.
+     *
+     * Absolute timeout would incorrectly abort a large first-sync pulling
+     * thousands of docs over a slow network. Idle-based tolerates slow but
+     * progressing transfers.
+     *
+     * The active replication handle is stored in `activeCatchup` so
+     * `teardown()` can cancel it from the outside.
      */
-    private async catchupPull(remoteDb: PouchDB.Database<CouchSyncDoc>): Promise<void> {
+    private catchupPull(remoteDb: PouchDB.Database<CouchSyncDoc>): Promise<void> {
         const db = this.localDb.getDb();
         logVerbose("catchup: starting one-shot pull");
-        await new Promise<void>((resolve, reject) => {
+        return new Promise<void>((resolve, reject) => {
+            let timer: ReturnType<typeof setTimeout> | null = null;
+            let settled = false;
             const rep = db.replicate.from(remoteDb, {
                 batch_size: 50,
                 batches_limit: 5,
             });
-            rep.on("complete", (info: any) => {
+            this.activeCatchup = rep as any;
+
+            const finish = (fn: () => void) => {
+                if (settled) return;
+                settled = true;
+                if (timer) { clearTimeout(timer); timer = null; }
+                if (this.activeCatchup === (rep as any)) this.activeCatchup = null;
+                fn();
+            };
+            const armTimer = () => {
+                if (timer) clearTimeout(timer);
+                timer = setTimeout(() => {
+                    finish(() => {
+                        logNotice("Catchup timed out (no progress for 60s)");
+                        try { rep.cancel(); } catch { /* ignore */ }
+                        reject(new Error("Catchup timed out"));
+                    });
+                }, CATCHUP_IDLE_TIMEOUT_MS);
+            };
+
+            rep.on("change", () => armTimer());
+            rep.on("complete", (info: any) => finish(() => {
                 logNotice(
                     `Catchup complete: docs_read=${info?.docs_read ?? 0} last_seq=${info?.last_seq ?? "?"}`,
                 );
                 resolve();
-            });
-            rep.on("error", (err: any) => {
-                reject(err);
-            });
+            }));
+            rep.on("error", (err: any) => finish(() => reject(err)));
+
+            armTimer();
         });
     }
 
@@ -362,8 +694,16 @@ export class Replicator {
         } as any); // PouchDB types don't include timeout/heartbeat/back_off_function
 
         this.sync.on("change", (info) => {
-            this.lastChangeAt = Date.now();
+            // State transition is unconditional: PouchDB is actively
+            // processing a batch, regardless of whether docs landed.
             this.setState("syncing");
+
+            // Fire an out-of-band probe for a decisive reachability
+            // check. The change event tells us PouchDB *read* a local
+            // doc — not that it *reached* the remote. Probe is the
+            // source of truth. Single-flight latch collapses bursts.
+            void this.probeHealth();
+
             if (info.direction === "pull" && info.change?.docs) {
                 for (const doc of info.change.docs) {
                     const typed = doc as unknown as CouchSyncDoc;
@@ -392,50 +732,34 @@ export class Replicator {
         });
 
         this.sync.on("denied", (err) => {
-            console.error("CouchSync: replication denied:", err);
-            this.setState("error");
-            this.emitError("Sync denied: check CouchDB permissions.");
+            // `denied` is a per-doc permission rejection. The replication
+            // session continues processing other docs, so promoting this
+            // to state=error would lie about the overall session health.
+            // Log always; emit a one-shot warning Notice so the user
+            // knows to check their _security doc.
+            logVerbose(`denied: ${(err as any)?.message ?? String(err)}`);
+            if (!this.deniedWarningEmitted) {
+                this.deniedWarningEmitted = true;
+                this.emitError(
+                    "Some documents were denied — check CouchDB _security permissions.",
+                );
+            }
         });
 
         this.sync.on("error", (err) => {
-            console.error("CouchSync: replication error:", err);
-            // 401/403 is a permanent credential failure. Stop the retry loop
-            // so PouchDB doesn't keep hammering the server forever.
-            if (err?.status === 401 || err?.status === 403) {
-                this.authError = true;
-                this.setState("error");
-                this.emitError(
-                    `Authentication failed (${err.status}). Check your CouchDB credentials.`,
-                );
-                if (this.sync) {
-                    (this.sync as any).removeAllListeners();
-                    this.sync.cancel();
-                    this.sync = null;
-                }
-                return;
-            }
-            this.setState("error");
-            this.emitError("Sync error: " + (err?.message || "unknown"));
+            logVerbose(`sync error: ${(err as any)?.message ?? String(err)}`);
+            // Non-auth sync errors are almost always transient — PouchDB's
+            // retry:true machinery is already reconnecting behind the
+            // scenes. Route through the soft path; auth gets escalated
+            // immediately via classifyError.
+            this.handleTransientError(err);
         });
 
-        this.sync.on("complete", () => {
-            this.setState("disconnected");
-        });
-
-        // Health check: detect silent disconnections (PouchDB bug #3714)
-        this.healthTimer = setInterval(() => this.checkHealth(), HEALTH_CHECK_INTERVAL);
-
-        // Environment state listeners for immediate detection
-        window.addEventListener("offline", this.boundOnOffline);
-        window.addEventListener("online", this.boundOnOnline);
-        document.addEventListener("visibilitychange", this.boundOnVisibility);
+        // Note: no `complete` handler. `live:true + retry:true` sync
+        // never completes on its own, and teardown() already removes all
+        // listeners before cancel(), so the event can't reach us anyway.
 
         this.setState("syncing");
-    }
-
-    stop(): void {
-        this.teardown();
-        this.setState("disconnected");
     }
 
     /**
@@ -507,68 +831,116 @@ export class Replicator {
         return this.testConnectionWith(s.couchdbUri, s.couchdbUser, s.couchdbPassword, s.couchdbDbName);
     }
 
-    private async updateLastSyncedSeq(): Promise<void> {
-        const info = await this.localDb.getDb().info();
-        this.lastSyncedSeq = info.update_seq;
-    }
-
     private async checkHealth(): Promise<void> {
         if (this.authError) return;
 
-        try {
-            // Connected (idle/long-poll): PouchDB's own timeout (30s) and
-            // heartbeat (10s) detect dead sockets. Stall check is not
-            // needed because update_seq not moving is normal when the
-            // vault is quiet. Silent socket death during background is
-            // caught by app-resume; network changes by network-online.
-            //
-            // Reconnecting: restart is already in progress, don't interfere.
-            if (this.state === "connected" || this.state === "reconnecting") return;
+        // Reconnecting: a restart is already in flight, don't interfere.
+        // Error: the dedicated backoff retry timer is the single source
+        // of truth for retry cadence — racing it with a periodic-tick
+        // reconnect would double-fire.
+        if (this.state === "reconnecting" || this.state === "error") return;
 
-            // Syncing (active transfer): if update_seq hasn't moved and
-            // no change event fired recently, the transfer is stuck.
-            if (this.state === "syncing") {
-                const info = await this.localDb.getDb().info();
-                const stalled = info.update_seq === this.lastSyncedSeq;
-                const recentChange = Date.now() - this.lastChangeAt < HEALTH_CHECK_INTERVAL;
-                if (stalled && !recentChange) {
-                    logVerbose(`health: syncing stall detected (seq=${info.update_seq})`);
-                    await this.requestReconnect("stalled");
-                }
-                return;
-            }
-
-            // Inactive session (disconnected/error): try to recover via
-            // the gateway. The "periodic-tick" reason routes through
-            // verify-then-restart so we don't hammer a still-down server.
-            if (this.state === "disconnected" || this.state === "error") {
+        // Disconnected: nothing to probe, just try to come back up.
+        if (this.state === "disconnected") {
+            try {
                 await this.requestReconnect("periodic-tick");
+            } catch (e) {
+                console.error("CouchSync: Health check error:", e);
             }
-        } catch (e) {
-            console.error("CouchSync: Health check error:", e);
+            return;
+        }
+
+        // Connected / syncing: issue a fresh HTTP probe. This is the
+        // single source of truth for `lastHealthyAt` and for catching
+        // asymmetric faults. PouchDB's own events are ambiguous under
+        // partial connectivity (pull longpoll can return empty while
+        // push is failing), so we can't infer health from them.
+        await this.probeHealth();
+    }
+
+    /**
+     * Single-flight fresh HTTP probe against the remote. This is the
+     * canonical health signal: it updates `lastHealthyAt` on success,
+     * promotes `syncing → connected` on success, and escalates
+     * straight to hard error on failure — bypassing the 10s transient
+     * window because fresh HTTP with a 5s ceiling is a more decisive
+     * signal than PouchDB's own (internally retried) error events.
+     *
+     * Fired from three places:
+     *   1. `checkHealth()` — 30s idle-state safety net
+     *   2. `sync.on("change")` — every local edit, for deterministic
+     *      lastHealthyAt updates (no dependency on probe tick phase)
+     *   3. `handlePaused(no err)` — replaces the old direct
+     *      `setState("connected")` so connected UI is always backed by
+     *      a real round-trip, not PouchDB's ambiguous paused events.
+     *
+     * Concurrent callers share the same in-flight probe via
+     * `probeInFlight`; rapid-fire change events from a multi-file save
+     * collapse into one round-trip.
+     */
+    private async probeHealth(): Promise<boolean> {
+        if (this.probeInFlight) return false;
+        if (!this.remoteDb) return false;
+        this.probeInFlight = true;
+        const remoteDb = this.remoteDb;
+        try {
+            await Promise.race([
+                remoteDb.info(),
+                new Promise((_, reject) =>
+                    setTimeout(
+                        () => reject(new Error("probe timed out")),
+                        PROBE_TIMEOUT_MS,
+                    ),
+                ),
+            ]);
+            // Guard against teardown racing the probe: remoteDb may
+            // have been closed while info() was in flight.
+            if (this.remoteDb !== remoteDb) return false;
+            this.lastHealthyAt = Date.now();
+            logVerbose(`health: probe ok state=${this.state}`);
+            if (this.state === "syncing") {
+                this.setState("connected");
+            }
+            return true;
+        } catch (e: any) {
+            if (this.remoteDb !== remoteDb) return false;
+            logVerbose(`health: probe failed ${e?.message ?? e}`);
+            // Fresh HTTP failure is decisive — skip the transient
+            // escalation window and go straight to hard error.
+            this.enterHardError(this.classifyError(e));
+            return false;
+        } finally {
+            this.probeInFlight = false;
         }
     }
 
     private async handlePaused(err: unknown): Promise<void> {
-        const epoch = this.syncEpoch;
-
         if (err) {
-            this.setState("error");
-            this.emitError("Sync paused: connection issue");
+            // `paused(err)` means PouchDB is in back-off retry — definitionally
+            // a transient state, not a hard error. Route through the soft
+            // path so PouchDB gets its escalation window to self-recover.
+            this.handleTransientError(err);
             return;
         }
 
-        // Catchup pull in bringUpSession() has already verified the session
-        // has pulled pending remote changes, so `paused` here means genuine
-        // idle (or back-off wait on a healthy socket — either way nothing
-        // to do). No need to re-verify reachability.
-        await this.updateLastSyncedSeq();
+        // paused (no err) is a queue-drained hint from PouchDB, NOT proof
+        // of server health. Under asymmetric faults (e.g. Tailscale drop)
+        // a pull longpoll returning empty fires paused(undefined) while
+        // push is still failing — so we must NOT trust this event to
+        // directly transition syncing → connected.
+        //
+        // Instead: kick a probe. The probe's success/failure is what
+        // actually promotes to connected (on success) or escalates to
+        // hard error (on failure), and it updates lastHealthyAt
+        // deterministically so the UI no longer depends on probe tick
+        // phase for "just now" display.
+        if (this.state === "syncing") {
+            void this.probeHealth();
+        }
 
-        // Sync session was replaced while we were awaiting — discard
-        // this stale callback to avoid overwriting the new session's state.
-        if (this.syncEpoch !== epoch) return;
-
-        this.setState("connected");
+        // Idle callbacks and onPaused handlers fire regardless of state:
+        // they represent "initial catchup drained" / "reconcile trigger"
+        // and need to run even if we're technically in reconnecting.
         if (!this.hasBeenIdle) {
             this.hasBeenIdle = true;
             for (const cb of this.idleCallbacks) cb();
@@ -581,14 +953,25 @@ export class Replicator {
         }
     }
 
-    /** Verify the server can be reached. Pins state="error" with a notice on
-     *  failure (without restarting); returns true if reachable. */
+    /** Verify the server can be reached. On failure, transitions to hard
+     *  error (which starts the backoff retry timer) and returns false. */
     private async verifyReachable(): Promise<boolean> {
         const err = await this.testConnection();
         if (err) {
+            // testConnection returns a string, not an Error. Wrap it so
+            // classifyError's regex still matches network-ish messages.
+            const detail = this.classifyError({ message: err });
+            // If classification falls to "unknown", treat unreachable
+            // pings as network issues — that's the usual cause.
+            if (detail.kind === "unknown") {
+                detail.kind = "network";
+                detail.message = `Server unreachable: ${err}`;
+            }
+            // Only transition if we're not already in a hard error — a
+            // verify from an already-backing-off state shouldn't reset
+            // the timer, just confirm we're stuck.
             if (this.state !== "error") {
-                this.setState("error");
-                this.emitError(`Server unreachable: ${err}`);
+                this.enterHardError(detail);
             }
             return false;
         }

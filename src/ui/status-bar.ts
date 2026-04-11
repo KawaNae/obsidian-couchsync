@@ -1,5 +1,5 @@
 import { Platform, type Plugin } from "obsidian";
-import type { SyncState } from "../db/replicator.ts";
+import type { SyncState, SyncErrorDetail } from "../db/replicator.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 
 const STATE_LABELS: Record<SyncState, string> = {
@@ -36,7 +36,8 @@ export class StatusBar {
     private textEl: HTMLSpanElement | null = null;
     private floatingEl: HTMLElement | null = null;
     private getSettings: () => CouchSyncSettings;
-    private getLastChangeAt: () => number;
+    private getLastHealthyAt: () => number;
+    private getErrorDetail: () => SyncErrorDetail | null;
     private state: SyncState = "disconnected";
     private detail?: string;
     private tickTimer: ReturnType<typeof setInterval> | null = null;
@@ -46,10 +47,12 @@ export class StatusBar {
     constructor(
         plugin: Plugin,
         getSettings: () => CouchSyncSettings,
-        getLastChangeAt: () => number,
+        getLastHealthyAt: () => number,
+        getErrorDetail: () => SyncErrorDetail | null,
     ) {
         this.getSettings = getSettings;
-        this.getLastChangeAt = getLastChangeAt;
+        this.getLastHealthyAt = getLastHealthyAt;
+        this.getErrorDetail = getErrorDetail;
 
         if (!Platform.isMobile) {
             const el = plugin.addStatusBarItem();
@@ -88,13 +91,24 @@ export class StatusBar {
         let text: string;
         if (this.detail !== undefined) {
             text = this.detail;
+        } else if (this.state === "error") {
+            // Compose an informative error label from the classified
+            // detail. HTTP code (if any) is preferred over kind — "401"
+            // is more specific than "auth", "503" more than "server".
+            const errDetail = this.getErrorDetail();
+            const tag = errDetail?.code ?? errDetail?.kind ?? null;
+            const base = tag != null ? `Error (${tag})` : "Error";
+            const lastHealthy = this.getLastHealthyAt();
+            text = lastHealthy > 0
+                ? `${base} · last seen ${formatAge(lastHealthy)}`
+                : base;
         } else {
             const base = STATE_LABELS[this.state];
-            const lastChange = this.getLastChangeAt();
-            if (lastChange > 0 && this.state === "connected") {
-                text = `${base} · ${formatAge(lastChange)}`;
-            } else if (lastChange > 0 && (this.state === "error" || this.state === "disconnected")) {
-                text = `${base} (last seen ${formatAge(lastChange)})`;
+            const lastHealthy = this.getLastHealthyAt();
+            if (lastHealthy > 0 && this.state === "connected") {
+                text = `${base} · ${formatAge(lastHealthy)}`;
+            } else if (lastHealthy > 0 && this.state === "disconnected") {
+                text = `${base} (last seen ${formatAge(lastHealthy)})`;
             } else {
                 text = base;
             }
