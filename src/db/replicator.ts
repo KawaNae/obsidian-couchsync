@@ -17,7 +17,6 @@ export type OnStateChangeHandler = (state: SyncState) => void;
 export type OnErrorHandler = (message: string) => void;
 
 const HEALTH_CHECK_INTERVAL = 30000; // 30s
-const RECENT_CHANGE_WINDOW_MS = 60000;
 
 export class Replicator {
     private sync: PouchDB.Replication.Sync<CouchSyncDoc> | null = null;
@@ -191,19 +190,24 @@ export class Replicator {
         this.hasBeenIdle = false;
         this.idleCallbacks = [];
         this.phase = "idle";
+        // Reset so the next session doesn't carry a stale timestamp into
+        // UI ("5h ago" after a fresh reconnect) or into handlePaused heuristics.
+        this.lastChangeAt = 0;
     }
 
     /**
      * Restart sync session (preserves PouchDB checkpoint).
      *
-     * Uses teardown() instead of stop() so we don't emit a transient
-     * "disconnected" state — the status bar shows "Reconnecting..."
-     * (set by requestReconnect) until start() transitions to "syncing".
+     * Goes through bringUpSession() so the new live sync is gated on a
+     * one-shot catchup pull completing. This prevents the "false connected"
+     * state where PouchDB fires `paused` on a fresh session before actually
+     * pulling remote changes — which would leave the device diverged until
+     * manual intervention.
      */
-    private restart(): void {
+    private async restart(): Promise<void> {
         this.lastRestartTime = Date.now();
         this.teardown();
-        this.start();
+        await this.bringUpSession();
     }
 
     /**
@@ -238,32 +242,111 @@ export class Replicator {
 
         if (decision === "skip") return;
 
+        // verify-then-restart keeps the pre-flight ping so a transient error
+        // doesn't tear down a still-recovering retry:true session. The real
+        // safety net is the catchup pull inside bringUpSession(), which
+        // definitively verifies the new session has pulled pending changes.
         if (decision === "verify-then-restart") {
             this.setState("reconnecting");
-            if (await this.verifyReachable()) {
-                logNotice(`Reconnect (${reason}): restarting`);
-                this.restart();
-            }
-            return;
+            if (!(await this.verifyReachable())) return;
+        } else {
+            this.setState("reconnecting");
         }
 
-        // restart-now
-        this.setState("reconnecting");
         logNotice(`Reconnect (${reason}): restarting`);
-        this.restart();
+        await this.restart();
     }
 
-    start(): void {
+    /**
+     * Entry point for bringing up a session (initial start or after restart).
+     * Same pipeline for both so there's a single path to reason about.
+     *
+     *   prepareRemoteDb → setState("reconnecting") → catchupPull (await) →
+     *   assign this.remoteDb → startLiveSync → setState("syncing")
+     *
+     * The catchup pull is the key difference from the previous design:
+     * it's a one-shot db.replicate.from() that resolves only when the local
+     * DB has pulled every pending doc from the remote. Without it, the
+     * subsequent live sync's `paused` event can fire spuriously before any
+     * batch has been processed, leaving the device falsely "connected".
+     */
+    async start(): Promise<void> {
         if (this.sync) return;
         // An explicit start() call means the user is trying again — assume
         // they've fixed their credentials and allow retries from here on.
         this.authError = false;
+        await this.bringUpSession();
+    }
 
+    private async bringUpSession(): Promise<void> {
+        if (this.sync) return;
+        if (this.authError) return;
+
+        const myEpoch = this.syncEpoch;
+        const remoteDb = this.prepareRemoteDb();
+        this.setState("reconnecting");
+
+        try {
+            await this.catchupPull(remoteDb);
+        } catch (e: any) {
+            if (e?.status === 401 || e?.status === 403) {
+                this.authError = true;
+                this.setState("error");
+                this.emitError(
+                    `Authentication failed (${e.status}). Check your CouchDB credentials.`,
+                );
+            } else {
+                this.setState("error");
+                this.emitError("Catchup failed: " + (e?.message ?? "unknown"));
+            }
+            remoteDb.close();
+            return;
+        }
+
+        // Another teardown happened during our await — discard this session.
+        if (this.syncEpoch !== myEpoch) {
+            remoteDb.close();
+            return;
+        }
+
+        this.remoteDb = remoteDb;
+        this.startLiveSync();
+    }
+
+    private prepareRemoteDb(): PouchDB.Database<CouchSyncDoc> {
         const remoteUrl = this.getRemoteUrl();
-        this.remoteDb = new PouchDB<CouchSyncDoc>(remoteUrl, {
+        return new PouchDB<CouchSyncDoc>(remoteUrl, {
             skip_setup: true,
         });
+    }
 
+    /**
+     * One-shot pull replication. Resolves on `complete`, rejects on `error`.
+     * Uses the shared PouchDB checkpoint so a fresh catchup after restart
+     * picks up exactly where the previous session left off (no re-download).
+     */
+    private async catchupPull(remoteDb: PouchDB.Database<CouchSyncDoc>): Promise<void> {
+        const db = this.localDb.getDb();
+        logVerbose("catchup: starting one-shot pull");
+        await new Promise<void>((resolve, reject) => {
+            const rep = db.replicate.from(remoteDb, {
+                batch_size: 50,
+                batches_limit: 5,
+            });
+            rep.on("complete", (info: any) => {
+                logNotice(
+                    `Catchup complete: docs_read=${info?.docs_read ?? 0} last_seq=${info?.last_seq ?? "?"}`,
+                );
+                resolve();
+            });
+            rep.on("error", (err: any) => {
+                reject(err);
+            });
+        });
+    }
+
+    private startLiveSync(): void {
+        if (!this.remoteDb) return;
         const db = this.localDb.getDb();
         this.sync = db.sync(this.remoteDb, {
             live: true,
@@ -474,18 +557,17 @@ export class Replicator {
             this.emitError("Sync paused: connection issue");
             return;
         }
-        // PouchDB fires `paused` (without err) for genuine idle, but also for
-        // back-off retry waits. Trust the event only if we saw a real change
-        // recently; otherwise leave verification to the periodic health check.
-        const sinceLastChange = Date.now() - this.lastChangeAt;
-        if (sinceLastChange > RECENT_CHANGE_WINDOW_MS) {
-            if (!(await this.verifyReachable())) return;
-        }
+
+        // Catchup pull in bringUpSession() has already verified the session
+        // has pulled pending remote changes, so `paused` here means genuine
+        // idle (or back-off wait on a healthy socket — either way nothing
+        // to do). No need to re-verify reachability.
+        await this.updateLastSyncedSeq();
+
         // Sync session was replaced while we were awaiting — discard
         // this stale callback to avoid overwriting the new session's state.
         if (this.syncEpoch !== epoch) return;
 
-        this.updateLastSyncedSeq();
         this.setState("connected");
         if (!this.hasBeenIdle) {
             this.hasBeenIdle = true;
