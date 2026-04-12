@@ -20,6 +20,7 @@ import type {
     AllDocsOpts,
     AllDocsResult,
     AllDocsRow,
+    LocalChangesResult,
 } from "./interfaces.ts";
 
 // ── Stored document shape ───────────────────────────────
@@ -30,6 +31,10 @@ export interface StoredDoc {
     _id: string;
     /** CAS version counter. Incremented on every write. */
     _version: number;
+    /** Monotonic local sequence number for change tracking. Set on every
+     *  write via `_bumpSeq()`. SyncEngine's push loop queries docs with
+     *  `_localSeq > lastPushedSeq` to find unpushed changes. */
+    _localSeq?: number;
     /** The document body (everything except _id/_rev/_version). */
     [key: string]: any;
 }
@@ -52,6 +57,11 @@ export class SyncDB extends Dexie {
             docs: "_id, type",
             meta: "key",
         });
+        // v2: add _localSeq index for change tracking (SyncEngine push loop).
+        this.version(2).stores({
+            docs: "_id, type, _localSeq",
+            meta: "key",
+        });
     }
 }
 
@@ -62,7 +72,7 @@ function makeRev(version: number): string {
 }
 
 function stripInternal<T>(stored: StoredDoc): T {
-    const { _version, ...doc } = stored;
+    const { _version, _localSeq, ...doc } = stored;
     // Synthesize _rev from _version for consumers that expect it
     return { ...doc, _rev: makeRev(_version) } as unknown as T;
 }
@@ -112,6 +122,7 @@ async put(doc: T): Promise<PutResponse> {
         if (!id) throw new Error("Document must have an _id");
 
         const existing = await this.db.docs.get(id);
+        const seq = await this._bumpSeq();
         if (existing) {
             // CAS: caller must provide _rev matching current version.
             // Missing _rev on an existing doc is a conflict (matches PouchDB).
@@ -119,10 +130,10 @@ async put(doc: T): Promise<PutResponse> {
                 throw conflict409(id);
             }
             const newVersion = existing._version + 1;
-            await this.db.docs.put({ ...body, _id: id, _version: newVersion });
+            await this.db.docs.put({ ...body, _id: id, _version: newVersion, _localSeq: seq });
             return { ok: true, id, rev: makeRev(newVersion) };
         } else {
-            await this.db.docs.put({ ...body, _id: id, _version: 1 });
+            await this.db.docs.put({ ...body, _id: id, _version: 1, _localSeq: seq });
             return { ok: true, id, rev: makeRev(1) };
         }
     }
@@ -140,6 +151,7 @@ async put(doc: T): Promise<PutResponse> {
         const toWrite: StoredDoc[] = [];
         const responses: PutResponse[] = [];
         const errors: Array<{ id: string; message: string }> = [];
+        const seq = await this._bumpSeq();
 
         for (let i = 0; i < docs.length; i++) {
             const { _rev, ...body } = docs[i] as any;
@@ -157,10 +169,10 @@ async put(doc: T): Promise<PutResponse> {
                     continue;
                 }
                 const newVersion = existing._version + 1;
-                toWrite.push({ ...body, _id: id, _version: newVersion });
+                toWrite.push({ ...body, _id: id, _version: newVersion, _localSeq: seq });
                 responses.push({ ok: true, id, rev: makeRev(newVersion) });
             } else {
-                toWrite.push({ ...body, _id: id, _version: 1 });
+                toWrite.push({ ...body, _id: id, _version: 1, _localSeq: seq });
                 responses.push({ ok: true, id, rev: makeRev(1) });
             }
         }
@@ -199,6 +211,7 @@ async put(doc: T): Promise<PutResponse> {
 
             try {
                 let success = false;
+                const seq = await this._bumpSeq();
                 await this.db.transaction("rw", this.db.docs, async () => {
                     const current = await this.db.docs.get(id);
                     const currentVersion = current?._version ?? 0;
@@ -209,6 +222,7 @@ async put(doc: T): Promise<PutResponse> {
                         ...body,
                         _id: id,
                         _version: newVersion,
+                        _localSeq: seq,
                     });
                     success = true;
                 });
@@ -228,6 +242,27 @@ async put(doc: T): Promise<PutResponse> {
 
     async delete(id: string): Promise<void> {
         await this.db.docs.delete(id);
+    }
+
+    async changes(
+        since?: number | string,
+        opts?: { include_docs?: boolean },
+    ): Promise<LocalChangesResult<T>> {
+        const sinceNum = typeof since === "string" ? parseInt(since, 10) || 0 : (since ?? 0);
+        const rows = await this.db.docs
+            .where("_localSeq")
+            .above(sinceNum)
+            .toArray();
+        // Sort by _localSeq ascending for deterministic order
+        rows.sort((a, b) => (a._localSeq ?? 0) - (b._localSeq ?? 0));
+        const results = rows.map((stored) => ({
+            id: stored._id,
+            seq: stored._localSeq ?? 0,
+            doc: opts?.include_docs ? stripInternal<T>(stored) : undefined,
+        }));
+        const seqMeta = await this.db.meta.get("_update_seq");
+        const lastSeq = (seqMeta?.value as number) ?? 0;
+        return { results, last_seq: lastSeq };
     }
 
 async allDocs(opts?: AllDocsOpts): Promise<AllDocsResult<T>> {

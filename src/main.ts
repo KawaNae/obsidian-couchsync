@@ -1,9 +1,9 @@
 import { Platform, Plugin } from "obsidian";
-import PouchDB from "pouchdb-browser/lib/index.js";
 import { type CouchSyncSettings, DEFAULT_SETTINGS } from "./settings.ts";
 import { LocalDB } from "./db/local-db.ts";
 import { ConfigLocalDB } from "./db/config-local-db.ts";
-import { Replicator } from "./db/replicator.ts";
+import { DexieStore } from "./db/dexie-store.ts";
+import { SyncEngine } from "./db/sync-engine.ts";
 import { VaultSync } from "./sync/vault-sync.ts";
 import { ConfigSync } from "./sync/config-sync.ts";
 import { SetupService } from "./sync/setup.ts";
@@ -11,11 +11,9 @@ import { ChangeTracker } from "./sync/change-tracker.ts";
 import { Reconciler, type ReconcileReason } from "./sync/reconciler.ts";
 import { ConflictResolver } from "./conflict/conflict-resolver.ts";
 import { checkInstallMarker } from "./sync/install-marker.ts";
-import { filePathFromId } from "./types/doc-id.ts";
 import { StatusBar } from "./ui/status-bar.ts";
 import { initLog } from "./ui/log.ts";
 import { CouchSyncSettingTab } from "./settings-tab/index.ts";
-import { isFileDoc, type CouchSyncDoc } from "./types.ts";
 import { showNotice, ProgressNotice } from "./ui/notices.ts";
 import { HistoryStorage } from "./history/storage.ts";
 import { HistoryCapture } from "./history/history-capture.ts";
@@ -31,9 +29,7 @@ export default class CouchSyncPlugin extends Plugin {
     localDb!: LocalDB;
     /** Null when `couchdbConfigDbName === ""` (config sync disabled) */
     configLocalDb: ConfigLocalDB | null = null;
-    /** Holds the underlying PouchDB so we can destroy it on unload */
-    private configPouch: PouchDB.Database | null = null;
-    replicator!: Replicator;
+    replicator!: SyncEngine;
     conflictResolver!: ConflictResolver;
     /** Null when config sync is disabled */
     configConflictResolver: ConflictResolver | null = null;
@@ -86,28 +82,28 @@ export default class CouchSyncPlugin extends Plugin {
         this.localDb = new LocalDB(dbName);
         this.localDb.open();
 
-        // Open the config-side local PouchDB only when the user has set
+        // Open the config-side local store only when the user has set
         // a config DB name. The local store is keyed by both vault name
         // and config DB name so switching device pools (e.g. mobile ↔
         // desktop) creates a fresh local store rather than mixing.
         if (this.settings.couchdbConfigDbName) {
             const configLocalName =
                 `couchsync-${vaultName}-config-${this.settings.couchdbConfigDbName}`;
-            this.configPouch = new PouchDB(configLocalName, {
-                auto_compaction: true,
-                revs_limit: 20,
-            });
-            this.configLocalDb = new ConfigLocalDB(this.configPouch as any);
+            this.configLocalDb = new ConfigLocalDB(
+                new DexieStore(configLocalName),
+            );
         }
 
         initLog(() => this.settings, showNotice);
-        this.replicator = new Replicator(this.localDb, () => this.settings, Platform.isMobile);
+        this.replicator = new SyncEngine(this.localDb, () => this.settings, Platform.isMobile);
         this.vaultSync = new VaultSync(this.app, this.localDb, () => this.settings);
         // ConfigSync needs *some* ConfigLocalDB even when sync is disabled,
-        // so we satisfy the type with a stand-in pointing at the vault DB.
+        // so we satisfy the type with a stand-in backed by a throwaway store.
         // The runtime guard `isConfigured()` blocks all DB I/O before it
         // could touch the wrong store.
-        const configDbForSync = this.configLocalDb ?? new ConfigLocalDB(this.localDb.getDb());
+        const configDbForSync = this.configLocalDb ?? new ConfigLocalDB(
+            new DexieStore(`${dbName}-config-stub`),
+        );
         this.configSync = new ConfigSync(this.app, configDbForSync, this.replicator, () => this.settings);
         this.statusBar = new StatusBar(
             this,
@@ -225,21 +221,10 @@ export default class CouchSyncPlugin extends Plugin {
             });
         }
 
-        // Live remote → vault hint path. Reconciler.reconcile("paused") below
-        // is the safety net that catches anything dbToFile missed.
-        this.replicator.onChange((doc: CouchSyncDoc) => {
-            if (isFileDoc(doc)) {
-                this.vaultSync.dbToFile(doc)
-                    .then(() => this.conflictResolver.resolveIfConflicted(doc))
-                    .catch((e) => console.error(
-                        `CouchSync: Failed to apply remote change for ${filePathFromId(doc._id)}:`,
-                        e,
-                    ));
-            }
-        });
-
         // Reconciler runs after every replication batch. The cursor + manifest
         // short-circuit makes the steady-state cost negligible.
+        // In the SyncEngine architecture, Reconciler is the SOLE vault write
+        // path — there is no onChange→dbToFile direct shortcut.
         this.replicator.onPaused(() => this.fireReconcile("paused"));
 
         this.addSettingTab(new CouchSyncSettingTab(this.app, this));
@@ -460,13 +445,12 @@ export default class CouchSyncPlugin extends Plugin {
         this.statusBar?.destroy();
         this.historyStorage?.close();
         await this.localDb?.close();
-        if (this.configPouch) {
+        if (this.configLocalDb) {
             try {
-                await this.configPouch.close();
+                await this.configLocalDb.close();
             } catch (e) {
                 console.error("CouchSync: failed to close config local DB:", e);
             }
-            this.configPouch = null;
             this.configLocalDb = null;
         }
     }
@@ -493,6 +477,8 @@ export default class CouchSyncPlugin extends Plugin {
     }
 
     async initVault(): Promise<void> {
+        this.replicator.stop();
+        this.changeTracker.stop();
         const progress = new ProgressNotice("Init");
         try {
             const result = await this.setupService.init((msg) => progress.update(msg));
@@ -506,6 +492,8 @@ export default class CouchSyncPlugin extends Plugin {
     }
 
     async cloneFromRemote(): Promise<void> {
+        this.replicator.stop();
+        this.changeTracker.stop();
         const progress = new ProgressNotice("Clone");
         try {
             const result = await this.setupService.clone((msg) => progress.update(msg));

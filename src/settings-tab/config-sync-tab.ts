@@ -24,14 +24,14 @@
 import { type App, Notice, Setting, type ButtonComponent } from "obsidian";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { ConfigSync } from "../sync/config-sync.ts";
-import type { Replicator } from "../db/replicator.ts";
+import type { SyncEngine } from "../db/sync-engine.ts";
 
 export interface ConfigSyncTabDeps {
     app: App;
     getSettings: () => CouchSyncSettings;
     updateSettings: (patch: Partial<CouchSyncSettings>) => Promise<void>;
     configSync: ConfigSync;
-    replicator: Replicator;
+    replicator: SyncEngine;
     refresh: () => void;
 }
 

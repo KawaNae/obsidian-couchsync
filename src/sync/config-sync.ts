@@ -1,6 +1,6 @@
 import type { App } from "obsidian";
 import type { ConfigLocalDB } from "../db/config-local-db.ts";
-import type { Replicator } from "../db/replicator.ts";
+import type { SyncEngine } from "../db/sync-engine.ts";
 import type { ConfigDoc, CouchSyncDoc } from "../types.ts";
 import {
     DOC_ID,
@@ -46,7 +46,7 @@ export class ConfigSync {
     constructor(
         private app: App,
         private configDb: ConfigLocalDB,
-        private replicator: Replicator,
+        private replicator: SyncEngine,
         private getSettings: () => CouchSyncSettings,
     ) {}
 

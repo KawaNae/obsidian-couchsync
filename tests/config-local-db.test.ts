@@ -1,21 +1,13 @@
 /**
- * Tests for ConfigLocalDB.
- *
- * ConfigLocalDB is a thin wrapper around a PouchDB instance dedicated to
- * ConfigDocs. It deliberately does NOT manage PouchDB lifecycle (open /
- * close / destroy) — the caller passes in a fully-constructed instance.
- * That makes it trivially testable with the memory adapter and avoids
- * the module-level `pouchdb-browser` import problem that LocalDB has.
+ * Tests for ConfigLocalDB — DexieStore-backed config document store.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import PouchDB from "pouchdb";
-import memoryAdapter from "pouchdb-adapter-memory";
+import "fake-indexeddb/auto";
+import { DexieStore } from "../src/db/dexie-store.ts";
 import { ConfigLocalDB } from "../src/db/config-local-db.ts";
 import type { ConfigDoc, CouchSyncDoc } from "../src/types.ts";
 import { makeConfigId, makeFileId } from "../src/types/doc-id.ts";
-
-PouchDB.plugin(memoryAdapter);
 
 function uniqueName(prefix: string) {
     return `${prefix}-${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
@@ -33,16 +25,16 @@ function makeConfig(path: string, vclock: Record<string, number> = { test: 1 }):
 }
 
 describe("ConfigLocalDB", () => {
-    let pouch: PouchDB.Database<CouchSyncDoc>;
+    let store: DexieStore<CouchSyncDoc>;
     let db: ConfigLocalDB;
 
     beforeEach(() => {
-        pouch = new PouchDB<CouchSyncDoc>(uniqueName("cdb"), { adapter: "memory" });
-        db = new ConfigLocalDB(pouch);
+        store = new DexieStore<CouchSyncDoc>(uniqueName("cdb"));
+        db = new ConfigLocalDB(store);
     });
 
     afterEach(async () => {
-        await pouch.destroy().catch(() => {});
+        await store.destroy().catch(() => {});
     });
 
     describe("get / put", () => {
@@ -60,7 +52,7 @@ describe("ConfigLocalDB", () => {
             expect(got).toBeNull();
         });
 
-        it("put is a passthrough — writing without _rev conflicts", async () => {
+        it("put without _rev on existing doc conflicts", async () => {
             await db.put(makeConfig(".obsidian/app.json", { A: 1 }));
             await expect(
                 db.put(makeConfig(".obsidian/app.json", { A: 2 })),
@@ -75,24 +67,6 @@ describe("ConfigLocalDB", () => {
             }));
             const got = await db.get(makeConfigId(".obsidian/app.json"));
             expect(got!.vclock).toEqual({ A: 2 });
-        });
-
-        it("update retries on 409 conflict", async () => {
-            await db.put(makeConfig(".obsidian/app.json", { A: 1 }));
-            let callCount = 0;
-            await db.update<ConfigDoc>(makeConfigId(".obsidian/app.json"), (existing) => {
-                callCount++;
-                if (callCount === 1) {
-                    // Cause a 409 by writing out-of-band before update() tries put()
-                    // This makes the _rev from get() stale.
-                    const outOfBand = { ...existing!, vclock: { A: 99 } };
-                    pouch.put(outOfBand as unknown as CouchSyncDoc);
-                }
-                return { ...existing!, vclock: { A: callCount * 10 } };
-            });
-            expect(callCount).toBe(2);
-            const got = await db.get(makeConfigId(".obsidian/app.json"));
-            expect(got!.vclock).toEqual({ A: 20 });
         });
 
         it("update returns null when fn returns null", async () => {
@@ -128,9 +102,8 @@ describe("ConfigLocalDB", () => {
         it("returns only ConfigDocs (range-bounded)", async () => {
             await db.put(makeConfig(".obsidian/x.json"));
             await db.put(makeConfig(".obsidian/y.json"));
-            // Sneak in an off-prefix doc directly via PouchDB to ensure
-            // allConfigDocs filters it out.
-            await pouch.put({
+            // Insert an off-prefix doc directly via DexieStore
+            await store.put({
                 _id: makeFileId("intruder.md"),
                 type: "file",
                 chunks: [],
@@ -179,8 +152,8 @@ describe("ConfigLocalDB", () => {
         });
 
         it("returns the id of a config without vclock", async () => {
-            // Bypass the typed put to insert a malformed legacy doc
-            await pouch.put({
+            // Insert a malformed legacy doc via DexieStore
+            await store.put({
                 _id: makeConfigId(".obsidian/legacy.json"),
                 type: "config",
                 data: "",
@@ -192,8 +165,7 @@ describe("ConfigLocalDB", () => {
         });
 
         it("returns the id of a non-config doc accidentally living here", async () => {
-            // file: doc in a config DB is a schema violation
-            await pouch.put({
+            await store.put({
                 _id: makeFileId("wrong-place.md"),
                 type: "file",
                 chunks: [],
@@ -204,12 +176,6 @@ describe("ConfigLocalDB", () => {
             } as CouchSyncDoc);
             const found = await db.findLegacyConfigDoc();
             expect(found).toBe(makeFileId("wrong-place.md"));
-        });
-    });
-
-    describe("getDb", () => {
-        it("exposes the underlying PouchDB instance for advanced operations", () => {
-            expect(db.getDb()).toBe(pouch);
         });
     });
 });

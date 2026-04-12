@@ -120,11 +120,16 @@ export async function listRemoteByPrefix(
         .map((row) => row.id);
 }
 
-/** Destroy the remote database. Will be auto-recreated on the next push. */
+/** Destroy the remote database. Tolerates 404 (DB already gone). */
 export async function destroyRemote(
     remote: ICouchClient,
 ): Promise<void> {
-    await remote.destroy();
+    try {
+        await remote.destroy();
+    } catch (e: any) {
+        if (e?.status === 404) return;
+        throw e;
+    }
 }
 
 /**

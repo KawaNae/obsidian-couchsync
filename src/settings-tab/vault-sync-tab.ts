@@ -14,14 +14,14 @@
  */
 import { type App, Notice, Setting, type ButtonComponent } from "obsidian";
 import type { ConnectionState, CouchSyncSettings } from "../settings.ts";
-import type { Replicator } from "../db/replicator.ts";
+import type { SyncEngine } from "../db/sync-engine.ts";
 import type { LocalDB } from "../db/local-db.ts";
 
 export interface VaultSyncTabDeps {
     app: App;
     getSettings: () => CouchSyncSettings;
     updateSettings: (patch: Partial<CouchSyncSettings>) => Promise<void>;
-    replicator: Replicator;
+    replicator: SyncEngine;
     localDb: LocalDB;
     initVault: () => Promise<void>;
     cloneFromRemote: () => Promise<void>;

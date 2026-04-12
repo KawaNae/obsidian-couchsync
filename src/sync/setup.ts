@@ -1,6 +1,6 @@
 import type { App } from "obsidian";
 import type { LocalDB } from "../db/local-db.ts";
-import type { Replicator } from "../db/replicator.ts";
+import type { SyncEngine } from "../db/sync-engine.ts";
 import type { VaultSync } from "./vault-sync.ts";
 import type { Reconciler } from "./reconciler.ts";
 import { filePathFromId, parseDocId } from "../types/doc-id.ts";
@@ -30,7 +30,7 @@ export class SetupService {
     constructor(
         private app: App,
         private localDb: LocalDB,
-        private replicator: Replicator,
+        private replicator: SyncEngine,
         private vaultSync: VaultSync,
         private reconciler: Reconciler,
     ) {}
@@ -44,6 +44,7 @@ export class SetupService {
 
             onProgress("Initializing remote database...");
             await this.replicator.destroyRemote();
+            await this.replicator.ensureRemoteDb();
 
             onProgress("Scanning vault files...");
             const vaultFiles = await this.scanVaultToDb(onProgress);

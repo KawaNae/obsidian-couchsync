@@ -340,10 +340,10 @@ describe("DexieStore", () => {
             expect(info.updateSeq).toBe(0);
         });
 
-        it("updateSeq reflects written docs after _bumpSeq", async () => {
+        it("updateSeq reflects written docs", async () => {
             await store.put(makeFile("a.md"));
-            await store._bumpSeq();
             const info = await store.info();
+            // put() internally bumps the seq counter
             expect(info.updateSeq).toBe(1);
         });
     });

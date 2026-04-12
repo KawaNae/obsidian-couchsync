@@ -1,6 +1,6 @@
 import { type App, Modal, Notice, Setting } from "obsidian";
 import type { CouchSyncSettings } from "../settings.ts";
-import type { Replicator } from "../db/replicator.ts";
+import type { SyncEngine } from "../db/sync-engine.ts";
 import { ConfirmModal } from "../ui/confirm-modal.ts";
 
 /** Thrown internally when a fetch gets 401/403, so callers can abort. */
@@ -72,7 +72,7 @@ class TypeToConfirmModal extends Modal {
 
 interface StatusTabDeps {
     getSettings: () => CouchSyncSettings;
-    replicator: Replicator;
+    replicator: SyncEngine;
     app: App;
     refresh: () => void;
 }
