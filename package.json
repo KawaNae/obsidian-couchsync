@@ -17,6 +17,7 @@
         "@types/pouchdb-browser": "^6.1.5",
         "builtin-modules": "5.0.0",
         "esbuild": "0.25.0",
+        "fake-indexeddb": "^6.2.5",
         "obsidian": "^1.12.3",
         "pouchdb": "^9.0.0",
         "pouchdb-adapter-memory": "^9.0.0",
