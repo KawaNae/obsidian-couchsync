@@ -44,6 +44,7 @@ export class SetupService {
 
             onProgress("Initializing remote database...");
             await this.replicator.destroyRemote();
+            await this.replicator.ensureRemoteDb();
 
             onProgress("Scanning vault files...");
             const vaultFiles = await this.scanVaultToDb(onProgress);

@@ -123,5 +123,7 @@ export interface ICouchClient {
     allDocs<T>(opts: AllDocsOpts): Promise<AllDocsResult<T>>;
     changes<T>(opts: ChangesOpts): Promise<ChangesResult<T>>;
     changesLongpoll<T>(opts: ChangesOpts): Promise<ChangesResult<T>>;
+    /** Create the database if it doesn't exist. Idempotent (412 ignored). */
+    ensureDb(): Promise<void>;
     destroy(): Promise<void>;
 }

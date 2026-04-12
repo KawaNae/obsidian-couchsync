@@ -37,7 +37,6 @@ export type {
     SyncErrorDetail,
     SyncErrorKind,
 } from "./reconnect-policy.ts";
-export type SyncPhase = "idle" | "pulling" | "applying" | "live";
 
 export type OnChangeHandler = (doc: CouchSyncDoc) => void;
 export type OnStateChangeHandler = (state: SyncState) => void;
@@ -78,7 +77,6 @@ export class SyncEngine {
     // ── State ─────────────────────────────────────────────
 
     private state: SyncState = "disconnected";
-    private phase: SyncPhase = "idle";
     private lastHealthyAt = 0;
     private lastErrorDetail: SyncErrorDetail | null = null;
     private lastRestartTime = 0;
@@ -137,9 +135,6 @@ export class SyncEngine {
     // ── Probe single-flight ───────────────────────────────
 
     private probePromise: Promise<boolean> | null = null;
-    /** Set by handlePaused-equivalent (longpoll returns), consumed by
-     *  doProbe on success. */
-    private pausedPending = false;
 
     /** Latch so we emit at most one warning Notice per `denied` storm. */
     private deniedWarningEmitted = false;
@@ -163,10 +158,6 @@ export class SyncEngine {
 
     getState(): SyncState {
         return this.state;
-    }
-
-    getPhase(): SyncPhase {
-        return this.phase;
     }
 
     /** Timestamp (ms) of the most recent proof the session was healthy,
@@ -320,6 +311,12 @@ export class SyncEngine {
         await remoteCouch.destroyRemote(client);
     }
 
+    /** Create the vault remote database if it doesn't exist. */
+    async ensureRemoteDb(): Promise<void> {
+        const client = this.makeVaultClient();
+        await client.ensureDb();
+    }
+
     /** Test connection with explicit credentials (for unsaved draft values). */
     async testConnectionWith(
         uri: string, user: string, pass: string, db: string,
@@ -396,9 +393,7 @@ export class SyncEngine {
         this.client = null;
         this.hasBeenIdle = false;
         this.idleCallbacks = [];
-        this.phase = "idle";
         this.deniedWarningEmitted = false;
-        this.pausedPending = false;
         this.probePromise = null;
         // lastHealthyAt and lastErrorDetail intentionally NOT reset.
     }
@@ -434,7 +429,11 @@ export class SyncEngine {
             // Start from 0 if meta is unavailable.
         }
 
-        // Catchup pull: drain all pending remote changes before going live.
+        if (this.syncEpoch !== myEpoch) return;
+
+        // Catchup = actual data transfer → syncing.
+        this.setState("syncing");
+
         try {
             await this.catchupPull(client, myEpoch);
         } catch (e: any) {
@@ -443,13 +442,14 @@ export class SyncEngine {
             return;
         }
 
-        // Teardown happened during catchup — discard this session.
         if (this.syncEpoch !== myEpoch) return;
 
-        // Catchup proved the session is in a known-good state.
+        // Catchup complete = caught up → connected immediately.
         this.lastHealthyAt = Date.now();
         this.client = client;
         this.running = true;
+        this.setState("connected");
+        this.firePausedCallbacks();
         this.startLiveSync(myEpoch);
     }
 
@@ -465,7 +465,6 @@ export class SyncEngine {
         epoch: number,
     ): Promise<void> {
         logVerbose("catchup: starting HTTP changes pull");
-        this.phase = "pulling";
 
         let lastProgressAt = Date.now();
 
@@ -503,8 +502,6 @@ export class SyncEngine {
                 break;
             }
         }
-
-        this.phase = "idle";
     }
 
     // ── Internal: Live sync loops ─────────────────────────
@@ -514,10 +511,7 @@ export class SyncEngine {
      * Both loops check syncEpoch to self-terminate on teardown.
      */
     private startLiveSync(epoch: number): void {
-        this.setState("syncing");
-        this.phase = "live";
-
-        // Fire and forget — loops self-terminate via epoch check.
+        // State is already "connected" — just start the loops.
         this.pullLoop(epoch).catch((e) =>
             console.error("CouchSync: pullLoop unexpected exit:", e),
         );
@@ -528,8 +522,8 @@ export class SyncEngine {
 
     /**
      * Long-poll pull loop. Each iteration issues a longpoll _changes
-     * request, writes received docs to local, fires onChange, and probes
-     * health. On empty longpoll return (timeout), fires paused + probe.
+     * request. On received changes: syncing → apply → connected.
+     * On empty result (max-wait timeout): no state change.
      */
     private async pullLoop(epoch: number): Promise<void> {
         while (this.syncEpoch === epoch) {
@@ -542,24 +536,28 @@ export class SyncEngine {
                 if (this.syncEpoch !== epoch) return;
 
                 if (result.results.length > 0) {
-                    this.phase = "pulling";
+                    this.setState("syncing");
                     await this.writePulledDocs(result);
-                    this.phase = "live";
-
-                    // Probe health on activity.
-                    void this.probeHealth();
+                    if (this.syncEpoch !== epoch) return;
+                    this.lastHealthyAt = Date.now();
+                    this.setState("connected");
+                    this.firePausedCallbacks();
                 }
-
-                // Longpoll returned (with or without changes) — treat as
-                // "paused" equivalent: we're caught up for now.
-                await this.handlePaused();
+                // Empty result (longpoll max-wait): stay connected.
             } catch (e: any) {
                 if (this.syncEpoch !== epoch) return;
 
-                // Treat pull errors as transient — the loop will retry.
-                this.handleTransientError(e);
+                const detail = this.classifyError(e);
 
-                // Brief delay before retry to avoid tight error loops.
+                if (detail.kind === "auth" || detail.kind === "server") {
+                    this.handleTransientError(e);
+                } else {
+                    // Network/timeout errors on longpoll are expected.
+                    logVerbose(
+                        `pullLoop: ${detail.kind} error, retrying — ${detail.message}`,
+                    );
+                }
+
                 await this.delay(2000, epoch);
             }
         }
@@ -587,6 +585,7 @@ export class SyncEngine {
                 if (toPush.length > 0 && this.client) {
                     const docs = toPush.map((r) => r.doc!);
                     await this.pushDocs(docs);
+                    this.lastHealthyAt = Date.now();
                 }
 
                 // Always advance the push checkpoint (even if no docs
@@ -625,9 +624,7 @@ export class SyncEngine {
         }
 
         if (docs.length > 0) {
-            this.phase = "applying";
             await this.localDb.bulkPut(docs);
-            this.phase = "live";
 
             // Fire onChange for each pulled doc.
             for (const row of result.results) {
@@ -899,19 +896,10 @@ export class SyncEngine {
             if (this.syncEpoch !== sessionEpoch) return false;
             this.lastHealthyAt = Date.now();
             logVerbose(`health: probe ok state=${this.state}`);
-
-            if (this.state === "reconnecting" || this.state === "disconnected") {
-                this.setState("syncing");
-            }
-            if (this.state === "syncing" && this.pausedPending) {
-                this.setState("connected");
-                this.firePausedCallbacks();
-            }
             return true;
         } catch (e: any) {
             if (this.syncEpoch !== sessionEpoch) return false;
             logVerbose(`health: probe failed ${e?.message ?? e}`);
-            this.pausedPending = false;
             this.enterHardError(this.classifyError(e));
             return false;
         } finally {
@@ -919,31 +907,9 @@ export class SyncEngine {
         }
     }
 
-    // ── Internal: Paused handling ─────────────────────────
-
-    /**
-     * Called when the pull longpoll returns (with or without changes).
-     * Equivalent to PouchDB's `paused` event — signals we're caught up.
-     */
-    private async handlePaused(): Promise<void> {
-        this.pausedPending = true;
-
-        const ok = await this.probeHealth();
-        if (!ok) return;
-
-        // If doProbe already consumed pausedPending, callbacks are fired.
-        // But if we shared an already-in-flight probe that started before
-        // pausedPending was set, handle here.
-        if (this.pausedPending) {
-            if (this.state === "syncing") {
-                this.setState("connected");
-            }
-            this.firePausedCallbacks();
-        }
-    }
+    // ── Internal: Paused callbacks ──────────────────────────
 
     private firePausedCallbacks(): void {
-        this.pausedPending = false;
         if (!this.hasBeenIdle) {
             this.hasBeenIdle = true;
             for (const cb of this.idleCallbacks) cb();

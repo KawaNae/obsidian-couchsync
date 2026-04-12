@@ -480,6 +480,8 @@ export default class CouchSyncPlugin extends Plugin {
     }
 
     async initVault(): Promise<void> {
+        this.replicator.stop();
+        this.changeTracker.stop();
         const progress = new ProgressNotice("Init");
         try {
             const result = await this.setupService.init((msg) => progress.update(msg));
@@ -493,6 +495,8 @@ export default class CouchSyncPlugin extends Plugin {
     }
 
     async cloneFromRemote(): Promise<void> {
+        this.replicator.stop();
+        this.changeTracker.stop();
         const progress = new ProgressNotice("Clone");
         try {
             const result = await this.setupService.clone((msg) => progress.update(msg));

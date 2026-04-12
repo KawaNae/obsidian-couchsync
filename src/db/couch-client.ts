@@ -25,10 +25,22 @@ import type {
 /** Default per-request timeout (ms). Longpoll has its own. */
 const DEFAULT_TIMEOUT_MS = 30_000;
 
-/** Longpoll timeout sent to CouchDB; the client-side abort is slightly
- *  longer to account for network latency. */
-const LONGPOLL_FEED_TIMEOUT_MS = 60_000;
-const LONGPOLL_ABORT_MS = LONGPOLL_FEED_TIMEOUT_MS + 10_000;
+/** Heartbeat interval (ms) sent to CouchDB for longpoll. CouchDB sends
+ *  a `\n` every heartbeat interval to keep the connection alive through
+ *  HTTP/2 proxies and intermediaries. Overrides CouchDB's `timeout`. */
+const LONGPOLL_HEARTBEAT_MS = 10_000;
+
+/** Client-side stale threshold: abort if no data (not even a heartbeat
+ *  `\n`) arrives within this window. 3× heartbeat interval = 3 missed
+ *  heartbeats before we consider the connection dead. */
+const LONGPOLL_STALE_MS = LONGPOLL_HEARTBEAT_MS * 3;
+
+/** Client-side maximum wait (ms) for a longpoll request. When heartbeat
+ *  is enabled CouchDB never returns an empty response — it keeps sending
+ *  `\n` forever. This wall-clock timer aborts the request and returns a
+ *  synthetic empty result so the caller's loop can iterate (e.g. call
+ *  handlePaused, transition state, then re-enter longpoll). */
+const LONGPOLL_MAX_WAIT_MS = 60_000;
 
 /** Maximum docs per `_bulk_docs` POST. Keeps memory and network
  *  pressure bounded on large push/pull operations. */
@@ -203,19 +215,121 @@ export class CouchClient implements ICouchClient {
         );
     }
 
+    /**
+     * Longpoll `_changes` with streaming body read.
+     *
+     * CouchDB sends `heartbeat` newlines to keep the connection alive
+     * through HTTP/2 proxies. The standard `request()` helper uses a
+     * wall-clock `AbortController` timer which fires regardless of
+     * whether heartbeat data is arriving — fundamentally incompatible
+     * with streaming responses. Instead, we read the body via
+     * `ReadableStream` and **reset the abort timer on every chunk**,
+     * so the connection is only aborted when the server truly goes
+     * silent (3 missed heartbeats = 30s of no data at all).
+     */
     async changesLongpoll<T>(opts: ChangesOpts): Promise<ChangesResult<T>> {
         const params = new URLSearchParams();
         params.set("feed", "longpoll");
-        params.set("timeout", String(LONGPOLL_FEED_TIMEOUT_MS));
+        params.set("heartbeat", String(LONGPOLL_HEARTBEAT_MS));
         if (opts.since !== undefined) params.set("since", String(opts.since));
         if (opts.limit !== undefined) params.set("limit", String(opts.limit));
         if (opts.include_docs) params.set("include_docs", "true");
 
-        return this.request<ChangesResult<T>>(
-            `/_changes?${params.toString()}`,
-            {},
-            LONGPOLL_ABORT_MS,
-        );
+        const url = `${this.baseUrl}/_changes?${params.toString()}`;
+        const controller = new AbortController();
+
+        // Flag to distinguish which timer caused the abort.
+        let maxWaitFired = false;
+
+        // Stale timer: resets on every chunk (heartbeat or data).
+        // 3 missed heartbeats = connection is dead → throw.
+        let staleTimer = setTimeout(() => controller.abort(), LONGPOLL_STALE_MS);
+        const resetStaleTimer = () => {
+            clearTimeout(staleTimer);
+            staleTimer = setTimeout(() => controller.abort(), LONGPOLL_STALE_MS);
+        };
+
+        // Max-wait timer: wall-clock, never resets. When heartbeat is
+        // enabled CouchDB never returns empty results — this timer
+        // ensures the caller's loop iterates periodically.
+        const maxWaitTimer = setTimeout(() => {
+            maxWaitFired = true;
+            controller.abort();
+        }, LONGPOLL_MAX_WAIT_MS);
+
+        try {
+            const res = await fetch(url, {
+                headers: this.headers,
+                signal: controller.signal,
+            });
+
+            if (!res.ok) {
+                const body = await res.text().catch(() => "");
+                const err: any = new Error(
+                    `CouchDB ${res.status}: ${body || res.statusText}`,
+                );
+                err.status = res.status;
+                throw err;
+            }
+
+            // Stream the body chunk by chunk. Each chunk (heartbeat \n
+            // or partial JSON) resets the stale timer.
+            const reader = res.body!.getReader();
+            const chunks: Uint8Array[] = [];
+            let totalLen = 0;
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                chunks.push(value);
+                totalLen += value.length;
+                resetStaleTimer();
+            }
+
+            clearTimeout(staleTimer);
+            clearTimeout(maxWaitTimer);
+
+            // Concatenate chunks and parse. Leading \n from heartbeats
+            // are trimmed — JSON.parse tolerates leading whitespace.
+            const merged = new Uint8Array(totalLen);
+            let offset = 0;
+            for (const chunk of chunks) {
+                merged.set(chunk, offset);
+                offset += chunk.length;
+            }
+            const text = new TextDecoder().decode(merged);
+            return JSON.parse(text.trim()) as ChangesResult<T>;
+        } catch (e: any) {
+            if (e?.name === "AbortError") {
+                if (maxWaitFired) {
+                    // Max-wait expired with no changes — return empty
+                    // result so the caller can proceed (handlePaused, etc.)
+                    return {
+                        results: [],
+                        last_seq: opts.since ?? 0,
+                    } as ChangesResult<T>;
+                }
+                // Stale: no data at all (not even heartbeats) → throw.
+                const err: any = new Error(
+                    `CouchDB longpoll stale (no data for ${LONGPOLL_STALE_MS}ms)`,
+                );
+                err.status = 0;
+                throw err;
+            }
+            throw e;
+        } finally {
+            clearTimeout(staleTimer);
+            clearTimeout(maxWaitTimer);
+        }
+    }
+
+    async ensureDb(): Promise<void> {
+        try {
+            await this.request<any>("", { method: "PUT" });
+        } catch (e: any) {
+            if (e?.status === 412) return; // DB already exists
+            throw e;
+        }
     }
 
     async destroy(): Promise<void> {

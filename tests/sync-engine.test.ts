@@ -102,11 +102,8 @@ describe("SyncEngine state machine", () => {
         expect(engine.getState()).toBe("disconnected");
         await engine.start();
 
-        expect(states).toContain("reconnecting");
-        expect(states).toContain("syncing");
-
-        // Give the live loop a tick to fire handlePaused -> probe -> connected.
-        await new Promise((r) => setTimeout(r, 50));
+        // Catchup complete → connected immediately, no longpoll wait.
+        expect(states).toEqual(["reconnecting", "syncing", "connected"]);
         expect(engine.getState()).toBe("connected");
         engine.stop();
     });
@@ -117,8 +114,6 @@ describe("SyncEngine state machine", () => {
         const engine = makeSyncEngine(localDb, mockClient);
 
         await engine.start();
-        await new Promise((r) => setTimeout(r, 50));
-
         engine.stop();
         expect(engine.getState()).toBe("disconnected");
     });
@@ -132,6 +127,83 @@ describe("SyncEngine state machine", () => {
 
         // catchup changes() should have been called exactly once.
         expect(mockClient.changes).toHaveBeenCalledTimes(1);
+        engine.stop();
+    });
+
+    it("onPaused fires immediately after catchup completes", async () => {
+        const engine = makeSyncEngine(makeMockLocalDb(), makeMockClient());
+
+        const pausedCalls: boolean[] = [];
+        engine.onPaused(() => pausedCalls.push(true));
+
+        await engine.start();
+
+        // onPaused fires during start(), no longpoll wait needed.
+        expect(pausedCalls).toEqual([true]);
+        expect(engine.getState()).toBe("connected");
+        engine.stop();
+    });
+
+    it("onceIdle fires immediately after catchup completes", async () => {
+        const engine = makeSyncEngine(makeMockLocalDb(), makeMockClient());
+
+        const idleCalls: boolean[] = [];
+        engine.onceIdle(() => idleCalls.push(true));
+
+        await engine.start();
+
+        expect(idleCalls).toEqual([true]);
+        engine.stop();
+    });
+
+    it("pullLoop transitions syncing->connected on received changes", async () => {
+        const doc1 = fakeDoc("file:live-a.md");
+        const mockClient = makeMockClient({
+            changesLongpoll: makeLongpollMock(1, {
+                results: [{ id: "file:live-a.md", seq: "5", doc: doc1 }],
+                last_seq: "5",
+            }),
+        });
+        const engine = makeSyncEngine(makeMockLocalDb(), mockClient);
+
+        const states: string[] = [];
+        engine.onStateChange((s) => states.push(s));
+
+        const pausedCalls: boolean[] = [];
+        engine.onPaused(() => pausedCalls.push(true));
+
+        await engine.start();
+        // Wait for pullLoop to process the longpoll result.
+        await new Promise((r) => setTimeout(r, 100));
+
+        // Initial: reconnecting → syncing → connected (catchup)
+        // Then pullLoop: syncing → connected (live change received)
+        expect(states).toContain("syncing");
+        expect(states).toContain("connected");
+        // onPaused: once for catchup, once for pullLoop change
+        expect(pausedCalls.length).toBeGreaterThanOrEqual(2);
+
+        engine.stop();
+    });
+
+    it("empty longpoll result does not change state", async () => {
+        // changesLongpoll returns empty results (max-wait timeout).
+        const mockClient = makeMockClient({
+            changesLongpoll: makeLongpollMock(2, { results: [], last_seq: "0" }),
+        });
+        const engine = makeSyncEngine(makeMockLocalDb(), mockClient);
+
+        const states: string[] = [];
+        engine.onStateChange((s) => states.push(s));
+
+        await engine.start();
+        // Wait for two longpoll cycles.
+        await new Promise((r) => setTimeout(r, 100));
+
+        // Only initial transitions: reconnecting → syncing → connected.
+        // Empty longpoll results don't trigger additional transitions.
+        expect(states).toEqual(["reconnecting", "syncing", "connected"]);
+
         engine.stop();
     });
 });
@@ -259,7 +331,6 @@ describe("SyncEngine error handling", () => {
         expect(engine.isAuthBlocked()).toBe(true);
 
         await engine.start();
-        await new Promise((r) => setTimeout(r, 50));
         expect(engine.isAuthBlocked()).toBe(false);
         engine.stop();
     });
@@ -361,7 +432,7 @@ describe("SyncEngine catchup pull", () => {
 describe("SyncEngine live sync", () => {
     afterEach(() => { vi.useRealTimers(); });
 
-    it("pull loop fires onChange for pulled docs and handlePaused", async () => {
+    it("pull loop fires onChange for pulled docs and transitions syncing->connected", async () => {
         const doc1 = fakeDoc("file:live-a.md");
 
         const mockClient = makeMockClient({
@@ -450,39 +521,96 @@ describe("SyncEngine live sync", () => {
         expect(mockClient.bulkDocs).not.toHaveBeenCalled();
         engine.stop();
     });
+
+    it("pull updates lastHealthyAt after applying changes", async () => {
+        const doc1 = fakeDoc("file:pull-healthy.md");
+        const mockClient = makeMockClient({
+            changesLongpoll: makeLongpollMock(1, {
+                results: [{ id: "file:pull-healthy.md", seq: "10", doc: doc1 }],
+                last_seq: "10",
+            }),
+        });
+        const engine = makeSyncEngine(makeMockLocalDb(), mockClient);
+
+        await engine.start();
+        // Reset to observe pullLoop update.
+        (engine as any).lastHealthyAt = 0;
+
+        const before = Date.now();
+        await new Promise((r) => setTimeout(r, 100));
+        const after = Date.now();
+
+        expect(engine.getLastHealthyAt()).toBeGreaterThanOrEqual(before);
+        expect(engine.getLastHealthyAt()).toBeLessThanOrEqual(after);
+        engine.stop();
+    });
+
+    it("push updates lastHealthyAt after successful push", async () => {
+        const localDoc = fakeDoc("file:push-healthy.md");
+        const bulkDocsMock = vi.fn().mockResolvedValue([{ ok: true, id: "file:push-healthy.md", rev: "2-new" }]);
+        const mockClient = makeMockClient({
+            changesLongpoll: vi.fn().mockImplementation(() => new Promise(() => {})),
+            allDocs: vi.fn().mockResolvedValue({ rows: [], total_rows: 0 }),
+            bulkDocs: bulkDocsMock,
+        });
+
+        let changeCallNum = 0;
+        const localDb = makeMockLocalDb({
+            changes: vi.fn().mockImplementation(async () => {
+                changeCallNum++;
+                if (changeCallNum <= 1) {
+                    return {
+                        results: [{ id: "file:push-healthy.md", seq: 1, doc: localDoc }],
+                        last_seq: 1,
+                    };
+                }
+                return { results: [], last_seq: 1 };
+            }),
+        });
+
+        const engine = makeSyncEngine(localDb, mockClient);
+        await engine.start();
+
+        // Wait for push loop to complete its first iteration.
+        const before = Date.now();
+        // Poll until bulkDocs has been called (push loop ran).
+        for (let i = 0; i < 20 && !bulkDocsMock.mock.calls.length; i++) {
+            await new Promise((r) => setTimeout(r, 50));
+        }
+        const after = Date.now();
+
+        expect(bulkDocsMock).toHaveBeenCalled();
+        expect(engine.getLastHealthyAt()).toBeGreaterThanOrEqual(before);
+        expect(engine.getLastHealthyAt()).toBeLessThanOrEqual(after);
+        engine.stop();
+    });
 });
 
 describe("SyncEngine health probing", () => {
     afterEach(() => { vi.useRealTimers(); });
 
-    it("probe success from syncing + pausedPending -> connected + callbacks", async () => {
+    it("probe success does not change state (pure health check)", async () => {
         const mockClient = makeMockClient();
         const engine = makeSyncEngine(makeMockLocalDb(), mockClient);
 
         (engine as any).client = mockClient;
         (engine as any).running = true;
-        (engine as any).setState("syncing");
-        (engine as any).pausedPending = true;
-
-        const pausedCalls: boolean[] = [];
-        engine.onPaused(() => pausedCalls.push(true));
+        (engine as any).setState("connected");
 
         await (engine as any).probeHealth();
 
+        // Probe only updates lastHealthyAt — no state transitions.
         expect(engine.getState()).toBe("connected");
-        expect((engine as any).pausedPending).toBe(false);
-        expect(pausedCalls).toEqual([true]);
         engine.stop();
     });
 
-    it("probe success from syncing without pausedPending stays syncing", async () => {
+    it("probe success during syncing stays syncing", async () => {
         const mockClient = makeMockClient();
         const engine = makeSyncEngine(makeMockLocalDb(), mockClient);
 
         (engine as any).client = mockClient;
         (engine as any).running = true;
         (engine as any).setState("syncing");
-        (engine as any).pausedPending = false;
 
         await (engine as any).probeHealth();
 
@@ -498,14 +626,12 @@ describe("SyncEngine health probing", () => {
 
         (engine as any).client = mockClient;
         (engine as any).running = true;
-        (engine as any).setState("syncing");
-        (engine as any).pausedPending = true;
+        (engine as any).setState("connected");
 
         await (engine as any).probeHealth();
 
         expect(engine.getState()).toBe("error");
         expect(engine.getLastErrorDetail()?.kind).toBe("network");
-        expect((engine as any).pausedPending).toBe(false);
         engine.stop();
     });
 
@@ -562,28 +688,6 @@ describe("SyncEngine health probing", () => {
         engine.stop();
     });
 
-    it("probe failure clears pausedPending to prevent stale callbacks", async () => {
-        const mockClient = makeMockClient({
-            info: vi.fn().mockRejectedValue(new Error("ECONNREFUSED")),
-        });
-        const engine = makeSyncEngine(makeMockLocalDb(), mockClient);
-
-        (engine as any).client = mockClient;
-        (engine as any).running = true;
-        (engine as any).setState("syncing");
-        (engine as any).pausedPending = true;
-
-        const pausedCalls: boolean[] = [];
-        engine.onPaused(() => pausedCalls.push(true));
-
-        await (engine as any).probeHealth();
-
-        expect(engine.getState()).toBe("error");
-        expect((engine as any).pausedPending).toBe(false);
-        expect(pausedCalls).toEqual([]);
-        engine.stop();
-    });
-
     it("probe timeout (5s) enters hard error", async () => {
         vi.useFakeTimers();
         try {
@@ -603,44 +707,6 @@ describe("SyncEngine health probing", () => {
             expect(engine.getState()).toBe("error");
             engine.stop();
         } finally { vi.useRealTimers(); }
-    });
-
-    it("handlePaused gates callbacks on probe completion", async () => {
-        const mockClient = makeMockClient();
-        const engine = makeSyncEngine(makeMockLocalDb(), mockClient);
-
-        (engine as any).client = mockClient;
-        (engine as any).running = true;
-        (engine as any).setState("syncing");
-
-        const callOrder: string[] = [];
-        engine.onPaused(() => callOrder.push("paused"));
-
-        await (engine as any).handlePaused();
-
-        expect(engine.getState()).toBe("connected");
-        expect(callOrder).toEqual(["paused"]);
-        engine.stop();
-    });
-
-    it("handlePaused with probe failure does not fire callbacks", async () => {
-        const mockClient = makeMockClient({
-            info: vi.fn().mockRejectedValue(new Error("ECONNREFUSED")),
-        });
-        const engine = makeSyncEngine(makeMockLocalDb(), mockClient);
-
-        (engine as any).client = mockClient;
-        (engine as any).running = true;
-        (engine as any).setState("syncing");
-
-        const pausedCalls: boolean[] = [];
-        engine.onPaused(() => pausedCalls.push(true));
-
-        await (engine as any).handlePaused();
-
-        expect(engine.getState()).toBe("error");
-        expect(pausedCalls).toEqual([]);
-        engine.stop();
     });
 
     it("checkHealth skips probe in reconnecting/error states", async () => {
