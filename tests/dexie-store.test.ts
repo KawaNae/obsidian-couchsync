@@ -251,39 +251,6 @@ describe("DexieStore", () => {
         });
     });
 
-    // ── getByRev / removeRev (transitional) ─────────────
-
-    describe("getByRev / removeRev", () => {
-        it("returns doc when rev matches current version", async () => {
-            await store.put(makeFile("a.md"));
-            const got = await store.getByRev(makeFileId("a.md"), "1-dexie");
-            expect(got).not.toBeNull();
-        });
-
-        it("returns null when rev does not match", async () => {
-            await store.put(makeFile("a.md"));
-            const got = await store.getByRev(makeFileId("a.md"), "99-dexie");
-            expect(got).toBeNull();
-        });
-
-        it("returns null for nonexistent doc", async () => {
-            const got = await store.getByRev("nonexistent", "1-dexie");
-            expect(got).toBeNull();
-        });
-
-        it("removeRev deletes when rev matches", async () => {
-            await store.put(makeFile("a.md"));
-            await store.removeRev(makeFileId("a.md"), "1-dexie");
-            expect(await store.get(makeFileId("a.md"))).toBeNull();
-        });
-
-        it("removeRev is a no-op when rev does not match", async () => {
-            await store.put(makeFile("a.md"));
-            await store.removeRev(makeFileId("a.md"), "99-dexie");
-            expect(await store.get(makeFileId("a.md"))).not.toBeNull();
-        });
-    });
-
     // ── allDocs ─────────────────────────────────────────
 
     describe("allDocs", () => {

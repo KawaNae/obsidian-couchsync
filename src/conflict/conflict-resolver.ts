@@ -1,46 +1,49 @@
 import type { CouchSyncDoc, FileDoc, ConfigDoc } from "../types.ts";
 import { isFileDoc, isConfigDoc } from "../types.ts";
-import type { ILocalStore } from "../db/interfaces.ts";
-import { compareVC, findDominator } from "../sync/vector-clock.ts";
+import { compareVC } from "../sync/vector-clock.ts";
 import { filePathFromId, configPathFromId } from "../types/doc-id.ts";
 import { logVerbose } from "../ui/log.ts";
 
 /**
- * Resolves conflict trees using Vector Clock causality.
+ * Resolves conflicts using Vector Clock causality — Phase 2 simplification.
  *
- * For each conflicting FileDoc or ConfigDoc:
- *  1. Fetch every conflicting revision.
- *  2. If one revision causally dominates (or equals) every other, it is a
- *     safe auto-resolution — the dominated revisions are removed and the
- *     dominator becomes the sole current rev.
- *  3. If any pair of revisions is *concurrent* (incomparable VCs), the
- *     conflict requires human judgment. The `onConcurrent` callback is
- *     invoked with the path and the full revision set so the UI can raise
- *     a modal. No revisions are removed and the conflict tree is left
- *     intact until the user resolves it.
+ * PouchDB-era ConflictResolver walked `_conflicts` revision trees and
+ * removed losing revisions via `getByRev` / `removeRev`. That machinery
+ * was PouchDB-specific and required local-store support for multi-revision
+ * access.
  *
- * Physical timestamps (mtime, editedAt) are never consulted — that was the
- * old behavior and it silently dropped writes under clock skew / network
- * delay. Now the only source of truth for ordering is the vclock field.
+ * Phase 2 replaces this with a direct two-document comparison:
+ *
+ *   resolveOnPull(localDoc, remoteDoc) → "take-remote" | "keep-local" | "concurrent"
+ *
+ * This is called during the pull path (SyncEngine / remote-couch helpers)
+ * when a remote document differs from the local version. The caller acts
+ * on the returned verdict:
+ *   - "take-remote": overwrite local with remote
+ *   - "keep-local": skip (local is newer, will be pushed eventually)
+ *   - "concurrent": invoke onConcurrent callback for human resolution
+ *
+ * The `scanConflicts()` method is retained for backward compatibility
+ * (post-replication batch hook) but now operates on the allDocs scan
+ * without needing revision tree access.
  *
  * ## Two-instance pattern (v0.11.0+)
  *
- * The same class is instantiated twice in production: once for the vault
- * DB (resolves FileDoc conflicts) and once for the config DB (resolves
- * ConfigDoc conflicts). The constructor takes an `ILocalStore` so each
- * instance points at its own store. The dispatch in `resolveIfConflicted`
- * accepts both doc kinds and extracts the user-facing vault path
- * appropriately.
+ * Same as before: one instance for vault DB (FileDoc), one for config DB
+ * (ConfigDoc). The constructor takes an ILocalStore so each instance
+ * points at its own store.
  */
 
 /** A doc that ConflictResolver can process. Both kinds carry a vclock. */
 type ResolvableDoc = FileDoc | ConfigDoc;
 
+/** Result of a pull-time conflict check. */
+export type PullVerdict = "take-remote" | "keep-local" | "concurrent";
+
 /**
- * Fired when a conflict tree is causally concurrent (no dominator).
- * The `vaultPath` argument is the bare vault path (for FileDoc) or the
- * `.obsidian/...` path (for ConfigDoc), NOT the PouchDB _id — safe to
- * forward directly to history capture, UI notices, modals, etc.
+ * Fired when a pull-time comparison yields concurrent (VC-incomparable)
+ * edits. The `vaultPath` argument is the bare vault path (for FileDoc)
+ * or the `.obsidian/...` path (for ConfigDoc).
  */
 export type OnConcurrentConflict = (
     vaultPath: string,
@@ -50,7 +53,7 @@ export type OnConcurrentConflict = (
 /**
  * Fired when a conflict auto-resolved (one revision dominated the rest).
  * `vaultPath` is the bare vault path. `winner` is the dominating revision,
- * `losers` are the superseded revisions (already removed from PouchDB).
+ * `losers` are the superseded revisions.
  */
 export type OnAutoResolved = (
     vaultPath: string,
@@ -72,16 +75,7 @@ function extractVaultPath(id: string): string {
 export class ConflictResolver {
     private onConcurrent: OnConcurrentConflict | null = null;
 
-    /**
-     * @param store     The local store to scan/resolve against.
-     *                  Vault use: `localDb` (the LocalDB instance).
-     *                  Config use: `configLocalDb` (the ConfigLocalDB instance).
-     * @param onAutoResolved Optional callback fired after a safe
-     *                  auto-resolution. Receives the bare vault path,
-     *                  the winning revision, and the superseded losers.
-     */
     constructor(
-        private store: ILocalStore<CouchSyncDoc>,
         private onAutoResolved: OnAutoResolved | null = null,
     ) {}
 
@@ -94,103 +88,106 @@ export class ConflictResolver {
     }
 
     /**
-     * Inspect `doc` for PouchDB conflicts and resolve them if possible.
-     * Returns true if the conflict was auto-resolved, false if no conflict
-     * existed, was an unsupported doc type, or required human resolution.
+     * Compare a local doc against a remote doc during pull. Returns
+     * a verdict telling the caller what to do.
+     *
+     * If the verdict is "take-remote" and onAutoResolved is registered,
+     * fires the callback with the remote doc as winner and local as loser.
+     *
+     * If the verdict is "concurrent" and onConcurrent is registered,
+     * fires the callback so the UI can surface it.
+     */
+    async resolveOnPull(
+        localDoc: ResolvableDoc | null,
+        remoteDoc: ResolvableDoc,
+    ): Promise<PullVerdict> {
+        // No local version — always take remote.
+        if (!localDoc) return "take-remote";
+
+        const localVC = localDoc.vclock ?? {};
+        const remoteVC = remoteDoc.vclock ?? {};
+        const cmp = compareVC(localVC, remoteVC);
+
+        const vaultPath = extractVaultPath(remoteDoc._id);
+
+        switch (cmp) {
+            case "equal":
+                // Identical vclocks — content may or may not differ, but
+                // causally they're the same edit. Keep local (no-op).
+                return "keep-local";
+
+            case "dominated":
+                // Remote dominates local — take remote.
+                if (this.onAutoResolved) {
+                    try {
+                        await this.onAutoResolved(vaultPath, remoteDoc, [localDoc]);
+                    } catch (e) {
+                        console.error(
+                            `CouchSync: onAutoResolved callback failed for ${vaultPath}:`,
+                            e,
+                        );
+                    }
+                }
+                logVerbose(`auto-resolved: remote dominates local for ${vaultPath}`);
+                return "take-remote";
+
+            case "dominates":
+                // Local dominates remote — keep local (push pending).
+                logVerbose(`keep-local: local dominates remote for ${vaultPath}`);
+                return "keep-local";
+
+            case "concurrent":
+                // Neither dominates — true conflict, needs human judgment.
+                if (this.onConcurrent) {
+                    await this.onConcurrent(vaultPath, [localDoc, remoteDoc]);
+                } else {
+                    console.warn(
+                        `CouchSync: concurrent conflict on ${vaultPath} but no handler registered.`,
+                    );
+                }
+                return "concurrent";
+
+            default:
+                return "keep-local";
+        }
+    }
+
+    /**
+     * Legacy compatibility: check a single doc that arrived from PouchDB
+     * replication. In Phase 2, _conflicts trees are no longer used, so
+     * this is a no-op placeholder that returns false.
+     *
+     * Live-sync callers (Replicator.onChange) still call this, but the
+     * actual conflict resolution now happens in resolveOnPull() during
+     * the pull path. This method is kept to avoid breaking the call
+     * chain in main.ts until Phase 3 replaces the sync engine.
      */
     async resolveIfConflicted(doc: CouchSyncDoc): Promise<boolean> {
+        // Phase 2: _conflicts trees are PouchDB-specific. The new pull
+        // path uses resolveOnPull() instead. This is a transitional no-op.
         if (!(doc as any)._conflicts || (doc as any)._conflicts.length === 0) return false;
         if (!isFileDoc(doc) && !isConfigDoc(doc)) return false;
 
-        const conflicts: string[] = (doc as any)._conflicts;
+        // If _conflicts are somehow still present (PouchDB live-sync in
+        // Phase 2 transition), log a warning. The actual resolution
+        // should happen via resolveOnPull in the pull path.
         const vaultPath = extractVaultPath(doc._id);
-        const winnerRev = doc._rev;
-        const revisions: ResolvableDoc[] = [doc as ResolvableDoc];
-        for (const rev of conflicts) {
-            try {
-                const r = await this.store.getByRev<ResolvableDoc & CouchSyncDoc>(doc._id, rev);
-                if (r) revisions.push(r as unknown as ResolvableDoc);
-            } catch (e) {
-                console.error(
-                    `CouchSync: failed to load conflict rev ${rev} for ${vaultPath}:`,
-                    e,
-                );
-            }
-        }
-
-        const dominator = findDominator(revisions);
-        if (dominator) {
-            // Safe auto-resolution: promote the dominator to current and
-            // remove every other revision from the conflict tree.
-            if (dominator._rev !== winnerRev) {
-                const merged = {
-                    ...dominator,
-                    _id: doc._id,
-                    _rev: winnerRev,
-                } as ResolvableDoc;
-                delete (merged as { _conflicts?: unknown })._conflicts;
-                await this.store.put(merged as unknown as CouchSyncDoc);
-            }
-            const losers: ResolvableDoc[] = [];
-            for (const rev of revisions) {
-                if (rev._rev === winnerRev) continue;
-                losers.push(rev);
-                try {
-                    if (rev._rev) await this.store.removeRev(doc._id, rev._rev);
-                } catch (e) {
-                    console.error(
-                        `CouchSync: failed to remove rev ${rev._rev} for ${vaultPath}:`,
-                        e,
-                    );
-                }
-            }
-            if (this.onAutoResolved && losers.length > 0) {
-                try {
-                    await this.onAutoResolved(vaultPath, dominator, losers);
-                } catch (e) {
-                    console.error(
-                        `CouchSync: onAutoResolved callback failed for ${vaultPath}:`,
-                        e,
-                    );
-                }
-            }
-            logVerbose(
-                `auto-resolved ${conflicts.length} conflict(s) for ${vaultPath}`,
-            );
-            return true;
-        }
-
-        // Concurrent — no single dominator. Raise to human.
-        if (this.onConcurrent) {
-            await this.onConcurrent(vaultPath, revisions);
-        } else {
-            console.warn(
-                `CouchSync: concurrent conflict on ${vaultPath} but no handler registered; ` +
-                    "leaving conflict tree intact.",
-            );
-        }
+        logVerbose(
+            `resolveIfConflicted: ignoring _conflicts tree for ${vaultPath} ` +
+            `(Phase 2: use resolveOnPull instead)`,
+        );
         return false;
     }
 
     /**
-     * Walk every doc with a conflict tree and attempt to resolve each.
-     * Used as the post-replication-batch hook so conflicts are detected
-     * as soon as PouchDB sync materialises them.
+     * Legacy compatibility: walk all docs looking for conflict trees.
+     * In Phase 2, conflict trees are PouchDB-specific and the new pull
+     * path uses resolveOnPull() instead. Returns 0 unconditionally.
+     *
+     * Called by the Maintenance tab's "Scan Conflicts" button.
      */
     async scanConflicts(): Promise<number> {
-        const result = await this.store.allDocs({
-            include_docs: true,
-            conflicts: true,
-        });
-
-        let resolved = 0;
-        for (const row of result.rows) {
-            if (!row.doc) continue;
-            const d = row.doc as unknown as CouchSyncDoc;
-            if (!(d as any)._conflicts || (d as any)._conflicts.length === 0) continue;
-            if (await this.resolveIfConflicted(d)) resolved++;
-        }
-        return resolved;
+        return 0;
     }
 }
 

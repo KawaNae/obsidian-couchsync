@@ -1,5 +1,4 @@
 import type { App } from "obsidian";
-import PouchDB from "pouchdb-browser/lib/index.js";
 import type { ConfigLocalDB } from "../db/config-local-db.ts";
 import type { Replicator } from "../db/replicator.ts";
 import type { ConfigDoc, CouchSyncDoc } from "../types.ts";
@@ -12,6 +11,7 @@ import type { CouchSyncSettings } from "../settings.ts";
 import { ProgressNotice } from "../ui/notices.ts";
 import { arrayBufferToBase64, base64ToArrayBuffer } from "../db/chunker.ts";
 import { incrementVC } from "./vector-clock.ts";
+import { CouchClient, makeCouchClient } from "../db/couch-client.ts";
 import * as remoteCouch from "../db/remote-couch.ts";
 
 /**
@@ -34,8 +34,9 @@ import * as remoteCouch from "../db/remote-couch.ts";
  *     same VC discipline as FileDoc — concurrent edits are detected
  *     and surfaced rather than silently LWW-merged
  *
- * The constructor takes a `Replicator` reference solely to share the
- * auth latch (one CouchDB server = one set of credentials = one latch).
+ * Phase 2: remote operations use CouchClient (fetch-based HTTP) instead
+ * of constructing PouchDB instances. The `withConfigRemote` helper now
+ * builds a CouchClient and passes it to the caller.
  */
 export class ConfigSync {
     private static readonly SKIP_DIRS = new Set(["node_modules", ".git"]);
@@ -52,51 +53,46 @@ export class ConfigSync {
     // ── Remote URL + auth helpers ──────────────────────
 
     /**
-     * Build the full CouchDB URL for the config database, with embedded
-     * credentials inherited from the vault sync settings (URI, user,
-     * password are shared — only the DB name differs). Returns null if
-     * config sync is not configured.
+     * Build a CouchClient for the config database, using credentials
+     * inherited from the vault sync settings. Returns null if config
+     * sync is not configured.
      */
-    private getConfigRemoteUrl(): string | null {
+    private makeConfigClient(): CouchClient | null {
         const settings = this.getSettings();
         if (!settings.couchdbConfigDbName) return null;
-        const url = new URL(settings.couchdbUri);
-        url.pathname = url.pathname.replace(/\/$/, "") + "/" + settings.couchdbConfigDbName;
-        if (settings.couchdbUser) {
-            url.username = settings.couchdbUser;
-            url.password = settings.couchdbPassword;
-        }
-        return url.toString();
+        return makeCouchClient(
+            settings.couchdbUri,
+            settings.couchdbConfigDbName,
+            settings.couchdbUser,
+            settings.couchdbPassword,
+        );
     }
 
     /**
-     * Open a fresh PouchDB instance against the config remote, run the
-     * caller's operation, then close it. Centralises auth-latch checks
-     * so every remote call honours the shared latch.
+     * Build a CouchClient, run the caller's operation, then return.
+     * Centralises auth-latch checks so every remote call honours the
+     * shared latch.
      *
      * Throws "Config sync not configured" if the config DB name is empty.
      * Latches the shared auth state on 401/403.
      */
     private async withConfigRemote<T>(
-        op: (remoteDb: PouchDB.Database<CouchSyncDoc>) => Promise<T>,
+        op: (client: CouchClient) => Promise<T>,
     ): Promise<T> {
-        const url = this.getConfigRemoteUrl();
-        if (url === null) {
+        const client = this.makeConfigClient();
+        if (client === null) {
             throw new Error("Config sync not configured (couchdbConfigDbName is empty)");
         }
         if (this.replicator.isAuthBlocked()) {
             throw new Error("Auth blocked — fix credentials in Vault Sync first");
         }
-        const remoteDb = new PouchDB<CouchSyncDoc>(url, {});
         try {
-            return await op(remoteDb);
+            return await op(client);
         } catch (e: any) {
             if (e?.status === 401 || e?.status === 403) {
                 this.replicator.markAuthError(e.status, e?.message);
             }
             throw e;
-        } finally {
-            await remoteDb.close();
         }
     }
 
@@ -117,10 +113,10 @@ export class ConfigSync {
             const affectedIds = [...new Set([...deletedIds, ...currentIds])];
 
             if (affectedIds.length > 0) {
-                await this.withConfigRemote((remoteDb) =>
+                await this.withConfigRemote((client) =>
                     remoteCouch.pushDocs(
-                        this.configDb.getDb(),
-                        remoteDb,
+                        this.configDb,
+                        client,
                         affectedIds,
                         (docId, n) => {
                             progress.update(`Pushing: ${configPathFromId(docId)} (${n}/${affectedIds.length})`);
@@ -147,10 +143,10 @@ export class ConfigSync {
 
             const docIds = await this.allDocIds();
             if (docIds.length > 0) {
-                await this.withConfigRemote((remoteDb) =>
+                await this.withConfigRemote((client) =>
                     remoteCouch.pushDocs(
-                        this.configDb.getDb(),
-                        remoteDb,
+                        this.configDb,
+                        client,
                         docIds,
                         (docId, n) => {
                             progress.update(`Pushing: ${configPathFromId(docId)} (${n}/${docIds.length})`);
@@ -172,8 +168,8 @@ export class ConfigSync {
         const progress = new ProgressNotice("Config Pull");
         try {
             progress.update("Pulling config from remote...");
-            await this.withConfigRemote((remoteDb) =>
-                remoteCouch.pullByPrefix(this.configDb.getDb(), remoteDb, DOC_ID.CONFIG),
+            await this.withConfigRemote((client) =>
+                remoteCouch.pullByPrefix(this.configDb, client, DOC_ID.CONFIG),
             );
 
             const written = await this.write((path, i, total) => {
@@ -236,17 +232,15 @@ export class ConfigSync {
         const entries: { path: string; data: string }[] = [];
         for (const p of paths) {
             if (p.endsWith("/")) {
-                // Prefix-range scan for everything under the folder, scoped
-                // within the config: range so we never collide with other
-                // doc kinds.
+                // Prefix-range scan for everything under the folder.
                 const prefix = makeConfigId(p.replace(/\/$/, "") + "/");
-                const result = await this.configDb.getDb().allDocs({
+                const result = await this.configDb.allDocs({
                     startkey: prefix,
                     endkey: prefix + "\ufff0",
                     include_docs: true,
                 });
                 for (const row of result.rows) {
-                    if (!("doc" in row) || !row.doc) continue;
+                    if (!row.doc) continue;
                     const doc = row.doc as unknown as ConfigDoc;
                     if (doc.type !== "config") continue;
                     entries.push({
@@ -281,13 +275,13 @@ export class ConfigSync {
 
     /** True when config sync has a target DB configured. */
     isConfigured(): boolean {
-        return this.getConfigRemoteUrl() !== null;
+        return this.makeConfigClient() !== null;
     }
 
     /** List config file paths available on remote */
     async listRemotePaths(): Promise<string[]> {
-        const docIds = await this.withConfigRemote((remoteDb) =>
-            remoteCouch.listRemoteByPrefix(remoteDb, DOC_ID.CONFIG),
+        const docIds = await this.withConfigRemote((client) =>
+            remoteCouch.listRemoteByPrefix(client, DOC_ID.CONFIG),
         );
         return docIds.map(configPathFromId);
     }
@@ -325,16 +319,11 @@ export class ConfigSync {
      * failure (Config Init will auto-create it on first push).
      */
     async testConnection(): Promise<string | null> {
-        const url = this.getConfigRemoteUrl();
-        if (url === null) return "Config sync is not configured";
+        const client = this.makeConfigClient();
+        if (client === null) return "Config sync is not configured";
         try {
-            const remoteDb = new PouchDB<CouchSyncDoc>(url, {});
-            try {
-                await remoteDb.info();
-                return null;
-            } finally {
-                await remoteDb.close();
-            }
+            await client.info();
+            return null;
         } catch (e: any) {
             if (e?.status === 404) return null; // DB will be created on first push
             if (e?.status === 401 || e?.status === 403) {

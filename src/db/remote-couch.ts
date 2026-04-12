@@ -1,95 +1,105 @@
 /**
- * Stateless helpers for one-shot remote PouchDB operations.
+ * Stateless helpers for one-shot remote CouchDB operations.
  *
- * These used to be methods on `Replicator`, but live-sync state and the
- * generic push/pull/list operations have different lifetimes and (after
- * v0.11.0) potentially different remote DBs:
+ * Phase 2: rewritten from PouchDB replication to ICouchClient HTTP +
+ * ILocalStore CRUD. Each function takes the appropriate abstraction
+ * layer; production callers pass a CouchClient and LocalDB/ConfigLocalDB.
  *
- *   - The vault Replicator does live bidirectional sync with the vault DB.
- *   - ConfigSync does scan-based push/pull against a separate config DB.
- *
- * Mixing both responsibilities in one class meant ConfigSync was bound to
- * the vault DB's URL. Extracting these helpers gives ConfigSync the
- * freedom to point at any remote.
- *
- * Each function takes BOTH a local and remote PouchDB instance. Production
- * callers construct the remote with `new PouchDB(remoteUrl, ...)`; tests
- * pass memory-adapter instances directly. The helper does NOT close the
- * remote it received — that's the caller's choice (allows reuse across
- * multiple calls if desired). Functions that internally allocate a remote
- * via the URL overload close it themselves.
+ * The helpers remain stateless — construct, call, discard. Callers own
+ * the lifecycle of both the local store and the remote client.
  */
 
-/// <reference types="pouchdb-browser" />
-// Triple-slash reference pulls in the global `PouchDB` namespace types
-// without any runtime import — `pouchdb-browser/lib/index.js` references
-// `self` at module init and would break node-only tests if imported.
-// All actual PouchDB instances are constructed by callers and passed in.
+import type { ICouchClient, ILocalStore } from "./interfaces.ts";
 import type { CouchSyncDoc } from "../types.ts";
 
 export type ProgressCallback = (docId: string, count: number) => void;
 
 /**
- * Push specific documents from `local` to `remote`. Skips work if the
- * id list is empty. Returns the count of docs written.
+ * Push specific documents from `local` to `remote`. Reads the docs
+ * from the local store and writes them to the remote via _bulk_docs.
+ * Returns the count of docs written. Skips work if the id list is empty.
  */
 export async function pushDocs(
-    local: PouchDB.Database<CouchSyncDoc>,
-    remote: PouchDB.Database<CouchSyncDoc>,
+    local: ILocalStore<CouchSyncDoc>,
+    remote: ICouchClient,
     docIds: string[],
     onProgress?: ProgressCallback,
 ): Promise<number> {
     if (docIds.length === 0) return 0;
-    let total = 0;
-    return new Promise<number>((resolve, reject) => {
-        const replication = local.replicate.to(remote, {
-            doc_ids: docIds,
-        } as any);
-        replication.on("change", (info) => {
-            if (info.docs) {
-                for (const doc of info.docs) {
-                    total++;
-                    onProgress?.(doc._id, total);
-                }
-            }
-        });
-        replication.on("complete", (info) => {
-            resolve(info.docs_written);
-        });
-        replication.on("error", (err) => {
-            reject(err);
-        });
+
+    // Read all requested docs from local store.
+    const result = await local.allDocs({
+        keys: docIds,
+        include_docs: true,
     });
+    const docs: any[] = [];
+    for (const row of result.rows) {
+        if (row.doc && !row.value?.deleted) {
+            // Strip local _rev — remote will assign its own.
+            const { _rev, ...rest } = row.doc as any;
+            docs.push(rest);
+        }
+    }
+    if (docs.length === 0) return 0;
+
+    // Fetch current remote revisions so we can include _rev for updates.
+    const remoteResult = await remote.allDocs<CouchSyncDoc>({
+        keys: docs.map((d) => d._id),
+    });
+    const remoteRevMap = new Map<string, string>();
+    for (const row of remoteResult.rows) {
+        if (row.value?.rev && !row.value?.deleted) {
+            remoteRevMap.set(row.id, row.value.rev);
+        }
+    }
+    for (const doc of docs) {
+        const remoteRev = remoteRevMap.get(doc._id);
+        if (remoteRev) doc._rev = remoteRev;
+    }
+
+    const results = await remote.bulkDocs(docs);
+    let total = 0;
+    for (const res of results) {
+        if (res.ok) {
+            total++;
+            onProgress?.(res.id, total);
+        }
+    }
+    return total;
 }
 
 /**
- * Pull every doc whose `_id` matches `prefix` from `remote` to `local`.
+ * Pull every doc whose `_id` matches `prefix` from `remote` into `local`.
  * Used by ConfigSync to fetch all `config:*` docs without touching
  * file/chunk space. Returns the count of docs written locally.
  */
 export async function pullByPrefix(
-    local: PouchDB.Database<CouchSyncDoc>,
-    remote: PouchDB.Database<CouchSyncDoc>,
+    local: ILocalStore<CouchSyncDoc>,
+    remote: ICouchClient,
     prefix: string,
 ): Promise<number> {
-    const result = await remote.allDocs({
+    const remoteResult = await remote.allDocs<CouchSyncDoc>({
         startkey: prefix,
         endkey: prefix + "\ufff0",
+        include_docs: true,
     });
-    const docIds = result.rows.map((row) => row.id);
-    if (docIds.length === 0) return 0;
 
-    return new Promise<number>((resolve, reject) => {
-        const replication = local.replicate.from(remote, {
-            doc_ids: docIds,
-        } as any);
-        replication.on("complete", (info) => {
-            resolve(info.docs_written);
-        });
-        replication.on("error", (err) => {
-            reject(err);
-        });
+    const docs: CouchSyncDoc[] = [];
+    for (const row of remoteResult.rows) {
+        if (row.doc && !row.value?.deleted) {
+            docs.push(row.doc);
+        }
+    }
+    if (docs.length === 0) return 0;
+
+    // Strip remote _rev before writing to local.
+    const localDocs = docs.map((d) => {
+        const { _rev, ...rest } = d as any;
+        return rest as CouchSyncDoc;
     });
+
+    const results = await local.bulkPut(localDocs);
+    return results.filter((r) => r.ok).length;
 }
 
 /**
@@ -98,19 +108,21 @@ export async function pullByPrefix(
  * Maintenance migration helpers.
  */
 export async function listRemoteByPrefix(
-    remote: PouchDB.Database<CouchSyncDoc>,
+    remote: ICouchClient,
     prefix: string,
 ): Promise<string[]> {
-    const result = await remote.allDocs({
+    const result = await remote.allDocs<CouchSyncDoc>({
         startkey: prefix,
         endkey: prefix + "\ufff0",
     });
-    return result.rows.map((row) => row.id);
+    return result.rows
+        .filter((row) => !row.value?.deleted)
+        .map((row) => row.id);
 }
 
 /** Destroy the remote database. Will be auto-recreated on the next push. */
 export async function destroyRemote(
-    remote: PouchDB.Database<CouchSyncDoc>,
+    remote: ICouchClient,
 ): Promise<void> {
     await remote.destroy();
 }
@@ -120,58 +132,81 @@ export async function destroyRemote(
  * during Init to seed the remote from a freshly-scanned vault.
  */
 export async function pushAll(
-    local: PouchDB.Database<CouchSyncDoc>,
-    remote: PouchDB.Database<CouchSyncDoc>,
+    local: ILocalStore<CouchSyncDoc>,
+    remote: ICouchClient,
     onProgress?: ProgressCallback,
 ): Promise<number> {
-    let total = 0;
-    return new Promise<number>((resolve, reject) => {
-        const replication = local.replicate.to(remote, { batch_size: 100 });
-        replication.on("change", (info) => {
-            if (info.docs) {
-                for (const doc of info.docs) {
-                    total++;
-                    onProgress?.(doc._id, total);
-                }
-            }
-        });
-        replication.on("complete", (info) => {
-            resolve(info.docs_written);
-        });
-        replication.on("error", (err) => {
-            reject(err);
-        });
+    const result = await local.allDocs({ include_docs: true });
+    const docs: any[] = [];
+    for (const row of result.rows) {
+        if (row.doc && !row.value?.deleted) {
+            const { _rev, ...rest } = row.doc as any;
+            docs.push(rest);
+        }
+    }
+    if (docs.length === 0) return 0;
+
+    // Fetch current remote revisions for existing docs.
+    const remoteResult = await remote.allDocs<CouchSyncDoc>({
+        keys: docs.map((d) => d._id),
     });
+    const remoteRevMap = new Map<string, string>();
+    for (const row of remoteResult.rows) {
+        if (row.value?.rev && !row.value?.deleted) {
+            remoteRevMap.set(row.id, row.value.rev);
+        }
+    }
+    for (const doc of docs) {
+        const remoteRev = remoteRevMap.get(doc._id);
+        if (remoteRev) doc._rev = remoteRev;
+    }
+
+    const results = await remote.bulkDocs(docs);
+    let total = 0;
+    for (const res of results) {
+        if (res.ok) {
+            total++;
+            onProgress?.(res.id, total);
+        }
+    }
+    return total;
 }
 
 /**
- * Pull every doc from `remote` to `local`. Returns both the written count
- * and the array of pulled documents (so callers can react to each, e.g.
- * SetupService writing files to the vault during Clone).
+ * Pull every doc from `remote` into `local`. Returns both the written
+ * count and the array of pulled documents (so callers can react to each,
+ * e.g. SetupService writing files to the vault during Clone).
  */
 export async function pullAll(
-    local: PouchDB.Database<CouchSyncDoc>,
-    remote: PouchDB.Database<CouchSyncDoc>,
+    local: ILocalStore<CouchSyncDoc>,
+    remote: ICouchClient,
     onProgress?: ProgressCallback,
 ): Promise<{ written: number; docs: CouchSyncDoc[] }> {
-    let total = 0;
-    const docs: CouchSyncDoc[] = [];
-    return new Promise((resolve, reject) => {
-        const replication = local.replicate.from(remote, { batch_size: 100 });
-        replication.on("change", (info) => {
-            if (info.docs) {
-                for (const doc of info.docs) {
-                    total++;
-                    docs.push(doc as unknown as CouchSyncDoc);
-                    onProgress?.(doc._id, total);
-                }
-            }
-        });
-        replication.on("complete", (info) => {
-            resolve({ written: info.docs_written, docs });
-        });
-        replication.on("error", (err) => {
-            reject(err);
-        });
+    const remoteResult = await remote.allDocs<CouchSyncDoc>({
+        include_docs: true,
     });
+
+    const docs: CouchSyncDoc[] = [];
+    for (const row of remoteResult.rows) {
+        if (row.doc && !row.value?.deleted) {
+            docs.push(row.doc);
+        }
+    }
+    if (docs.length === 0) return { written: 0, docs: [] };
+
+    // Strip remote _rev before writing to local.
+    const localDocs = docs.map((d) => {
+        const { _rev, ...rest } = d as any;
+        return rest as CouchSyncDoc;
+    });
+
+    const results = await local.bulkPut(localDocs);
+    let total = 0;
+    for (const res of results) {
+        if (res.ok) {
+            total++;
+            onProgress?.(res.id, total);
+        }
+    }
+    return { written: total, docs };
 }

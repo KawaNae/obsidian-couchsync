@@ -113,22 +113,7 @@ export class ConfigLocalDB implements ILocalStore<CouchSyncDoc> {
         return results as PutResponse[];
     }
 
-    /** Fetch a specific revision. Used by ConflictResolver; removed in Phase 2. */
-    async getByRev<T extends CouchSyncDoc>(id: string, rev: string): Promise<T | null> {
-        try {
-            return (await this.db.get(id, { rev })) as unknown as T;
-        } catch (e: any) {
-            if (e?.status === 404) return null;
-            throw e;
-        }
-    }
-
-    /** Remove a specific revision. Used by ConflictResolver; removed in Phase 2. */
-    async removeRev(id: string, rev: string): Promise<void> {
-        await this.db.remove(id, rev);
-    }
-
-    async allDocs(opts?: AllDocsOpts): Promise<AllDocsResult<CouchSyncDoc>> {
+async allDocs(opts?: AllDocsOpts): Promise<AllDocsResult<CouchSyncDoc>> {
         const result = await this.db.allDocs(opts as any);
         return result as unknown as AllDocsResult<CouchSyncDoc>;
     }

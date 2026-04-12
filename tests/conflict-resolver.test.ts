@@ -1,185 +1,155 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import PouchDB from "pouchdb";
-import memoryAdapter from "pouchdb-adapter-memory";
+/**
+ * Tests for the Phase 2 ConflictResolver — resolveOnPull() API.
+ *
+ * Phase 2 simplification: no PouchDB conflict trees, no getByRev/removeRev.
+ * Resolution is a direct two-document vclock comparison via resolveOnPull().
+ */
+
+import { describe, it, expect, vi } from "vitest";
 import { ConflictResolver } from "../src/conflict/conflict-resolver.ts";
-import type { CouchSyncDoc, FileDoc, VectorClock } from "../src/types.ts";
+import type { FileDoc } from "../src/types.ts";
 import { makeFileId } from "../src/types/doc-id.ts";
 
-PouchDB.plugin(memoryAdapter);
-
-function createTestDB(name: string) {
-    const db = new PouchDB<CouchSyncDoc>(name, { adapter: "memory" });
+function makeFile(path: string, vclock: Record<string, number>, data?: string): FileDoc {
     return {
-        getDb: () => db,
-        put: async (doc: CouchSyncDoc) => {
-            const existing = await db.get(doc._id).catch(() => null);
-            if (existing) doc._rev = (existing as any)._rev;
-            return db.put(doc);
-        },
-        getByRev: async (id: string, rev: string) => {
-            try {
-                return await db.get(id, { rev }) as unknown;
-            } catch (e: any) {
-                if (e.status === 404) return null;
-                throw e;
-            }
-        },
-        removeRev: async (id: string, rev: string) => {
-            await db.remove(id, rev);
-        },
-        allDocs: async (opts?: any) => {
-            return await db.allDocs(opts) as any;
-        },
-        get: async (id: string) => {
-            try { return await db.get(id) as unknown; }
-            catch (e: any) { if (e.status === 404) return null; throw e; }
-        },
-        getChunks: async () => [],
-        destroy: () => db.destroy(),
-    };
-}
-
-/**
- * Build a conflict state where `localAttrs` is the current winning rev and
- * `remoteAttrs` is an alternate rev in the _conflicts tree. Returns the
- * current rev as read back from PouchDB with conflicts populated.
- */
-async function createConflict(
-    testDb: ReturnType<typeof createTestDB>,
-    vaultPath: string,
-    localAttrs: Partial<FileDoc>,
-    remoteAttrs: Partial<FileDoc>,
-): Promise<FileDoc> {
-    const db = testDb.getDb();
-    const docId = makeFileId(vaultPath);
-    const baseDoc: FileDoc = {
-        _id: docId,
+        _id: makeFileId(path),
         type: "file",
-        chunks: ["chunk:base"],
+        chunks: [data ?? "chunk:default"],
         mtime: 1000,
         ctime: 1000,
         size: 0,
-        vclock: {},
+        vclock,
     };
-    const { rev: baseRev } = await db.put(baseDoc);
-
-    const localDoc: FileDoc = {
-        ...baseDoc,
-        _rev: baseRev,
-        chunks: ["chunk:local"],
-        ...localAttrs,
-    };
-    await db.put(localDoc);
-
-    const remoteDoc: FileDoc = {
-        ...baseDoc,
-        chunks: ["chunk:remote"],
-        ...remoteAttrs,
-    };
-    await db.bulkDocs(
-        [{ ...remoteDoc, _rev: `2-remote${Date.now()}${Math.random()}` }],
-        { new_edits: false },
-    );
-
-    const result = await db.get(docId, { conflicts: true });
-    return result as unknown as FileDoc;
 }
 
-describe("ConflictResolver — VC-based resolution", () => {
-    let testDb: ReturnType<typeof createTestDB>;
+describe("ConflictResolver — resolveOnPull (Phase 2)", () => {
+    it("returns take-remote when no local doc exists", async () => {
+        const resolver = new ConflictResolver();
+        const remote = makeFile("new.md", { A: 1 });
 
-    beforeEach(() => {
-        testDb = createTestDB(`vc-conflict-test-${Date.now()}-${Math.random()}`);
+        const verdict = await resolver.resolveOnPull(null, remote);
+        expect(verdict).toBe("take-remote");
     });
 
-    afterEach(async () => {
-        await testDb.destroy();
+    it("returns take-remote when remote dominates local", async () => {
+        const resolver = new ConflictResolver();
+        const local = makeFile("doc.md", { A: 1, B: 1 }, "chunk:local");
+        const remote = makeFile("doc.md", { A: 2, B: 1 }, "chunk:remote");
+
+        const verdict = await resolver.resolveOnPull(local, remote);
+        expect(verdict).toBe("take-remote");
     });
 
-    it("auto-resolves when one revision strictly dominates the other", async () => {
-        const doc = await createConflict(testDb, "dominates.md",
-            { vclock: { A: 2, B: 1 }, chunks: ["chunk:local"] },
-            { vclock: { A: 1, B: 1 }, chunks: ["chunk:remote"] },
-        );
-        expect(doc._conflicts?.length).toBeGreaterThan(0);
+    it("fires onAutoResolved when remote dominates", async () => {
+        const onAuto = vi.fn();
+        const resolver = new ConflictResolver(onAuto);
+        const local = makeFile("doc.md", { A: 1, B: 1 });
+        const remote = makeFile("doc.md", { A: 2, B: 1 });
 
-        const resolver = new ConflictResolver(testDb as any);
+        await resolver.resolveOnPull(local, remote);
+
+        expect(onAuto).toHaveBeenCalledTimes(1);
+        expect(onAuto.mock.calls[0][0]).toBe("doc.md");
+        expect(onAuto.mock.calls[0][1]).toBe(remote); // winner
+        expect(onAuto.mock.calls[0][2]).toEqual([local]); // losers
+    });
+
+    it("returns keep-local when local dominates remote", async () => {
+        const resolver = new ConflictResolver();
+        const local = makeFile("doc.md", { A: 2, B: 1 });
+        const remote = makeFile("doc.md", { A: 1, B: 1 });
+
+        const verdict = await resolver.resolveOnPull(local, remote);
+        expect(verdict).toBe("keep-local");
+    });
+
+    it("does NOT fire onAutoResolved when local dominates", async () => {
+        const onAuto = vi.fn();
+        const resolver = new ConflictResolver(onAuto);
+        const local = makeFile("doc.md", { A: 2 });
+        const remote = makeFile("doc.md", { A: 1 });
+
+        await resolver.resolveOnPull(local, remote);
+        expect(onAuto).not.toHaveBeenCalled();
+    });
+
+    it("returns keep-local when vclocks are equal", async () => {
+        const resolver = new ConflictResolver();
+        const local = makeFile("doc.md", { A: 1, B: 1 });
+        const remote = makeFile("doc.md", { A: 1, B: 1 });
+
+        const verdict = await resolver.resolveOnPull(local, remote);
+        expect(verdict).toBe("keep-local");
+    });
+
+    it("returns concurrent when vclocks are incomparable", async () => {
+        const resolver = new ConflictResolver();
         const onConcurrent = vi.fn();
         resolver.setOnConcurrent(onConcurrent);
 
-        const resolved = await resolver.resolveIfConflicted(doc);
-        expect(resolved).toBe(true);
-        expect(onConcurrent).not.toHaveBeenCalled();
+        const local = makeFile("doc.md", { A: 1, B: 0 }, "chunk:local");
+        const remote = makeFile("doc.md", { A: 0, B: 1 }, "chunk:remote");
 
-        const final = await testDb.getDb().get(makeFileId("dominates.md"), { conflicts: true }) as any;
-        expect(final._conflicts).toBeUndefined();
-        // Winner should be the A:2 revision — its chunks
-        expect(final.chunks).toEqual(["chunk:local"]);
-        expect(final.vclock).toEqual({ A: 2, B: 1 });
+        const verdict = await resolver.resolveOnPull(local, remote);
+        expect(verdict).toBe("concurrent");
     });
 
-    it("raises onConcurrent callback when no revision dominates", async () => {
-        const doc = await createConflict(testDb, "concurrent.md",
-            { vclock: { A: 1, B: 0 }, chunks: ["chunk:local"] },
-            { vclock: { A: 0, B: 1 }, chunks: ["chunk:remote"] },
-        );
-
-        const resolver = new ConflictResolver(testDb as any);
+    it("fires onConcurrent with path and both revisions", async () => {
         const onConcurrent = vi.fn();
+        const resolver = new ConflictResolver();
         resolver.setOnConcurrent(onConcurrent);
 
-        const resolved = await resolver.resolveIfConflicted(doc);
-        expect(resolved).toBe(false);
+        const local = makeFile("concurrent.md", { A: 1 });
+        const remote = makeFile("concurrent.md", { B: 1 });
+
+        await resolver.resolveOnPull(local, remote);
+
         expect(onConcurrent).toHaveBeenCalledTimes(1);
         const [path, revs] = onConcurrent.mock.calls[0];
         expect(path).toBe("concurrent.md");
-        expect(Array.isArray(revs)).toBe(true);
-        expect(revs.length).toBe(2);
+        expect(revs).toEqual([local, remote]);
     });
 
-    it("does NOT use mtime or editedAt as a tiebreaker", async () => {
-        // Both revs are causally concurrent. If the resolver fell back to
-        // mtime, it would silently pick the higher mtime one. We want it
-        // to raise a conflict instead.
-        const doc = await createConflict(testDb, "tiebreak.md",
-            {
-                vclock: { A: 1, B: 0 },
-                chunks: ["chunk:local"],
-                mtime: 9999, // very new
-            },
-            {
-                vclock: { A: 0, B: 1 },
-                chunks: ["chunk:remote"],
-                mtime: 1,    // very old
-            },
-        );
+    it("returns concurrent even without onConcurrent handler", async () => {
+        const resolver = new ConflictResolver();
+        const local = makeFile("no-handler.md", { A: 1 });
+        const remote = makeFile("no-handler.md", { B: 1 });
 
-        const resolver = new ConflictResolver(testDb as any);
+        const verdict = await resolver.resolveOnPull(local, remote);
+        expect(verdict).toBe("concurrent");
+    });
+
+    it("does NOT use mtime as a tiebreaker", async () => {
+        const resolver = new ConflictResolver();
         const onConcurrent = vi.fn();
         resolver.setOnConcurrent(onConcurrent);
 
-        const resolved = await resolver.resolveIfConflicted(doc);
-        expect(resolved).toBe(false);
+        const local = makeFile("tiebreak.md", { A: 1, B: 0 });
+        local.mtime = 9999; // very new
+        const remote = makeFile("tiebreak.md", { A: 0, B: 1 });
+        remote.mtime = 1; // very old
+
+        const verdict = await resolver.resolveOnPull(local, remote);
+        expect(verdict).toBe("concurrent");
         expect(onConcurrent).toHaveBeenCalled();
     });
 
-    it("is a no-op when the doc has no conflicts", async () => {
-        const clean: FileDoc = {
-            _id: makeFileId("clean.md"), type: "file",
-            chunks: ["chunk:only"], mtime: 1, ctime: 1, size: 0,
-            vclock: { A: 1 },
-        };
-        const resolver = new ConflictResolver(testDb as any);
-        expect(await resolver.resolveIfConflicted(clean)).toBe(false);
+    it("handles missing vclock as empty", async () => {
+        const resolver = new ConflictResolver();
+        const local = makeFile("no-vc.md", {});
+        delete (local as any).vclock;
+        const remote = makeFile("no-vc.md", { A: 1 });
+
+        // Remote has a vclock, local doesn't — remote dominates.
+        const verdict = await resolver.resolveOnPull(local, remote);
+        expect(verdict).toBe("take-remote");
     });
 
-    it("returns false and does not call callback when onConcurrent is unset", async () => {
-        const doc = await createConflict(testDb, "no-cb.md",
-            { vclock: { A: 1 }, chunks: ["chunk:local"] },
-            { vclock: { B: 1 }, chunks: ["chunk:remote"] },
-        );
-        const resolver = new ConflictResolver(testDb as any);
-        const resolved = await resolver.resolveIfConflicted(doc);
-        expect(resolved).toBe(false);
+    it("resolveIfConflicted is a no-op (backward compat)", async () => {
+        const resolver = new ConflictResolver();
+        const doc = makeFile("legacy.md", { A: 1 });
+        // No _conflicts → false immediately
+        const result = await resolver.resolveIfConflicted(doc as any);
+        expect(result).toBe(false);
     });
 });

@@ -1,16 +1,11 @@
 /**
- * Tests for the stateless remote-couch helpers.
+ * Tests for the stateless remote-couch helpers (Phase 2).
  *
- * These functions used to live as methods on Replicator. They were extracted
- * so ConfigSync can talk to a different remote DB than the vault Replicator
- * (config DB separation in v0.11.0). The tests use PouchDB memory adapters
- * for both "local" and "remote" so we can exercise the full replicate code
- * path without a real network.
+ * Phase 2 replaces PouchDB replication with ILocalStore + ICouchClient
+ * abstractions. Tests use in-memory stubs for both sides.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import PouchDB from "pouchdb";
-import memoryAdapter from "pouchdb-adapter-memory";
+import { describe, it, expect, beforeEach } from "vitest";
 import {
     pushDocs,
     pullByPrefix,
@@ -20,24 +15,104 @@ import {
     pullAll,
 } from "../src/db/remote-couch.ts";
 import type { CouchSyncDoc, FileDoc } from "../src/types.ts";
+import type {
+    ILocalStore,
+    ICouchClient,
+    PutResponse,
+    AllDocsResult,
+    AllDocsRow,
+    BulkDocsResult,
+} from "../src/db/interfaces.ts";
 import { makeFileId, makeChunkId } from "../src/types/doc-id.ts";
 
-PouchDB.plugin(memoryAdapter);
+// ── In-memory ILocalStore stub ──────────────────────────
 
-function uniqueName(prefix: string) {
-    return `${prefix}-${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
+function createLocalStub(): ILocalStore<CouchSyncDoc> & { _docs: Map<string, any> } {
+    const _docs = new Map<string, any>();
+    let _rev = 0;
+    return {
+        _docs,
+        get: async (id: string) => _docs.get(id) ?? null,
+        put: async (doc: any) => {
+            const rev = `${++_rev}-stub`;
+            _docs.set(doc._id, { ...doc, _rev: rev });
+            return { ok: true, id: doc._id, rev };
+        },
+        bulkPut: async (docs: any[]) => {
+            const results: PutResponse[] = [];
+            for (const doc of docs) {
+                const rev = `${++_rev}-stub`;
+                _docs.set(doc._id, { ...doc, _rev: rev });
+                results.push({ ok: true, id: doc._id, rev });
+            }
+            return results;
+        },
+        update: async () => null,
+        delete: async (id: string) => { _docs.delete(id); },
+        allDocs: async (opts?: any) => {
+            let entries = Array.from(_docs.entries());
+            if (opts?.keys) {
+                const keySet = new Set(opts.keys);
+                entries = entries.filter(([k]) => keySet.has(k));
+            } else {
+                if (opts?.startkey) entries = entries.filter(([k]) => k >= opts.startkey);
+                if (opts?.endkey) entries = entries.filter(([k]) => k <= opts.endkey);
+            }
+            const rows: AllDocsRow<CouchSyncDoc>[] = entries.map(([id, doc]) => ({
+                id,
+                key: id,
+                value: { rev: doc._rev || "1-stub" },
+                ...(opts?.include_docs ? { doc } : {}),
+            }));
+            return { rows } as AllDocsResult<CouchSyncDoc>;
+        },
+        info: async () => ({ updateSeq: 0 }),
+        close: async () => {},
+        destroy: async () => { _docs.clear(); },
+    };
 }
 
-function mkLocal() {
-    return new PouchDB<CouchSyncDoc>(uniqueName("rc-local"), { adapter: "memory" });
-}
+// ── In-memory ICouchClient stub ─────────────────────────
 
-function mkRemote() {
-    // remote-couch operates on PouchDB instances directly via a "remote URL".
-    // Inside tests we substitute a memory-adapter PouchDB for the URL by
-    // passing the instance reference. The helper accepts either string or
-    // an existing PouchDB instance to make this easy to test.
-    return new PouchDB<CouchSyncDoc>(uniqueName("rc-remote"), { adapter: "memory" });
+function createRemoteStub(): ICouchClient & { _docs: Map<string, any>, _destroyed: boolean } {
+    const _docs = new Map<string, any>();
+    let _rev = 0;
+    return {
+        _docs,
+        _destroyed: false,
+        info: async () => ({ db_name: "test", doc_count: _docs.size, update_seq: 0 }),
+        getDoc: async (id: string) => _docs.get(id) ?? null,
+        bulkGet: async (ids: string[]) => ids.map((id) => _docs.get(id)).filter(Boolean),
+        bulkDocs: async (docs: any[]) => {
+            const results: BulkDocsResult[] = [];
+            for (const doc of docs) {
+                const rev = `${++_rev}-remote`;
+                _docs.set(doc._id, { ...doc, _rev: rev });
+                results.push({ ok: true, id: doc._id, rev });
+            }
+            return results;
+        },
+        allDocs: async (opts?: any) => {
+            let entries = Array.from(_docs.entries());
+            if (opts?.keys) {
+                const keySet = new Set(opts.keys);
+                entries = entries.filter(([k]) => keySet.has(k));
+            } else {
+                if (opts?.startkey) entries = entries.filter(([k]) => k >= opts.startkey);
+                if (opts?.endkey) entries = entries.filter(([k]) => k <= opts.endkey);
+            }
+            const rows: AllDocsRow<CouchSyncDoc>[] = entries.map(([id, doc]) => ({
+                id,
+                key: id,
+                value: { rev: doc._rev || "1-remote" },
+                ...(opts?.include_docs ? { doc } : {}),
+            }));
+            return { rows } as AllDocsResult<CouchSyncDoc>;
+        },
+        changes: async () => ({ results: [], last_seq: 0 }),
+        changesLongpoll: async () => ({ results: [], last_seq: 0 }),
+        destroy: async function (this: any) { this._destroyed = true; _docs.clear(); },
+    };
 }
 
 function makeFileDoc(path: string, body: string): FileDoc {
@@ -52,18 +127,13 @@ function makeFileDoc(path: string, body: string): FileDoc {
     };
 }
 
-describe("remote-couch", () => {
-    let local: PouchDB.Database<CouchSyncDoc>;
-    let remote: PouchDB.Database<CouchSyncDoc>;
+describe("remote-couch (Phase 2 — ILocalStore + ICouchClient)", () => {
+    let local: ReturnType<typeof createLocalStub>;
+    let remote: ReturnType<typeof createRemoteStub>;
 
     beforeEach(() => {
-        local = mkLocal();
-        remote = mkRemote();
-    });
-
-    afterEach(async () => {
-        await local.destroy().catch(() => {});
-        await remote.destroy().catch(() => {});
+        local = createLocalStub();
+        remote = createRemoteStub();
     });
 
     describe("pushDocs", () => {
@@ -84,12 +154,10 @@ describe("remote-couch", () => {
                 new Set([makeFileId("a.md"), makeFileId("b.md")]),
             );
 
-            // c.md was NOT in the doc_ids list — should not appear
-            const remoteAll = await remote.allDocs();
-            const ids = remoteAll.rows.map((r) => r.id);
-            expect(ids).toContain(makeFileId("a.md"));
-            expect(ids).toContain(makeFileId("b.md"));
-            expect(ids).not.toContain(makeFileId("c.md"));
+            // c.md was NOT in the doc_ids list — should not appear on remote
+            expect(remote._docs.has(makeFileId("a.md"))).toBe(true);
+            expect(remote._docs.has(makeFileId("b.md"))).toBe(true);
+            expect(remote._docs.has(makeFileId("c.md"))).toBe(false);
         });
 
         it("returns 0 immediately for an empty id list", async () => {
@@ -100,23 +168,19 @@ describe("remote-couch", () => {
 
     describe("pullByPrefix", () => {
         it("pulls only docs matching the prefix", async () => {
-            await remote.put(makeFileDoc("a.md", "x"));
-            await remote.put(makeFileDoc("b.md", "y"));
-            // Add a non-matching doc to ensure it's filtered out
-            await remote.put({
-                _id: makeChunkId("orphan"),
-                type: "chunk",
-                data: "ZGF0YQ==",
-            } as CouchSyncDoc);
+            // Seed remote with file docs and a chunk doc.
+            remote._docs.set(makeFileId("a.md"), { ...makeFileDoc("a.md", "x"), _rev: "1-r" });
+            remote._docs.set(makeFileId("b.md"), { ...makeFileDoc("b.md", "y"), _rev: "1-r" });
+            remote._docs.set(makeChunkId("orphan"), {
+                _id: makeChunkId("orphan"), type: "chunk", data: "ZGF0YQ==", _rev: "1-r",
+            });
 
             const written = await pullByPrefix(local, remote, "file:");
             expect(written).toBe(2);
 
-            const localAll = await local.allDocs();
-            const ids = localAll.rows.map((r) => r.id);
-            expect(ids).toContain(makeFileId("a.md"));
-            expect(ids).toContain(makeFileId("b.md"));
-            expect(ids).not.toContain(makeChunkId("orphan"));
+            expect(local._docs.has(makeFileId("a.md"))).toBe(true);
+            expect(local._docs.has(makeFileId("b.md"))).toBe(true);
+            expect(local._docs.has(makeChunkId("orphan"))).toBe(false);
         });
 
         it("returns 0 when prefix matches nothing", async () => {
@@ -127,13 +191,9 @@ describe("remote-couch", () => {
 
     describe("listRemoteByPrefix", () => {
         it("returns ids matching the prefix", async () => {
-            await remote.put(makeFileDoc("notes/x.md", "1"));
-            await remote.put(makeFileDoc("notes/y.md", "2"));
-            await remote.put({
-                _id: makeChunkId("nope"),
-                type: "chunk",
-                data: "",
-            } as CouchSyncDoc);
+            remote._docs.set(makeFileId("notes/x.md"), { _id: makeFileId("notes/x.md"), _rev: "1-r" });
+            remote._docs.set(makeFileId("notes/y.md"), { _id: makeFileId("notes/y.md"), _rev: "1-r" });
+            remote._docs.set(makeChunkId("nope"), { _id: makeChunkId("nope"), _rev: "1-r" });
 
             const ids = await listRemoteByPrefix(remote, "file:");
             expect(ids).toContain(makeFileId("notes/x.md"));
@@ -148,15 +208,11 @@ describe("remote-couch", () => {
     });
 
     describe("destroyRemote", () => {
-        it("destroys the given remote db", async () => {
-            await remote.put(makeFileDoc("doomed.md", "x"));
+        it("destroys the remote", async () => {
+            remote._docs.set(makeFileId("doomed.md"), { _id: makeFileId("doomed.md") });
             await destroyRemote(remote);
-            // After destroy, the original PouchDB instance should reject
-            // operations or auto-recreate as empty.
-            const fresh = new PouchDB<CouchSyncDoc>(remote.name, { adapter: "memory" });
-            const info = await fresh.info();
-            expect(info.doc_count).toBe(0);
-            await fresh.destroy();
+            expect(remote._destroyed).toBe(true);
+            expect(remote._docs.size).toBe(0);
         });
     });
 
@@ -174,8 +230,10 @@ describe("remote-couch", () => {
 
     describe("pullAll", () => {
         it("pulls every remote doc to local and returns the docs", async () => {
-            await remote.put(makeFileDoc("a.md", "1"));
-            await remote.put(makeFileDoc("b.md", "2"));
+            const docA = { ...makeFileDoc("a.md", "1"), _rev: "1-r" };
+            const docB = { ...makeFileDoc("b.md", "2"), _rev: "1-r" };
+            remote._docs.set(docA._id, docA);
+            remote._docs.set(docB._id, docB);
 
             const seen: string[] = [];
             const result = await pullAll(local, remote, (id) => seen.push(id));

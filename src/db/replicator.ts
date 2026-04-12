@@ -3,6 +3,7 @@ import type { CouchSyncDoc } from "../types.ts";
 import type { LocalDB } from "./local-db.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import * as remoteCouch from "./remote-couch.ts";
+import { makeCouchClient } from "./couch-client.ts";
 import {
     decideReconnect,
     type ReconnectReason,
@@ -770,33 +771,22 @@ export class Replicator {
      * directly by ConfigSync against its own remote.
      */
     async pushToRemote(onProgress?: (docId: string, count: number) => void): Promise<number> {
-        const remoteUrl = this.getRemoteUrl();
-        const remoteDb = new PouchDB<CouchSyncDoc>(remoteUrl, {});
-        try {
-            return await remoteCouch.pushAll(this.localDb.getDb(), remoteDb, onProgress);
-        } finally {
-            await remoteDb.close();
-        }
+        const client = this.makeVaultClient();
+        return remoteCouch.pushAll(this.localDb, client, onProgress);
     }
 
     /** One-shot pull of the entire vault remote → local. */
     async pullFromRemote(
         onProgress?: (docId: string, count: number) => void,
     ): Promise<{ written: number; docs: CouchSyncDoc[] }> {
-        const remoteUrl = this.getRemoteUrl();
-        const remoteDb = new PouchDB<CouchSyncDoc>(remoteUrl, {});
-        try {
-            return await remoteCouch.pullAll(this.localDb.getDb(), remoteDb, onProgress);
-        } finally {
-            await remoteDb.close();
-        }
+        const client = this.makeVaultClient();
+        return remoteCouch.pullAll(this.localDb, client, onProgress);
     }
 
     /** Destroy the vault remote database (auto-recreated on next push). */
     async destroyRemote(): Promise<void> {
-        const remoteUrl = this.getRemoteUrl();
-        const remoteDb = new PouchDB<CouchSyncDoc>(remoteUrl, {});
-        await remoteCouch.destroyRemote(remoteDb);
+        const client = this.makeVaultClient();
+        await remoteCouch.destroyRemote(client);
     }
 
     /** Test connection with explicit credentials (for unsaved draft values) */
@@ -804,12 +794,8 @@ export class Replicator {
         uri: string, user: string, pass: string, db: string
     ): Promise<string | null> {
         try {
-            const url = new URL(uri);
-            url.pathname = url.pathname.replace(/\/$/, "") + "/" + db;
-            if (user) { url.username = user; url.password = pass; }
-            const remoteDb = new PouchDB(url.toString(), {});
-            await remoteDb.info();
-            await remoteDb.close();
+            const client = makeCouchClient(uri, db, user, pass);
+            await client.info();
             return null;
         } catch (e: any) {
             return e.message || "Connection failed";
@@ -830,6 +816,12 @@ export class Replicator {
         }
         const s = this.getSettings();
         return this.testConnectionWith(s.couchdbUri, s.couchdbUser, s.couchdbPassword, s.couchdbDbName);
+    }
+
+    /** Build a CouchClient for the vault database. */
+    private makeVaultClient() {
+        const s = this.getSettings();
+        return makeCouchClient(s.couchdbUri, s.couchdbDbName, s.couchdbUser, s.couchdbPassword);
     }
 
     private async checkHealth(): Promise<void> {

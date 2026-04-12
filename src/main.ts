@@ -136,7 +136,6 @@ export default class CouchSyncPlugin extends Plugin {
             this.app.vault, this.historyStorage, this.historyCapture, () => this.settings,
         );
         this.conflictResolver = new ConflictResolver(
-            this.localDb,
             async (filePath, winnerDoc, loserDocs) => {
                 // ConflictResolver passes us either FileDoc or ConfigDoc;
                 // history capture only knows about file content, so we
@@ -203,9 +202,7 @@ export default class CouchSyncPlugin extends Plugin {
 
         // Config-side conflict resolver (only when config sync is enabled)
         if (this.configLocalDb) {
-            const configDbRef = this.configLocalDb;
             this.configConflictResolver = new ConflictResolver(
-                configDbRef,
                 async (configPath, winnerDoc, _loserDocs) => {
                     // ConfigDoc auto-resolution: log + Notice. History
                     // capture is text-oriented (vault notes), so we don't

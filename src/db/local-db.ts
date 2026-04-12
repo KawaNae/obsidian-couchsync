@@ -247,22 +247,7 @@ export class LocalDB implements ILocalStore<CouchSyncDoc> {
         }
     }
 
-    /** Fetch a specific revision. Used by ConflictResolver; removed in Phase 2. */
-    async getByRev<T extends CouchSyncDoc>(id: string, rev: string): Promise<T | null> {
-        try {
-            return (await this.getDb().get(id, { rev })) as unknown as T;
-        } catch (e: any) {
-            if (e.status === 404) return null;
-            throw e;
-        }
-    }
-
-    /** Remove a specific revision. Used by ConflictResolver; removed in Phase 2. */
-    async removeRev(id: string, rev: string): Promise<void> {
-        await this.getDb().remove(id, rev);
-    }
-
-    async allDocs(opts?: AllDocsOpts): Promise<AllDocsResult<CouchSyncDoc>> {
+async allDocs(opts?: AllDocsOpts): Promise<AllDocsResult<CouchSyncDoc>> {
         const result = await this.getDb().allDocs(opts as any);
         return result as unknown as AllDocsResult<CouchSyncDoc>;
     }

@@ -17,16 +17,11 @@ function createLocalDB(name: string) {
             try { return (await db.get(id)) as T; }
             catch (e: any) { if (e.status === 404) return null; throw e; }
         },
-        getByRev: async (id: string, rev: string) => {
-            try { return await db.get(id, { rev }) as unknown; }
-            catch (e: any) { if (e.status === 404) return null; throw e; }
-        },
         put: async (doc: CouchSyncDoc) => {
             const existing = await db.get(doc._id).catch(() => null);
             if (existing) doc._rev = (existing as any)._rev;
             return db.put(doc);
         },
-        removeRev: async (id: string, rev: string) => { await db.remove(id, rev); },
         allDocs: async (opts?: any) => db.allDocs(opts) as any,
         getChunks: async (chunkIds: string[]) => {
             const result = await db.allDocs({ keys: chunkIds, include_docs: true });
@@ -114,46 +109,25 @@ describe("PouchDB replication", () => {
     });
 
     it("ConflictResolver picks the VC-dominator as winner (ignoring mtime)", async () => {
-        // Build a scenario where mtime DISAGREES with VC to prove the
-        // resolver trusts vector clocks, not timestamps. The "old edit"
-        // side has a HIGHER mtime but a DOMINATED vclock. A mtime-based
-        // resolver would pick it wrongly; the VC resolver must not.
-        await createFileDoc(db1, "note.md", "original", 1000, { A: 1 });
-        await db1.getDb().replicate.to(db2.getDb());
+        // Build a scenario where mtime DISAGREES with VC. The "old edit"
+        // side has a HIGHER mtime but a DOMINATED vclock.
+        const localDoc = await createFileDoc(db1, "note.md", "old edit (wrong)", 9999, { A: 2 });
+        const remoteDoc = await createFileDoc(db2, "note.md", "new edit (right)", 1, { A: 3 });
 
-        await createFileDoc(db1, "note.md", "old edit (wrong)", 9999, { A: 2 });
-        await createFileDoc(db2, "note.md", "new edit (right)", 1, { A: 3 });
-
-        await db1.getDb().replicate.to(db2.getDb());
-        await db2.getDb().replicate.to(db1.getDb());
-
-        const doc = await db1.getDb().get(makeFileId("note.md"), { conflicts: true }) as unknown as CouchSyncDoc;
-
-        const resolver = new ConflictResolver(db1 as any);
-        const resolved = await resolver.resolveIfConflicted(doc);
-        expect(resolved).toBe(true);
-
-        // Winner should have vclock A:3 regardless of mtime
-        const result = await db1.getFileDoc("note.md");
-        expect(result!.vclock).toEqual({ A: 3 });
+        // Phase 2: resolveOnPull compares docs directly.
+        const resolver = new ConflictResolver();
+        const verdict = await resolver.resolveOnPull(localDoc, remoteDoc);
+        // Remote (A:3) dominates local (A:2) → take-remote
+        expect(verdict).toBe("take-remote");
     });
 
     it("ConflictResolver calls onAutoResolved with winner and losers for dominated conflicts", async () => {
-        await createFileDoc(db1, "note.md", "original", 1000, { A: 1 });
-        await db1.getDb().replicate.to(db2.getDb());
-
-        await createFileDoc(db1, "note.md", "loser", 2000, { A: 2 });
-        await createFileDoc(db2, "note.md", "winner", 5000, { A: 3 });
-
-        await db1.getDb().replicate.to(db2.getDb());
-        await db2.getDb().replicate.to(db1.getDb());
-
-        const doc = await db1.getDb().get(makeFileId("note.md"), { conflicts: true }) as unknown as CouchSyncDoc;
+        const localDoc = await createFileDoc(db1, "note.md", "loser", 2000, { A: 2 });
+        const remoteDoc = await createFileDoc(db2, "note.md", "winner", 5000, { A: 3 });
 
         let callbackArgs: { filePath: string; winnerVC: any; loserCount: number } | null = null;
 
         const resolver = new ConflictResolver(
-            db1 as any,
             async (filePath, winner, losers) => {
                 callbackArgs = {
                     filePath,
@@ -163,35 +137,27 @@ describe("PouchDB replication", () => {
             },
         );
 
-        await resolver.resolveIfConflicted(doc);
+        await resolver.resolveOnPull(localDoc, remoteDoc);
 
         expect(callbackArgs).not.toBeNull();
         expect(callbackArgs!.filePath).toBe("note.md");
         expect(callbackArgs!.winnerVC).toEqual({ A: 3 });
-        expect(callbackArgs!.loserCount).toBeGreaterThanOrEqual(1);
+        expect(callbackArgs!.loserCount).toBe(1);
     });
 
     it("ConflictResolver raises onConcurrent callback when VCs are incomparable", async () => {
-        await createFileDoc(db1, "note.md", "original", 1000, { A: 1 });
-        await db1.getDb().replicate.to(db2.getDb());
-
         // Device A and B each bump only their own key — pure concurrent edits.
-        await createFileDoc(db1, "note.md", "A's edit", 2000, { A: 2, B: 0 });
-        await createFileDoc(db2, "note.md", "B's edit", 2000, { A: 0, B: 1 });
-
-        await db1.getDb().replicate.to(db2.getDb());
-        await db2.getDb().replicate.to(db1.getDb());
-
-        const doc = await db1.getDb().get(makeFileId("note.md"), { conflicts: true }) as unknown as CouchSyncDoc;
+        const localDoc = await createFileDoc(db1, "note.md", "A's edit", 2000, { A: 2, B: 0 });
+        const remoteDoc = await createFileDoc(db2, "note.md", "B's edit", 2000, { A: 0, B: 1 });
 
         const concurrentCalls: string[] = [];
-        const resolver = new ConflictResolver(db1 as any);
+        const resolver = new ConflictResolver();
         resolver.setOnConcurrent((path) => {
             concurrentCalls.push(path);
         });
 
-        const resolved = await resolver.resolveIfConflicted(doc);
-        expect(resolved).toBe(false);
+        const verdict = await resolver.resolveOnPull(localDoc, remoteDoc);
+        expect(verdict).toBe("concurrent");
         expect(concurrentCalls).toContain("note.md");
     });
 });
