@@ -72,7 +72,7 @@ function makeRev(version: number): string {
 }
 
 function stripInternal<T>(stored: StoredDoc): T {
-    const { _version, ...doc } = stored;
+    const { _version, _localSeq, ...doc } = stored;
     // Synthesize _rev from _version for consumers that expect it
     return { ...doc, _rev: makeRev(_version) } as unknown as T;
 }
