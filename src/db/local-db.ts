@@ -32,6 +32,7 @@ export interface VaultManifest {
 const SCAN_CURSOR_ID = "_local/scan-cursor";
 const VAULT_MANIFEST_ID = "_local/vault-manifest";
 const SKIPPED_FILES_ID = "_local/skipped-files";
+const LAST_SYNCED_VCLOCKS_ID = "_local/last-synced-vclocks";
 
 /**
  * Files that fileToDb() refused to push because they exceeded
@@ -175,6 +176,7 @@ export class LocalDB {
         fn: (existing: T | null) => T | null,
         maxRetries = 3,
     ): Promise<PouchDB.Core.Response | null> {
+        let lastErr: any;
         for (let attempt = 0; attempt <= maxRetries; attempt++) {
             const existing = await this.get<T>(id);
             const updated = fn(existing);
@@ -183,11 +185,12 @@ export class LocalDB {
             try {
                 return await this.getDb().put(updated);
             } catch (e: any) {
+                lastErr = e;
                 if (e?.status === 409 && attempt < maxRetries) continue;
                 throw e;
             }
         }
-        throw new Error(`update failed: exhausted retries for ${id}`);
+        throw new Error(`update failed after ${maxRetries} retries for ${id}: status=${lastErr?.status}`);
     }
 
     async bulkPut(docs: CouchSyncDoc[]): Promise<PouchDB.Core.Response[]> {
@@ -357,6 +360,15 @@ export class LocalDB {
 
     async putSkippedFiles(doc: SkippedFilesDoc): Promise<void> {
         await this.localPut(SKIPPED_FILES_ID, doc);
+    }
+
+    async getLastSyncedVclocks(): Promise<Record<string, Record<string, number>> | null> {
+        const doc = await this.localGet<{ clocks: Record<string, Record<string, number>> }>(LAST_SYNCED_VCLOCKS_ID);
+        return doc?.clocks ?? null;
+    }
+
+    async putLastSyncedVclocks(clocks: Record<string, Record<string, number>>): Promise<void> {
+        await this.localPut(LAST_SYNCED_VCLOCKS_ID, { clocks });
     }
 
     async destroy(): Promise<void> {

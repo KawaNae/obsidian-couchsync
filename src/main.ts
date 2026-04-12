@@ -458,6 +458,7 @@ export default class CouchSyncPlugin extends Plugin {
         this.historyCapture?.stop();
         this.historyManager?.stopCleanup();
         this.replicator?.stop();
+        await this.vaultSync?.teardown();
         this.reconciler?.destroy();
         this.statusBar?.destroy();
         this.historyStorage?.close();
@@ -522,6 +523,7 @@ export default class CouchSyncPlugin extends Plugin {
 
     async startSync(): Promise<void> {
         if (this.settings.connectionState !== "syncing") return;
+        await this.vaultSync.loadLastSyncedVclocks();
         this.replicator.stop();
         this.replicator.start();
         this.changeTracker.start();

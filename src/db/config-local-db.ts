@@ -62,6 +62,7 @@ export class ConfigLocalDB {
         fn: (existing: T | null) => T | null,
         maxRetries = 3,
     ): Promise<PouchDB.Core.Response | null> {
+        let lastErr: any;
         for (let attempt = 0; attempt <= maxRetries; attempt++) {
             const existing = await this.get(id) as T | null;
             const updated = fn(existing);
@@ -70,11 +71,12 @@ export class ConfigLocalDB {
             try {
                 return await this.db.put(updated as unknown as CouchSyncDoc);
             } catch (e: any) {
+                lastErr = e;
                 if (e?.status === 409 && attempt < maxRetries) continue;
                 throw e;
             }
         }
-        throw new Error(`update failed: exhausted retries for ${id}`);
+        throw new Error(`update failed after ${maxRetries} retries for ${id}: status=${lastErr?.status}`);
     }
 
     /**
