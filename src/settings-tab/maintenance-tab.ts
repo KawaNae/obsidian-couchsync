@@ -2,7 +2,7 @@ import { Notice, Platform, Setting } from "obsidian";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { LocalDB } from "../db/local-db.ts";
 import type { ConfigLocalDB } from "../db/config-local-db.ts";
-import type { Replicator } from "../db/replicator.ts";
+import type { SyncEngine } from "../db/sync-engine.ts";
 import type { ConflictResolver } from "../conflict/conflict-resolver.ts";
 import type { StatusBar } from "../ui/status-bar.ts";
 import { DOC_ID } from "../types/doc-id.ts";
@@ -13,7 +13,7 @@ interface MaintenanceTabDeps {
     localDb: LocalDB;
     /** Null when config sync is not configured (`couchdbConfigDbName === ""`) */
     configLocalDb: ConfigLocalDB | null;
-    replicator: Replicator;
+    replicator: SyncEngine;
     /** ConflictResolver bound to the vault DB */
     conflictResolver: ConflictResolver;
     /** ConflictResolver bound to the config DB (null when config sync disabled) */

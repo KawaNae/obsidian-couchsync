@@ -3,7 +3,7 @@ import PouchDB from "pouchdb-browser/lib/index.js";
 import { type CouchSyncSettings, DEFAULT_SETTINGS } from "./settings.ts";
 import { LocalDB } from "./db/local-db.ts";
 import { ConfigLocalDB } from "./db/config-local-db.ts";
-import { Replicator } from "./db/replicator.ts";
+import { SyncEngine } from "./db/sync-engine.ts";
 import { VaultSync } from "./sync/vault-sync.ts";
 import { ConfigSync } from "./sync/config-sync.ts";
 import { SetupService } from "./sync/setup.ts";
@@ -11,11 +11,9 @@ import { ChangeTracker } from "./sync/change-tracker.ts";
 import { Reconciler, type ReconcileReason } from "./sync/reconciler.ts";
 import { ConflictResolver } from "./conflict/conflict-resolver.ts";
 import { checkInstallMarker } from "./sync/install-marker.ts";
-import { filePathFromId } from "./types/doc-id.ts";
 import { StatusBar } from "./ui/status-bar.ts";
 import { initLog } from "./ui/log.ts";
 import { CouchSyncSettingTab } from "./settings-tab/index.ts";
-import { isFileDoc, type CouchSyncDoc } from "./types.ts";
 import { showNotice, ProgressNotice } from "./ui/notices.ts";
 import { HistoryStorage } from "./history/storage.ts";
 import { HistoryCapture } from "./history/history-capture.ts";
@@ -33,7 +31,7 @@ export default class CouchSyncPlugin extends Plugin {
     configLocalDb: ConfigLocalDB | null = null;
     /** Holds the underlying PouchDB so we can destroy it on unload */
     private configPouch: PouchDB.Database | null = null;
-    replicator!: Replicator;
+    replicator!: SyncEngine;
     conflictResolver!: ConflictResolver;
     /** Null when config sync is disabled */
     configConflictResolver: ConflictResolver | null = null;
@@ -101,7 +99,7 @@ export default class CouchSyncPlugin extends Plugin {
         }
 
         initLog(() => this.settings, showNotice);
-        this.replicator = new Replicator(this.localDb, () => this.settings, Platform.isMobile);
+        this.replicator = new SyncEngine(this.localDb, () => this.settings, Platform.isMobile);
         this.vaultSync = new VaultSync(this.app, this.localDb, () => this.settings);
         // ConfigSync needs *some* ConfigLocalDB even when sync is disabled,
         // so we satisfy the type with a stand-in pointing at the vault DB.
@@ -225,21 +223,10 @@ export default class CouchSyncPlugin extends Plugin {
             });
         }
 
-        // Live remote → vault hint path. Reconciler.reconcile("paused") below
-        // is the safety net that catches anything dbToFile missed.
-        this.replicator.onChange((doc: CouchSyncDoc) => {
-            if (isFileDoc(doc)) {
-                this.vaultSync.dbToFile(doc)
-                    .then(() => this.conflictResolver.resolveIfConflicted(doc))
-                    .catch((e) => console.error(
-                        `CouchSync: Failed to apply remote change for ${filePathFromId(doc._id)}:`,
-                        e,
-                    ));
-            }
-        });
-
         // Reconciler runs after every replication batch. The cursor + manifest
         // short-circuit makes the steady-state cost negligible.
+        // In the SyncEngine architecture, Reconciler is the SOLE vault write
+        // path — there is no onChange→dbToFile direct shortcut.
         this.replicator.onPaused(() => this.fireReconcile("paused"));
 
         this.addSettingTab(new CouchSyncSettingTab(this.app, this));
