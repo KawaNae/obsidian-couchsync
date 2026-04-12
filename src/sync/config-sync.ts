@@ -211,16 +211,15 @@ export class ConfigSync {
                 const buf = await adapter.readBinary(file);
                 const data = arrayBufferToBase64(buf);
 
-                const existing = await this.configDb.get(makeConfigId(file));
-                const doc: ConfigDoc = {
-                    _id: makeConfigId(file),
+                const configId = makeConfigId(file);
+                await this.configDb.update<ConfigDoc>(configId, (existing) => ({
+                    _id: configId,
                     type: "config",
                     data,
                     mtime: stat.mtime,
                     size: stat.size,
                     vclock: incrementVC(existing?.vclock, deviceId),
-                };
-                await this.configDb.put(doc);
+                } as ConfigDoc));
                 count++;
             } catch (e) {
                 console.error(`CouchSync: Failed to scan config ${file}:`, e);

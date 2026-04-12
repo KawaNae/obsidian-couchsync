@@ -159,14 +159,38 @@ export class LocalDB {
     }
 
     async put(doc: CouchSyncDoc): Promise<PouchDB.Core.Response> {
-        const existing = await this.get(doc._id);
-        if (existing) {
-            doc._rev = existing._rev;
-        }
         return this.getDb().put(doc);
     }
 
-    async bulkPut(docs: CouchSyncDoc[]): Promise<Array<PouchDB.Core.Response | PouchDB.Core.Error>> {
+    /**
+     * CAS read-modify-write: reads the current doc, passes it to `fn`,
+     * and writes the result. On 409 (rev conflict from a concurrent
+     * replication update), re-reads and retries so the caller's vclock
+     * computation always uses a fresh base.
+     *
+     * `fn` receives `null` for new docs. Return `null` to skip the write.
+     */
+    async update<T extends CouchSyncDoc>(
+        id: string,
+        fn: (existing: T | null) => T | null,
+        maxRetries = 3,
+    ): Promise<PouchDB.Core.Response | null> {
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+            const existing = await this.get<T>(id);
+            const updated = fn(existing);
+            if (!updated) return null;
+            if (existing?._rev) updated._rev = existing._rev;
+            try {
+                return await this.getDb().put(updated);
+            } catch (e: any) {
+                if (e?.status === 409 && attempt < maxRetries) continue;
+                throw e;
+            }
+        }
+        throw new Error(`update failed: exhausted retries for ${id}`);
+    }
+
+    async bulkPut(docs: CouchSyncDoc[]): Promise<PouchDB.Core.Response[]> {
         const ids = docs.map((d) => d._id);
         const existing = await this.getDb().allDocs({ keys: ids });
         const revMap = new Map<string, string>();
@@ -179,7 +203,21 @@ export class LocalDB {
             const rev = revMap.get(doc._id);
             if (rev) doc._rev = rev;
         }
-        return this.getDb().bulkDocs(docs);
+        const results = await this.getDb().bulkDocs(docs);
+        const errors = results.filter(
+            (r, i): r is PouchDB.Core.Error => {
+                if (!("error" in r && r.error)) return false;
+                if ((r as any).status === 409 && docs[i].type === "chunk") return false;
+                return true;
+            }
+        );
+        if (errors.length > 0) {
+            const summary = errors
+                .map((e) => `${(e as any).id ?? "?"}: ${e.message}`)
+                .join("; ");
+            throw new Error(`bulkPut partial failure (${errors.length}/${docs.length}): ${summary}`);
+        }
+        return results as PouchDB.Core.Response[];
     }
 
     async delete(id: string): Promise<void> {
