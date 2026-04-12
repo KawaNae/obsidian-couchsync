@@ -223,10 +223,8 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
                     .setButtonText("Delete & Restart")
                     .setWarning()
                     .onClick(async () => {
-                        // ConfigLocalDB does not own its lifecycle — destroy
-                        // the underlying PouchDB directly.
                         try {
-                            await deps.configLocalDb!.getDb().destroy();
+                            await deps.configLocalDb!.destroy();
                             new Notice(
                                 "CouchSync: Local config database deleted. Restarting...",
                             );

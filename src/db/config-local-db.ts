@@ -30,9 +30,10 @@
 
 /// <reference types="pouchdb-browser" />
 import type { ConfigDoc, CouchSyncDoc } from "../types.ts";
+import type { ILocalStore, PutResponse, AllDocsOpts, AllDocsResult } from "./interfaces.ts";
 import { ID_RANGE, isConfigDocId } from "../types/doc-id.ts";
 
-export class ConfigLocalDB {
+export class ConfigLocalDB implements ILocalStore<CouchSyncDoc> {
     constructor(private db: PouchDB.Database<CouchSyncDoc>) {}
 
     getDb(): PouchDB.Database<CouchSyncDoc> {
@@ -53,15 +54,15 @@ export class ConfigLocalDB {
      * the caller doesn't have to thread `_rev` through. Mirrors
      * `LocalDB.put` semantics.
      */
-    async put(doc: ConfigDoc): Promise<PouchDB.Core.Response> {
-        return this.db.put(doc as unknown as CouchSyncDoc);
+    async put(doc: CouchSyncDoc): Promise<PutResponse> {
+        return this.db.put(doc);
     }
 
-    async update<T extends ConfigDoc>(
+    async update<T extends CouchSyncDoc>(
         id: string,
         fn: (existing: T | null) => T | null,
         maxRetries = 3,
-    ): Promise<PouchDB.Core.Response | null> {
+    ): Promise<PutResponse | null> {
         let lastErr: any;
         for (let attempt = 0; attempt <= maxRetries; attempt++) {
             const existing = await this.get(id) as T | null;
@@ -84,8 +85,8 @@ export class ConfigLocalDB {
      * via allDocs and threads them onto the input docs before bulkDocs.
      */
     async bulkPut(
-        docs: ConfigDoc[],
-    ): Promise<PouchDB.Core.Response[]> {
+        docs: CouchSyncDoc[],
+    ): Promise<PutResponse[]> {
         if (docs.length === 0) return [];
         const ids = docs.map((d) => d._id);
         const existing = await this.db.allDocs({ keys: ids });
@@ -101,7 +102,7 @@ export class ConfigLocalDB {
         }
         const results = await this.db.bulkDocs(docs as unknown as CouchSyncDoc[]);
         const errors = results.filter(
-            (r): r is PouchDB.Core.Error => "error" in r && !!r.error
+            (r): r is { error: true; id: string; message: string } => "error" in r && !!(r as any).error
         );
         if (errors.length > 0) {
             const summary = errors
@@ -109,7 +110,50 @@ export class ConfigLocalDB {
                 .join("; ");
             throw new Error(`bulkPut partial failure (${errors.length}/${docs.length}): ${summary}`);
         }
-        return results as PouchDB.Core.Response[];
+        return results as PutResponse[];
+    }
+
+    /** Fetch a specific revision. Used by ConflictResolver; removed in Phase 2. */
+    async getByRev<T extends CouchSyncDoc>(id: string, rev: string): Promise<T | null> {
+        try {
+            return (await this.db.get(id, { rev })) as unknown as T;
+        } catch (e: any) {
+            if (e?.status === 404) return null;
+            throw e;
+        }
+    }
+
+    /** Remove a specific revision. Used by ConflictResolver; removed in Phase 2. */
+    async removeRev(id: string, rev: string): Promise<void> {
+        await this.db.remove(id, rev);
+    }
+
+    async allDocs(opts?: AllDocsOpts): Promise<AllDocsResult<CouchSyncDoc>> {
+        const result = await this.db.allDocs(opts as any);
+        return result as unknown as AllDocsResult<CouchSyncDoc>;
+    }
+
+    async info(): Promise<{ updateSeq: number | string }> {
+        const dbInfo = await this.db.info();
+        return { updateSeq: dbInfo.update_seq };
+    }
+
+    async close(): Promise<void> {
+        await this.db.close();
+    }
+
+    async destroy(): Promise<void> {
+        await this.db.destroy();
+    }
+
+    async delete(id: string): Promise<void> {
+        try {
+            const doc = await this.db.get(id);
+            if (doc?._rev) await this.db.remove(id, doc._rev);
+        } catch (e: any) {
+            if (e?.status === 404) return;
+            throw e;
+        }
     }
 
     /**

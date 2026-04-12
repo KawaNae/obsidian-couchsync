@@ -1,12 +1,12 @@
-/// <reference types="pouchdb-browser" />
 import type { CouchSyncDoc, FileDoc, ConfigDoc } from "../types.ts";
 import { isFileDoc, isConfigDoc } from "../types.ts";
+import type { ILocalStore } from "../db/interfaces.ts";
 import { compareVC, findDominator } from "../sync/vector-clock.ts";
 import { filePathFromId, configPathFromId } from "../types/doc-id.ts";
 import { logVerbose } from "../ui/log.ts";
 
 /**
- * Resolves PouchDB conflict trees using Vector Clock causality.
+ * Resolves conflict trees using Vector Clock causality.
  *
  * For each conflicting FileDoc or ConfigDoc:
  *  1. Fetch every conflicting revision.
@@ -16,8 +16,8 @@ import { logVerbose } from "../ui/log.ts";
  *  3. If any pair of revisions is *concurrent* (incomparable VCs), the
  *     conflict requires human judgment. The `onConcurrent` callback is
  *     invoked with the path and the full revision set so the UI can raise
- *     a modal. No revisions are removed and the PouchDB conflict tree is
- *     left intact until the user resolves it.
+ *     a modal. No revisions are removed and the conflict tree is left
+ *     intact until the user resolves it.
  *
  * Physical timestamps (mtime, editedAt) are never consulted — that was the
  * old behavior and it silently dropped writes under clock skew / network
@@ -27,10 +27,10 @@ import { logVerbose } from "../ui/log.ts";
  *
  * The same class is instantiated twice in production: once for the vault
  * DB (resolves FileDoc conflicts) and once for the config DB (resolves
- * ConfigDoc conflicts). The constructor takes a `getDb()` accessor so
- * each instance points at its own PouchDB. The dispatch in
- * `resolveIfConflicted` accepts both doc kinds and extracts the
- * user-facing vault path appropriately.
+ * ConfigDoc conflicts). The constructor takes an `ILocalStore` so each
+ * instance points at its own store. The dispatch in `resolveIfConflicted`
+ * accepts both doc kinds and extracts the user-facing vault path
+ * appropriately.
  */
 
 /** A doc that ConflictResolver can process. Both kinds carry a vclock. */
@@ -73,15 +73,15 @@ export class ConflictResolver {
     private onConcurrent: OnConcurrentConflict | null = null;
 
     /**
-     * @param getDb     Returns the PouchDB instance to scan/resolve against.
-     *                  Vault use: `() => localDb.getDb()`.
-     *                  Config use: `() => configLocalDb.getDb()`.
+     * @param store     The local store to scan/resolve against.
+     *                  Vault use: `localDb` (the LocalDB instance).
+     *                  Config use: `configLocalDb` (the ConfigLocalDB instance).
      * @param onAutoResolved Optional callback fired after a safe
      *                  auto-resolution. Receives the bare vault path,
      *                  the winning revision, and the superseded losers.
      */
     constructor(
-        private getDb: () => PouchDB.Database<CouchSyncDoc>,
+        private store: ILocalStore<CouchSyncDoc>,
         private onAutoResolved: OnAutoResolved | null = null,
     ) {}
 
@@ -99,21 +99,17 @@ export class ConflictResolver {
      * existed, was an unsupported doc type, or required human resolution.
      */
     async resolveIfConflicted(doc: CouchSyncDoc): Promise<boolean> {
-        if (!doc._conflicts || doc._conflicts.length === 0) return false;
+        if (!(doc as any)._conflicts || (doc as any)._conflicts.length === 0) return false;
         if (!isFileDoc(doc) && !isConfigDoc(doc)) return false;
 
-        // Extract the vault path once so every downstream callback and
-        // log line reports the user-meaningful path instead of the
-        // prefixed PouchDB id. PouchDB operations (get/put/remove) still
-        // use the raw `doc._id` since that's what they index on.
+        const conflicts: string[] = (doc as any)._conflicts;
         const vaultPath = extractVaultPath(doc._id);
-        const db = this.getDb();
         const winnerRev = doc._rev;
         const revisions: ResolvableDoc[] = [doc as ResolvableDoc];
-        for (const rev of doc._conflicts) {
+        for (const rev of conflicts) {
             try {
-                const r = (await db.get(doc._id, { rev })) as unknown as ResolvableDoc;
-                revisions.push(r);
+                const r = await this.store.getByRev<ResolvableDoc & CouchSyncDoc>(doc._id, rev);
+                if (r) revisions.push(r as unknown as ResolvableDoc);
             } catch (e) {
                 console.error(
                     `CouchSync: failed to load conflict rev ${rev} for ${vaultPath}:`,
@@ -127,23 +123,20 @@ export class ConflictResolver {
             // Safe auto-resolution: promote the dominator to current and
             // remove every other revision from the conflict tree.
             if (dominator._rev !== winnerRev) {
-                // Replace the current winner's content with the dominator's
-                // while keeping the current rev chain so PouchDB accepts
-                // it as an update.
                 const merged = {
                     ...dominator,
                     _id: doc._id,
                     _rev: winnerRev,
                 } as ResolvableDoc;
                 delete (merged as { _conflicts?: unknown })._conflicts;
-                await db.put(merged as unknown as CouchSyncDoc);
+                await this.store.put(merged as unknown as CouchSyncDoc);
             }
             const losers: ResolvableDoc[] = [];
             for (const rev of revisions) {
                 if (rev._rev === winnerRev) continue;
                 losers.push(rev);
                 try {
-                    if (rev._rev) await db.remove(doc._id, rev._rev);
+                    if (rev._rev) await this.store.removeRev(doc._id, rev._rev);
                 } catch (e) {
                     console.error(
                         `CouchSync: failed to remove rev ${rev._rev} for ${vaultPath}:`,
@@ -162,7 +155,7 @@ export class ConflictResolver {
                 }
             }
             logVerbose(
-                `auto-resolved ${doc._conflicts.length} conflict(s) for ${vaultPath}`,
+                `auto-resolved ${conflicts.length} conflict(s) for ${vaultPath}`,
             );
             return true;
         }
@@ -173,7 +166,7 @@ export class ConflictResolver {
         } else {
             console.warn(
                 `CouchSync: concurrent conflict on ${vaultPath} but no handler registered; ` +
-                    "leaving PouchDB conflict tree intact.",
+                    "leaving conflict tree intact.",
             );
         }
         return false;
@@ -185,17 +178,16 @@ export class ConflictResolver {
      * as soon as PouchDB sync materialises them.
      */
     async scanConflicts(): Promise<number> {
-        const db = this.getDb();
-        const result = await db.allDocs({
+        const result = await this.store.allDocs({
             include_docs: true,
             conflicts: true,
         });
 
         let resolved = 0;
         for (const row of result.rows) {
-            if (!("doc" in row) || !row.doc) continue;
+            if (!row.doc) continue;
             const d = row.doc as unknown as CouchSyncDoc;
-            if (!d._conflicts || d._conflicts.length === 0) continue;
+            if (!(d as any)._conflicts || (d as any)._conflicts.length === 0) continue;
             if (await this.resolveIfConflicted(d)) resolved++;
         }
         return resolved;

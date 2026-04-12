@@ -16,6 +16,24 @@ function createTestDB(name: string) {
             if (existing) doc._rev = (existing as any)._rev;
             return db.put(doc);
         },
+        getByRev: async (id: string, rev: string) => {
+            try {
+                return await db.get(id, { rev }) as unknown;
+            } catch (e: any) {
+                if (e.status === 404) return null;
+                throw e;
+            }
+        },
+        removeRev: async (id: string, rev: string) => {
+            await db.remove(id, rev);
+        },
+        allDocs: async (opts?: any) => {
+            return await db.allDocs(opts) as any;
+        },
+        get: async (id: string) => {
+            try { return await db.get(id) as unknown; }
+            catch (e: any) { if (e.status === 404) return null; throw e; }
+        },
         getChunks: async () => [],
         destroy: () => db.destroy(),
     };
@@ -85,7 +103,7 @@ describe("ConflictResolver — VC-based resolution", () => {
         );
         expect(doc._conflicts?.length).toBeGreaterThan(0);
 
-        const resolver = new ConflictResolver(() => testDb.getDb() as any);
+        const resolver = new ConflictResolver(testDb as any);
         const onConcurrent = vi.fn();
         resolver.setOnConcurrent(onConcurrent);
 
@@ -106,7 +124,7 @@ describe("ConflictResolver — VC-based resolution", () => {
             { vclock: { A: 0, B: 1 }, chunks: ["chunk:remote"] },
         );
 
-        const resolver = new ConflictResolver(() => testDb.getDb() as any);
+        const resolver = new ConflictResolver(testDb as any);
         const onConcurrent = vi.fn();
         resolver.setOnConcurrent(onConcurrent);
 
@@ -136,7 +154,7 @@ describe("ConflictResolver — VC-based resolution", () => {
             },
         );
 
-        const resolver = new ConflictResolver(() => testDb.getDb() as any);
+        const resolver = new ConflictResolver(testDb as any);
         const onConcurrent = vi.fn();
         resolver.setOnConcurrent(onConcurrent);
 
@@ -151,7 +169,7 @@ describe("ConflictResolver — VC-based resolution", () => {
             chunks: ["chunk:only"], mtime: 1, ctime: 1, size: 0,
             vclock: { A: 1 },
         };
-        const resolver = new ConflictResolver(() => testDb.getDb() as any);
+        const resolver = new ConflictResolver(testDb as any);
         expect(await resolver.resolveIfConflicted(clean)).toBe(false);
     });
 
@@ -160,7 +178,7 @@ describe("ConflictResolver — VC-based resolution", () => {
             { vclock: { A: 1 }, chunks: ["chunk:local"] },
             { vclock: { B: 1 }, chunks: ["chunk:remote"] },
         );
-        const resolver = new ConflictResolver(() => testDb.getDb() as any);
+        const resolver = new ConflictResolver(testDb as any);
         const resolved = await resolver.resolveIfConflicted(doc);
         expect(resolved).toBe(false);
     });

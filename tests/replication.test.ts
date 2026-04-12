@@ -17,19 +17,23 @@ function createLocalDB(name: string) {
             try { return (await db.get(id)) as T; }
             catch (e: any) { if (e.status === 404) return null; throw e; }
         },
+        getByRev: async (id: string, rev: string) => {
+            try { return await db.get(id, { rev }) as unknown; }
+            catch (e: any) { if (e.status === 404) return null; throw e; }
+        },
         put: async (doc: CouchSyncDoc) => {
             const existing = await db.get(doc._id).catch(() => null);
             if (existing) doc._rev = (existing as any)._rev;
             return db.put(doc);
         },
+        removeRev: async (id: string, rev: string) => { await db.remove(id, rev); },
+        allDocs: async (opts?: any) => db.allDocs(opts) as any,
         getChunks: async (chunkIds: string[]) => {
             const result = await db.allDocs({ keys: chunkIds, include_docs: true });
             return result.rows
                 .filter((r): r is any => "doc" in r && r.doc != null)
                 .map((r) => r.doc);
         },
-        // Mirrors production LocalDB.getFileDoc: takes a bare vault path
-        // and wraps with makeFileId internally.
         getFileDoc: async (path: string) => {
             try { return (await db.get(makeFileId(path))) as FileDoc; }
             catch { return null; }
@@ -125,7 +129,7 @@ describe("PouchDB replication", () => {
 
         const doc = await db1.getDb().get(makeFileId("note.md"), { conflicts: true }) as unknown as CouchSyncDoc;
 
-        const resolver = new ConflictResolver(() => db1.getDb() as any);
+        const resolver = new ConflictResolver(db1 as any);
         const resolved = await resolver.resolveIfConflicted(doc);
         expect(resolved).toBe(true);
 
@@ -149,7 +153,7 @@ describe("PouchDB replication", () => {
         let callbackArgs: { filePath: string; winnerVC: any; loserCount: number } | null = null;
 
         const resolver = new ConflictResolver(
-            () => db1.getDb() as any,
+            db1 as any,
             async (filePath, winner, losers) => {
                 callbackArgs = {
                     filePath,
@@ -181,7 +185,7 @@ describe("PouchDB replication", () => {
         const doc = await db1.getDb().get(makeFileId("note.md"), { conflicts: true }) as unknown as CouchSyncDoc;
 
         const concurrentCalls: string[] = [];
-        const resolver = new ConflictResolver(() => db1.getDb() as any);
+        const resolver = new ConflictResolver(db1 as any);
         resolver.setOnConcurrent((path) => {
             concurrentCalls.push(path);
         });

@@ -1,6 +1,7 @@
 // Use CJS entry directly — ESM entry's `export default` breaks in esbuild CJS output
 import PouchDB from "pouchdb-browser/lib/index.js";
 import type { CouchSyncDoc, FileDoc, ChunkDoc } from "../types.ts";
+import type { ILocalStore, PutResponse, AllDocsOpts, AllDocsResult } from "./interfaces.ts";
 import {
     ID_RANGE,
     makeFileId,
@@ -43,7 +44,7 @@ export interface SkippedFilesDoc {
     files: Record<string, { sizeMB: number; skippedAt: number }>;
 }
 
-export class LocalDB {
+export class LocalDB implements ILocalStore<CouchSyncDoc> {
     private db: PouchDB.Database<CouchSyncDoc> | null = null;
     private dbName: string;
 
@@ -159,7 +160,7 @@ export class LocalDB {
         }
     }
 
-    async put(doc: CouchSyncDoc): Promise<PouchDB.Core.Response> {
+    async put(doc: CouchSyncDoc): Promise<PutResponse> {
         return this.getDb().put(doc);
     }
 
@@ -175,7 +176,7 @@ export class LocalDB {
         id: string,
         fn: (existing: T | null) => T | null,
         maxRetries = 3,
-    ): Promise<PouchDB.Core.Response | null> {
+    ): Promise<PutResponse | null> {
         let lastErr: any;
         for (let attempt = 0; attempt <= maxRetries; attempt++) {
             const existing = await this.get<T>(id);
@@ -193,7 +194,7 @@ export class LocalDB {
         throw new Error(`update failed after ${maxRetries} retries for ${id}: status=${lastErr?.status}`);
     }
 
-    async bulkPut(docs: CouchSyncDoc[]): Promise<PouchDB.Core.Response[]> {
+    async bulkPut(docs: CouchSyncDoc[]): Promise<PutResponse[]> {
         const ids = docs.map((d) => d._id);
         const existing = await this.getDb().allDocs({ keys: ids });
         const revMap = new Map<string, string>();
@@ -220,7 +221,7 @@ export class LocalDB {
                 .join("; ");
             throw new Error(`bulkPut partial failure (${errors.length}/${docs.length}): ${summary}`);
         }
-        return results as PouchDB.Core.Response[];
+        return results as PutResponse[];
     }
 
     async delete(id: string): Promise<void> {
@@ -228,6 +229,31 @@ export class LocalDB {
         if (doc && doc._rev) {
             await this.getDb().remove(id, doc._rev);
         }
+    }
+
+    /** Fetch a specific revision. Used by ConflictResolver; removed in Phase 2. */
+    async getByRev<T extends CouchSyncDoc>(id: string, rev: string): Promise<T | null> {
+        try {
+            return (await this.getDb().get(id, { rev })) as unknown as T;
+        } catch (e: any) {
+            if (e.status === 404) return null;
+            throw e;
+        }
+    }
+
+    /** Remove a specific revision. Used by ConflictResolver; removed in Phase 2. */
+    async removeRev(id: string, rev: string): Promise<void> {
+        await this.getDb().remove(id, rev);
+    }
+
+    async allDocs(opts?: AllDocsOpts): Promise<AllDocsResult<CouchSyncDoc>> {
+        const result = await this.getDb().allDocs(opts as any);
+        return result as unknown as AllDocsResult<CouchSyncDoc>;
+    }
+
+    async info(): Promise<{ updateSeq: number | string }> {
+        const dbInfo = await this.getDb().info();
+        return { updateSeq: dbInfo.update_seq };
     }
 
     async getFileDoc(path: string): Promise<FileDoc | null> {

@@ -14,6 +14,23 @@ import { makeConfigId } from "../src/types/doc-id.ts";
 
 PouchDB.plugin(memoryAdapter);
 
+/** Adapt a raw PouchDB into an ILocalStore-shaped object for ConflictResolver tests. */
+function wrapAsStore(db: PouchDB.Database<CouchSyncDoc>) {
+    return {
+        get: async (id: string) => {
+            try { return await db.get(id) as unknown; }
+            catch (e: any) { if (e.status === 404) return null; throw e; }
+        },
+        getByRev: async (id: string, rev: string) => {
+            try { return await db.get(id, { rev }) as unknown; }
+            catch (e: any) { if (e.status === 404) return null; throw e; }
+        },
+        put: async (doc: CouchSyncDoc) => db.put(doc),
+        removeRev: async (id: string, rev: string) => { await db.remove(id, rev); },
+        allDocs: async (opts?: any) => db.allDocs(opts) as any,
+    };
+}
+
 function uniqueName(prefix: string) {
     return `${prefix}-${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
 }
@@ -77,7 +94,7 @@ describe("ConflictResolver — ConfigDoc support", () => {
         );
         expect(doc._conflicts?.length).toBeGreaterThan(0);
 
-        const resolver = new ConflictResolver(() => db);
+        const resolver = new ConflictResolver(wrapAsStore(db) as any);
         const onConcurrent = vi.fn();
         const onAuto = vi.fn();
         resolver.setOnConcurrent(onConcurrent);
@@ -99,7 +116,7 @@ describe("ConflictResolver — ConfigDoc support", () => {
             { vclock: { mobile: 0, desktop: 1 } },
         );
 
-        const resolver = new ConflictResolver(() => db);
+        const resolver = new ConflictResolver(wrapAsStore(db) as any);
         const onConcurrent = vi.fn();
         resolver.setOnConcurrent(onConcurrent);
 
@@ -120,7 +137,7 @@ describe("ConflictResolver — ConfigDoc support", () => {
             { vclock: { A: 1 } },
         );
 
-        const resolver = new ConflictResolver(() => db);
+        const resolver = new ConflictResolver(wrapAsStore(db) as any);
         const resolvedCount = await resolver.scanConflicts();
         expect(resolvedCount).toBe(1);
     });
@@ -135,7 +152,7 @@ describe("ConflictResolver — ConfigDoc support", () => {
             { vclock: { A: 3 }, mtime: 999999, data: "bG9zZXI=" }, // "loser", new mtime
         );
 
-        const resolver = new ConflictResolver(() => db);
+        const resolver = new ConflictResolver(wrapAsStore(db) as any);
         const resolved = await resolver.resolveIfConflicted(doc);
         expect(resolved).toBe(true);
 
