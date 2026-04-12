@@ -30,7 +30,7 @@
 
 /// <reference types="pouchdb-browser" />
 import type { ConfigDoc, CouchSyncDoc } from "../types.ts";
-import type { ILocalStore, PutResponse, AllDocsOpts, AllDocsResult } from "./interfaces.ts";
+import type { ILocalStore, PutResponse, AllDocsOpts, AllDocsResult, LocalChangesResult } from "./interfaces.ts";
 import { ID_RANGE, isConfigDocId } from "../types/doc-id.ts";
 
 export class ConfigLocalDB implements ILocalStore<CouchSyncDoc> {
@@ -139,6 +139,26 @@ async allDocs(opts?: AllDocsOpts): Promise<AllDocsResult<CouchSyncDoc>> {
             if (e?.status === 404) return;
             throw e;
         }
+    }
+
+    async changes(
+        since?: number | string,
+        opts?: { include_docs?: boolean },
+    ): Promise<LocalChangesResult<CouchSyncDoc>> {
+        const pouchOpts: PouchDB.Core.ChangesOptions = {
+            since: since ?? 0,
+            include_docs: opts?.include_docs ?? false,
+        };
+        const result = await this.db.changes(pouchOpts);
+        return {
+            results: result.results.map((r) => ({
+                id: r.id,
+                seq: r.seq,
+                doc: opts?.include_docs ? (r.doc as unknown as CouchSyncDoc) : undefined,
+                deleted: r.deleted,
+            })),
+            last_seq: result.last_seq,
+        };
     }
 
     /**

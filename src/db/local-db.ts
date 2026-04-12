@@ -1,7 +1,7 @@
 // Use CJS entry directly — ESM entry's `export default` breaks in esbuild CJS output
 import PouchDB from "pouchdb-browser/lib/index.js";
 import type { CouchSyncDoc, FileDoc, ChunkDoc } from "../types.ts";
-import type { ILocalStore, PutResponse, AllDocsOpts, AllDocsResult } from "./interfaces.ts";
+import type { ILocalStore, PutResponse, AllDocsOpts, AllDocsResult, LocalChangesResult } from "./interfaces.ts";
 import { DexieStore, SyncDB } from "./dexie-store.ts";
 import {
     ID_RANGE,
@@ -255,6 +255,26 @@ async allDocs(opts?: AllDocsOpts): Promise<AllDocsResult<CouchSyncDoc>> {
     async info(): Promise<{ updateSeq: number | string }> {
         const dbInfo = await this.getDb().info();
         return { updateSeq: dbInfo.update_seq };
+    }
+
+    async changes(
+        since?: number | string,
+        opts?: { include_docs?: boolean },
+    ): Promise<LocalChangesResult<CouchSyncDoc>> {
+        const pouchOpts: PouchDB.Core.ChangesOptions = {
+            since: since ?? 0,
+            include_docs: opts?.include_docs ?? false,
+        };
+        const result = await this.getDb().changes(pouchOpts);
+        return {
+            results: result.results.map((r) => ({
+                id: r.id,
+                seq: r.seq,
+                doc: opts?.include_docs ? (r.doc as unknown as CouchSyncDoc) : undefined,
+                deleted: r.deleted,
+            })),
+            last_seq: result.last_seq,
+        };
     }
 
     async getFileDoc(path: string): Promise<FileDoc | null> {

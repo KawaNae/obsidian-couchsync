@@ -49,6 +49,11 @@ export interface AllDocsResult<T> {
  * longer walks PouchDB conflict trees; resolution is pure vclock
  * comparison via `resolveOnPull()`.
  */
+export interface LocalChangesResult<T> {
+    results: Array<{ id: string; seq: number | string; doc?: T; deleted?: boolean }>;
+    last_seq: number | string;
+}
+
 export interface ILocalStore<T = any> {
     get(id: string): Promise<T | null>;
     put(doc: T): Promise<PutResponse>;
@@ -61,6 +66,11 @@ export interface ILocalStore<T = any> {
     delete(id: string): Promise<void>;
     allDocs(opts?: AllDocsOpts): Promise<AllDocsResult<T>>;
     info(): Promise<{ updateSeq: number | string }>;
+    /**
+     * Return documents that changed since `since`. Used by SyncEngine's
+     * push loop to detect local writes that need uploading to the remote.
+     */
+    changes(since?: number | string, opts?: { include_docs?: boolean }): Promise<LocalChangesResult<T>>;
     close(): Promise<void>;
     destroy(): Promise<void>;
 }
