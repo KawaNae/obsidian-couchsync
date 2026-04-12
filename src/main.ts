@@ -1,8 +1,8 @@
 import { Platform, Plugin } from "obsidian";
-import PouchDB from "pouchdb-browser/lib/index.js";
 import { type CouchSyncSettings, DEFAULT_SETTINGS } from "./settings.ts";
 import { LocalDB } from "./db/local-db.ts";
 import { ConfigLocalDB } from "./db/config-local-db.ts";
+import { DexieStore } from "./db/dexie-store.ts";
 import { SyncEngine } from "./db/sync-engine.ts";
 import { VaultSync } from "./sync/vault-sync.ts";
 import { ConfigSync } from "./sync/config-sync.ts";
@@ -29,8 +29,6 @@ export default class CouchSyncPlugin extends Plugin {
     localDb!: LocalDB;
     /** Null when `couchdbConfigDbName === ""` (config sync disabled) */
     configLocalDb: ConfigLocalDB | null = null;
-    /** Holds the underlying PouchDB so we can destroy it on unload */
-    private configPouch: PouchDB.Database | null = null;
     replicator!: SyncEngine;
     conflictResolver!: ConflictResolver;
     /** Null when config sync is disabled */
@@ -84,28 +82,28 @@ export default class CouchSyncPlugin extends Plugin {
         this.localDb = new LocalDB(dbName);
         this.localDb.open();
 
-        // Open the config-side local PouchDB only when the user has set
+        // Open the config-side local store only when the user has set
         // a config DB name. The local store is keyed by both vault name
         // and config DB name so switching device pools (e.g. mobile ↔
         // desktop) creates a fresh local store rather than mixing.
         if (this.settings.couchdbConfigDbName) {
             const configLocalName =
                 `couchsync-${vaultName}-config-${this.settings.couchdbConfigDbName}`;
-            this.configPouch = new PouchDB(configLocalName, {
-                auto_compaction: true,
-                revs_limit: 20,
-            });
-            this.configLocalDb = new ConfigLocalDB(this.configPouch as any);
+            this.configLocalDb = new ConfigLocalDB(
+                new DexieStore(configLocalName),
+            );
         }
 
         initLog(() => this.settings, showNotice);
         this.replicator = new SyncEngine(this.localDb, () => this.settings, Platform.isMobile);
         this.vaultSync = new VaultSync(this.app, this.localDb, () => this.settings);
         // ConfigSync needs *some* ConfigLocalDB even when sync is disabled,
-        // so we satisfy the type with a stand-in pointing at the vault DB.
+        // so we satisfy the type with a stand-in backed by a throwaway store.
         // The runtime guard `isConfigured()` blocks all DB I/O before it
         // could touch the wrong store.
-        const configDbForSync = this.configLocalDb ?? new ConfigLocalDB(this.localDb.getDb());
+        const configDbForSync = this.configLocalDb ?? new ConfigLocalDB(
+            new DexieStore(`${dbName}-config-stub`),
+        );
         this.configSync = new ConfigSync(this.app, configDbForSync, this.replicator, () => this.settings);
         this.statusBar = new StatusBar(
             this,
@@ -447,13 +445,12 @@ export default class CouchSyncPlugin extends Plugin {
         this.statusBar?.destroy();
         this.historyStorage?.close();
         await this.localDb?.close();
-        if (this.configPouch) {
+        if (this.configLocalDb) {
             try {
-                await this.configPouch.close();
+                await this.configLocalDb.close();
             } catch (e) {
                 console.error("CouchSync: failed to close config local DB:", e);
             }
-            this.configPouch = null;
             this.configLocalDb = null;
         }
     }
