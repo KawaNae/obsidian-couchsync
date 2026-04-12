@@ -26,7 +26,6 @@ export type { DocKind, ParsedDocId } from "./types/doc-id.ts";
 interface CouchSyncDocBase {
     _id: string;
     _rev?: string;
-    _conflicts?: string[];
 }
 
 /** A vault file (note, image, attachment) stored as chunks.

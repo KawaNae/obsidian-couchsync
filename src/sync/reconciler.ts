@@ -162,7 +162,7 @@ export class Reconciler {
             const hasMtimeChanges = vaultFiles.some((f) => f.stat.mtime > threshold);
             const manifestMatchesVault =
                 manifestPaths !== null && setEquals(manifestPaths, vaultPathSet);
-            const currentSeq = (await this.localDb.getDb().info()).update_seq;
+            const currentSeq = (await this.localDb.info()).updateSeq;
             const dbUnchanged = cursor?.lastSeenUpdateSeq !== undefined &&
                 cursor.lastSeenUpdateSeq === currentSeq;
 
@@ -253,7 +253,7 @@ export class Reconciler {
                 updatedAt: Date.now(),
             };
             await this.localDb.putVaultManifest(newManifest);
-            const finalSeq = (await this.localDb.getDb().info()).update_seq;
+            const finalSeq = (await this.localDb.info()).updateSeq;
             await this.localDb.putScanCursor({
                 lastScanStartedAt: startedAt,
                 lastScanCompletedAt: Date.now(),

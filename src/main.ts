@@ -136,7 +136,7 @@ export default class CouchSyncPlugin extends Plugin {
             this.app.vault, this.historyStorage, this.historyCapture, () => this.settings,
         );
         this.conflictResolver = new ConflictResolver(
-            () => this.localDb.getDb(),
+            this.localDb,
             async (filePath, winnerDoc, loserDocs) => {
                 // ConflictResolver passes us either FileDoc or ConfigDoc;
                 // history capture only knows about file content, so we
@@ -205,7 +205,7 @@ export default class CouchSyncPlugin extends Plugin {
         if (this.configLocalDb) {
             const configDbRef = this.configLocalDb;
             this.configConflictResolver = new ConflictResolver(
-                () => configDbRef.getDb(),
+                configDbRef,
                 async (configPath, winnerDoc, _loserDocs) => {
                     // ConfigDoc auto-resolution: log + Notice. History
                     // capture is text-oriented (vault notes), so we don't
@@ -458,6 +458,7 @@ export default class CouchSyncPlugin extends Plugin {
         this.historyCapture?.stop();
         this.historyManager?.stopCleanup();
         this.replicator?.stop();
+        await this.vaultSync?.teardown();
         this.reconciler?.destroy();
         this.statusBar?.destroy();
         this.historyStorage?.close();
@@ -522,6 +523,7 @@ export default class CouchSyncPlugin extends Plugin {
 
     async startSync(): Promise<void> {
         if (this.settings.connectionState !== "syncing") return;
+        await this.vaultSync.loadLastSyncedVclocks();
         this.replicator.stop();
         this.replicator.start();
         this.changeTracker.start();

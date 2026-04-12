@@ -53,7 +53,9 @@ export class ChangeTracker {
                 this.lastSyncTime.delete(file.path);
                 if (this.pendingDeleteIgnores.delete(file.path)) return;
                 if (!this.paused) {
-                    this.vaultSync.markDeleted(file.path);
+                    this.vaultSync.markDeleted(file.path).catch((e) =>
+                        console.error("CouchSync: markDeleted failed:", file.path, e),
+                    );
                 }
             })
         );
@@ -63,7 +65,9 @@ export class ChangeTracker {
                 this.cancelPending(oldPath);
                 this.lastSyncTime.delete(oldPath);
                 if (!this.paused && file instanceof Object && "stat" in file) {
-                    this.vaultSync.handleRename(file as TFile, oldPath);
+                    this.vaultSync.handleRename(file as TFile, oldPath).catch((e) =>
+                        console.error("CouchSync: handleRename failed:", oldPath, "→", (file as TFile).path, e),
+                    );
                 }
             })
         );

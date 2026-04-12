@@ -872,6 +872,7 @@ export class Replicator {
     }
 
     private async doProbe(): Promise<boolean> {
+        const sessionEpoch = this.syncEpoch;
         const remoteDb = this.remoteDb!;
         try {
             await Promise.race([
@@ -883,7 +884,7 @@ export class Replicator {
                     ),
                 ),
             ]);
-            if (this.remoteDb !== remoteDb) return false;
+            if (this.syncEpoch !== sessionEpoch) return false;
             this.lastHealthyAt = Date.now();
             logVerbose(`health: probe ok state=${this.state}`);
 
@@ -896,7 +897,7 @@ export class Replicator {
             }
             return true;
         } catch (e: any) {
-            if (this.remoteDb !== remoteDb) return false;
+            if (this.syncEpoch !== sessionEpoch) return false;
             logVerbose(`health: probe failed ${e?.message ?? e}`);
             this.pausedPending = false;
             this.enterHardError(this.classifyError(e));

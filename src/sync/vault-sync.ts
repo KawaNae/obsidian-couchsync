@@ -34,6 +34,10 @@ export class VaultSync {
      * cross-device mtime comparison (which breaks under clock skew).
      */
     private lastSyncedVclock = new Map<string, VectorClock>();
+    /** Timer handle for debounced persistence of lastSyncedVclock. */
+    private vclockFlushTimer: ReturnType<typeof setTimeout> | null = null;
+    /** Whether the in-memory map has unflushed changes. */
+    private vclockDirty = false;
     /**
      * In-memory mirror of `_local/skipped-files` paths. Initialised lazily on
      * the first `fileToDb` that might touch it, then kept in sync with the
@@ -65,6 +69,57 @@ export class VaultSync {
      */
     setChangeTracker(changeTracker: ChangeTracker): void {
         this.changeTracker = changeTracker;
+    }
+
+    /**
+     * Load persisted lastSyncedVclock from `_local/last-synced-vclocks`.
+     * Called once during plugin init, before reconciliation starts.
+     */
+    async loadLastSyncedVclocks(): Promise<void> {
+        const stored = await this.db.getLastSyncedVclocks();
+        if (!stored) return;
+        this.lastSyncedVclock.clear();
+        for (const [path, vc] of Object.entries(stored)) {
+            this.lastSyncedVclock.set(path, vc);
+        }
+    }
+
+    /**
+     * Flush lastSyncedVclock to the local DB. Debounced — only the latest
+     * snapshot is persisted, at most once every 5 seconds.
+     */
+    async flushLastSyncedVclocks(): Promise<void> {
+        this.vclockDirty = false;
+        const obj: Record<string, VectorClock> = {};
+        for (const [path, vc] of this.lastSyncedVclock) {
+            obj[path] = vc;
+        }
+        await this.db.putLastSyncedVclocks(obj);
+    }
+
+    private scheduleVclockFlush(): void {
+        this.vclockDirty = true;
+        if (this.vclockFlushTimer) return;
+        this.vclockFlushTimer = setTimeout(() => {
+            this.vclockFlushTimer = null;
+            this.flushLastSyncedVclocks().catch((e) =>
+                console.error("CouchSync: failed to persist lastSyncedVclocks:", e),
+            );
+        }, 5_000);
+    }
+
+    /**
+     * Cancel pending flush timer and persist if dirty. Call from plugin
+     * unload to avoid losing recent vclock state.
+     */
+    async teardown(): Promise<void> {
+        if (this.vclockFlushTimer) {
+            clearTimeout(this.vclockFlushTimer);
+            this.vclockFlushTimer = null;
+        }
+        if (this.vclockDirty) {
+            await this.flushLastSyncedVclocks();
+        }
     }
 
     async fileToDb(file: TFile): Promise<void> {
@@ -115,6 +170,7 @@ export class VaultSync {
         });
         if (pushedVclock) {
             this.lastSyncedVclock.set(file.path, pushedVclock);
+            this.scheduleVclockFlush();
         }
     }
 
@@ -196,6 +252,7 @@ export class VaultSync {
 
         if (writtenFile) {
             this.lastSyncedVclock.set(vaultPath, { ...(fileDoc.vclock ?? {}) });
+            this.scheduleVclockFlush();
         }
 
         // Record this sync-driven write as a history entry. captureSyncWrite
@@ -242,6 +299,7 @@ export class VaultSync {
 
     async markDeleted(path: string): Promise<void> {
         this.lastSyncedVclock.delete(path);
+        this.scheduleVclockFlush();
         await this.db.update<FileDoc>(makeFileId(path), (existing) => {
             if (!existing) return null;
             return {

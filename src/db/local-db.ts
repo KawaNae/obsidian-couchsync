@@ -1,6 +1,8 @@
 // Use CJS entry directly — ESM entry's `export default` breaks in esbuild CJS output
 import PouchDB from "pouchdb-browser/lib/index.js";
 import type { CouchSyncDoc, FileDoc, ChunkDoc } from "../types.ts";
+import type { ILocalStore, PutResponse, AllDocsOpts, AllDocsResult } from "./interfaces.ts";
+import { DexieStore, SyncDB } from "./dexie-store.ts";
 import {
     ID_RANGE,
     makeFileId,
@@ -32,6 +34,7 @@ export interface VaultManifest {
 const SCAN_CURSOR_ID = "_local/scan-cursor";
 const VAULT_MANIFEST_ID = "_local/vault-manifest";
 const SKIPPED_FILES_ID = "_local/skipped-files";
+const LAST_SYNCED_VCLOCKS_ID = "_local/last-synced-vclocks";
 
 /**
  * Files that fileToDb() refused to push because they exceeded
@@ -42,9 +45,13 @@ export interface SkippedFilesDoc {
     files: Record<string, { sizeMB: number; skippedAt: number }>;
 }
 
-export class LocalDB {
+export class LocalDB implements ILocalStore<CouchSyncDoc> {
     private db: PouchDB.Database<CouchSyncDoc> | null = null;
     private dbName: string;
+    /** Dexie store for local metadata (scan cursor, vault manifest, etc.).
+     *  Non-replicated `_local/*` docs migrated here in Phase 1. Full doc
+     *  storage migrates in Phase 3 when the sync engine is also replaced. */
+    private metaStore: DexieStore<CouchSyncDoc> | null = null;
 
     constructor(dbName: string) {
         this.dbName = dbName;
@@ -56,6 +63,7 @@ export class LocalDB {
             auto_compaction: true,
             revs_limit: 20,
         });
+        this.metaStore = new DexieStore<CouchSyncDoc>(`${this.dbName}-meta`);
         return this.db;
     }
 
@@ -64,11 +72,21 @@ export class LocalDB {
             await this.db.close();
             this.db = null;
         }
+        if (this.metaStore) {
+            await this.metaStore.close();
+            this.metaStore = null;
+        }
     }
 
     getDb(): PouchDB.Database<CouchSyncDoc> {
         if (!this.db) throw new Error("Database not opened");
         return this.db;
+    }
+
+    /** Expose the Dexie meta store for migration and testing. */
+    getMetaStore(): DexieStore<CouchSyncDoc> {
+        if (!this.metaStore) throw new Error("Database not opened");
+        return this.metaStore;
     }
 
     /**
@@ -158,7 +176,7 @@ export class LocalDB {
         }
     }
 
-    async put(doc: CouchSyncDoc): Promise<PouchDB.Core.Response> {
+    async put(doc: CouchSyncDoc): Promise<PutResponse> {
         return this.getDb().put(doc);
     }
 
@@ -174,7 +192,8 @@ export class LocalDB {
         id: string,
         fn: (existing: T | null) => T | null,
         maxRetries = 3,
-    ): Promise<PouchDB.Core.Response | null> {
+    ): Promise<PutResponse | null> {
+        let lastErr: any;
         for (let attempt = 0; attempt <= maxRetries; attempt++) {
             const existing = await this.get<T>(id);
             const updated = fn(existing);
@@ -183,14 +202,15 @@ export class LocalDB {
             try {
                 return await this.getDb().put(updated);
             } catch (e: any) {
+                lastErr = e;
                 if (e?.status === 409 && attempt < maxRetries) continue;
                 throw e;
             }
         }
-        throw new Error(`update failed: exhausted retries for ${id}`);
+        throw new Error(`update failed after ${maxRetries} retries for ${id}: status=${lastErr?.status}`);
     }
 
-    async bulkPut(docs: CouchSyncDoc[]): Promise<PouchDB.Core.Response[]> {
+    async bulkPut(docs: CouchSyncDoc[]): Promise<PutResponse[]> {
         const ids = docs.map((d) => d._id);
         const existing = await this.getDb().allDocs({ keys: ids });
         const revMap = new Map<string, string>();
@@ -217,7 +237,7 @@ export class LocalDB {
                 .join("; ");
             throw new Error(`bulkPut partial failure (${errors.length}/${docs.length}): ${summary}`);
         }
-        return results as PouchDB.Core.Response[];
+        return results as PutResponse[];
     }
 
     async delete(id: string): Promise<void> {
@@ -225,6 +245,31 @@ export class LocalDB {
         if (doc && doc._rev) {
             await this.getDb().remove(id, doc._rev);
         }
+    }
+
+    /** Fetch a specific revision. Used by ConflictResolver; removed in Phase 2. */
+    async getByRev<T extends CouchSyncDoc>(id: string, rev: string): Promise<T | null> {
+        try {
+            return (await this.getDb().get(id, { rev })) as unknown as T;
+        } catch (e: any) {
+            if (e.status === 404) return null;
+            throw e;
+        }
+    }
+
+    /** Remove a specific revision. Used by ConflictResolver; removed in Phase 2. */
+    async removeRev(id: string, rev: string): Promise<void> {
+        await this.getDb().remove(id, rev);
+    }
+
+    async allDocs(opts?: AllDocsOpts): Promise<AllDocsResult<CouchSyncDoc>> {
+        const result = await this.getDb().allDocs(opts as any);
+        return result as unknown as AllDocsResult<CouchSyncDoc>;
+    }
+
+    async info(): Promise<{ updateSeq: number | string }> {
+        const dbInfo = await this.getDb().info();
+        return { updateSeq: dbInfo.update_seq };
     }
 
     async getFileDoc(path: string): Promise<FileDoc | null> {
@@ -300,31 +345,11 @@ export class LocalDB {
         return result.rows.map((row) => row.id);
     }
 
-    /**
-     * Get a `_local/` doc. PouchDB's typed Database<CouchSyncDoc> rejects
-     * local doc IDs that aren't in the union, so we route through the
-     * untyped surface in one place.
-     */
-    private async localGet<T extends object>(id: string): Promise<(T & { _rev?: string }) | null> {
-        try {
-            return await (this.getDb() as PouchDB.Database<any>).get(id) as T & { _rev?: string };
-        } catch (e: any) {
-            if (e.status === 404) return null;
-            throw e;
-        }
-    }
-
-    private async localPut<T extends object>(id: string, body: T): Promise<void> {
-        const existing = await this.localGet<T>(id);
-        await (this.getDb() as PouchDB.Database<any>).put({
-            ...body,
-            _id: id,
-            _rev: existing?._rev,
-        });
-    }
+    // ── Metadata (Dexie meta table) ────────────────────
 
     async getScanCursor(): Promise<ScanCursor | null> {
-        const doc = await this.localGet<ScanCursor>(SCAN_CURSOR_ID);
+        const meta = this.getMetaStore();
+        const doc = await meta.getMeta<ScanCursor>(SCAN_CURSOR_ID);
         if (!doc) return null;
         return {
             lastScanStartedAt: doc.lastScanStartedAt ?? 0,
@@ -334,11 +359,11 @@ export class LocalDB {
     }
 
     async putScanCursor(cursor: ScanCursor): Promise<void> {
-        await this.localPut(SCAN_CURSOR_ID, cursor);
+        await this.getMetaStore().putMeta(SCAN_CURSOR_ID, cursor);
     }
 
     async getVaultManifest(): Promise<VaultManifest | null> {
-        const doc = await this.localGet<VaultManifest>(VAULT_MANIFEST_ID);
+        const doc = await this.getMetaStore().getMeta<VaultManifest>(VAULT_MANIFEST_ID);
         if (!doc) return null;
         return {
             paths: doc.paths ?? [],
@@ -347,22 +372,35 @@ export class LocalDB {
     }
 
     async putVaultManifest(manifest: VaultManifest): Promise<void> {
-        await this.localPut(VAULT_MANIFEST_ID, manifest);
+        await this.getMetaStore().putMeta(VAULT_MANIFEST_ID, manifest);
     }
 
     async getSkippedFiles(): Promise<SkippedFilesDoc> {
-        const doc = await this.localGet<SkippedFilesDoc>(SKIPPED_FILES_ID);
+        const doc = await this.getMetaStore().getMeta<SkippedFilesDoc>(SKIPPED_FILES_ID);
         return { files: doc?.files ?? {} };
     }
 
     async putSkippedFiles(doc: SkippedFilesDoc): Promise<void> {
-        await this.localPut(SKIPPED_FILES_ID, doc);
+        await this.getMetaStore().putMeta(SKIPPED_FILES_ID, doc);
+    }
+
+    async getLastSyncedVclocks(): Promise<Record<string, Record<string, number>> | null> {
+        const doc = await this.getMetaStore().getMeta<{ clocks: Record<string, Record<string, number>> }>(LAST_SYNCED_VCLOCKS_ID);
+        return doc?.clocks ?? null;
+    }
+
+    async putLastSyncedVclocks(clocks: Record<string, Record<string, number>>): Promise<void> {
+        await this.getMetaStore().putMeta(LAST_SYNCED_VCLOCKS_ID, { clocks });
     }
 
     async destroy(): Promise<void> {
         if (this.db) {
             await this.db.destroy();
             this.db = null;
+        }
+        if (this.metaStore) {
+            await this.metaStore.destroy();
+            this.metaStore = null;
         }
     }
 }

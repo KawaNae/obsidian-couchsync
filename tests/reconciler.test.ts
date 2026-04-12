@@ -57,13 +57,10 @@ class FakeLocalDb {
     async putVaultManifest(m: VaultManifest) { this.manifest = { paths: [...m.paths], updatedAt: m.updatedAt }; }
     async allFileDocs(): Promise<FileDoc[]> { return [...this.fileDocs.values()]; }
     async getFileDoc(path: string) { return this.fileDocs.get(path) ?? null; }
-    /** Bump the simulated PouchDB update_seq. Tests can call this to mimic
+    /** Bump the simulated update_seq. Tests can call this to mimic
      *  external writes that the Reconciler short-circuit must notice. */
     bumpSeq() { this.updateSeq++; }
-    getDb() {
-        const seq = () => this.updateSeq;
-        return { info: async () => ({ update_seq: seq() }) } as any;
-    }
+    async info() { return { updateSeq: this.updateSeq }; }
 }
 
 type CompareResult = "identical" | "local-unpushed" | "remote-pending";

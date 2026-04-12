@@ -38,6 +38,16 @@ function mkDb(name: string) {
             if (existing) doc._rev = (existing as any)._rev;
             return db.put(doc);
         },
+        get: async (id: string) => {
+            try { return await db.get(id) as unknown; }
+            catch (e: any) { if (e.status === 404) return null; throw e; }
+        },
+        getByRev: async (id: string, rev: string) => {
+            try { return await db.get(id, { rev }) as unknown; }
+            catch (e: any) { if (e.status === 404) return null; throw e; }
+        },
+        removeRev: async (id: string, rev: string) => { await db.remove(id, rev); },
+        allDocs: async (opts?: any) => db.allDocs(opts) as any,
         getChunks: async () => [],
         destroy: () => db.destroy(),
     };
@@ -97,7 +107,7 @@ describe("VC integration — two peers over in-memory replication", () => {
         await dbB.getDb().replicate.to(dbA.getDb());
 
         const onConcurrent = vi.fn();
-        const resolver = new ConflictResolver(() => dbA.getDb() as any);
+        const resolver = new ConflictResolver(dbA as any);
         resolver.setOnConcurrent(onConcurrent);
 
         const resolved = await resolver.scanConflicts();
@@ -124,7 +134,7 @@ describe("VC integration — two peers over in-memory replication", () => {
         await dbA.getDb().replicate.to(dbB.getDb());
         await dbB.getDb().replicate.to(dbA.getDb());
 
-        const resolver = new ConflictResolver(() => dbA.getDb() as any);
+        const resolver = new ConflictResolver(dbA as any);
         const onConcurrent = vi.fn();
         resolver.setOnConcurrent(onConcurrent);
 
@@ -170,7 +180,7 @@ describe("VC integration — two peers over in-memory replication", () => {
         const doc = (await dbA.getDb().get(lieId, { conflicts: true })) as any;
         expect(doc._conflicts?.length).toBeGreaterThan(0);
 
-        const resolver = new ConflictResolver(() => dbA.getDb() as any);
+        const resolver = new ConflictResolver(dbA as any);
         const resolved = await resolver.resolveIfConflicted(doc);
         expect(resolved).toBe(true);
 
@@ -273,7 +283,7 @@ describe("VC integration — two peers over in-memory replication", () => {
         );
         const current = (await dbA.getDb().get(makeFileId("edge.md"), { conflicts: true })) as any;
 
-        const resolver = new ConflictResolver(() => dbA.getDb() as any);
+        const resolver = new ConflictResolver(dbA as any);
         const onConcurrent = vi.fn();
         resolver.setOnConcurrent(onConcurrent);
 
