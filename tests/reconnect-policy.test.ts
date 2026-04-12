@@ -76,6 +76,12 @@ const cases: PolicyCase[] = [
     { state: "error",        reason: "app-foreground", authError: false, coolDownActive: false, expected: "restart-now" },
     { state: "error",        reason: "periodic-tick",  authError: false, coolDownActive: false, expected: "verify-then-restart" },
     { state: "error",        reason: "stalled",        authError: false, coolDownActive: false, expected: "restart-now",         note: "stalled-while-error: somebody marked us as stalled in error, treat as a strong hint to retry" },
+
+    // ── retry-backoff: dedicated hard-error recovery ticks ────────
+    { state: "error",        reason: "retry-backoff",  authError: false, coolDownActive: false, expected: "verify-then-restart", note: "backoff tick uses verify-then-restart" },
+    { state: "error",        reason: "retry-backoff",  authError: false, coolDownActive: true,  expected: "verify-then-restart", note: "backoff tick bypasses the 5s cool-down — the backoff schedule IS the cadence control" },
+    { state: "error",        reason: "retry-backoff",  authError: true,  coolDownActive: false, expected: "skip",                note: "auth latch still beats retry-backoff" },
+    { state: "disconnected", reason: "retry-backoff",  authError: false, coolDownActive: false, expected: "verify-then-restart" },
 ];
 
 describe("decideReconnect — gateway policy table", () => {
@@ -107,6 +113,7 @@ describe("decideReconnect — invariants", () => {
             "periodic-tick",
             "stalled",
             "manual",
+            "retry-backoff",
         ];
         const states: SyncState[] = ["disconnected", "connected", "syncing", "reconnecting", "error"];
         for (const state of states) {

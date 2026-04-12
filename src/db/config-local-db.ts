@@ -54,11 +54,27 @@ export class ConfigLocalDB {
      * `LocalDB.put` semantics.
      */
     async put(doc: ConfigDoc): Promise<PouchDB.Core.Response> {
-        const existing = await this.get(doc._id);
-        if (existing) {
-            doc._rev = existing._rev;
+        return this.db.put(doc as unknown as CouchSyncDoc);
+    }
+
+    async update<T extends ConfigDoc>(
+        id: string,
+        fn: (existing: T | null) => T | null,
+        maxRetries = 3,
+    ): Promise<PouchDB.Core.Response | null> {
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+            const existing = await this.get(id) as T | null;
+            const updated = fn(existing);
+            if (!updated) return null;
+            if (existing?._rev) updated._rev = existing._rev;
+            try {
+                return await this.db.put(updated as unknown as CouchSyncDoc);
+            } catch (e: any) {
+                if (e?.status === 409 && attempt < maxRetries) continue;
+                throw e;
+            }
         }
-        return this.db.put(doc);
+        throw new Error(`update failed: exhausted retries for ${id}`);
     }
 
     /**
@@ -67,7 +83,7 @@ export class ConfigLocalDB {
      */
     async bulkPut(
         docs: ConfigDoc[],
-    ): Promise<Array<PouchDB.Core.Response | PouchDB.Core.Error>> {
+    ): Promise<PouchDB.Core.Response[]> {
         if (docs.length === 0) return [];
         const ids = docs.map((d) => d._id);
         const existing = await this.db.allDocs({ keys: ids });
@@ -81,7 +97,17 @@ export class ConfigLocalDB {
             const rev = revMap.get(doc._id);
             if (rev) doc._rev = rev;
         }
-        return this.db.bulkDocs(docs as unknown as CouchSyncDoc[]);
+        const results = await this.db.bulkDocs(docs as unknown as CouchSyncDoc[]);
+        const errors = results.filter(
+            (r): r is PouchDB.Core.Error => "error" in r && !!r.error
+        );
+        if (errors.length > 0) {
+            const summary = errors
+                .map((e) => `${(e as any).id ?? "?"}: ${e.message}`)
+                .join("; ");
+            throw new Error(`bulkPut partial failure (${errors.length}/${docs.length}): ${summary}`);
+        }
+        return results as PouchDB.Core.Response[];
     }
 
     /**

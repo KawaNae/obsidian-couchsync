@@ -109,7 +109,12 @@ export default class CouchSyncPlugin extends Plugin {
         // could touch the wrong store.
         const configDbForSync = this.configLocalDb ?? new ConfigLocalDB(this.localDb.getDb());
         this.configSync = new ConfigSync(this.app, configDbForSync, this.replicator, () => this.settings);
-        this.statusBar = new StatusBar(this, () => this.settings, () => this.replicator.getLastChangeAt());
+        this.statusBar = new StatusBar(
+            this,
+            () => this.settings,
+            () => this.replicator.getLastHealthyAt(),
+            () => this.replicator.getLastErrorDetail(),
+        );
         this.replicator.onStateChange((state) => this.statusBar.update(state));
         this.replicator.onError((msg) => showNotice(msg, 8000));
         this.reconciler = new Reconciler(

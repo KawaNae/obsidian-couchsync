@@ -70,8 +70,6 @@ export class VaultSync {
         }
         if (!this.shouldSync(file.path)) return;
 
-        // Only hit the DB if this path was previously skipped. In steady
-        // state the cache is an empty set and this costs one Set.has().
         if (await this.wasSkipped(file.path)) {
             await this.forgetSkipped(file.path);
         }
@@ -80,27 +78,32 @@ export class VaultSync {
         const chunks = await splitIntoChunks(content);
         const chunkIds = chunks.map((c) => c._id);
 
-        // Skip if content unchanged (same chunk IDs = same content)
-        const existing = await this.db.getFileDoc(file.path);
-        if (existing &&
-            existing.chunks.length === chunkIds.length &&
-            existing.chunks.every((id, i) => id === chunkIds[i])) {
+        const quickCheck = await this.db.getFileDoc(file.path);
+        if (quickCheck &&
+            quickCheck.chunks.length === chunkIds.length &&
+            quickCheck.chunks.every((id, i) => id === chunkIds[i])) {
             return;
         }
 
         await this.db.bulkPut(chunks);
 
         const deviceId = this.getSettings().deviceId;
-        const fileDoc: FileDoc = {
-            _id: makeFileId(file.path),
-            type: "file",
-            chunks: chunkIds,
-            mtime: file.stat.mtime,
-            ctime: file.stat.ctime,
-            size: file.stat.size,
-            vclock: incrementVC(existing?.vclock, deviceId),
-        };
-        await this.db.put(fileDoc);
+        await this.db.update<FileDoc>(makeFileId(file.path), (existing) => {
+            if (existing &&
+                existing.chunks.length === chunkIds.length &&
+                existing.chunks.every((id, i) => id === chunkIds[i])) {
+                return null;
+            }
+            return {
+                _id: makeFileId(file.path),
+                type: "file",
+                chunks: chunkIds,
+                mtime: file.stat.mtime,
+                ctime: file.stat.ctime,
+                size: file.stat.size,
+                vclock: incrementVC(existing?.vclock, deviceId),
+            } as FileDoc;
+        });
     }
 
     async dbToFile(fileDoc: FileDoc): Promise<void> {
@@ -203,13 +206,15 @@ export class VaultSync {
     }
 
     async markDeleted(path: string): Promise<void> {
-        const existing = await this.db.getFileDoc(path);
-        if (existing) {
-            existing.deleted = true;
-            existing.mtime = Date.now();
-            existing.vclock = incrementVC(existing.vclock, this.getSettings().deviceId);
-            await this.db.put(existing);
-        }
+        await this.db.update<FileDoc>(makeFileId(path), (existing) => {
+            if (!existing) return null;
+            return {
+                ...existing,
+                deleted: true,
+                mtime: Date.now(),
+                vclock: incrementVC(existing.vclock, this.getSettings().deviceId),
+            } as FileDoc;
+        });
     }
 
     async handleRename(file: TFile, oldPath: string): Promise<void> {

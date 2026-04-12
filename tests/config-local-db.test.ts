@@ -60,13 +60,48 @@ describe("ConfigLocalDB", () => {
             expect(got).toBeNull();
         });
 
-        it("put updates an existing doc by injecting the current rev", async () => {
+        it("put is a passthrough — writing without _rev conflicts", async () => {
             await db.put(makeConfig(".obsidian/app.json", { A: 1 }));
-            // A second put without _rev should still succeed (ConfigLocalDB
-            // fetches the existing rev under the hood like LocalDB).
-            await db.put(makeConfig(".obsidian/app.json", { A: 2 }));
+            await expect(
+                db.put(makeConfig(".obsidian/app.json", { A: 2 })),
+            ).rejects.toThrow(/conflict/i);
+        });
+
+        it("update performs CAS read-modify-write", async () => {
+            await db.put(makeConfig(".obsidian/app.json", { A: 1 }));
+            await db.update<ConfigDoc>(makeConfigId(".obsidian/app.json"), (existing) => ({
+                ...existing!,
+                vclock: { A: 2 },
+            }));
             const got = await db.get(makeConfigId(".obsidian/app.json"));
             expect(got!.vclock).toEqual({ A: 2 });
+        });
+
+        it("update retries on 409 conflict", async () => {
+            await db.put(makeConfig(".obsidian/app.json", { A: 1 }));
+            let callCount = 0;
+            await db.update<ConfigDoc>(makeConfigId(".obsidian/app.json"), (existing) => {
+                callCount++;
+                if (callCount === 1) {
+                    // Cause a 409 by writing out-of-band before update() tries put()
+                    // This makes the _rev from get() stale.
+                    const outOfBand = { ...existing!, vclock: { A: 99 } };
+                    pouch.put(outOfBand as unknown as CouchSyncDoc);
+                }
+                return { ...existing!, vclock: { A: callCount * 10 } };
+            });
+            expect(callCount).toBe(2);
+            const got = await db.get(makeConfigId(".obsidian/app.json"));
+            expect(got!.vclock).toEqual({ A: 20 });
+        });
+
+        it("update returns null when fn returns null", async () => {
+            await db.put(makeConfig(".obsidian/app.json", { A: 1 }));
+            const result = await db.update<ConfigDoc>(
+                makeConfigId(".obsidian/app.json"),
+                () => null,
+            );
+            expect(result).toBeNull();
         });
     });
 

@@ -21,6 +21,28 @@
 export type SyncState = "disconnected" | "connected" | "syncing" | "reconnecting" | "error";
 
 /**
+ * Classification of an error that caused a hard state=error transition.
+ * Surfaces in the status bar as `Error (<code>)` / `Error (<kind>)` so
+ * the user can tell at a glance whether it's an auth problem, a network
+ * blip, a catchup timeout, etc., without having to catch the Notice.
+ */
+export type SyncErrorKind =
+    | "auth"      // 401 / 403
+    | "network"   // unreachable, DNS, connection refused, fetch failed
+    | "timeout"   // catchup idle timeout, request timeout
+    | "server"    // 5xx
+    | "denied"    // per-doc permission rejection (warning-only, does not promote state)
+    | "unknown";
+
+export interface SyncErrorDetail {
+    kind: SyncErrorKind;
+    /** HTTP status or similar numeric code, if known. Preferred for display. */
+    code?: number;
+    /** Full human-readable message, suitable for Notice and log. */
+    message: string;
+}
+
+/**
  * Why a reconnect is being requested. Each value corresponds to a
  * distinct trigger entry point in the codebase:
  *
@@ -38,7 +60,12 @@ export type ReconnectReason =
     | "app-resume"
     | "periodic-tick"
     | "stalled"
-    | "manual";
+    | "manual"
+    /** Dedicated backoff retry tick from the hard-error recovery timer.
+     *  Bypasses the 5s cool-down because the backoff schedule itself
+     *  controls cadence — the cool-down would block the fast first
+     *  retries (2s, 5s) that make transient failures feel transparent. */
+    | "retry-backoff";
 
 /**
  * What the gateway decided. Replicator interprets the value:
@@ -72,6 +99,12 @@ export interface ReconnectInput {
  */
 export function decideReconnect(input: ReconnectInput): ReconnectDecision {
     if (input.authError) return "skip";
+
+    // retry-backoff bypasses cool-down: the backoff schedule is the
+    // cadence control, and the cool-down would swallow the 2s first
+    // retry that lets transient blips recover quickly.
+    if (input.reason === "retry-backoff") return "verify-then-restart";
+
     if (input.coolDownActive) return "skip";
 
     // Mobile foreground or long desktop background — the socket may have
