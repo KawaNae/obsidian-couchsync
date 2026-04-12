@@ -34,7 +34,7 @@ const PROBE_TIMEOUT_MS = 5000; // fresh-HTTP probe in checkHealth()
 /** Build identifier, logged at start(). Lets us verify on mobile that a
  *  deployed plugin update actually reached the device (Obsidian Sync can
  *  lag or silently fail). Bump when shipping behavioral changes. */
-const BUILD_TAG = "probe-based-health-2026-04-12";
+const BUILD_TAG = "probe-gated-transitions-v0.11.3";
 
 /** How long to keep a transient error in `reconnecting` state before
  *  escalating to hard `error`. PouchDB's `retry:true` normally recovers
