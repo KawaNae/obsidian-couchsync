@@ -344,10 +344,18 @@ export class Reconciler {
     ): "delete" | "restore" {
         if (manifestPaths === null) return "restore";
         const lastWriter = latestDevice(doc.vclock ?? {});
-        if (lastWriter === deviceId) return "delete";
+        if (this.isLocalDevice(lastWriter)) return "delete";
         // Manifest stores bare vault paths; doc._id is "file:<path>".
         if (manifestPaths.has(filePathFromId(doc._id))) return "delete";
         return "restore";
+    }
+
+    /** Check if writerDeviceId matches this device (current or previous IDs). */
+    private isLocalDevice(writerDeviceId: string | null): boolean {
+        if (!writerDeviceId) return false;
+        const s = this.getSettings();
+        if (writerDeviceId === s.deviceId) return true;
+        return (s.previousDeviceIds ?? []).includes(writerDeviceId);
     }
 }
 

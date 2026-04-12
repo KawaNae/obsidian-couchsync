@@ -1,35 +1,14 @@
 /**
  * Install marker: detects when a vault has been copied to a different
- * Obsidian installation so we can regenerate the deviceId and preserve
- * Vector Clock uniqueness.
+ * Obsidian installation. Advisory only — shows a warning but does NOT
+ * regenerate deviceId (v0.12+: deviceId is user-managed).
  *
- * ## The problem
+ * ## How it works
  *
- * `deviceId` lives in `data.json` (Obsidian plugin settings), which travels
- * with the vault folder. If a user copies their vault to another machine
- * (backup restore, Dropbox sync, etc.), the `deviceId` is copied too —
- * and now two physically distinct devices share a Vector Clock key. That
- * breaks the VC uniqueness premise and can silently lose updates.
- *
- * ## The solution
- *
- * Keep a second, **install-scoped** identifier in `localStorage` (which
- * belongs to the Obsidian installation, not the vault). Remember the last
- * install marker a vault saw; on startup, if the current marker disagrees,
- * the vault has been moved to a new install → regenerate `deviceId`.
- *
- * Edge cases:
- *  - **First run**: `lastInstallMarker` is undefined, no regeneration,
- *    just remember the current marker.
- *  - **Normal restart (same install)**: markers match, no-op.
- *  - **Multiple vaults on same install**: each vault has its own
- *    `lastInstallMarker` (stored in its own `data.json`), but they all
- *    match the single install-wide `localStorage` marker, so no
- *    regeneration happens. Correct — they're on the same device.
- *  - **Portable Obsidian moved to a new machine**: the localStorage
- *    travels with the portable install but the machine is different.
- *    We can't detect this case with this scheme, but it's rare enough
- *    to accept (documented in plan risks).
+ * Keep an install-scoped identifier in `localStorage` (belongs to the
+ * Obsidian installation, not the vault). On startup, compare it against
+ * the last-seen marker stored in `data.json`. A mismatch means the vault
+ * was copied to a new install — warn the user to check their device name.
  */
 
 const MARKER_KEY = "couchsync.installMarker";
@@ -41,7 +20,6 @@ export interface InstallMarkerStorage {
 
 export interface MarkerCheckInput {
     lastInstallMarker: string | undefined;
-    currentDeviceId: string;
     storage: InstallMarkerStorage;
     generateUuid: () => string;
 }
@@ -49,26 +27,20 @@ export interface MarkerCheckInput {
 export interface MarkerCheckResult {
     /** Updated `lastInstallMarker` to persist to settings. */
     nextInstallMarker: string;
-    /** Updated `deviceId` (either unchanged or newly regenerated). */
-    nextDeviceId: string;
-    /** True if the marker mismatched and deviceId was regenerated. */
-    regenerated: boolean;
-    /** The prior deviceId, preserved for UI messaging. Undefined on first run. */
-    previousDeviceId?: string;
+    /** True if the marker mismatched (vault may have been copied). */
+    markerMismatch: boolean;
 }
 
 /**
- * Pure function that encapsulates the whole install-marker check — no
- * Obsidian dependencies, so it's trivially unit-testable.
+ * Pure function — no Obsidian dependencies, trivially unit-testable.
  *
- * Call it from onload, then persist the returned fields:
+ * Call from onload, then persist:
  *   settings.lastInstallMarker = result.nextInstallMarker
- *   settings.deviceId          = result.nextDeviceId
  *
- * Notify the user only when `regenerated === true`.
+ * Show a warning notice when `markerMismatch === true`.
  */
 export function checkInstallMarker(input: MarkerCheckInput): MarkerCheckResult {
-    const { lastInstallMarker, currentDeviceId, storage, generateUuid } = input;
+    const { lastInstallMarker, storage, generateUuid } = input;
 
     let currentMarker = storage.get(MARKER_KEY);
     if (!currentMarker) {
@@ -76,30 +48,26 @@ export function checkInstallMarker(input: MarkerCheckInput): MarkerCheckResult {
         storage.set(MARKER_KEY, currentMarker);
     }
 
-    // First run: remember the marker but don't regenerate anything.
+    // First run: remember the marker.
     if (!lastInstallMarker) {
         return {
             nextInstallMarker: currentMarker,
-            nextDeviceId: currentDeviceId,
-            regenerated: false,
+            markerMismatch: false,
         };
     }
 
-    // Markers match: same install as last time, no-op.
+    // Match: same install as last time.
     if (lastInstallMarker === currentMarker) {
         return {
             nextInstallMarker: currentMarker,
-            nextDeviceId: currentDeviceId,
-            regenerated: false,
+            markerMismatch: false,
         };
     }
 
-    // Mismatch: vault was opened on a different install. Regenerate.
+    // Mismatch: vault was opened on a different install.
     return {
         nextInstallMarker: currentMarker,
-        nextDeviceId: generateUuid(),
-        regenerated: true,
-        previousDeviceId: currentDeviceId,
+        markerMismatch: true,
     };
 }
 

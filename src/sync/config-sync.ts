@@ -37,6 +37,10 @@ import * as remoteCouch from "../db/remote-couch.ts";
 export class ConfigSync {
     private static readonly SKIP_DIRS = new Set(["node_modules", ".git"]);
     private static readonly SKIP_FILES = new Set(["workspace.json", "workspace-mobile.json"]);
+    /** Own data.json — contains deviceId, must not be synced across devices. */
+    private static readonly SKIP_PATHS = new Set([
+        ".obsidian/plugins/obsidian-couchsync/data.json",
+    ]);
     private static readonly MAX_CONFIG_SIZE = 5 * 1024 * 1024; // 5MB
 
     constructor(
@@ -194,6 +198,7 @@ export class ConfigSync {
             const file = files[i];
             const fileName = file.split("/").pop() ?? "";
             if (ConfigSync.SKIP_FILES.has(fileName)) continue;
+            if (ConfigSync.SKIP_PATHS.has(file)) continue;
 
             try {
                 onProgress?.(file, i + 1, files.length);
@@ -253,6 +258,7 @@ export class ConfigSync {
         let count = 0;
         for (let i = 0; i < entries.length; i++) {
             const { path, data } = entries[i];
+            if (ConfigSync.SKIP_PATHS.has(path)) continue;
             try {
                 onProgress?.(path, i + 1, entries.length);
                 await this.ensureDir(path);

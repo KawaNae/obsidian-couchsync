@@ -46,33 +46,28 @@ export default class CouchSyncPlugin extends Plugin {
     async onload(): Promise<void> {
         await this.loadSettings();
 
-        if (!this.settings.deviceId) {
-            this.settings.deviceId = crypto.randomUUID();
-            await this.saveSettings();
+        // Ensure previousDeviceIds exists (migration from pre-v0.12 settings)
+        if (!this.settings.previousDeviceIds) {
+            this.settings.previousDeviceIds = [];
         }
 
-        // Install-marker check: detects when the vault has been copied to
-        // a new Obsidian installation (deviceId travels with data.json,
-        // which would otherwise violate Vector Clock uniqueness).
+        // Install-marker check (advisory only — does NOT regenerate deviceId).
         {
             const result = checkInstallMarker({
                 lastInstallMarker: this.settings.lastInstallMarker,
-                currentDeviceId: this.settings.deviceId,
                 storage: {
                     get: (k) => window.localStorage.getItem(k),
                     set: (k, v) => window.localStorage.setItem(k, v),
                 },
                 generateUuid: () => crypto.randomUUID(),
             });
-            if (result.regenerated) {
+            if (result.markerMismatch) {
                 showNotice(
-                    `CouchSync: vault opened on a new installation. Device identity ` +
-                        `regenerated (was ${result.previousDeviceId?.slice(0, 8)}, ` +
-                        `now ${result.nextDeviceId.slice(0, 8)}).`,
+                    "CouchSync: this vault may have been copied from another installation. " +
+                        "Please verify your device name in Settings → Vault Sync.",
                     10000,
                 );
             }
-            this.settings.deviceId = result.nextDeviceId;
             this.settings.lastInstallMarker = result.nextInstallMarker;
             await this.saveSettings();
         }
@@ -298,7 +293,21 @@ export default class CouchSyncPlugin extends Plugin {
                 console.error("CouchSync: schema guard probe failed:", e);
             }
 
-            if (this.settings.connectionState === "syncing") {
+            if (!this.settings.deviceId) {
+                showNotice(
+                    "CouchSync: デバイス名を設定してください（Settings → Vault Sync）。" +
+                        "設定するまで同期は開始されません。",
+                    15000,
+                );
+            } else if (this.isLegacyDeviceId(this.settings.deviceId)) {
+                showNotice(
+                    "CouchSync: デバイス名を設定してください（Settings → Vault Sync）。" +
+                        "現在は自動生成 ID を使用中です。",
+                    10000,
+                );
+            }
+
+            if (this.settings.connectionState === "syncing" && this.settings.deviceId) {
                 this.replicator.start();
                 this.changeTracker.start();
             }
@@ -476,6 +485,11 @@ export default class CouchSyncPlugin extends Plugin {
         await this.saveData(this.settings);
     }
 
+    /** True if the deviceId looks like an auto-generated UUID (pre-v0.12). */
+    isLegacyDeviceId(id: string): boolean {
+        return /^[0-9a-f]{8}-/.test(id);
+    }
+
     async initVault(): Promise<void> {
         this.replicator.stop();
         this.changeTracker.stop();
@@ -508,6 +522,10 @@ export default class CouchSyncPlugin extends Plugin {
 
     async startSync(): Promise<void> {
         if (this.settings.connectionState !== "syncing") return;
+        if (!this.settings.deviceId) {
+            showNotice("CouchSync: デバイス名を設定してから同期を開始してください。");
+            return;
+        }
         await this.vaultSync.loadLastSyncedVclocks();
         this.replicator.stop();
         this.replicator.start();

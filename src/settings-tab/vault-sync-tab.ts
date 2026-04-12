@@ -97,6 +97,9 @@ export class VaultSyncTab {
         this.applyBtn = null;
         this.applyDesc = null;
 
+        // ── Device Identity ────────────────────────────────────
+        this.renderDeviceIdentity(el, locked);
+
         // ── Step 1: Connection ──────────────────────────────────
         el.createEl("h3", { text: "Step 1: Connection" });
 
@@ -341,6 +344,106 @@ export class VaultSyncTab {
         this.testPassed = false;
         this.deps.refresh();
     }
+
+    private renderDeviceIdentity(el: HTMLElement, locked: boolean): void {
+        const settings = this.deps.getSettings();
+        const isLegacy = /^[0-9a-f]{8}-/.test(settings.deviceId);
+        const isEmpty = !settings.deviceId;
+
+        el.createEl("h3", { text: "Device Name" });
+        el.createEl("p", {
+            text: "Unique name for this vault copy (e.g. desktop, iphone). " +
+                "Each device must have a different name. " +
+                "Using the same name on two devices will cause data corruption.",
+            cls: "setting-item-description",
+        });
+
+        let inputValue = isLegacy ? "" : settings.deviceId;
+        let validationMsg: HTMLElement | null = null;
+
+        const setting = new Setting(el).setName("Device name");
+
+        setting.addText((text) => {
+            text.setPlaceholder("desktop")
+                .setValue(inputValue)
+                .onChange((value) => {
+                    inputValue = value;
+                    if (validationMsg) {
+                        const error = validateDeviceName(value);
+                        validationMsg.textContent = error ?? "";
+                        validationMsg.style.display = error ? "block" : "none";
+                    }
+                });
+            text.setDisabled(locked);
+        });
+
+        setting.addButton((btn) =>
+            btn
+                .setButtonText("Apply")
+                .setCta()
+                .setDisabled(locked)
+                .onClick(async () => {
+                    const error = validateDeviceName(inputValue);
+                    if (error) {
+                        new Notice(error);
+                        return;
+                    }
+                    if (inputValue === settings.deviceId) {
+                        new Notice("Device name unchanged.");
+                        return;
+                    }
+                    if (settings.deviceId) {
+                        const prev = [...(settings.previousDeviceIds ?? [])];
+                        if (!prev.includes(settings.deviceId)) {
+                            prev.push(settings.deviceId);
+                        }
+                        await this.deps.updateSettings({
+                            deviceId: inputValue,
+                            previousDeviceIds: prev,
+                        });
+                    } else {
+                        await this.deps.updateSettings({ deviceId: inputValue });
+                    }
+                    new Notice(`Device name set to "${inputValue}". Restart sync to apply.`);
+                    this.deps.refresh();
+                }),
+        );
+
+        validationMsg = el.createEl("p", {
+            cls: "setting-item-description mod-warning",
+        });
+        validationMsg.style.display = "none";
+
+        if (isEmpty) {
+            el.createEl("p", {
+                text: "Device name is required before sync can start.",
+                cls: "setting-item-description mod-warning",
+            });
+        } else if (isLegacy) {
+            el.createEl("p", {
+                text: "Currently using an auto-generated ID. Set a name for stable sync.",
+                cls: "setting-item-description mod-warning",
+            });
+        }
+
+        if (isLegacy) {
+            const detail = el.createEl("details");
+            detail.createEl("summary", { text: "Current auto-generated ID" });
+            detail.createEl("code", { text: settings.deviceId });
+        }
+    }
+}
+
+const DEVICE_NAME_RE = /^[a-z0-9][a-z0-9-]{0,28}[a-z0-9]$/;
+
+function validateDeviceName(name: string): string | null {
+    if (!name) return "Device name is required.";
+    if (name.length < 2) return "Device name must be at least 2 characters.";
+    if (name.length > 30) return "Device name must be 30 characters or fewer.";
+    if (!DEVICE_NAME_RE.test(name)) {
+        return "Use lowercase letters, numbers, and hyphens only (e.g. desktop, iphone-pro).";
+    }
+    return null;
 }
 
 /**

@@ -47,13 +47,14 @@ export interface CouchSyncSettings {
 
     // Internal
     connectionState: ConnectionState;
+    /** Human-readable device name used as the vclock key (e.g. "desktop", "iphone"). */
     deviceId: string;
+    /** Old deviceIds this device has used (UUIDs from pre-v0.12, renamed names). */
+    previousDeviceIds: string[];
     /**
      * Fingerprint of the Obsidian installation this vault was last opened on.
-     * Compared against `localStorage["couchsync.installMarker"]` at startup —
-     * a mismatch means the vault (and its data.json) was copied to a new
-     * install, so `deviceId` must be regenerated to preserve Vector Clock
-     * uniqueness across peers. See main.ts onload for the check.
+     * Compared against `localStorage["couchsync.installMarker"]` at startup.
+     * Mismatch triggers a warning notice (advisory only — deviceId is not changed).
      */
     lastInstallMarker?: string;
 }
@@ -88,4 +89,5 @@ export const DEFAULT_SETTINGS: CouchSyncSettings = {
 
     connectionState: "editing",
     deviceId: "",
+    previousDeviceIds: [],
 };
