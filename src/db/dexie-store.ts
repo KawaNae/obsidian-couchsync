@@ -1,16 +1,12 @@
 /**
  * DexieStore — Dexie-based ILocalStore implementation.
  *
- * Phase 1 of the PouchDB removal plan. This module is a complete,
- * standalone ILocalStore that stores documents in Dexie (IndexedDB).
- * It will replace PouchDB as the local storage backend in Phase 3
- * when the sync engine is also replaced.
+ * Stores documents in Dexie (IndexedDB). Used as the local storage
+ * backend by LocalDB and ConfigLocalDB.
  *
- * Key differences from the PouchDB-based LocalDB:
  *   - `_rev` is replaced by `_version` (integer CAS counter).
  *     PutResponse.rev is synthesized as `"${_version}-dexie"`.
  *   - No revision tree, no conflict tree. CAS via _version check.
- *   - No `getByRev` / `removeRev` — removed in Phase 2.
  */
 
 import Dexie, { type Table } from "dexie";
@@ -77,7 +73,7 @@ function stripInternal<T>(stored: StoredDoc): T {
     return { ...doc, _rev: makeRev(_version) } as unknown as T;
 }
 
-/** Conflict error matching PouchDB's 409 shape. */
+/** Conflict error with CouchDB-style 409 shape. */
 function conflict409(id: string): Error {
     const err = new Error(`Document update conflict: ${id}`) as any;
     err.status = 409;
@@ -125,7 +121,7 @@ async put(doc: T): Promise<PutResponse> {
         const seq = await this._bumpSeq();
         if (existing) {
             // CAS: caller must provide _rev matching current version.
-            // Missing _rev on an existing doc is a conflict (matches PouchDB).
+            // Missing _rev on an existing doc is a conflict (CouchDB semantics).
             if (!_rev || makeRev(existing._version) !== _rev) {
                 throw conflict409(id);
             }

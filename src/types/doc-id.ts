@@ -8,7 +8,7 @@
  * file:<vaultPath>      FileDoc    e.g. "file:notes/hello.md"
  * chunk:<xxhash64>      ChunkDoc   e.g. "chunk:a1b2c3d4..."
  * config:<vaultPath>    ConfigDoc  e.g. "config:.obsidian/appearance.json"
- * _local/<name>         PouchDB reserved (not replicated)
+ * _local/<name>         CouchDB reserved (not replicated)
  * ```
  *
  * All three replicated prefixes are lexicographically disjoint, so
@@ -33,7 +33,7 @@ export const DOC_ID = {
 export type DocKind = "file" | "chunk" | "config";
 
 /**
- * PouchDB range query bounds per replicated kind. Use with `allDocs`:
+ * Range query bounds per replicated kind. Use with `allDocs`:
  *
  *   db.allDocs({
  *     startkey: ID_RANGE.file.startkey,
@@ -78,7 +78,7 @@ export function isConfigDocId(id: string): boolean {
     return id.startsWith(DOC_ID.CONFIG);
 }
 
-/** PouchDB-reserved local / design docs (never replicated). */
+/** CouchDB-reserved local / design docs (never replicated). */
 export function isLocalDocId(id: string): boolean {
     return id.startsWith("_");
 }

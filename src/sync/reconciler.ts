@@ -100,7 +100,7 @@ export function totalDiscrepancies(report: ReconcileReport): number {
  * completion, replicator pause, and the manual verify-consistency command.
  *
  * Cost is near-zero on the steady-state hot path: combining the cursor's
- * mtime threshold, manifest path equality, and PouchDB update_seq check
+ * mtime threshold, manifest path equality, and local update_seq check
  * lets the fast-path return without ever calling allFileDocs().
  */
 export class Reconciler {

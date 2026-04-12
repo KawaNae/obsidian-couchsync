@@ -25,18 +25,14 @@ import * as remoteCouch from "../db/remote-couch.ts";
  * different resolution policies.
  *
  * Architecturally:
- *   - Local storage: `ConfigLocalDB` (its own PouchDB IndexedDB store)
+ *   - Local storage: `ConfigLocalDB` (Dexie-backed IndexedDB store)
  *   - Remote storage: `settings.couchdbConfigDbName` on the same CouchDB
- *     server as the vault DB (auth shared via `Replicator.isAuthBlocked`)
+ *     server as the vault DB (auth shared via `SyncEngine.isAuthBlocked`)
  *   - Replication: one-shot push/pull/list via `remote-couch` helpers,
  *     never live-sync (manual init/push/pull from the settings UI)
  *   - Ordering: every write increments the device's `vclock` counter,
  *     same VC discipline as FileDoc — concurrent edits are detected
  *     and surfaced rather than silently LWW-merged
- *
- * Phase 2: remote operations use CouchClient (fetch-based HTTP) instead
- * of constructing PouchDB instances. The `withConfigRemote` helper now
- * builds a CouchClient and passes it to the caller.
  */
 export class ConfigSync {
     private static readonly SKIP_DIRS = new Set(["node_modules", ".git"]);

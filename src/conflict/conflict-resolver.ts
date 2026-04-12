@@ -5,33 +5,19 @@ import { filePathFromId, configPathFromId } from "../types/doc-id.ts";
 import { logVerbose } from "../ui/log.ts";
 
 /**
- * Resolves conflicts using Vector Clock causality — Phase 2 simplification.
- *
- * PouchDB-era ConflictResolver walked `_conflicts` revision trees and
- * removed losing revisions via `getByRev` / `removeRev`. That machinery
- * was PouchDB-specific and required local-store support for multi-revision
- * access.
- *
- * Phase 2 replaces this with a direct two-document comparison:
+ * Resolves conflicts using Vector Clock causality.
  *
  *   resolveOnPull(localDoc, remoteDoc) → "take-remote" | "keep-local" | "concurrent"
  *
- * This is called during the pull path (SyncEngine / remote-couch helpers)
+ * Called during the pull path (SyncEngine / remote-couch helpers)
  * when a remote document differs from the local version. The caller acts
  * on the returned verdict:
  *   - "take-remote": overwrite local with remote
  *   - "keep-local": skip (local is newer, will be pushed eventually)
  *   - "concurrent": invoke onConcurrent callback for human resolution
  *
- * The `scanConflicts()` method is retained for backward compatibility
- * (post-replication batch hook) but now operates on the allDocs scan
- * without needing revision tree access.
- *
- * ## Two-instance pattern (v0.11.0+)
- *
- * Same as before: one instance for vault DB (FileDoc), one for config DB
- * (ConfigDoc). The constructor takes an ILocalStore so each instance
- * points at its own store.
+ * Two-instance pattern: one instance for vault DB (FileDoc), one for
+ * config DB (ConfigDoc).
  */
 
 /** A doc that ConflictResolver can process. Both kinds carry a vclock. */
@@ -153,37 +139,23 @@ export class ConflictResolver {
     }
 
     /**
-     * Legacy compatibility: check a single doc that arrived from PouchDB
-     * replication. In Phase 2, _conflicts trees are no longer used, so
-     * this is a no-op placeholder that returns false.
-     *
-     * Live-sync callers (Replicator.onChange) still call this, but the
-     * actual conflict resolution now happens in resolveOnPull() during
-     * the pull path. This method is kept to avoid breaking the call
-     * chain in main.ts until Phase 3 replaces the sync engine.
+     * Legacy no-op: _conflicts trees are not used. Conflict resolution
+     * happens via resolveOnPull() during the pull path.
      */
     async resolveIfConflicted(doc: CouchSyncDoc): Promise<boolean> {
-        // Phase 2: _conflicts trees are PouchDB-specific. The new pull
-        // path uses resolveOnPull() instead. This is a transitional no-op.
         if (!(doc as any)._conflicts || (doc as any)._conflicts.length === 0) return false;
         if (!isFileDoc(doc) && !isConfigDoc(doc)) return false;
 
-        // If _conflicts are somehow still present (PouchDB live-sync in
-        // Phase 2 transition), log a warning. The actual resolution
-        // should happen via resolveOnPull in the pull path.
         const vaultPath = extractVaultPath(doc._id);
         logVerbose(
             `resolveIfConflicted: ignoring _conflicts tree for ${vaultPath} ` +
-            `(Phase 2: use resolveOnPull instead)`,
+            `(use resolveOnPull instead)`,
         );
         return false;
     }
 
     /**
-     * Legacy compatibility: walk all docs looking for conflict trees.
-     * In Phase 2, conflict trees are PouchDB-specific and the new pull
-     * path uses resolveOnPull() instead. Returns 0 unconditionally.
-     *
+     * Legacy no-op: returns 0. Conflict resolution uses resolveOnPull().
      * Called by the Maintenance tab's "Scan Conflicts" button.
      */
     async scanConflicts(): Promise<number> {

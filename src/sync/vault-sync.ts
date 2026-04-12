@@ -15,8 +15,7 @@ import { makeFileId, filePathFromId } from "../types/doc-id.ts";
  *
  * This answers *local drift* ("has the vault diverged from what the DB
  * thinks?"), NOT cross-device ordering. Cross-device ordering lives in
- * Vector Clocks and is decided by ConflictResolver against PouchDB's
- * _conflicts tree.
+ * Vector Clocks and is decided by ConflictResolver via resolveOnPull().
  *
  *  - identical:       chunk IDs match → no action needed
  *  - local-unpushed:  chunks differ, vclock unchanged since last sync → push
@@ -41,7 +40,7 @@ export class VaultSync {
     /**
      * In-memory mirror of `_local/skipped-files` paths. Initialised lazily on
      * the first `fileToDb` that might touch it, then kept in sync with the
-     * doc. Lets the hot path skip a PouchDB read on every successful file
+     * doc. Lets the hot path skip a DB read on every successful file
      * sync (which is ~every file edit via ChangeTracker).
      */
     private skippedPaths: Set<string> | null = null;
@@ -194,7 +193,7 @@ export class VaultSync {
         // Skip only when vault content is already identical to the doc.
         // The old guard also skipped "local-unpushed" based on cross-device
         // mtime comparison, but that breaks under clock skew. Since this
-        // method is called from the pull path (onChange), PouchDB replication
+        // method is called from the pull path (onChange), the sync engine
         // already guarantees the doc is causally newer. ChangeTracker +
         // ignoreWrite prevent echo loops for sync-driven writes.
         if (existing && "stat" in existing) {

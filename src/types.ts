@@ -61,7 +61,7 @@ export interface ChunkDoc extends CouchSyncDocBase {
  *  `_id` is `"config:" + vaultPath` — always constructed via `makeConfigId`.
  *  Config sync is scan-based (explicit rescan/write, not continuous watch).
  *
- *  Lives in a SEPARATE PouchDB (`ConfigLocalDB`) and a separate remote
+ *  Lives in a SEPARATE database (`ConfigLocalDB`) and a separate remote
  *  CouchDB (`couchdbConfigDbName`) — see v0.11.0 design. The vault DB
  *  must NOT contain `config:*` docs; the config DB must NOT contain
  *  anything else.
@@ -79,7 +79,7 @@ export interface ConfigDoc extends CouchSyncDocBase {
     vclock: VectorClock;
 }
 
-/** Union of all document types stored in PouchDB */
+/** Union of all document types stored in the local DB */
 export type CouchSyncDoc = FileDoc | ChunkDoc | ConfigDoc;
 
 export function isFileDoc(doc: CouchSyncDoc): doc is FileDoc {

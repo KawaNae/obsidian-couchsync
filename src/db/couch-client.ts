@@ -1,8 +1,6 @@
 /**
  * Fetch-based CouchDB HTTP client implementing ICouchClient.
  *
- * Phase 2 of PouchDB removal: replaces the implicit remote-PouchDB
- * instances that callers used to construct via `new PouchDB(remoteUrl)`.
  * All CouchDB interaction goes through standard HTTP endpoints using
  * the browser `fetch` API.
  *

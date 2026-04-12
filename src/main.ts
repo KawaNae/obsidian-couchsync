@@ -307,7 +307,7 @@ export default class CouchSyncPlugin extends Plugin {
             this.fireReconcile("onload");
         });
 
-        // Foreground return: Replicator handles reconnect internally
+        // Foreground return: SyncEngine handles reconnect internally
         // (via handleVisibilityChange registered in start()). Reconcile
         // runs independently — it catches local vault ↔ local DB drift
         // regardless of whether the sync session was restarted.

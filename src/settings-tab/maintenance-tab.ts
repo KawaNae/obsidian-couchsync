@@ -196,7 +196,7 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
 
     new Setting(el)
         .setName("Delete local vault database")
-        .setDesc("Destroy the local vault PouchDB and restart. Remote data is preserved.")
+        .setDesc("Destroy the local vault database and restart. Remote data is preserved.")
         .addButton((btn) =>
             btn
                 .setButtonText("Delete & Restart")
@@ -214,7 +214,7 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
         new Setting(el)
             .setName("Delete local config database")
             .setDesc(
-                `Destroy the local config PouchDB (${configDbName}) and restart. ` +
+                `Destroy the local config database (${configDbName}) and restart. ` +
                     "Remote config data is preserved. Use this when switching device pools " +
                     "(e.g. mobile ↔ desktop) leaves an unused local store behind.",
             )

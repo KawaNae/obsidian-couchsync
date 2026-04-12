@@ -1,16 +1,10 @@
 /**
- * SyncEngine — PouchDB-free sync loop using CouchClient HTTP + ILocalStore.
+ * SyncEngine — sync loop using CouchClient HTTP + ILocalStore.
  *
- * Replaces Replicator with the same public API but swaps PouchDB's
- * `db.sync()` / `db.replicate.from()` with:
  *   - CouchClient.changes() + bulkGet() for catchup pull
  *   - CouchClient.changesLongpoll() loop for live pull
  *   - localDb.changes() poll + CouchClient.bulkDocs() for push
  *   - CouchClient.info() for health probes
- *
- * Phase 3 of the PouchDB removal plan. Consumers (main.ts, setup.ts,
- * settings-tab, etc.) can swap Replicator → SyncEngine with minimal
- * wiring changes — all method signatures and event callbacks are identical.
  */
 
 import type { CouchSyncDoc } from "../types.ts";
@@ -29,7 +23,7 @@ import {
 } from "./reconnect-policy.ts";
 import { logVerbose, logNotice } from "../ui/log.ts";
 
-// ── Re-exports (same as Replicator) ──────────────────────
+// ── Re-exports ──────────────────────────────────────────
 
 export type {
     SyncState,

@@ -1,22 +1,19 @@
 /**
- * Reconnect gateway policy — pure decision logic, no PouchDB.
+ * Reconnect gateway policy — pure decision logic.
  *
- * Replicator's `requestReconnect()` is the single entry point for every
+ * SyncEngine's `requestReconnect()` is the single entry point for every
  * reconnect attempt (window.online, periodic tick, mobile foreground,
  * manual user action, sync stall detection). It centralises the policy
  * here so adding a new trigger doesn't risk skipping the auth latch or
  * the cool-down or some state-specific guard.
  *
  * The policy itself is a pure function so it can be unit-tested without
- * spinning up a Replicator instance (which would drag in pouchdb-browser
- * and break in node tests). Replicator just plumbs its current state
+ * spinning up a SyncEngine instance. SyncEngine plumbs its current state
  * into `decideReconnect()` and acts on the returned `ReconnectDecision`.
  */
 
 /**
- * Connection state owned by Replicator. Defined here (rather than in
- * replicator.ts) so this module is the single import target for tests
- * that don't want pouchdb-browser pulled in.
+ * Connection state owned by SyncEngine.
  */
 export type SyncState = "disconnected" | "connected" | "syncing" | "reconnecting" | "error";
 

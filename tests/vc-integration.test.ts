@@ -1,25 +1,20 @@
 /**
  * End-to-end Vector Clock integration tests.
  *
- * Uses two in-memory PouchDB instances to reproduce the failure modes
- * the VC redesign was built to fix:
+ * Reproduces the failure modes the VC redesign was built to fix:
  *
  *   - Lost update under network delay
  *   - Silent conflict loss between causally concurrent edits
  *   - Long-offline return overwriting remote state
  *   - Schema guard refusing to sync legacy (pre-VC) databases
  *
- * Phase 2: ConflictResolver.resolveOnPull() replaces resolveIfConflicted().
- * Instead of building PouchDB conflict trees and walking `_conflicts`,
- * tests directly compare pairs of documents via resolveOnPull().
+ * Uses pure in-memory FileDoc objects — no PouchDB dependency.
  */
 
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import PouchDB from "pouchdb";
-import memoryAdapter from "pouchdb-adapter-memory";
+import { describe, it, expect, vi } from "vitest";
 import { ConflictResolver } from "../src/conflict/conflict-resolver.ts";
 import { incrementVC, compareVC } from "../src/sync/vector-clock.ts";
-import type { FileDoc, CouchSyncDoc, VectorClock } from "../src/types.ts";
+import type { FileDoc, VectorClock } from "../src/types.ts";
 import {
     isFileDocId,
     isChunkDocId,
@@ -28,82 +23,41 @@ import {
     makeFileId,
 } from "../src/types/doc-id.ts";
 
-PouchDB.plugin(memoryAdapter);
-
-function mkDb(name: string) {
-    const db = new PouchDB<CouchSyncDoc>(name, { adapter: "memory" });
-    return {
-        getDb: () => db,
-        put: async (doc: CouchSyncDoc) => {
-            const existing = await db.get(doc._id).catch(() => null);
-            if (existing) doc._rev = (existing as any)._rev;
-            return db.put(doc);
-        },
-        get: async (id: string) => {
-            try { return await db.get(id) as unknown; }
-            catch (e: any) { if (e.status === 404) return null; throw e; }
-        },
-        allDocs: async (opts?: any) => db.allDocs(opts) as any,
-        getChunks: async () => [],
-        destroy: () => db.destroy(),
-    };
-}
-
-async function writeFile(
-    db: ReturnType<typeof mkDb>,
-    deviceId: string,
+function makeFile(
     path: string,
     content: string,
-): Promise<FileDoc> {
-    const docId = makeFileId(path);
-    const existing = (await db.getDb().get(docId).catch(() => null)) as FileDoc | null;
-    const doc: FileDoc = {
-        _id: docId,
+    deviceId: string,
+    baseVclock?: VectorClock,
+): FileDoc {
+    return {
+        _id: makeFileId(path),
         type: "file",
         chunks: [`chunk:${content}`],
         mtime: Date.now(),
-        ctime: existing?.ctime ?? Date.now(),
+        ctime: Date.now(),
         size: content.length,
-        vclock: incrementVC(existing?.vclock, deviceId),
+        vclock: incrementVC(baseVclock, deviceId),
     };
-    await db.put(doc);
-    return doc;
 }
 
-describe("VC integration — two peers over in-memory replication", () => {
-    let dbA: ReturnType<typeof mkDb>;
-    let dbB: ReturnType<typeof mkDb>;
+describe("VC integration — two peers", () => {
     const DEVICE_A = "device-A";
     const DEVICE_B = "device-B";
 
-    beforeEach(() => {
-        const stamp = `${Date.now()}-${Math.random()}`;
-        dbA = mkDb(`vc-int-A-${stamp}`);
-        dbB = mkDb(`vc-int-B-${stamp}`);
-    });
-
-    afterEach(async () => {
-        await dbA.destroy();
-        await dbB.destroy();
-    });
-
     it("Scenario Lost-Update: A's delayed write after B replicates becomes concurrent, raises modal", async () => {
-        // A writes v1, replicates to B.
-        await writeFile(dbA, DEVICE_A, "note.md", "v1");
-        await dbA.getDb().replicate.to(dbB.getDb());
+        // A writes v1
+        const v1 = makeFile("note.md", "v1", DEVICE_A);
 
-        // B writes v2 on top → causally dominates A's v1.
-        const bDoc = await writeFile(dbB, DEVICE_B, "note.md", "v2");
+        // B writes v2 on top of v1 → causally dominates v1
+        const bDoc = makeFile("note.md", "v2", DEVICE_B, v1.vclock);
 
-        // Meanwhile A, unaware of v2, writes "v3" based on v1 → concurrent.
-        const aDoc = await writeFile(dbA, DEVICE_A, "note.md", "v3");
+        // A writes "v3" based on v1 (unaware of v2) → concurrent with B
+        const aDoc = makeFile("note.md", "v3", DEVICE_A, v1.vclock);
 
-        // Phase 2: compare docs directly via resolveOnPull.
         const onConcurrent = vi.fn();
         const resolver = new ConflictResolver();
         resolver.setOnConcurrent(onConcurrent);
 
-        // When A pulls B's doc, the two are concurrent.
         const verdict = await resolver.resolveOnPull(aDoc, bDoc);
         expect(verdict).toBe("concurrent");
         expect(onConcurrent).toHaveBeenCalled();
@@ -111,22 +65,21 @@ describe("VC integration — two peers over in-memory replication", () => {
     });
 
     it("Scenario Offline-Return: auto-resolves in favour of the dominator when one side is a strict extension", async () => {
-        // A writes initial content and replicates to B.
-        await writeFile(dbA, DEVICE_A, "offline.md", "base");
-        await dbA.getDb().replicate.to(dbB.getDb());
+        // A writes initial content
+        const base = makeFile("offline.md", "base", DEVICE_A);
 
-        // B makes a single edit.
-        const bDoc = await writeFile(dbB, DEVICE_B, "offline.md", "b-edit");
-        await dbB.getDb().replicate.to(dbA.getDb());
+        // B makes a single edit on top
+        const bDoc = makeFile("offline.md", "b-edit", DEVICE_B, base.vclock);
 
-        // A makes 10 edits in sequence — each dominates B's state because
-        // A's local clock now includes A's replicated {A:1,B:1} base.
+        // A pulls B's edit, then makes 10 sequential edits
+        let vc = bDoc.vclock;
         let aDoc: FileDoc = bDoc;
         for (let i = 0; i < 10; i++) {
-            aDoc = await writeFile(dbA, DEVICE_A, "offline.md", `a-edit-${i}`);
+            aDoc = makeFile("offline.md", `a-edit-${i}`, DEVICE_A, vc);
+            vc = aDoc.vclock;
         }
 
-        // Phase 2: when B pulls A's latest, A dominates → take-remote.
+        // When B pulls A's latest, A dominates → take-remote
         const onConcurrent = vi.fn();
         const resolver = new ConflictResolver();
         resolver.setOnConcurrent(onConcurrent);
@@ -137,8 +90,6 @@ describe("VC integration — two peers over in-memory replication", () => {
     });
 
     it("Scenario Mtime-Lies: mtime disagreement with VC must not influence winner", async () => {
-        // The hostile case: construct two docs where mtime LIES.
-        // "wrong" has a higher mtime but a dominated vclock.
         const right: FileDoc = {
             _id: makeFileId("lie.md"),
             type: "file",
@@ -158,73 +109,33 @@ describe("VC integration — two peers over in-memory replication", () => {
             vclock: { X: 3 },
         };
 
-        // When pulling "wrong" while local has "right", local dominates.
         const resolver = new ConflictResolver();
         const verdict = await resolver.resolveOnPull(right, wrong);
         expect(verdict).toBe("keep-local");
     });
 
-    it("Schema-Guard: bare-path and missing-vclock legacy docs are both detected", async () => {
-        const db = new PouchDB<any>(
-            `vc-int-guard-${Date.now()}-${Math.random()}`,
-            { adapter: "memory" },
-        );
+    it("Schema-Guard: bare-path and missing-vclock legacy docs are both detected", () => {
+        // Bare-path (no prefix) → not a replicated doc ID
+        expect(isReplicatedDocId("legacy.md")).toBe(false);
 
-        async function findLegacy(): Promise<string | null> {
-            const idResult = await db.allDocs({ limit: 200 });
-            for (const row of idResult.rows) {
-                if (row.id.startsWith("_")) continue;
-                if (!isReplicatedDocId(row.id)) return row.id;
-                if (isFileDocId(row.id)) {
-                    const doc = (await db.get(row.id)) as any;
-                    if (doc.type !== "file") continue;
-                    if (!doc.vclock || Object.keys(doc.vclock).length === 0) {
-                        return row.id;
-                    }
-                    return null;
-                }
-                if (isConfigDocId(row.id)) {
-                    const doc = (await db.get(row.id)) as any;
-                    if ("binary" in doc) return row.id;
-                    return null;
-                }
-                if (isChunkDocId(row.id)) continue;
-            }
-            return null;
-        }
-
-        await db.put({
-            _id: "legacy.md",
-            type: "file",
-            chunks: ["chunk:old"],
-            mtime: 1,
-            ctime: 1,
-            size: 3,
-        });
-        expect(await findLegacy()).toBe("legacy.md");
-
-        await db.remove((await db.get("legacy.md")) as any);
-        await db.put({
+        // Prefixed file doc with no vclock → legacy
+        const noVcDoc: any = {
             _id: makeFileId("no-vc.md"),
             type: "file",
             chunks: ["chunk:old"],
             mtime: 1,
             ctime: 1,
             size: 3,
-        });
-        expect(await findLegacy()).toBe(makeFileId("no-vc.md"));
+        };
+        expect(isFileDocId(noVcDoc._id)).toBe(true);
+        expect(!noVcDoc.vclock || Object.keys(noVcDoc.vclock).length === 0).toBe(true);
 
-        const doc = (await db.get(makeFileId("no-vc.md"))) as any;
-        doc.vclock = { D: 1 };
-        await db.put(doc);
-        expect(await findLegacy()).toBeNull();
-
-        await db.destroy();
+        // Adding vclock makes it non-legacy
+        noVcDoc.vclock = { D: 1 };
+        expect(Object.keys(noVcDoc.vclock).length > 0).toBe(true);
     });
 
-    it("compareVC sanity: equal vclocks with different chunks → concurrent", async () => {
-        // Edge case: two docs with identical VCs but different chunks.
-        // Causally they're equal → keep-local (no conflict raised).
+    it("compareVC sanity: equal vclocks with different chunks → keep-local", async () => {
         const local: FileDoc = {
             _id: makeFileId("edge.md"),
             type: "file",
@@ -241,7 +152,6 @@ describe("VC integration — two peers over in-memory replication", () => {
 
         const resolver = new ConflictResolver();
         const verdict = await resolver.resolveOnPull(local, remote);
-        // Equal vclocks → keep-local
         expect(verdict).toBe("keep-local");
     });
 

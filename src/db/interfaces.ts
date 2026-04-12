@@ -1,11 +1,8 @@
 /**
- * Storage interfaces — decouple all consumers from PouchDB types.
+ * Storage interfaces — decouple all consumers from concrete storage types.
  *
- * Phase 0 of the PouchDB removal plan: every file outside `src/db/` should
- * reference these interfaces instead of `PouchDB.Database` or
- * `PouchDB.Core.Response`. The concrete implementations (LocalDB,
- * ConfigLocalDB) continue to use PouchDB internally until Phase 1 swaps
- * them to Dexie.
+ * Every file outside `src/db/` references these interfaces. Concrete
+ * implementations: DexieStore (local), CouchClient (remote).
  */
 
 // ── Response types ───────────────────────────────────────
@@ -42,12 +39,8 @@ export interface AllDocsResult<T> {
 // ── ILocalStore ──────────────────────────────────────────
 
 /**
- * Abstraction over the local document store. Phase 0 implementation is
- * PouchDB; Phase 1 replaces it with Dexie.
- *
- * Phase 2: `getByRev` and `removeRev` removed — ConflictResolver no
- * longer walks PouchDB conflict trees; resolution is pure vclock
- * comparison via `resolveOnPull()`.
+ * Abstraction over the local document store (backed by DexieStore).
+ * ConflictResolver uses pure vclock comparison via `resolveOnPull()`.
  */
 export interface LocalChangesResult<T> {
     results: Array<{ id: string; seq: number | string; doc?: T; deleted?: boolean }>;
@@ -111,9 +104,7 @@ export interface BulkDocsResult {
 }
 
 /**
- * Abstraction over the remote CouchDB HTTP API. Implemented in Phase 2
- * with a fetch-based client; until then, callers inside `src/db/` still
- * use PouchDB's remote instance directly.
+ * Abstraction over the remote CouchDB HTTP API (backed by CouchClient).
  */
 export interface ICouchClient {
     info(): Promise<DbInfo>;

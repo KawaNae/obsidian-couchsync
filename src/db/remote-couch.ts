@@ -1,9 +1,8 @@
 /**
  * Stateless helpers for one-shot remote CouchDB operations.
  *
- * Phase 2: rewritten from PouchDB replication to ICouchClient HTTP +
- * ILocalStore CRUD. Each function takes the appropriate abstraction
- * layer; production callers pass a CouchClient and LocalDB/ConfigLocalDB.
+ * Each function takes ICouchClient + ILocalStore; production callers
+ * pass a CouchClient and LocalDB/ConfigLocalDB.
  *
  * The helpers remain stateless — construct, call, discard. Callers own
  * the lifecycle of both the local store and the remote client.
