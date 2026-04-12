@@ -10,7 +10,7 @@
  *   - `_rev` is replaced by `_version` (integer CAS counter).
  *     PutResponse.rev is synthesized as `"${_version}-dexie"`.
  *   - No revision tree, no conflict tree. CAS via _version check.
- *   - `getByRev` / `removeRev` are transitional stubs (Phase 2 drops them).
+ *   - No `getByRev` / `removeRev` — removed in Phase 2.
  */
 
 import Dexie, { type Table } from "dexie";
@@ -106,20 +106,7 @@ export class DexieStore<T extends { _id: string; _rev?: string } = any>
         return stripInternal<T>(stored);
     }
 
-    /**
-     * Fetch by specific revision. In DexieStore there's only one version
-     * per document (no revision tree). Returns the doc if its current
-     * _version matches the requested rev, null otherwise.
-     * Transitional — Phase 2 removes this from ILocalStore.
-     */
-    async getByRev(id: string, rev: string): Promise<T | null> {
-        const stored = await this.db.docs.get(id);
-        if (!stored) return null;
-        if (makeRev(stored._version) !== rev) return null;
-        return stripInternal<T>(stored);
-    }
-
-    async put(doc: T): Promise<PutResponse> {
+async put(doc: T): Promise<PutResponse> {
         const { _rev, ...body } = doc as any;
         const id: string = body._id;
         if (!id) throw new Error("Document must have an _id");
@@ -243,18 +230,7 @@ export class DexieStore<T extends { _id: string; _rev?: string } = any>
         await this.db.docs.delete(id);
     }
 
-    /**
-     * Remove a specific revision. In DexieStore, deletes the doc if the
-     * current version matches. Transitional — Phase 2 removes this.
-     */
-    async removeRev(id: string, rev: string): Promise<void> {
-        const stored = await this.db.docs.get(id);
-        if (stored && makeRev(stored._version) === rev) {
-            await this.db.docs.delete(id);
-        }
-    }
-
-    async allDocs(opts?: AllDocsOpts): Promise<AllDocsResult<T>> {
+async allDocs(opts?: AllDocsOpts): Promise<AllDocsResult<T>> {
         let collection: StoredDoc[];
 
         if (opts?.keys) {

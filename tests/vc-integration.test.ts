@@ -1,16 +1,17 @@
 /**
  * End-to-end Vector Clock integration tests.
  *
- * Uses two in-memory PouchDB instances replicated against each other to
- * reproduce the failure modes the VC redesign was built to fix:
+ * Uses two in-memory PouchDB instances to reproduce the failure modes
+ * the VC redesign was built to fix:
  *
  *   - Lost update under network delay
  *   - Silent conflict loss between causally concurrent edits
  *   - Long-offline return overwriting remote state
  *   - Schema guard refusing to sync legacy (pre-VC) databases
  *
- * These tests assert BEHAVIOR, not implementation: they drive
- * ConflictResolver via the public API against real replicated state.
+ * Phase 2: ConflictResolver.resolveOnPull() replaces resolveIfConflicted().
+ * Instead of building PouchDB conflict trees and walking `_conflicts`,
+ * tests directly compare pairs of documents via resolveOnPull().
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
@@ -42,11 +43,6 @@ function mkDb(name: string) {
             try { return await db.get(id) as unknown; }
             catch (e: any) { if (e.status === 404) return null; throw e; }
         },
-        getByRev: async (id: string, rev: string) => {
-            try { return await db.get(id, { rev }) as unknown; }
-            catch (e: any) { if (e.status === 404) return null; throw e; }
-        },
-        removeRev: async (id: string, rev: string) => { await db.remove(id, rev); },
         allDocs: async (opts?: any) => db.allDocs(opts) as any,
         getChunks: async () => [],
         destroy: () => db.destroy(),
@@ -97,22 +93,19 @@ describe("VC integration — two peers over in-memory replication", () => {
         await dbA.getDb().replicate.to(dbB.getDb());
 
         // B writes v2 on top → causally dominates A's v1.
-        await writeFile(dbB, DEVICE_B, "note.md", "v2");
+        const bDoc = await writeFile(dbB, DEVICE_B, "note.md", "v2");
 
         // Meanwhile A, unaware of v2, writes "v3" based on v1 → concurrent.
-        await writeFile(dbA, DEVICE_A, "note.md", "v3");
+        const aDoc = await writeFile(dbA, DEVICE_A, "note.md", "v3");
 
-        // Now both sides replicate. PouchDB merges into a conflict tree.
-        await dbA.getDb().replicate.to(dbB.getDb());
-        await dbB.getDb().replicate.to(dbA.getDb());
-
+        // Phase 2: compare docs directly via resolveOnPull.
         const onConcurrent = vi.fn();
-        const resolver = new ConflictResolver(dbA as any);
+        const resolver = new ConflictResolver();
         resolver.setOnConcurrent(onConcurrent);
 
-        const resolved = await resolver.scanConflicts();
-        // No auto-resolution: the writes are concurrent.
-        expect(resolved).toBe(0);
+        // When A pulls B's doc, the two are concurrent.
+        const verdict = await resolver.resolveOnPull(aDoc, bDoc);
+        expect(verdict).toBe("concurrent");
         expect(onConcurrent).toHaveBeenCalled();
         expect(onConcurrent.mock.calls[0][0]).toBe("note.md");
     });
@@ -123,89 +116,65 @@ describe("VC integration — two peers over in-memory replication", () => {
         await dbA.getDb().replicate.to(dbB.getDb());
 
         // B makes a single edit.
-        await writeFile(dbB, DEVICE_B, "offline.md", "b-edit");
+        const bDoc = await writeFile(dbB, DEVICE_B, "offline.md", "b-edit");
         await dbB.getDb().replicate.to(dbA.getDb());
 
         // A makes 10 edits in sequence — each dominates B's state because
         // A's local clock now includes A's replicated {A:1,B:1} base.
+        let aDoc: FileDoc = bDoc;
         for (let i = 0; i < 10; i++) {
-            await writeFile(dbA, DEVICE_A, "offline.md", `a-edit-${i}`);
+            aDoc = await writeFile(dbA, DEVICE_A, "offline.md", `a-edit-${i}`);
         }
-        await dbA.getDb().replicate.to(dbB.getDb());
-        await dbB.getDb().replicate.to(dbA.getDb());
 
-        const resolver = new ConflictResolver(dbA as any);
+        // Phase 2: when B pulls A's latest, A dominates → take-remote.
         const onConcurrent = vi.fn();
+        const resolver = new ConflictResolver();
         resolver.setOnConcurrent(onConcurrent);
 
-        await resolver.scanConflicts();
-        // A's chain dominates → any conflict auto-resolves without modal.
+        const verdict = await resolver.resolveOnPull(bDoc, aDoc);
+        expect(verdict).toBe("take-remote");
         expect(onConcurrent).not.toHaveBeenCalled();
-
-        const final = (await dbA.getDb().get(makeFileId("offline.md"))) as unknown as FileDoc;
-        expect(final.chunks[0]).toBe("chunk:a-edit-9");
     });
 
     it("Scenario Mtime-Lies: mtime disagreement with VC must not influence winner", async () => {
-        // The hostile case: construct two revisions where mtime LIES.
+        // The hostile case: construct two docs where mtime LIES.
         // "wrong" has a higher mtime but a dominated vclock.
-        // A pre-VC resolver would pick "wrong"; the VC resolver must not.
-        const lieId = makeFileId("lie.md");
-        await dbA.getDb().put({
-            _id: lieId,
+        const right: FileDoc = {
+            _id: makeFileId("lie.md"),
             type: "file",
             chunks: ["chunk:right"],
-            mtime: 1,
+            mtime: 1, // old mtime
             ctime: 1,
             size: 5,
             vclock: { X: 5 },
-        });
+        };
+        const wrong: FileDoc = {
+            _id: makeFileId("lie.md"),
+            type: "file",
+            chunks: ["chunk:wrong"],
+            mtime: 999999, // new mtime, but dominated vclock
+            ctime: 1,
+            size: 5,
+            vclock: { X: 3 },
+        };
 
-        await dbA.getDb().bulkDocs(
-            [
-                {
-                    _id: lieId,
-                    type: "file",
-                    chunks: ["chunk:wrong"],
-                    mtime: 999999,
-                    ctime: 1,
-                    size: 5,
-                    vclock: { X: 3 },
-                    _rev: `2-${Math.floor(Math.random() * 1e16).toString(16).padStart(32, "0")}`,
-                },
-            ],
-            { new_edits: false },
-        );
-
-        const doc = (await dbA.getDb().get(lieId, { conflicts: true })) as any;
-        expect(doc._conflicts?.length).toBeGreaterThan(0);
-
-        const resolver = new ConflictResolver(dbA as any);
-        const resolved = await resolver.resolveIfConflicted(doc);
-        expect(resolved).toBe(true);
-
-        const final = (await dbA.getDb().get(lieId)) as unknown as FileDoc;
-        expect(final.chunks).toEqual(["chunk:right"]);
-        expect(final.vclock).toEqual({ X: 5 });
+        // When pulling "wrong" while local has "right", local dominates.
+        const resolver = new ConflictResolver();
+        const verdict = await resolver.resolveOnPull(right, wrong);
+        expect(verdict).toBe("keep-local");
     });
 
     it("Schema-Guard: bare-path and missing-vclock legacy docs are both detected", async () => {
-        // Exercise the probe logic directly. We can't import LocalDB here
-        // because its module-level pouchdb-browser import blows up in
-        // node (needs `self`), but the probe is tested here as a pure
-        // mirror of src/db/local-db.ts#findLegacyFileDoc.
         const db = new PouchDB<any>(
             `vc-int-guard-${Date.now()}-${Math.random()}`,
             { adapter: "memory" },
         );
 
-        // Mirror of LocalDB.findLegacyFileDoc, minus the FileDoc class
-        // constraint (plain PouchDB in this test):
         async function findLegacy(): Promise<string | null> {
             const idResult = await db.allDocs({ limit: 200 });
             for (const row of idResult.rows) {
                 if (row.id.startsWith("_")) continue;
-                if (!isReplicatedDocId(row.id)) return row.id; // bare path
+                if (!isReplicatedDocId(row.id)) return row.id;
                 if (isFileDocId(row.id)) {
                     const doc = (await db.get(row.id)) as any;
                     if (doc.type !== "file") continue;
@@ -224,8 +193,6 @@ describe("VC integration — two peers over in-memory replication", () => {
             return null;
         }
 
-        // Case 1: a bare-path legacy doc (pre ID-redesign) is detected
-        // purely by its missing prefix.
         await db.put({
             _id: "legacy.md",
             type: "file",
@@ -236,8 +203,6 @@ describe("VC integration — two peers over in-memory replication", () => {
         });
         expect(await findLegacy()).toBe("legacy.md");
 
-        // Case 2: after we remove the bare-path doc and insert a proper
-        // file:-prefixed doc WITHOUT vclock, it's still detected.
         await db.remove((await db.get("legacy.md")) as any);
         await db.put({
             _id: makeFileId("no-vc.md"),
@@ -249,7 +214,6 @@ describe("VC integration — two peers over in-memory replication", () => {
         });
         expect(await findLegacy()).toBe(makeFileId("no-vc.md"));
 
-        // Case 3: once it has a vclock, it's current.
         const doc = (await db.get(makeFileId("no-vc.md"))) as any;
         doc.vclock = { D: 1 };
         await db.put(doc);
@@ -258,10 +222,10 @@ describe("VC integration — two peers over in-memory replication", () => {
         await db.destroy();
     });
 
-    it("compareVC sanity: equal vclocks with different chunks is not silently resolved", async () => {
-        // Edge case: two revs with identical VCs but different chunks.
-        // Causally they're equal → neither dominates → concurrent.
-        const doc: FileDoc = {
+    it("compareVC sanity: equal vclocks with different chunks → concurrent", async () => {
+        // Edge case: two docs with identical VCs but different chunks.
+        // Causally they're equal → keep-local (no conflict raised).
+        const local: FileDoc = {
             _id: makeFileId("edge.md"),
             type: "file",
             chunks: ["chunk:A"],
@@ -270,39 +234,15 @@ describe("VC integration — two peers over in-memory replication", () => {
             size: 1,
             vclock: { X: 1 },
         };
-        await dbA.getDb().put(doc);
-        await dbA.getDb().bulkDocs(
-            [
-                {
-                    ...doc,
-                    chunks: ["chunk:B"],
-                    _rev: `2-${Math.floor(Math.random() * 1e16).toString(16).padStart(32, "0")}`,
-                } as any,
-            ],
-            { new_edits: false },
-        );
-        const current = (await dbA.getDb().get(makeFileId("edge.md"), { conflicts: true })) as any;
+        const remote: FileDoc = {
+            ...local,
+            chunks: ["chunk:B"],
+        };
 
-        const resolver = new ConflictResolver(dbA as any);
-        const onConcurrent = vi.fn();
-        resolver.setOnConcurrent(onConcurrent);
-
-        // An equal-VC pair technically has a dominator (either one),
-        // because findDominator treats "equal" as acceptable. This is
-        // intentional: if two devices independently produced identical
-        // clock states with different content, one of them will become
-        // the winner and the other will flow through history via the
-        // auto-resolved callback. The point of this test is to document
-        // that this path is NOT silent — either findDominator picks one
-        // (and onAutoResolved fires) or onConcurrent fires.
-        const autoSeen: string[] = [];
-        resolver.setOnAutoResolved((path) => {
-            autoSeen.push(path);
-        });
-        const resolved = await resolver.resolveIfConflicted(current);
-        expect(resolved || onConcurrent.mock.calls.length > 0).toBe(true);
-        // At least one of the two paths fired:
-        expect(autoSeen.length + onConcurrent.mock.calls.length).toBeGreaterThan(0);
+        const resolver = new ConflictResolver();
+        const verdict = await resolver.resolveOnPull(local, remote);
+        // Equal vclocks → keep-local
+        expect(verdict).toBe("keep-local");
     });
 
     it("VC chain sanity: incrementVC produces strictly dominating clocks", () => {

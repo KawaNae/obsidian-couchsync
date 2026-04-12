@@ -45,14 +45,12 @@ export interface AllDocsResult<T> {
  * Abstraction over the local document store. Phase 0 implementation is
  * PouchDB; Phase 1 replaces it with Dexie.
  *
- * `getByRev` and `removeRev` exist only for ConflictResolver's
- * PouchDB-era conflict-tree walking and will be dropped in Phase 2
- * when conflict resolution is simplified to pure vclock comparison.
+ * Phase 2: `getByRev` and `removeRev` removed — ConflictResolver no
+ * longer walks PouchDB conflict trees; resolution is pure vclock
+ * comparison via `resolveOnPull()`.
  */
 export interface ILocalStore<T = any> {
     get(id: string): Promise<T | null>;
-    /** Fetch a specific revision. Phase 2 removes this. */
-    getByRev(id: string, rev: string): Promise<T | null>;
     put(doc: T): Promise<PutResponse>;
     bulkPut(docs: T[]): Promise<PutResponse[]>;
     update<D extends T>(
@@ -61,8 +59,6 @@ export interface ILocalStore<T = any> {
         maxRetries?: number,
     ): Promise<PutResponse | null>;
     delete(id: string): Promise<void>;
-    /** Remove a specific revision. Phase 2 removes this. */
-    removeRev(id: string, rev: string): Promise<void>;
     allDocs(opts?: AllDocsOpts): Promise<AllDocsResult<T>>;
     info(): Promise<{ updateSeq: number | string }>;
     close(): Promise<void>;
