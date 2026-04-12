@@ -93,10 +93,16 @@ export class Replicator {
      *  truth for retry cadence. */
     private errorRetryTimer: ReturnType<typeof setTimeout> | null = null;
 
-    /** Single-flight latch for `probeHealth()`. Rapid-fire change events
-     *  (e.g. multi-file save) would otherwise spawn a probe per event;
-     *  the latch lets them share one in-flight round-trip. */
-    private probeInFlight = false;
+    /** Single-flight Promise for `probeHealth()`. Rapid-fire change events
+     *  (e.g. multi-file save) share one in-flight round-trip via the same
+     *  Promise. `handlePaused` awaits this to gate callbacks on probe
+     *  completion. */
+    private probePromise: Promise<boolean> | null = null;
+
+    /** Set by `handlePaused(no err)`, consumed by `doProbe` on success.
+     *  When true, a successful probe promotes syncing → connected and
+     *  fires idle/paused callbacks. */
+    private pausedPending = false;
 
     /** Index into ERROR_RETRY_DELAYS_MS. Incremented on each retry,
      *  reset on successful transition to syncing/connected. */
@@ -292,6 +298,8 @@ export class Replicator {
         this.idleCallbacks = [];
         this.phase = "idle";
         this.deniedWarningEmitted = false;
+        this.pausedPending = false;
+        this.probePromise = null;
         // lastHealthyAt intentionally NOT reset: the status bar should
         // keep showing "(last seen X ago)" in disconnected/error states
         // until a fresh session produces a newer timestamp.
@@ -694,14 +702,6 @@ export class Replicator {
         } as any); // PouchDB types don't include timeout/heartbeat/back_off_function
 
         this.sync.on("change", (info) => {
-            // State transition is unconditional: PouchDB is actively
-            // processing a batch, regardless of whether docs landed.
-            this.setState("syncing");
-
-            // Fire an out-of-band probe for a decisive reachability
-            // check. The change event tells us PouchDB *read* a local
-            // doc — not that it *reached* the remote. Probe is the
-            // source of truth. Single-flight latch collapses bursts.
             void this.probeHealth();
 
             if (info.direction === "pull" && info.change?.docs) {
@@ -729,6 +729,7 @@ export class Replicator {
 
         this.sync.on("active", () => {
             this.setState("syncing");
+            void this.probeHealth();
         });
 
         this.sync.on("denied", (err) => {
@@ -859,30 +860,19 @@ export class Replicator {
     }
 
     /**
-     * Single-flight fresh HTTP probe against the remote. This is the
-     * canonical health signal: it updates `lastHealthyAt` on success,
-     * promotes `syncing → connected` on success, and escalates
-     * straight to hard error on failure — bypassing the 10s transient
-     * window because fresh HTTP with a 5s ceiling is a more decisive
-     * signal than PouchDB's own (internally retried) error events.
-     *
-     * Fired from three places:
-     *   1. `checkHealth()` — 30s idle-state safety net
-     *   2. `sync.on("change")` — every local edit, for deterministic
-     *      lastHealthyAt updates (no dependency on probe tick phase)
-     *   3. `handlePaused(no err)` — replaces the old direct
-     *      `setState("connected")` so connected UI is always backed by
-     *      a real round-trip, not PouchDB's ambiguous paused events.
-     *
-     * Concurrent callers share the same in-flight probe via
-     * `probeInFlight`; rapid-fire change events from a multi-file save
-     * collapse into one round-trip.
+     * Single-flight fresh HTTP probe against the remote. Concurrent
+     * callers share the same in-flight Promise; `handlePaused` awaits
+     * it to gate callbacks on probe completion.
      */
-    private async probeHealth(): Promise<boolean> {
-        if (this.probeInFlight) return false;
-        if (!this.remoteDb) return false;
-        this.probeInFlight = true;
-        const remoteDb = this.remoteDb;
+    private probeHealth(): Promise<boolean> {
+        if (!this.remoteDb) return Promise.resolve(false);
+        if (this.probePromise) return this.probePromise;
+        this.probePromise = this.doProbe();
+        return this.probePromise;
+    }
+
+    private async doProbe(): Promise<boolean> {
+        const remoteDb = this.remoteDb!;
         try {
             await Promise.race([
                 remoteDb.info(),
@@ -893,54 +883,31 @@ export class Replicator {
                     ),
                 ),
             ]);
-            // Guard against teardown racing the probe: remoteDb may
-            // have been closed while info() was in flight.
             if (this.remoteDb !== remoteDb) return false;
             this.lastHealthyAt = Date.now();
             logVerbose(`health: probe ok state=${this.state}`);
-            if (this.state === "syncing") {
+
+            if (this.state === "reconnecting" || this.state === "disconnected") {
+                this.setState("syncing");
+            }
+            if (this.state === "syncing" && this.pausedPending) {
                 this.setState("connected");
+                this.firePausedCallbacks();
             }
             return true;
         } catch (e: any) {
             if (this.remoteDb !== remoteDb) return false;
             logVerbose(`health: probe failed ${e?.message ?? e}`);
-            // Fresh HTTP failure is decisive — skip the transient
-            // escalation window and go straight to hard error.
+            this.pausedPending = false;
             this.enterHardError(this.classifyError(e));
             return false;
         } finally {
-            this.probeInFlight = false;
+            this.probePromise = null;
         }
     }
 
-    private async handlePaused(err: unknown): Promise<void> {
-        if (err) {
-            // `paused(err)` means PouchDB is in back-off retry — definitionally
-            // a transient state, not a hard error. Route through the soft
-            // path so PouchDB gets its escalation window to self-recover.
-            this.handleTransientError(err);
-            return;
-        }
-
-        // paused (no err) is a queue-drained hint from PouchDB, NOT proof
-        // of server health. Under asymmetric faults (e.g. Tailscale drop)
-        // a pull longpoll returning empty fires paused(undefined) while
-        // push is still failing — so we must NOT trust this event to
-        // directly transition syncing → connected.
-        //
-        // Instead: kick a probe. The probe's success/failure is what
-        // actually promotes to connected (on success) or escalates to
-        // hard error (on failure), and it updates lastHealthyAt
-        // deterministically so the UI no longer depends on probe tick
-        // phase for "just now" display.
-        if (this.state === "syncing") {
-            void this.probeHealth();
-        }
-
-        // Idle callbacks and onPaused handlers fire regardless of state:
-        // they represent "initial catchup drained" / "reconcile trigger"
-        // and need to run even if we're technically in reconnecting.
+    private firePausedCallbacks(): void {
+        this.pausedPending = false;
         if (!this.hasBeenIdle) {
             this.hasBeenIdle = true;
             for (const cb of this.idleCallbacks) cb();
@@ -950,6 +917,29 @@ export class Replicator {
             try { handler(); } catch (e) {
                 console.error("CouchSync: onPaused handler error:", e);
             }
+        }
+    }
+
+    private async handlePaused(err: unknown): Promise<void> {
+        if (err) {
+            this.handleTransientError(err);
+            return;
+        }
+
+        this.pausedPending = true;
+
+        const ok = await this.probeHealth();
+        if (!ok) return;
+
+        // If doProbe already consumed pausedPending (it was set before
+        // the probe started), callbacks are already fired. But if we
+        // shared an already-in-flight probe that started before
+        // pausedPending was set, doProbe didn't see it — handle here.
+        if (this.pausedPending) {
+            if (this.state === "syncing") {
+                this.setState("connected");
+            }
+            this.firePausedCallbacks();
         }
     }
 

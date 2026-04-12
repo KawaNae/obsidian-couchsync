@@ -349,30 +349,25 @@ describe("Replicator healthy-signal guards (asymmetric fault)", () => {
         try { await remote.destroy(); } catch { /* ignore */ }
     });
 
-    /** Spin until the in-flight probe (if any) has completed. Probes
-     *  kicked via `void this.probeHealth()` are detached from the
-     *  caller, so tests need an explicit join point. */
     async function waitForProbe(r: InstanceType<typeof Replicator>): Promise<void> {
         for (let i = 0; i < 100; i++) {
-            if (!(r as any).probeInFlight) return;
+            const p = (r as any).probePromise;
+            if (p) { await p.catch(() => {}); return; }
             await new Promise((res) => setTimeout(res, 5));
         }
-        throw new Error("probe did not settle within 500ms");
     }
 
-    it("handlePaused(no err) while state=reconnecting does NOT transition to connected", async () => {
+    it("handlePaused(no err) while state=reconnecting promotes via probe", async () => {
         const r = makeReplicator(local, () => remote);
         await r.start();
-        // Force state into reconnecting via the transient path.
         (r as any).handleTransientError({ message: "ECONNREFUSED" });
         expect(r.getState()).toBe("reconnecting");
 
         await (r as any).handlePaused(undefined);
-        await waitForProbe(r);
 
-        // Probe is NOT kicked from reconnecting (handlePaused guards on
-        // state === "syncing"), so state stays reconnecting.
-        expect(r.getState()).toBe("reconnecting");
+        // Probe succeeds (real memory remote) → reconnecting → syncing,
+        // then pausedPending drives syncing → connected + callbacks.
+        expect(r.getState()).toBe("connected");
         r.stop();
     });
 
@@ -383,8 +378,9 @@ describe("Replicator healthy-signal guards (asymmetric fault)", () => {
         expect(r.getState()).toBe("error");
 
         await (r as any).handlePaused(undefined);
-        await waitForProbe(r);
 
+        // Probe succeeds (real memory remote) but error state is
+        // preserved — recovery goes through backoff retry only.
         expect(r.getState()).toBe("error");
         r.stop();
     });
@@ -392,15 +388,11 @@ describe("Replicator healthy-signal guards (asymmetric fault)", () => {
     it("handlePaused(no err) from state=syncing kicks probe → connected", async () => {
         const r = makeReplicator(local, () => remote);
         await r.start();
-        // After start(), state should be connected. Force back to syncing.
         (r as any).setState("syncing");
         expect(r.getState()).toBe("syncing");
 
         await (r as any).handlePaused(undefined);
-        await waitForProbe(r);
 
-        // The probe (against real memory remote) succeeds, which drives
-        // the syncing → connected promotion.
         expect(r.getState()).toBe("connected");
         r.stop();
     });
@@ -413,11 +405,8 @@ describe("Replicator healthy-signal guards (asymmetric fault)", () => {
 
         (r as any).setState("syncing");
         await (r as any).handlePaused(undefined);
-        await waitForProbe(r);
 
         expect(r.getState()).toBe("connected");
-        // Probe ran against real memory remote → lastHealthyAt advances.
-        // This is what gives the UI deterministic "just now" after edits.
         expect(r.getLastHealthyAt()).toBeGreaterThan(baseline);
         r.stop();
     });
@@ -461,14 +450,27 @@ describe("Replicator active health probe", () => {
         r.stop();
     });
 
-    it("probe success from syncing promotes to connected", async () => {
+    it("probe success from syncing stays syncing without pausedPending", async () => {
         const r = makeReplicator(local, () => remote);
         await r.start();
         (r as any).setState("syncing");
 
         await (r as any).probeHealth();
 
+        expect(r.getState()).toBe("syncing");
+        r.stop();
+    });
+
+    it("probe success from syncing with pausedPending promotes to connected", async () => {
+        const r = makeReplicator(local, () => remote);
+        await r.start();
+        (r as any).setState("syncing");
+        (r as any).pausedPending = true;
+
+        await (r as any).probeHealth();
+
         expect(r.getState()).toBe("connected");
+        expect((r as any).pausedPending).toBe(false);
         r.stop();
     });
 
@@ -514,7 +516,7 @@ describe("Replicator active health probe", () => {
         }
     });
 
-    it("probe is skipped in reconnecting/error/disconnected states", async () => {
+    it("checkHealth skips probe in reconnecting/error, reconnects in disconnected", async () => {
         const r = makeReplicator(local, () => remote);
         await r.start();
 
@@ -532,7 +534,6 @@ describe("Replicator active health probe", () => {
         await (r as any).checkHealth();
         expect(infoCalls).toBe(0);
 
-        // Disconnected takes the requestReconnect path, not the probe.
         const reconnectSpy = vi
             .spyOn(r as any, "requestReconnect")
             .mockResolvedValue(undefined);
@@ -545,11 +546,22 @@ describe("Replicator active health probe", () => {
         r.stop();
     });
 
+    it("probe success from reconnecting promotes to syncing", async () => {
+        const r = makeReplicator(local, () => remote);
+        await r.start();
+        (r as any).handleTransientError({ message: "ECONNREFUSED" });
+        expect(r.getState()).toBe("reconnecting");
+
+        await (r as any).probeHealth();
+
+        expect(r.getState()).toBe("syncing");
+        r.stop();
+    });
+
     it("change event kicks a probe (deterministic lastHealthyAt update)", async () => {
         const r = makeReplicator(local, () => remote);
         await r.start();
-        // Freeze lastHealthyAt to a sentinel so we can observe the
-        // probe-driven update unambiguously.
+        await new Promise((res) => setTimeout(res, 50));
         (r as any).lastHealthyAt = 1;
 
         const sync: any = (r as any).sync;
@@ -557,14 +569,18 @@ describe("Replicator active health probe", () => {
             direction: "pull",
             change: { ok: true, docs_written: 1, doc_write_failures: 0, docs: [] },
         });
-        await waitForProbe(r);
+        // Grab probePromise synchronously — the polling waitForProbe
+        // races with PouchDB's own async events (paused fires after
+        // change, triggering its own probe that clears ours).
+        const p = (r as any).probePromise;
+        expect(p).toBeTruthy();
+        await p;
 
-        // Probe ran against real memory remote → updated.
         expect(r.getLastHealthyAt()).toBeGreaterThan(1);
         r.stop();
     });
 
-    it("probe in flight deduplicates concurrent callers", async () => {
+    it("probe in flight deduplicates concurrent callers via shared promise", async () => {
         const r = makeReplicator(local, () => remote);
         await r.start();
 
@@ -581,8 +597,6 @@ describe("Replicator active health probe", () => {
         };
         (r as any).setState("connected");
 
-        // Fire 5 concurrent probe requests; only the first should
-        // actually call info(), the rest hit the probeInFlight latch.
         const probes = [
             (r as any).probeHealth(),
             (r as any).probeHealth(),
@@ -592,8 +606,13 @@ describe("Replicator active health probe", () => {
         ];
         expect(infoCalls).toBe(1);
 
+        // All callers share the same Promise.
+        const first = probes[0];
+        for (const p of probes) expect(p).toBe(first);
+
         resolveInfo();
-        await Promise.all(probes);
+        const results = await Promise.all(probes);
+        for (const r of results) expect(r).toBe(true);
 
         expect(infoCalls).toBe(1);
         r.stop();
@@ -602,25 +621,75 @@ describe("Replicator active health probe", () => {
     it("change event → probe failure escalates straight to hard error", async () => {
         const r = makeReplicator(local, () => remote);
         await r.start();
-        // Swap in a failing remoteDb to simulate asymmetric fault after
-        // the session is up (Tailscale drops mid-session).
+        await new Promise((res) => setTimeout(res, 50));
         (r as any).remoteDb = {
             info: () => Promise.reject(new Error("ECONNREFUSED")),
             close: () => Promise.resolve(),
         };
         (r as any).setState("connected");
 
-        // Simulate the user editing a file → change event fires → probe
-        // is kicked → probe fails → hard error immediately.
         const sync: any = (r as any).sync;
         sync.emit("change", {
             direction: "push",
             change: { ok: true, docs_written: 1, doc_write_failures: 0, docs: [] },
         });
-        await waitForProbe(r);
+        const p = (r as any).probePromise;
+        expect(p).toBeTruthy();
+        await p.catch(() => {});
 
         expect(r.getState()).toBe("error");
         expect(r.getLastErrorDetail()?.kind).toBe("network");
+        r.stop();
+    });
+
+    it("probe failure clears pausedPending to prevent stale callback fires", async () => {
+        const r = makeReplicator(local, () => remote);
+        await r.start();
+        (r as any).remoteDb = {
+            info: () => Promise.reject(new Error("ECONNREFUSED")),
+            close: () => Promise.resolve(),
+        };
+        (r as any).setState("syncing");
+        (r as any).pausedPending = true;
+
+        await (r as any).probeHealth();
+
+        expect(r.getState()).toBe("error");
+        expect((r as any).pausedPending).toBe(false);
+        r.stop();
+    });
+
+    it("handlePaused gates callbacks on probe completion", async () => {
+        const r = makeReplicator(local, () => remote);
+        await r.start();
+        (r as any).setState("syncing");
+
+        const callOrder: string[] = [];
+        r.onPaused(() => callOrder.push("paused"));
+
+        await (r as any).handlePaused(undefined);
+
+        expect(r.getState()).toBe("connected");
+        expect(callOrder).toEqual(["paused"]);
+        r.stop();
+    });
+
+    it("handlePaused with probe failure does not fire callbacks", async () => {
+        const r = makeReplicator(local, () => remote);
+        await r.start();
+        (r as any).remoteDb = {
+            info: () => Promise.reject(new Error("ECONNREFUSED")),
+            close: () => Promise.resolve(),
+        };
+        (r as any).setState("syncing");
+
+        const pausedCalled: boolean[] = [];
+        r.onPaused(() => pausedCalled.push(true));
+
+        await (r as any).handlePaused(undefined);
+
+        expect(r.getState()).toBe("error");
+        expect(pausedCalled).toEqual([]);
         r.stop();
     });
 });
