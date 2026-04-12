@@ -743,6 +743,156 @@ describe("SyncEngine health probing", () => {
     });
 });
 
+describe("SyncEngine vclock guard in writePulledDocs", () => {
+    it("take-remote: writes doc when remote vclock dominates", async () => {
+        const localDb = makeMockLocalDb({
+            get: vi.fn().mockResolvedValue({
+                _id: "file:test.md", type: "file", chunks: [], vclock: { A: 1 },
+                mtime: 1, ctime: 1, size: 0,
+            }),
+        });
+        const engine = makeSyncEngine(localDb, makeMockClient());
+
+        const mockResolver = {
+            resolveOnPull: vi.fn().mockResolvedValue("take-remote"),
+            setOnConcurrent: vi.fn(),
+        };
+        engine.setConflictResolver(mockResolver as any);
+
+        const result = {
+            results: [
+                { id: "file:test.md", seq: "1", doc: {
+                    _id: "file:test.md", _rev: "2-abc", type: "file",
+                    chunks: [], vclock: { A: 2 }, mtime: 2, ctime: 1, size: 0,
+                }},
+            ],
+            last_seq: "1",
+        };
+
+        await (engine as any).writePulledDocs(result);
+        expect(localDb.bulkPut).toHaveBeenCalled();
+        const written = localDb.bulkPut.mock.calls[0][0];
+        expect(written.length).toBe(1);
+        expect(written[0]._id).toBe("file:test.md");
+        engine.stop();
+    });
+
+    it("keep-local: skips doc when local vclock dominates", async () => {
+        const localDb = makeMockLocalDb({
+            get: vi.fn().mockResolvedValue({
+                _id: "file:test.md", type: "file", chunks: [], vclock: { A: 5 },
+                mtime: 5, ctime: 1, size: 0,
+            }),
+        });
+        const engine = makeSyncEngine(localDb, makeMockClient());
+
+        const mockResolver = {
+            resolveOnPull: vi.fn().mockResolvedValue("keep-local"),
+            setOnConcurrent: vi.fn(),
+        };
+        engine.setConflictResolver(mockResolver as any);
+
+        const result = {
+            results: [
+                { id: "file:test.md", seq: "1", doc: {
+                    _id: "file:test.md", _rev: "2-abc", type: "file",
+                    chunks: [], vclock: { B: 3 }, mtime: 3, ctime: 1, size: 0,
+                }},
+            ],
+            last_seq: "1",
+        };
+
+        await (engine as any).writePulledDocs(result);
+        expect(localDb.bulkPut).not.toHaveBeenCalled();
+        engine.stop();
+    });
+
+    it("concurrent: skips doc and fires onConcurrent handler", async () => {
+        const localDb = makeMockLocalDb({
+            get: vi.fn().mockResolvedValue({
+                _id: "file:test.md", type: "file", chunks: [], vclock: { A: 2 },
+                mtime: 2, ctime: 1, size: 0,
+            }),
+        });
+        const engine = makeSyncEngine(localDb, makeMockClient());
+
+        const mockResolver = {
+            resolveOnPull: vi.fn().mockResolvedValue("concurrent"),
+            setOnConcurrent: vi.fn(),
+        };
+        engine.setConflictResolver(mockResolver as any);
+
+        const concurrentCalls: string[] = [];
+        engine.onConcurrent(async (filePath) => {
+            concurrentCalls.push(filePath);
+        });
+
+        const result = {
+            results: [
+                { id: "file:test.md", seq: "1", doc: {
+                    _id: "file:test.md", _rev: "2-abc", type: "file",
+                    chunks: [], vclock: { B: 1 }, mtime: 1, ctime: 1, size: 0,
+                }},
+            ],
+            last_seq: "1",
+        };
+
+        await (engine as any).writePulledDocs(result);
+        expect(localDb.bulkPut).not.toHaveBeenCalled();
+        expect(concurrentCalls).toContain("test.md");
+        engine.stop();
+    });
+
+    it("chunk docs are always accepted (no vclock)", async () => {
+        const localDb = makeMockLocalDb();
+        const engine = makeSyncEngine(localDb, makeMockClient());
+
+        const result = {
+            results: [
+                { id: "chunk:abc123", seq: "1", doc: {
+                    _id: "chunk:abc123", _rev: "1-xyz", type: "chunk", data: "base64...",
+                }},
+            ],
+            last_seq: "1",
+        };
+
+        await (engine as any).writePulledDocs(result);
+        expect(localDb.bulkPut).toHaveBeenCalled();
+        const written = localDb.bulkPut.mock.calls[0][0];
+        expect(written[0]._id).toBe("chunk:abc123");
+        engine.stop();
+    });
+
+    it("new doc (no local version): always accepted", async () => {
+        const localDb = makeMockLocalDb({
+            get: vi.fn().mockResolvedValue(null),
+        });
+        const engine = makeSyncEngine(localDb, makeMockClient());
+
+        const mockResolver = {
+            resolveOnPull: vi.fn(),
+            setOnConcurrent: vi.fn(),
+        };
+        engine.setConflictResolver(mockResolver as any);
+
+        const result = {
+            results: [
+                { id: "file:new.md", seq: "1", doc: {
+                    _id: "file:new.md", _rev: "1-abc", type: "file",
+                    chunks: [], vclock: { B: 1 }, mtime: 1, ctime: 1, size: 0,
+                }},
+            ],
+            last_seq: "1",
+        };
+
+        await (engine as any).writePulledDocs(result);
+        expect(localDb.bulkPut).toHaveBeenCalled();
+        // resolveOnPull should not be called for new docs
+        expect(mockResolver.resolveOnPull).not.toHaveBeenCalled();
+        engine.stop();
+    });
+});
+
 describe("SyncEngine one-shot operations", () => {
     it("testConnectionWith returns error string on unreachable server", async () => {
         const engine = makeSyncEngine(makeMockLocalDb(), makeMockClient());

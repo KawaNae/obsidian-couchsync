@@ -12,6 +12,9 @@ import { isReplicatedDocId } from "../types/doc-id.ts";
 import type { LocalDB } from "./local-db.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { ICouchClient, ChangesResult } from "./interfaces.ts";
+import type { ConflictResolver, PullVerdict } from "../conflict/conflict-resolver.ts";
+import { isFileDoc, isConfigDoc } from "../types.ts";
+import { filePathFromId, configPathFromId } from "../types/doc-id.ts";
 import * as remoteCouch from "./remote-couch.ts";
 import { CouchClient, makeCouchClient } from "./couch-client.ts";
 import {
@@ -35,6 +38,11 @@ export type {
 export type OnChangeHandler = (doc: CouchSyncDoc) => void;
 export type OnStateChangeHandler = (state: SyncState) => void;
 export type OnErrorHandler = (message: string) => void;
+export type OnConcurrentHandler = (
+    filePath: string,
+    localDoc: CouchSyncDoc,
+    remoteDoc: CouchSyncDoc,
+) => void | Promise<void>;
 
 // ── Constants ────────────────────────────────────────────
 
@@ -82,6 +90,7 @@ export class SyncEngine {
     private onErrorHandlers: OnErrorHandler[] = [];
     private onPausedHandlers: (() => void)[] = [];
     private onReconnectHandlers: (() => void)[] = [];
+    private onConcurrentHandlers: OnConcurrentHandler[] = [];
     private idleCallbacks: (() => void)[] = [];
     private hasBeenIdle = false;
 
@@ -147,6 +156,12 @@ export class SyncEngine {
         private getSettings: () => CouchSyncSettings,
         private isMobile: boolean = false,
     ) {}
+
+    setConflictResolver(resolver: ConflictResolver): void {
+        this.conflictResolver = resolver;
+    }
+
+    private conflictResolver?: ConflictResolver;
 
     // ── Public API: State ─────────────────────────────────
 
@@ -216,6 +231,10 @@ export class SyncEngine {
 
     onReconnect(handler: () => void): void {
         this.onReconnectHandlers.push(handler);
+    }
+
+    onConcurrent(handler: OnConcurrentHandler): void {
+        this.onConcurrentHandlers.push(handler);
     }
 
     /** Register callback to fire once initial sync reaches idle state. */
@@ -601,36 +620,81 @@ export class SyncEngine {
     // ── Internal: Doc I/O ─────────────────────────────────
 
     /**
-     * Write pulled docs to local store and fire onChange handlers.
-     * Strips remote _rev before writing (local store manages its own).
-     * Updates remoteSeq and lastPushedSeq checkpoints.
+     * Write pulled docs to local store with vclock guard.
+     * For FileDoc/ConfigDoc: compare vclock before writing.
+     * ChunkDoc: always accept (no vclock, keyed by content hash).
      */
     private async writePulledDocs(
         result: ChangesResult<CouchSyncDoc>,
     ): Promise<void> {
-        const docs: CouchSyncDoc[] = [];
+        const accepted: CouchSyncDoc[] = [];
+        const concurrent: Array<{
+            filePath: string;
+            localDoc: CouchSyncDoc;
+            remoteDoc: CouchSyncDoc;
+        }> = [];
+
         for (const row of result.results) {
-            if (row.doc && !row.deleted) {
-                // Strip remote _rev — local store manages its own versioning.
-                const { _rev, ...rest } = row.doc as any;
-                docs.push(rest as CouchSyncDoc);
+            if (!row.doc || row.deleted) continue;
+            const { _rev, ...rest } = row.doc as any;
+            const remoteDoc = rest as CouchSyncDoc;
+
+            // ChunkDocs have no vclock — always accept.
+            if (!isFileDoc(remoteDoc) && !isConfigDoc(remoteDoc)) {
+                accepted.push(remoteDoc);
+                continue;
+            }
+
+            // vclock guard: compare with local version.
+            if (this.conflictResolver) {
+                const localDoc = await this.localDb.get(remoteDoc._id);
+                if (localDoc && (isFileDoc(localDoc) || isConfigDoc(localDoc))) {
+                    const verdict = await this.conflictResolver.resolveOnPull(
+                        localDoc, remoteDoc,
+                    );
+                    if (verdict === "keep-local") {
+                        logVerbose(`pull: keep-local for ${remoteDoc._id}`);
+                        continue;
+                    }
+                    if (verdict === "concurrent") {
+                        logVerbose(`pull: concurrent conflict for ${remoteDoc._id}`);
+                        const filePath = isFileDoc(remoteDoc)
+                            ? filePathFromId(remoteDoc._id)
+                            : configPathFromId(remoteDoc._id);
+                        concurrent.push({ filePath, localDoc, remoteDoc });
+                        continue; // keep local, don't write remote
+                    }
+                    // "take-remote": fall through to accept
+                }
+            }
+
+            accepted.push(remoteDoc);
+        }
+
+        // Write accepted docs (including chunks) BEFORE firing concurrent
+        // handlers — the handler needs remote chunks in local DB to show
+        // the diff modal.
+        if (accepted.length > 0) {
+            await this.localDb.bulkPut(accepted);
+
+            for (const doc of accepted) {
+                for (const handler of this.onChangeHandlers) {
+                    try {
+                        handler(doc);
+                    } catch (e) {
+                        console.error("CouchSync: onChange handler error:", e);
+                    }
+                }
             }
         }
 
-        if (docs.length > 0) {
-            await this.localDb.bulkPut(docs);
-
-            // Fire onChange for each pulled doc.
-            for (const row of result.results) {
-                if (row.doc && !row.deleted) {
-                    const typed = row.doc as CouchSyncDoc;
-                    for (const handler of this.onChangeHandlers) {
-                        try {
-                            handler(typed);
-                        } catch (e) {
-                            console.error("CouchSync: onChange handler error:", e);
-                        }
-                    }
+        // Fire concurrent handlers after chunks are written.
+        for (const { filePath, localDoc, remoteDoc } of concurrent) {
+            for (const h of this.onConcurrentHandlers) {
+                try {
+                    await h(filePath, localDoc, remoteDoc);
+                } catch (e) {
+                    console.error("CouchSync: onConcurrent handler error:", e);
                 }
             }
         }

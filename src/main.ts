@@ -20,8 +20,10 @@ import { HistoryCapture } from "./history/history-capture.ts";
 import { HistoryManager } from "./history/history-manager.ts";
 import { DiffHistoryView, VIEW_TYPE_DIFF_HISTORY } from "./ui/history-view.ts";
 import { ConsistencyReportModal } from "./ui/consistency-report-modal.ts";
+import { ConflictModal } from "./ui/conflict-modal.ts";
 import { totalDiscrepancies } from "./sync/reconciler.ts";
 import { isDiffableText } from "./utils/binary.ts";
+import { isFileDoc } from "./types.ts";
 import { joinChunks } from "./db/chunker.ts";
 
 export default class CouchSyncPlugin extends Plugin {
@@ -216,6 +218,64 @@ export default class CouchSyncPlugin extends Plugin {
             });
         }
 
+        // Wire ConflictResolver into SyncEngine for pull-time vclock guard.
+        this.replicator.setConflictResolver(this.conflictResolver);
+        this.replicator.onConcurrent(async (filePath, localDoc, remoteDoc) => {
+            // Show side-by-side diff modal for text files.
+            if (isFileDoc(localDoc) && isFileDoc(remoteDoc)) {
+                try {
+                    const dec = new TextDecoder("utf-8");
+                    const localChunks = await this.localDb.getChunks(localDoc.chunks);
+                    const localBuf = joinChunks(localChunks);
+                    const remoteChunks = await this.localDb.getChunks(remoteDoc.chunks);
+                    const remoteBuf = joinChunks(remoteChunks);
+
+                    if (isDiffableText(localBuf) && isDiffableText(remoteBuf)) {
+                        const modal = new ConflictModal(
+                            this.app, filePath,
+                            dec.decode(localBuf), dec.decode(remoteBuf),
+                        );
+                        const choice = await modal.waitForResult();
+                        if (choice === "take-remote") {
+                            // bulkPut skips _rev CAS check (unlike put).
+                            const { _rev, ...rest } = remoteDoc as any;
+                            await this.localDb.bulkPut([rest]);
+                            await this.vaultSync.dbToFile(remoteDoc);
+                        }
+                        // keep-local: no action, next push will resolve
+                    } else {
+                        // Binary file — can't diff, default to keep-local + notify
+                        showNotice(
+                            `CouchSync: concurrent edit on binary file ${filePath.split("/").pop()} — ` +
+                                "keeping local version. Check Diff History for details.",
+                            10000,
+                        );
+                    }
+
+                    // Save both versions to history
+                    await this.historyCapture.saveConflict(
+                        filePath,
+                        isDiffableText(localBuf) ? dec.decode(localBuf) : "",
+                        isDiffableText(remoteBuf) ? dec.decode(remoteBuf) : "",
+                    );
+                } catch (e) {
+                    console.error("CouchSync: conflict resolution error:", e);
+                    showNotice(
+                        `CouchSync: conflict on ${filePath.split("/").pop()} — ` +
+                            "keeping local version due to error.",
+                        10000,
+                    );
+                }
+            } else {
+                // ConfigDoc or unknown — keep local, notify
+                showNotice(
+                    `CouchSync: concurrent config edit on ${filePath.split("/").pop()} — ` +
+                        "keeping local version.",
+                    8000,
+                );
+            }
+        });
+
         // Reconciler runs after every replication batch. The cursor + manifest
         // short-circuit makes the steady-state cost negligible.
         // In the SyncEngine architecture, Reconciler is the SOLE vault write
@@ -306,6 +366,11 @@ export default class CouchSyncPlugin extends Plugin {
                     10000,
                 );
             }
+
+            // Load vclock cache BEFORE reconciler or changeTracker run.
+            // Without this, compareFileToDoc() misclassifies local edits
+            // as "remote-pending" and overwrites them with stale DB content.
+            await this.vaultSync.loadLastSyncedVclocks();
 
             if (this.settings.connectionState === "syncing" && this.settings.deviceId) {
                 this.replicator.start();
