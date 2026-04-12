@@ -6,7 +6,8 @@ import type { HistoryCapture } from "../history/history-capture.ts";
 import type { ChangeTracker } from "./change-tracker.ts";
 import { splitIntoChunks, joinChunks } from "../db/chunker.ts";
 import { showNotice } from "../ui/notices.ts";
-import { incrementVC } from "./vector-clock.ts";
+import { compareVC, incrementVC } from "./vector-clock.ts";
+import type { VectorClock } from "./vector-clock.ts";
 import { makeFileId, filePathFromId } from "../types/doc-id.ts";
 
 /**
@@ -15,19 +16,24 @@ import { makeFileId, filePathFromId } from "../types/doc-id.ts";
  * This answers *local drift* ("has the vault diverged from what the DB
  * thinks?"), NOT cross-device ordering. Cross-device ordering lives in
  * Vector Clocks and is decided by ConflictResolver against PouchDB's
- * _conflicts tree. Here, `doc.mtime` is the file's mtime at the moment
- * of the last fileToDb/dbToFile for this path — a purely local signal
- * that's safe to compare against `file.stat.mtime`.
+ * _conflicts tree.
  *
  *  - identical:       chunk IDs match → no action needed
- *  - local-unpushed:  chunks differ, vault mtime newer → push
- *  - remote-pending:  chunks differ, DB mtime newer  → pull
+ *  - local-unpushed:  chunks differ, vclock unchanged since last sync → push
+ *  - remote-pending:  chunks differ, vclock advanced since last sync → pull
  */
 export type CompareResult = "identical" | "local-unpushed" | "remote-pending";
 
 export class VaultSync {
     private historyCapture: HistoryCapture | null = null;
     private changeTracker: ChangeTracker | null = null;
+    /**
+     * In-memory map of vault path → vclock at the time of the last
+     * successful sync write (dbToFile or fileToDb). Used by
+     * compareFileToDoc to detect local drift without relying on
+     * cross-device mtime comparison (which breaks under clock skew).
+     */
+    private lastSyncedVclock = new Map<string, VectorClock>();
     /**
      * In-memory mirror of `_local/skipped-files` paths. Initialised lazily on
      * the first `fileToDb` that might touch it, then kept in sync with the
@@ -88,12 +94,15 @@ export class VaultSync {
         await this.db.bulkPut(chunks);
 
         const deviceId = this.getSettings().deviceId;
+        let pushedVclock: VectorClock | undefined;
         await this.db.update<FileDoc>(makeFileId(file.path), (existing) => {
             if (existing &&
                 existing.chunks.length === chunkIds.length &&
                 existing.chunks.every((id, i) => id === chunkIds[i])) {
                 return null;
             }
+            const vc = incrementVC(existing?.vclock, deviceId);
+            pushedVclock = vc;
             return {
                 _id: makeFileId(file.path),
                 type: "file",
@@ -101,9 +110,12 @@ export class VaultSync {
                 mtime: file.stat.mtime,
                 ctime: file.stat.ctime,
                 size: file.stat.size,
-                vclock: incrementVC(existing?.vclock, deviceId),
+                vclock: vc,
             } as FileDoc;
         });
+        if (pushedVclock) {
+            this.lastSyncedVclock.set(file.path, pushedVclock);
+        }
     }
 
     async dbToFile(fileDoc: FileDoc): Promise<void> {
@@ -123,12 +135,25 @@ export class VaultSync {
 
         const existing = this.app.vault.getAbstractFileByPath(vaultPath);
 
+        // Skip only when vault content is already identical to the doc.
+        // The old guard also skipped "local-unpushed" based on cross-device
+        // mtime comparison, but that breaks under clock skew. Since this
+        // method is called from the pull path (onChange), PouchDB replication
+        // already guarantees the doc is causally newer. ChangeTracker +
+        // ignoreWrite prevent echo loops for sync-driven writes.
         if (existing && "stat" in existing) {
-            const cmp = await this.compareFileToDoc(fileDoc, existing as TFile);
-            // Skip if identical or if the vault has unpushed local edits
-            // ChangeTracker will catch. Only overwrite when the remote doc
-            // is ahead of what the local vault currently holds.
-            if (cmp !== "remote-pending") return;
+            const localFile = existing as TFile;
+            if (localFile.stat.size === fileDoc.size) {
+                const localContent = await this.app.vault.readBinary(localFile);
+                const localChunks = await splitIntoChunks(localContent);
+                const localChunkIds = localChunks.map((c) => c._id);
+                if (
+                    localChunkIds.length === fileDoc.chunks.length &&
+                    localChunkIds.every((id, i) => id === fileDoc.chunks[i])
+                ) {
+                    return; // Content identical, skip
+                }
+            }
         }
 
         // Apply remote content to vault
@@ -169,6 +194,10 @@ export class VaultSync {
             this.changeTracker?.clearIgnore(vaultPath);
         }
 
+        if (writtenFile) {
+            this.lastSyncedVclock.set(vaultPath, { ...(fileDoc.vclock ?? {}) });
+        }
+
         // Record this sync-driven write as a history entry. captureSyncWrite
         // sniffs the bytes itself and skips non-text files, so we can call it
         // unconditionally here.
@@ -183,12 +212,12 @@ export class VaultSync {
      * Step 1 — chunk equality: if every chunk ID matches, the content is
      * identical and no further comparison is needed.
      *
-     * Step 2 — mtime comparison as a *local* signal: `fileDoc.mtime` is
-     * the vault file's mtime at the moment of the last fileToDb/dbToFile
-     * for this path. Comparing it against the vault file's current
-     * `stat.mtime` answers "has anything touched this file locally since
-     * we last synced it?". This is NOT cross-device ordering (VCs do
-     * that); it's purely local filesystem drift detection.
+     * Step 2 — vclock comparison: if the doc's vclock has advanced beyond
+     * what was recorded at the last sync write for this path, a remote
+     * device pushed new content → "remote-pending". If the vclock is
+     * unchanged, the vault file was edited locally since the last sync
+     * but not yet pushed → "local-unpushed". This replaces the old
+     * cross-device mtime comparison which broke under clock skew.
      */
     async compareFileToDoc(fileDoc: FileDoc, localFile: TFile): Promise<CompareResult> {
         if (localFile.stat.size === fileDoc.size) {
@@ -202,10 +231,17 @@ export class VaultSync {
                 return "identical";
             }
         }
-        return localFile.stat.mtime > fileDoc.mtime ? "local-unpushed" : "remote-pending";
+        const lastSynced = this.lastSyncedVclock.get(filePathFromId(fileDoc._id));
+        if (lastSynced) {
+            const rel = compareVC(fileDoc.vclock ?? {}, lastSynced);
+            return rel === "equal" ? "local-unpushed" : "remote-pending";
+        }
+        // No record (e.g. plugin just loaded) — conservatively pull.
+        return "remote-pending";
     }
 
     async markDeleted(path: string): Promise<void> {
+        this.lastSyncedVclock.delete(path);
         await this.db.update<FileDoc>(makeFileId(path), (existing) => {
             if (!existing) return null;
             return {
@@ -218,7 +254,7 @@ export class VaultSync {
     }
 
     async handleRename(file: TFile, oldPath: string): Promise<void> {
-        await this.markDeleted(oldPath);
+        await this.markDeleted(oldPath); // also clears lastSyncedVclock for oldPath
         await this.fileToDb(file);
     }
 
