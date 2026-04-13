@@ -25,6 +25,7 @@ import { type App, Notice, Setting, type ButtonComponent } from "obsidian";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { ConfigSync } from "../sync/config-sync.ts";
 import type { SyncEngine } from "../db/sync-engine.ts";
+import { logWarn } from "../ui/log.ts";
 
 export interface ConfigSyncTabDeps {
     app: App;
@@ -481,7 +482,7 @@ async function renderLocalFallback(
             if (currentPaths.has(folder)) continue;
             createSuggestionItem(el, folder, deps);
         }
-    } catch { /* ignore */ }
+    } catch (e: any) { logWarn(`Failed to list plugin folders for suggestions: ${e?.message ?? e}`); }
 }
 
 function createSuggestionItem(container: HTMLElement, path: string, deps: ConfigSyncTabDeps): void {

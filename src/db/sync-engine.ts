@@ -4,7 +4,7 @@
  *   - CouchClient.changes() + bulkGet() for catchup pull
  *   - CouchClient.changesLongpoll() loop for live pull
  *   - localDb.changes() poll + CouchClient.bulkDocs() for push
- *   - CouchClient.info() for health probes
+ *   - CouchClient.info() for stall detection
  */
 
 import type { CouchSyncDoc, FileDoc, ChunkDoc } from "../types.ts";
@@ -26,6 +26,8 @@ import {
     type SyncErrorKind,
 } from "./reconnect-policy.ts";
 import { logDebug, logInfo, logWarn, logError } from "../ui/log.ts";
+import { ErrorRecovery } from "./error-recovery.ts";
+import { EnvListeners } from "./env-listeners.ts";
 
 // ── Re-exports ──────────────────────────────────────────
 
@@ -49,19 +51,10 @@ export type OnConcurrentHandler = (
 
 const HEALTH_CHECK_INTERVAL = 30000; // 30s
 const CATCHUP_IDLE_TIMEOUT_MS = 60000; // abort catchup after 60s of no progress
-const PROBE_TIMEOUT_MS = 5000; // fresh-HTTP probe in checkHealth()
 
 /** Build identifier, logged at start(). Lets us verify on mobile that a
  *  deployed plugin update actually reached the device. */
 const BUILD_TAG = "sync-engine-v0.13.0";
-
-/** How long to keep a transient error in `reconnecting` state before
- *  escalating to hard `error`. */
-const TRANSIENT_ESCALATION_MS = 10_000;
-
-/** Backoff delays used after escalation into hard error state. Capped at
- *  the last entry — a permanently-down server is polled every 30s. */
-const ERROR_RETRY_DELAYS_MS: readonly number[] = [2_000, 5_000, 10_000, 20_000, 30_000];
 
 /** How often to check for local changes to push. */
 const PUSH_POLL_INTERVAL_MS = 2000;
@@ -103,8 +96,9 @@ export class SyncEngine {
     private pullWrittenIds = new Set<string>();
     /** Doc IDs recently pushed. Pull skips logging for these (echo suppression). */
     private recentlyPushedIds = new Set<string>();
-    /** Track probe state for change-only logging. */
-    private lastProbeOk = true;
+    /** Last remote update_seq seen by stall detection. Compared against
+     *  our consumed remoteSeq to detect a stalled pull loop. */
+    private lastObservedRemoteSeq: number | string = 0;
 
     // ── Session management ────────────────────────────────
 
@@ -127,29 +121,27 @@ export class SyncEngine {
      *  start() call (user has presumably fixed credentials). */
     private authError = false;
 
-    /** Armed on transient live-sync errors. If nothing recovers within
-     *  TRANSIENT_ESCALATION_MS, the transient state is promoted to hard error. */
-    private transientErrorTimer: ReturnType<typeof setTimeout> | null = null;
-
-    /** Schedules the next backoff retry while in hard-error state. */
-    private errorRetryTimer: ReturnType<typeof setTimeout> | null = null;
-
-    /** Index into ERROR_RETRY_DELAYS_MS. */
-    private errorRetryStep = 0;
+    private readonly errorRecovery = new ErrorRecovery({
+        getState: () => this.state,
+        setState: (s, d) => this.setState(s, d),
+        emitError: (m) => this.emitError(m),
+        setAuthError: () => { this.authError = true; },
+        teardown: () => this.teardown(),
+        requestReconnect: (r) => this.requestReconnect(r),
+    });
 
     // ── Timers & env listeners ────────────────────────────
 
     private healthTimer: ReturnType<typeof setInterval> | null = null;
-    private envListenersAttached = false;
-    private boundOnOffline = () => this.handleOffline();
-    private boundOnOnline = () => this.handleOnline();
-    private boundOnVisibility = () =>
-        this.handleVisibilityChange(document.visibilityState === "visible");
-    private backgroundedAt = 0;
 
-    // ── Probe single-flight ───────────────────────────────
-
-    private probePromise: Promise<boolean> | null = null;
+    private readonly envListeners = new EnvListeners({
+        getState: () => this.state,
+        setState: (s) => this.setState(s),
+        emitError: (m) => this.emitError(m),
+        requestReconnect: (r) => this.requestReconnect(r),
+        fireReconnectHandlers: () => this.fireReconnectHandlers(),
+        isMobile: this.isMobile,
+    });
 
     /** Latch so we emit at most one warning Notice per `denied` storm. */
     private deniedWarningEmitted = false;
@@ -240,7 +232,7 @@ export class SyncEngine {
      */
     markAuthError(status: number, reason?: string): void {
         if (this.authError) return;
-        this.enterHardError({
+        this.errorRecovery.enterHardError({
             kind: "auth",
             code: status,
             message:
@@ -329,15 +321,15 @@ export class SyncEngine {
         // An explicit start() call means the user is trying again — assume
         // they've fixed their credentials.
         this.authError = false;
-        this.attachEnvListeners();
+        this.envListeners.attach();
         this.startHealthTimer();
         await this.bringUpSession();
     }
 
     stop(): void {
-        this.detachEnvListeners();
+        this.envListeners.detach();
         this.stopHealthTimer();
-        this.resetErrorRecovery();
+        this.errorRecovery.reset();
         this.teardown();
         this.setState("disconnected");
     }
@@ -445,10 +437,10 @@ export class SyncEngine {
         } else {
             this.lastErrorDetail = null;
             if (wasError && (state === "syncing" || state === "connected")) {
-                this.resetErrorRecovery();
+                this.errorRecovery.reset();
             }
             if (state !== "reconnecting") {
-                this.clearTransientErrorTimer();
+                this.errorRecovery.reset();
             }
         }
 
@@ -478,7 +470,7 @@ export class SyncEngine {
         this.hasBeenIdle = false;
         this.idleCallbacks = [];
         this.deniedWarningEmitted = false;
-        this.probePromise = null;
+        this.lastObservedRemoteSeq = 0;
         // lastHealthyAt and lastErrorDetail intentionally NOT reset.
     }
 
@@ -522,7 +514,7 @@ export class SyncEngine {
             await this.catchupPull(client, myEpoch);
         } catch (e: any) {
             if (this.syncEpoch !== myEpoch) return;
-            this.enterHardError(this.classifyError(e));
+            this.errorRecovery.enterHardError(this.errorRecovery.classifyError(e));
             this.onCatchupFailedHandler?.();
             return;
         }
@@ -634,10 +626,10 @@ export class SyncEngine {
             } catch (e: any) {
                 if (this.syncEpoch !== epoch) return;
 
-                const detail = this.classifyError(e);
+                const detail = this.errorRecovery.classifyError(e);
 
                 if (detail.kind === "auth" || detail.kind === "server") {
-                    this.handleTransientError(e);
+                    this.errorRecovery.handleTransientError(e);
                 } else if (this.state !== "reconnecting" && this.state !== "error") {
                     // Network/timeout errors on longpoll are expected during
                     // reconnect/error. Only log when state is healthy.
@@ -931,128 +923,15 @@ export class SyncEngine {
         }
     }
 
-    // ── Internal: Error handling ──────────────────────────
+    // ── Internal: Stall detection ──────────────────────────
 
     /**
-     * Classify a CouchDB/fetch error into a SyncErrorDetail. Consistent
-     * labelling across all error paths.
+     * Periodic health check (30s interval). In connected/syncing states,
+     * performs stall detection: fetches the remote update_seq and compares
+     * it against our consumed remoteSeq. If the remote has advanced but
+     * our pull loop hasn't consumed those changes, the session is stalled
+     * and we trigger a reconnect.
      */
-    private classifyError(err: any): SyncErrorDetail {
-        const code: number | undefined = typeof err?.status === "number" ? err.status : undefined;
-        const rawMessage: string = (err?.message ?? (err && String(err)) ?? "unknown").toString();
-
-        if (code === 401 || code === 403) {
-            return {
-                kind: "auth",
-                code,
-                message: `Authentication failed (${code}). Check your CouchDB credentials.`,
-            };
-        }
-        if (typeof code === "number" && code >= 500) {
-            return {
-                kind: "server",
-                code,
-                message: `Server error (${code}): ${rawMessage}`,
-            };
-        }
-        if (/timed?[\s_-]?out|timeout/i.test(rawMessage)) {
-            return { kind: "timeout", code, message: rawMessage };
-        }
-        if (/network|fetch|econn|enotfound|getaddrinfo|failed to fetch|dns|unreachable|offline/i.test(rawMessage)) {
-            return { kind: "network", code, message: rawMessage };
-        }
-        return { kind: "unknown", code, message: rawMessage };
-    }
-
-    /**
-     * Soft error path. We route through `reconnecting` state and give
-     * TRANSIENT_ESCALATION_MS to recover before promoting to hard error.
-     * Auth errors are exempt — they escalate immediately.
-     */
-    private handleTransientError(err: any): void {
-        const detail = this.classifyError(err);
-        logDebug(
-            `transient error: kind=${detail.kind} code=${detail.code ?? "-"} msg=${detail.message}`,
-        );
-
-        if (detail.kind === "auth") {
-            this.enterHardError(detail);
-            return;
-        }
-
-        if (this.state !== "reconnecting") {
-            this.setState("reconnecting");
-        }
-        if (this.transientErrorTimer) clearTimeout(this.transientErrorTimer);
-        this.transientErrorTimer = setTimeout(() => {
-            this.transientErrorTimer = null;
-            if (this.state === "reconnecting") {
-                logDebug(`transient escalated to hard error after ${TRANSIENT_ESCALATION_MS}ms`);
-                this.enterHardError(detail);
-            }
-        }, TRANSIENT_ESCALATION_MS);
-    }
-
-    /**
-     * Hard error path. Fires a one-shot Notice, pins state="error" with
-     * the classified detail, and — unless it's an auth latch — kicks off
-     * the dedicated backoff retry timer.
-     */
-    private enterHardError(detail: SyncErrorDetail): void {
-        this.clearTransientErrorTimer();
-        this.setState("error", detail);
-        this.emitError(detail.message);
-
-        if (detail.kind === "auth") {
-            this.authError = true;
-            this.teardown();
-            this.stopErrorRetryTimer();
-            return;
-        }
-
-        this.scheduleErrorRetry();
-    }
-
-    private scheduleErrorRetry(): void {
-        if (this.errorRetryTimer) clearTimeout(this.errorRetryTimer);
-        const idx = Math.min(this.errorRetryStep, ERROR_RETRY_DELAYS_MS.length - 1);
-        const delay = ERROR_RETRY_DELAYS_MS[idx];
-        logDebug(`error retry scheduled in ${delay}ms (step ${this.errorRetryStep})`);
-        this.errorRetryTimer = setTimeout(async () => {
-            this.errorRetryTimer = null;
-            this.errorRetryStep++;
-            try {
-                await this.requestReconnect("retry-backoff");
-            } catch (e) {
-                logError(`CouchSync: retry reconnect failed: ${e?.message ?? e}`);
-            }
-            if (this.state === "error") {
-                this.scheduleErrorRetry();
-            }
-        }, delay);
-    }
-
-    private stopErrorRetryTimer(): void {
-        if (!this.errorRetryTimer) return;
-        clearTimeout(this.errorRetryTimer);
-        this.errorRetryTimer = null;
-    }
-
-    private clearTransientErrorTimer(): void {
-        if (!this.transientErrorTimer) return;
-        clearTimeout(this.transientErrorTimer);
-        this.transientErrorTimer = null;
-    }
-
-    /** Clean up everything related to error recovery. */
-    private resetErrorRecovery(): void {
-        this.errorRetryStep = 0;
-        this.stopErrorRetryTimer();
-        this.clearTransientErrorTimer();
-    }
-
-    // ── Internal: Health probing ──────────────────────────
-
     private async checkHealth(): Promise<void> {
         if (this.authError) return;
 
@@ -1067,49 +946,31 @@ export class SyncEngine {
             return;
         }
 
-        // Connected / syncing: issue a fresh HTTP probe.
-        await this.probeHealth();
-    }
-
-    /**
-     * Single-flight fresh HTTP probe against the remote. Concurrent
-     * callers share the same in-flight Promise.
-     */
-    private probeHealth(): Promise<boolean> {
-        if (!this.client) return Promise.resolve(false);
-        if (this.probePromise) return this.probePromise;
-        this.probePromise = this.doProbe();
-        return this.probePromise;
-    }
-
-    private async doProbe(): Promise<boolean> {
+        // Connected / syncing: stall detection via update_seq comparison.
+        if (!this.client) return;
         const sessionEpoch = this.syncEpoch;
-        const client = this.client!;
         try {
-            await Promise.race([
-                client.info(),
-                new Promise((_, reject) =>
-                    setTimeout(
-                        () => reject(new Error("probe timed out")),
-                        PROBE_TIMEOUT_MS,
-                    ),
-                ),
-            ]);
-            if (this.syncEpoch !== sessionEpoch) return false;
-            this.lastHealthyAt = Date.now();
-            if (!this.lastProbeOk) {
-                logDebug(`health: recovered, state=${this.state}`);
-                this.lastProbeOk = true;
+            const info = await this.client.info();
+            if (this.syncEpoch !== sessionEpoch) return;
+
+            const currentRemoteSeq = info.update_seq;
+            const seqStr = String(currentRemoteSeq);
+            const localSeqStr = String(this.remoteSeq);
+
+            if (seqStr !== localSeqStr && seqStr === String(this.lastObservedRemoteSeq)) {
+                // Remote seq hasn't changed since last check, but differs
+                // from what we've consumed — the pull loop is stalled.
+                logDebug(`health: stall detected (remote=${seqStr}, consumed=${localSeqStr})`);
+                await this.requestReconnect("stalled");
+                return;
             }
-            return true;
+
+            this.lastObservedRemoteSeq = currentRemoteSeq;
+            this.lastHealthyAt = Date.now();
         } catch (e: any) {
-            if (this.syncEpoch !== sessionEpoch) return false;
-            this.lastProbeOk = false;
-            logDebug(`health: probe failed ${e?.message ?? e}`);
-            this.enterHardError(this.classifyError(e));
-            return false;
-        } finally {
-            this.probePromise = null;
+            if (this.syncEpoch !== sessionEpoch) return;
+            logDebug(`health: info() failed ${e?.message ?? e}`);
+            this.errorRecovery.enterHardError(this.errorRecovery.classifyError(e));
         }
     }
 
@@ -1128,24 +989,6 @@ export class SyncEngine {
         }
     }
 
-    // ── Internal: Environment listeners ───────────────────
-
-    private attachEnvListeners(): void {
-        if (this.envListenersAttached) return;
-        window.addEventListener("offline", this.boundOnOffline);
-        window.addEventListener("online", this.boundOnOnline);
-        document.addEventListener("visibilitychange", this.boundOnVisibility);
-        this.envListenersAttached = true;
-    }
-
-    private detachEnvListeners(): void {
-        if (!this.envListenersAttached) return;
-        window.removeEventListener("offline", this.boundOnOffline);
-        window.removeEventListener("online", this.boundOnOnline);
-        document.removeEventListener("visibilitychange", this.boundOnVisibility);
-        this.envListenersAttached = false;
-    }
-
     private startHealthTimer(): void {
         if (this.healthTimer) return;
         this.healthTimer = setInterval(() => this.checkHealth(), HEALTH_CHECK_INTERVAL);
@@ -1157,38 +1000,12 @@ export class SyncEngine {
         this.healthTimer = null;
     }
 
-    private handleVisibilityChange(visible: boolean): void {
-        if (!visible) {
-            this.backgroundedAt = Date.now();
-            return;
-        }
-        const hiddenMs = this.backgroundedAt
-            ? Date.now() - this.backgroundedAt
-            : 0;
-        this.backgroundedAt = 0;
-        const reason: ReconnectReason =
-            this.isMobile || hiddenMs >= 30_000
-                ? "app-resume"
-                : "app-foreground";
-        void this.requestReconnect(reason);
-    }
-
-    private handleOffline(): void {
-        if (this.state === "connected" || this.state === "syncing") {
-            this.setState("disconnected");
-            this.emitError("Network offline");
-        }
-    }
-
-    private handleOnline(): void {
-        void this.requestReconnect("network-online");
-        if (this.state === "disconnected" || this.state === "error") {
-            for (const handler of this.onReconnectHandlers) {
-                try {
-                    handler();
-                } catch (e) {
-                    logError(`CouchSync: onReconnect handler error: ${e?.message ?? e}`);
-                }
+    private fireReconnectHandlers(): void {
+        for (const handler of this.onReconnectHandlers) {
+            try {
+                handler();
+            } catch (e) {
+                logError(`CouchSync: onReconnect handler error: ${e?.message ?? e}`);
             }
         }
     }
@@ -1200,13 +1017,13 @@ export class SyncEngine {
     private async verifyReachable(): Promise<boolean> {
         const err = await this.testConnection();
         if (err) {
-            const detail = this.classifyError({ message: err });
+            const detail = this.errorRecovery.classifyError({ message: err });
             if (detail.kind === "unknown") {
                 detail.kind = "network";
                 detail.message = `Server unreachable: ${err}`;
             }
             if (this.state !== "error") {
-                this.enterHardError(detail);
+                this.errorRecovery.enterHardError(detail);
             }
             return false;
         }

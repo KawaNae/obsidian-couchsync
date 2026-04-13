@@ -9,7 +9,7 @@ import { notify } from "../ui/log.ts";
 import { compareVC, incrementVC } from "./vector-clock.ts";
 import type { VectorClock } from "./vector-clock.ts";
 import { makeFileId, filePathFromId } from "../types/doc-id.ts";
-import { logError } from "../ui/log.ts";
+import { logError, logWarn } from "../ui/log.ts";
 
 /**
  * Result of comparing a vault file against its local DB record.
@@ -369,13 +369,13 @@ export class VaultSync {
             try {
                 const re = new RegExp(settings.syncFilter);
                 if (!re.test(path)) return false;
-            } catch { /* invalid regex, sync all */ }
+            } catch { logWarn(`syncFilter is not a valid regex: ${settings.syncFilter}`); }
         }
         if (settings.syncIgnore) {
             try {
                 const re = new RegExp(settings.syncIgnore);
                 if (re.test(path)) return false;
-            } catch { /* invalid regex, ignore nothing */ }
+            } catch { logWarn(`syncIgnore is not a valid regex: ${settings.syncIgnore}`); }
         }
         return true;
     }

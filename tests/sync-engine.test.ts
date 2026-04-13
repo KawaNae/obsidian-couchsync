@@ -216,14 +216,14 @@ describe("SyncEngine error handling", () => {
         try {
             const engine = makeSyncEngine(makeMockLocalDb(), makeMockClient());
 
-            (engine as any).enterHardError({
+            (engine as any).errorRecovery.enterHardError({
                 kind: "auth", code: 401,
                 message: "Authentication failed (401).",
             });
 
             expect(engine.getState()).toBe("error");
             expect(engine.isAuthBlocked()).toBe(true);
-            expect((engine as any).errorRetryTimer).toBeNull();
+            expect((engine as any).errorRecovery.errorRetryTimer).toBeNull();
 
             await vi.advanceTimersByTimeAsync(60_000);
             expect(engine.getState()).toBe("error");
@@ -237,7 +237,7 @@ describe("SyncEngine error handling", () => {
             const engine = makeSyncEngine(makeMockLocalDb(), makeMockClient());
             const retrySpy = vi.spyOn(engine as any, "requestReconnect").mockResolvedValue(undefined);
 
-            (engine as any).handleTransientError({ message: "ECONNREFUSED" });
+            (engine as any).errorRecovery.handleTransientError({ message: "ECONNREFUSED" });
 
             expect(engine.getState()).toBe("reconnecting");
             expect(engine.getLastErrorDetail()).toBeNull();
@@ -259,11 +259,11 @@ describe("SyncEngine error handling", () => {
         try {
             const engine = makeSyncEngine(makeMockLocalDb(), makeMockClient());
 
-            (engine as any).handleTransientError({ message: "ECONNREFUSED" });
+            (engine as any).errorRecovery.handleTransientError({ message: "ECONNREFUSED" });
             expect(engine.getState()).toBe("reconnecting");
 
             (engine as any).setState("syncing");
-            expect((engine as any).transientErrorTimer).toBeNull();
+            expect((engine as any).errorRecovery.transientErrorTimer).toBeNull();
 
             await vi.advanceTimersByTimeAsync(11_000);
             expect(engine.getState()).toBe("syncing");
@@ -278,7 +278,7 @@ describe("SyncEngine error handling", () => {
             const engine = makeSyncEngine(makeMockLocalDb(), makeMockClient());
             const retrySpy = vi.spyOn(engine as any, "requestReconnect").mockResolvedValue(undefined);
 
-            (engine as any).enterHardError({ kind: "network", message: "fake down" });
+            (engine as any).errorRecovery.enterHardError({ kind: "network", message: "fake down" });
 
             expect(retrySpy).toHaveBeenCalledTimes(0);
             await vi.advanceTimersByTimeAsync(2_000);
@@ -302,17 +302,17 @@ describe("SyncEngine error handling", () => {
             const engine = makeSyncEngine(makeMockLocalDb(), makeMockClient());
             const retrySpy = vi.spyOn(engine as any, "requestReconnect").mockResolvedValue(undefined);
 
-            (engine as any).enterHardError({ kind: "network", message: "fake" });
+            (engine as any).errorRecovery.enterHardError({ kind: "network", message: "fake" });
             await vi.advanceTimersByTimeAsync(2_000); // step 0
             await vi.advanceTimersByTimeAsync(5_000); // step 1
-            expect((engine as any).errorRetryStep).toBe(2);
+            expect((engine as any).errorRecovery.errorRetryStep).toBe(2);
 
             (engine as any).setState("connected");
-            expect((engine as any).errorRetryStep).toBe(0);
-            expect((engine as any).errorRetryTimer).toBeNull();
+            expect((engine as any).errorRecovery.errorRetryStep).toBe(0);
+            expect((engine as any).errorRecovery.errorRetryTimer).toBeNull();
 
             retrySpy.mockClear();
-            (engine as any).enterHardError({ kind: "network", message: "again" });
+            (engine as any).errorRecovery.enterHardError({ kind: "network", message: "again" });
             await vi.advanceTimersByTimeAsync(2_000);
             expect(retrySpy).toHaveBeenCalledTimes(1);
 
@@ -324,7 +324,7 @@ describe("SyncEngine error handling", () => {
     it("start() clears authError flag", async () => {
         const engine = makeSyncEngine(makeMockLocalDb(), makeMockClient());
 
-        (engine as any).enterHardError({
+        (engine as any).errorRecovery.enterHardError({
             kind: "auth", code: 401,
             message: "Authentication failed (401).",
         });
@@ -337,7 +337,7 @@ describe("SyncEngine error handling", () => {
 
     it("classifyError heuristics", () => {
         const engine = makeSyncEngine(makeMockLocalDb(), makeMockClient());
-        const classify = (err: any) => (engine as any).classifyError(err);
+        const classify = (err: any) => (engine as any).errorRecovery.classifyError(err);
 
         expect(classify({ status: 401, message: "nope" }).kind).toBe("auth");
         expect(classify({ status: 403, message: "nope" }).kind).toBe("auth");
@@ -423,7 +423,7 @@ describe("SyncEngine catchup pull", () => {
         // The catchup loop throws "Catchup timed out" when 60s pass
         // with no progress. Verify this message classifies correctly.
         const engine = makeSyncEngine(makeMockLocalDb(), makeMockClient());
-        const detail = (engine as any).classifyError(new Error("Catchup timed out"));
+        const detail = (engine as any).errorRecovery.classifyError(new Error("Catchup timed out"));
         expect(detail.kind).toBe("timeout");
         engine.stop();
     });
@@ -586,39 +586,75 @@ describe("SyncEngine live sync", () => {
     });
 });
 
-describe("SyncEngine health probing", () => {
-    afterEach(() => { vi.useRealTimers(); });
-
-    it("probe success does not change state (pure health check)", async () => {
-        const mockClient = makeMockClient();
+describe("SyncEngine stall detection (checkHealth)", () => {
+    it("seq match → no stall, updates lastHealthyAt", async () => {
+        const mockClient = makeMockClient({
+            info: vi.fn().mockResolvedValue({ db_name: "test", doc_count: 0, update_seq: "42" }),
+        });
         const engine = makeSyncEngine(makeMockLocalDb(), mockClient);
 
         (engine as any).client = mockClient;
         (engine as any).running = true;
+        (engine as any).remoteSeq = "42";
         (engine as any).setState("connected");
 
-        await (engine as any).probeHealth();
+        const before = Date.now();
+        await (engine as any).checkHealth();
+        const after = Date.now();
 
-        // Probe only updates lastHealthyAt — no state transitions.
         expect(engine.getState()).toBe("connected");
+        expect(engine.getLastHealthyAt()).toBeGreaterThanOrEqual(before);
+        expect(engine.getLastHealthyAt()).toBeLessThanOrEqual(after);
         engine.stop();
     });
 
-    it("probe success during syncing stays syncing", async () => {
-        const mockClient = makeMockClient();
+    it("seq mismatch on first check → records seq, no stall yet", async () => {
+        const mockClient = makeMockClient({
+            info: vi.fn().mockResolvedValue({ db_name: "test", doc_count: 0, update_seq: "50" }),
+        });
         const engine = makeSyncEngine(makeMockLocalDb(), mockClient);
 
         (engine as any).client = mockClient;
         (engine as any).running = true;
+        (engine as any).remoteSeq = "40";
         (engine as any).setState("syncing");
 
-        await (engine as any).probeHealth();
+        await (engine as any).checkHealth();
 
+        // First observation: records the seq but does not trigger stall.
         expect(engine.getState()).toBe("syncing");
+        expect((engine as any).lastObservedRemoteSeq).toBe("50");
         engine.stop();
     });
 
-    it("probe failure -> hard error", async () => {
+    it("seq mismatch persists across two checks → stall → reconnect", async () => {
+        const mockClient = makeMockClient({
+            info: vi.fn().mockResolvedValue({ db_name: "test", doc_count: 0, update_seq: "50" }),
+        });
+        const engine = makeSyncEngine(makeMockLocalDb(), mockClient);
+
+        (engine as any).client = mockClient;
+        (engine as any).running = true;
+        (engine as any).remoteSeq = "40";
+        (engine as any).setState("connected");
+
+        const reconnectSpy = vi
+            .spyOn(engine as any, "requestReconnect")
+            .mockResolvedValue(undefined);
+
+        // First check: records remote seq.
+        await (engine as any).checkHealth();
+        expect(reconnectSpy).not.toHaveBeenCalled();
+
+        // Second check: same remote seq, still not consumed → stall.
+        await (engine as any).checkHealth();
+        expect(reconnectSpy).toHaveBeenCalledWith("stalled");
+
+        reconnectSpy.mockRestore();
+        engine.stop();
+    });
+
+    it("info() failure → hard error", async () => {
         const mockClient = makeMockClient({
             info: vi.fn().mockRejectedValue(new Error("ECONNREFUSED")),
         });
@@ -628,88 +664,28 @@ describe("SyncEngine health probing", () => {
         (engine as any).running = true;
         (engine as any).setState("connected");
 
-        await (engine as any).probeHealth();
+        await (engine as any).checkHealth();
 
         expect(engine.getState()).toBe("error");
         expect(engine.getLastErrorDetail()?.kind).toBe("network");
         engine.stop();
     });
 
-    it("probe deduplication: concurrent callers share one Promise", async () => {
-        let infoCalls = 0;
-        let resolveInfo: () => void = () => {};
-        const mockClient = makeMockClient({
-            info: vi.fn().mockImplementation(() => {
-                infoCalls++;
-                return new Promise<DbInfo>((res) => {
-                    resolveInfo = () => res({ db_name: "test", doc_count: 0, update_seq: "0" });
-                });
-            }),
-        });
-        const engine = makeSyncEngine(makeMockLocalDb(), mockClient);
-
-        (engine as any).client = mockClient;
-        (engine as any).running = true;
-        (engine as any).setState("connected");
-
-        const probes = [
-            (engine as any).probeHealth(),
-            (engine as any).probeHealth(),
-            (engine as any).probeHealth(),
-        ];
-        expect(infoCalls).toBe(1);
-
-        const first = probes[0];
-        for (const p of probes) expect(p).toBe(first);
-
-        resolveInfo();
-        const results = await Promise.all(probes);
-        for (const r of results) expect(r).toBe(true);
-
-        expect(infoCalls).toBe(1);
-        engine.stop();
-    });
-
-    it("probe success updates lastHealthyAt", async () => {
+    it("auth error → checkHealth skipped entirely", async () => {
         const mockClient = makeMockClient();
         const engine = makeSyncEngine(makeMockLocalDb(), mockClient);
 
         (engine as any).client = mockClient;
         (engine as any).running = true;
-        (engine as any).lastHealthyAt = 0;
+        (engine as any).authError = true;
         (engine as any).setState("connected");
 
-        const before = Date.now();
-        await (engine as any).probeHealth();
-        const after = Date.now();
-
-        expect(engine.getLastHealthyAt()).toBeGreaterThanOrEqual(before);
-        expect(engine.getLastHealthyAt()).toBeLessThanOrEqual(after);
+        await (engine as any).checkHealth();
+        expect(mockClient.info).not.toHaveBeenCalled();
         engine.stop();
     });
 
-    it("probe timeout (5s) enters hard error", async () => {
-        vi.useFakeTimers();
-        try {
-            const mockClient = makeMockClient({
-                info: vi.fn().mockImplementation(() => new Promise(() => {})),
-            });
-            const engine = makeSyncEngine(makeMockLocalDb(), mockClient);
-
-            (engine as any).client = mockClient;
-            (engine as any).running = true;
-            (engine as any).setState("syncing");
-
-            const probePromise = (engine as any).probeHealth();
-            await vi.advanceTimersByTimeAsync(5_001);
-            await probePromise;
-
-            expect(engine.getState()).toBe("error");
-            engine.stop();
-        } finally { vi.useRealTimers(); }
-    });
-
-    it("checkHealth skips probe in reconnecting/error states", async () => {
+    it("checkHealth skips in reconnecting/error states", async () => {
         const mockClient = makeMockClient();
         const engine = makeSyncEngine(makeMockLocalDb(), mockClient);
 
@@ -720,7 +696,7 @@ describe("SyncEngine health probing", () => {
         await (engine as any).checkHealth();
         expect(mockClient.info).not.toHaveBeenCalled();
 
-        (engine as any).enterHardError({ kind: "network", message: "down" });
+        (engine as any).errorRecovery.enterHardError({ kind: "network", message: "down" });
         (mockClient.info as any).mockClear();
         await (engine as any).checkHealth();
         expect(mockClient.info).not.toHaveBeenCalled();
