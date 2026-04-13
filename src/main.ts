@@ -315,11 +315,15 @@ export default class CouchSyncPlugin extends Plugin {
         });
 
         // Pull-driven vault writes: accepted FileDocs are written directly
-        // to vault in the pull path. Reconciler handles only drift detection
-        // (onload, foreground, reconnect, manual).
+        // to vault in the pull path. Reconciler handles only drift detection.
         this.replicator.onPullWrite(async (doc) => {
             await this.vaultSync.dbToFile(doc);
         });
+
+        // Reconcile AFTER catchup completes — never concurrent with pull.
+        // This ordering guarantees reconcile sees the latest DB state.
+        this.replicator.onCatchupComplete(() => this.fireReconcile("onload"));
+        this.replicator.onCatchupFailed(() => this.fireReconcile("onload"));
 
         this.addSettingTab(new CouchSyncSettingTab(this.app, this));
 
@@ -421,33 +425,17 @@ export default class CouchSyncPlugin extends Plugin {
             if (this.settings.connectionState === "syncing" && this.settings.deviceId) {
                 this.replicator.start();
                 this.changeTracker.start();
-            }
-            // Always reconcile on load: initialises the manifest on first run
-            // and catches any drift accumulated while the plugin was offline.
-            this.fireReconcile("onload");
-        });
-
-        // Foreground return: SyncEngine handles reconnect internally
-        // (via handleVisibilityChange registered in start()). Reconcile
-        // runs independently — it catches local vault ↔ local DB drift
-        // regardless of whether the sync session was restarted.
-        this.registerDomEvent(document, "visibilitychange", () => {
-            if (
-                document.visibilityState === "visible" &&
-                this.settings.connectionState === "syncing"
-            ) {
-                this.fireReconcile("foreground");
+                // Reconcile fires via onCatchupComplete/onCatchupFailed.
+            } else {
+                // Sync disabled: no catchup, reconcile directly.
+                this.fireReconcile("onload");
             }
         });
 
-        // Reconcile on network reconnection — runs independently of the
-        // gateway's sync decision. Even if the gateway skipped the restart
-        // (cool-down, auth latch), drift may have accumulated.
-        this.replicator.onReconnect(() => {
-            if (this.settings.connectionState === "syncing") {
-                this.fireReconcile("reconnect");
-            }
-        });
+        // Foreground and reconnect reconcile are handled by
+        // onCatchupComplete — SyncEngine's handleVisibilityChange and
+        // reconnect both trigger catchup, which fires the callback.
+        // No independent reconcile triggers needed here.
 
         this.addCommand({
             id: "couchsync-force-sync",
@@ -641,7 +629,7 @@ export default class CouchSyncPlugin extends Plugin {
         this.replicator.stop();
         this.replicator.start();
         this.changeTracker.start();
-        this.fireReconcile("startSync");
+        // Reconcile fires via onCatchupComplete.
     }
 
     stopSync(): void {

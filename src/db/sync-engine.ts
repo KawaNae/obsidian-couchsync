@@ -93,6 +93,8 @@ export class SyncEngine {
     private onConcurrentHandlers: OnConcurrentHandler[] = [];
     private onPullWriteHandler: ((doc: FileDoc) => Promise<void>) | null = null;
     private onAutoResolveHandler: ((filePath: string) => void) | null = null;
+    private onCatchupCompleteHandler: (() => void) | null = null;
+    private onCatchupFailedHandler: (() => void) | null = null;
     private idleCallbacks: (() => void)[] = [];
     private hasBeenIdle = false;
 
@@ -258,6 +260,16 @@ export class SyncEngine {
      */
     onAutoResolve(handler: (filePath: string) => void): void {
         this.onAutoResolveHandler = handler;
+    }
+
+    /** Called after catchup completes and pull-writes are done. */
+    onCatchupComplete(handler: () => void): void {
+        this.onCatchupCompleteHandler = handler;
+    }
+
+    /** Called when catchup fails (hard error). */
+    onCatchupFailed(handler: () => void): void {
+        this.onCatchupFailedHandler = handler;
     }
 
     /** Register callback to fire once initial sync reaches idle state. */
@@ -475,6 +487,7 @@ export class SyncEngine {
         } catch (e: any) {
             if (this.syncEpoch !== myEpoch) return;
             this.enterHardError(this.classifyError(e));
+            this.onCatchupFailedHandler?.();
             return;
         }
 
@@ -486,6 +499,7 @@ export class SyncEngine {
         this.running = true;
         this.setState("connected");
         this.firePausedCallbacks();
+        this.onCatchupCompleteHandler?.();
         this.startLiveSync(myEpoch);
     }
 
