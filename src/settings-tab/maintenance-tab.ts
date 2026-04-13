@@ -30,9 +30,9 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
             .addDropdown((dropdown) => {
                 dropdown.addOption("left", "Left");
                 dropdown.addOption("right", "Right");
-                dropdown.setValue(settings.mobileStatusAlign);
+                dropdown.setValue(settings.mobileStatus.align);
                 dropdown.onChange(async (value) => {
-                    await deps.updateSettings({ mobileStatusAlign: value as "left" | "right" });
+                    await deps.updateSettings({ mobileStatus: { ...settings.mobileStatus, align: value as "left" | "right" } });
                     deps.statusBar.applyPosition();
                 });
             });
@@ -41,10 +41,10 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
             .setName("Bottom (px)")
             .setDesc("Distance from the bottom of the screen.")
             .addText((text) =>
-                text.setValue(String(settings.mobileStatusBottom)).onChange(async (value) => {
+                text.setValue(String(settings.mobileStatus.bottom)).onChange(async (value) => {
                     const num = parseInt(value, 10);
                     if (!isNaN(num) && num >= 0) {
-                        await deps.updateSettings({ mobileStatusBottom: num });
+                        await deps.updateSettings({ mobileStatus: { ...settings.mobileStatus, bottom: num } });
                         deps.statusBar.applyPosition();
                     }
                 })
@@ -54,10 +54,10 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
             .setName("Horizontal offset (px)")
             .setDesc("Distance from the left or right edge.")
             .addText((text) =>
-                text.setValue(String(settings.mobileStatusOffset)).onChange(async (value) => {
+                text.setValue(String(settings.mobileStatus.offset)).onChange(async (value) => {
                     const num = parseInt(value, 10);
                     if (!isNaN(num) && num >= 0) {
-                        await deps.updateSettings({ mobileStatusOffset: num });
+                        await deps.updateSettings({ mobileStatus: { ...settings.mobileStatus, offset: num } });
                         deps.statusBar.applyPosition();
                     }
                 })

@@ -20,4 +20,16 @@ export function migrateSettings(data: Record<string, any>): void {
     if (!data.previousDeviceIds) {
         data.previousDeviceIds = [];
     }
+
+    // Migrate flat mobileStatus* fields to nested object (pre-v0.14)
+    if (data.mobileStatusAlign !== undefined || data.mobileStatusBottom !== undefined || data.mobileStatusOffset !== undefined) {
+        data.mobileStatus = {
+            align: data.mobileStatusAlign ?? "left",
+            bottom: data.mobileStatusBottom ?? 50,
+            offset: data.mobileStatusOffset ?? 8,
+        };
+        delete data.mobileStatusAlign;
+        delete data.mobileStatusBottom;
+        delete data.mobileStatusOffset;
+    }
 }

@@ -1,4 +1,13 @@
+/** Keep only the N most recent previous device IDs. */
+export const MAX_PREVIOUS_DEVICE_IDS = 10;
+
 export type ConnectionState = "editing" | "tested" | "setupDone" | "syncing";
+
+export interface MobileStatusPosition {
+    align: "left" | "right";
+    bottom: number;
+    offset: number;
+}
 
 export interface CouchSyncSettings {
     // Connection (shared between vault and config sync)
@@ -35,9 +44,7 @@ export interface CouchSyncSettings {
     historyMaxStorageMB: number;
 
     // Mobile status position
-    mobileStatusAlign: "left" | "right";
-    mobileStatusBottom: number;
-    mobileStatusOffset: number;
+    mobileStatus: MobileStatusPosition;
 
     // History
     historyExcludePatterns: string[];
@@ -49,13 +56,12 @@ export interface CouchSyncSettings {
     connectionState: ConnectionState;
     /** Human-readable device name used as the vclock key (e.g. "desktop", "iphone"). */
     deviceId: string;
-    /** Old deviceIds this device has used (UUIDs from pre-v0.12, renamed names). */
+    /** Old deviceIds this device has used (UUIDs from pre-v0.12, renamed names).
+     *  Capped at MAX_PREVIOUS_DEVICE_IDS to avoid unbounded growth. */
     previousDeviceIds: string[];
-    /**
-     * Fingerprint of the Obsidian installation this vault was last opened on.
-     * Compared against `localStorage["couchsync.installMarker"]` at startup.
-     * Mismatch triggers a warning notice (advisory only — deviceId is not changed).
-     */
+    /** Fingerprint of the Obsidian installation this vault was last opened on.
+     *  Compared at startup against `localStorage["couchsync.installMarker"]`;
+     *  mismatch triggers a warning notice (advisory only). */
     lastInstallMarker?: string;
 }
 
@@ -79,9 +85,7 @@ export const DEFAULT_SETTINGS: CouchSyncSettings = {
     historyMinIntervalMs: 60000,
     historyMaxStorageMB: 500,
 
-    mobileStatusAlign: "left",
-    mobileStatusBottom: 50,
-    mobileStatusOffset: 8,
+    mobileStatus: { align: "left", bottom: 50, offset: 8 },
 
     historyExcludePatterns: [],
 

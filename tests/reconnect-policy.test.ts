@@ -31,57 +31,57 @@ interface PolicyCase {
 
 const cases: PolicyCase[] = [
     // ── Auth latch is the highest priority — always skips ─────────
-    { state: "disconnected", reason: "manual",         authError: true,  coolDownActive: false, expected: "skip", note: "auth latch beats manual" },
-    { state: "syncing",      reason: "manual",         authError: true,  coolDownActive: false, expected: "skip" },
-    { state: "error",        reason: "network-online", authError: true,  coolDownActive: false, expected: "skip" },
+    { state: "disconnected", reason: "manual",         authError: true,  coolDownActive: false, expected: "skip", note: "auth latch beats manual — retrying with bad creds risks CouchDB lockout" },
+    { state: "syncing",      reason: "manual",         authError: true,  coolDownActive: false, expected: "skip", note: "same: auth latch is absolute, even mid-sync" },
+    { state: "error",        reason: "network-online", authError: true,  coolDownActive: false, expected: "skip", note: "network coming back can't fix bad credentials" },
 
     // ── Cool-down is second priority — beats everything except auth ─
-    { state: "disconnected", reason: "manual",         authError: false, coolDownActive: true,  expected: "skip", note: "cool-down beats manual" },
-    { state: "syncing",      reason: "stalled",        authError: false, coolDownActive: true,  expected: "skip" },
-    { state: "disconnected", reason: "periodic-tick",  authError: false, coolDownActive: true,  expected: "skip" },
+    { state: "disconnected", reason: "manual",         authError: false, coolDownActive: true,  expected: "skip", note: "cool-down prevents reconnect storms from rapid user clicks" },
+    { state: "syncing",      reason: "stalled",        authError: false, coolDownActive: true,  expected: "skip", note: "stall during cool-down: wait for cool-down to expire first" },
+    { state: "disconnected", reason: "periodic-tick",  authError: false, coolDownActive: true,  expected: "skip", note: "blind tick during cool-down is redundant" },
 
     // ── Healthy session (syncing/connected) ──────────────────────
-    { state: "syncing",   reason: "manual",         authError: false, coolDownActive: false, expected: "restart-now",       note: "manual always restarts even when healthy" },
-    { state: "connected", reason: "manual",         authError: false, coolDownActive: false, expected: "restart-now" },
-    { state: "syncing",   reason: "stalled",        authError: false, coolDownActive: false, expected: "restart-now",       note: "stall detection forces a restart" },
-    { state: "connected", reason: "stalled",        authError: false, coolDownActive: false, expected: "restart-now" },
-    { state: "syncing",   reason: "network-online", authError: false, coolDownActive: false, expected: "skip",               note: "healthy session ignores network hint" },
-    { state: "syncing",   reason: "app-foreground", authError: false, coolDownActive: false, expected: "skip" },
-    { state: "syncing",   reason: "periodic-tick",  authError: false, coolDownActive: false, expected: "skip",               note: "active session has its own stall logic" },
-    { state: "connected", reason: "network-online", authError: false, coolDownActive: false, expected: "skip" },
-    { state: "connected", reason: "app-foreground", authError: false, coolDownActive: false, expected: "skip" },
-    { state: "connected", reason: "periodic-tick",  authError: false, coolDownActive: false, expected: "skip" },
+    { state: "syncing",   reason: "manual",         authError: false, coolDownActive: false, expected: "restart-now",       note: "manual always restarts — user explicitly wants a fresh session" },
+    { state: "connected", reason: "manual",         authError: false, coolDownActive: false, expected: "restart-now",       note: "same: user intent overrides healthy state" },
+    { state: "syncing",   reason: "stalled",        authError: false, coolDownActive: false, expected: "restart-now",       note: "stall detection forces restart — pull loop is stuck" },
+    { state: "connected", reason: "stalled",        authError: false, coolDownActive: false, expected: "restart-now",       note: "same: stalled pull must be replaced" },
+    { state: "syncing",   reason: "network-online", authError: false, coolDownActive: false, expected: "skip",               note: "healthy session has a working connection — network hint is noise" },
+    { state: "syncing",   reason: "app-foreground", authError: false, coolDownActive: false, expected: "skip",               note: "tab focus doesn't invalidate an active longpoll" },
+    { state: "syncing",   reason: "periodic-tick",  authError: false, coolDownActive: false, expected: "skip",               note: "active session has its own stall logic via checkHealth" },
+    { state: "connected", reason: "network-online", authError: false, coolDownActive: false, expected: "skip",               note: "connected + network hint = already fine" },
+    { state: "connected", reason: "app-foreground", authError: false, coolDownActive: false, expected: "skip",               note: "same: longpoll is alive, no action needed" },
+    { state: "connected", reason: "periodic-tick",  authError: false, coolDownActive: false, expected: "skip",               note: "same: healthy session handles its own health checks" },
 
     // ── app-resume: socket may be silently dead (mobile / long bg) ─
-    { state: "syncing",      reason: "app-resume",     authError: false, coolDownActive: false, expected: "verify-then-restart", note: "mobile resume — don't trust healthy state" },
-    { state: "connected",    reason: "app-resume",     authError: false, coolDownActive: false, expected: "verify-then-restart" },
-    { state: "disconnected", reason: "app-resume",     authError: false, coolDownActive: false, expected: "verify-then-restart" },
-    { state: "error",        reason: "app-resume",     authError: false, coolDownActive: false, expected: "verify-then-restart" },
-    { state: "syncing",      reason: "app-resume",     authError: true,  coolDownActive: false, expected: "skip",                note: "auth latch beats app-resume" },
-    { state: "disconnected", reason: "app-resume",     authError: false, coolDownActive: true,  expected: "skip",                note: "cool-down beats app-resume" },
+    { state: "syncing",      reason: "app-resume",     authError: false, coolDownActive: false, expected: "verify-then-restart", note: "mobile resume — OS may have killed the socket in background" },
+    { state: "connected",    reason: "app-resume",     authError: false, coolDownActive: false, expected: "verify-then-restart", note: "same: can't trust socket liveness after long background" },
+    { state: "disconnected", reason: "app-resume",     authError: false, coolDownActive: false, expected: "verify-then-restart", note: "waking from dead state: verify server is reachable first" },
+    { state: "error",        reason: "app-resume",     authError: false, coolDownActive: false, expected: "verify-then-restart", note: "same: app-resume always verifies before restart" },
+    { state: "syncing",      reason: "app-resume",     authError: true,  coolDownActive: false, expected: "skip",                note: "auth latch beats app-resume — verifying with bad creds is pointless" },
+    { state: "disconnected", reason: "app-resume",     authError: false, coolDownActive: true,  expected: "skip",                note: "cool-down beats app-resume — recent restart is still settling" },
 
-    // ── Reconnecting (same as disconnected — restart already in progress) ─
-    { state: "reconnecting", reason: "manual",         authError: false, coolDownActive: false, expected: "restart-now",         note: "manual overrides in-progress reconnect" },
-    { state: "reconnecting", reason: "network-online", authError: false, coolDownActive: false, expected: "restart-now" },
-    { state: "reconnecting", reason: "periodic-tick",  authError: false, coolDownActive: false, expected: "verify-then-restart" },
-    { state: "reconnecting", reason: "app-resume",     authError: false, coolDownActive: false, expected: "verify-then-restart" },
+    // ── Reconnecting (restart already in progress) ───────────────
+    { state: "reconnecting", reason: "manual",         authError: false, coolDownActive: false, expected: "restart-now",         note: "manual overrides in-progress reconnect — user wants a clean restart" },
+    { state: "reconnecting", reason: "network-online", authError: false, coolDownActive: false, expected: "restart-now",         note: "network just came up — restart immediately with fresh connection" },
+    { state: "reconnecting", reason: "periodic-tick",  authError: false, coolDownActive: false, expected: "verify-then-restart", note: "blind tick during reconnect — verify first, don't pile on" },
+    { state: "reconnecting", reason: "app-resume",     authError: false, coolDownActive: false, expected: "verify-then-restart", note: "same: app-resume always verifies" },
 
     // ── Dead/unhealthy session (disconnected/error) ──────────────
-    { state: "disconnected", reason: "manual",         authError: false, coolDownActive: false, expected: "restart-now",         note: "manual restarts dead session immediately" },
-    { state: "disconnected", reason: "network-online", authError: false, coolDownActive: false, expected: "restart-now",         note: "browser network up — strong hint" },
-    { state: "disconnected", reason: "app-foreground", authError: false, coolDownActive: false, expected: "restart-now",         note: "mobile resume — strong hint" },
+    { state: "disconnected", reason: "manual",         authError: false, coolDownActive: false, expected: "restart-now",         note: "manual restarts dead session immediately — user intent" },
+    { state: "disconnected", reason: "network-online", authError: false, coolDownActive: false, expected: "restart-now",         note: "browser network up — strong hint, restart immediately" },
+    { state: "disconnected", reason: "app-foreground", authError: false, coolDownActive: false, expected: "restart-now",         note: "tab/app visible — user is active, restore sync" },
     { state: "disconnected", reason: "periodic-tick",  authError: false, coolDownActive: false, expected: "verify-then-restart", note: "blind tick — verify first to avoid restart storm against down server" },
-    { state: "error",        reason: "manual",         authError: false, coolDownActive: false, expected: "restart-now" },
-    { state: "error",        reason: "network-online", authError: false, coolDownActive: false, expected: "restart-now" },
-    { state: "error",        reason: "app-foreground", authError: false, coolDownActive: false, expected: "restart-now" },
-    { state: "error",        reason: "periodic-tick",  authError: false, coolDownActive: false, expected: "verify-then-restart" },
-    { state: "error",        reason: "stalled",        authError: false, coolDownActive: false, expected: "restart-now",         note: "stalled-while-error: somebody marked us as stalled in error, treat as a strong hint to retry" },
+    { state: "error",        reason: "manual",         authError: false, coolDownActive: false, expected: "restart-now",         note: "user explicitly retrying after error — honour immediately" },
+    { state: "error",        reason: "network-online", authError: false, coolDownActive: false, expected: "restart-now",         note: "network restored after error — strong signal to retry" },
+    { state: "error",        reason: "app-foreground", authError: false, coolDownActive: false, expected: "restart-now",         note: "user returned to app during error — try again" },
+    { state: "error",        reason: "periodic-tick",  authError: false, coolDownActive: false, expected: "verify-then-restart", note: "blind tick in error — verify first, server may still be down" },
+    { state: "error",        reason: "stalled",        authError: false, coolDownActive: false, expected: "restart-now",         note: "stalled-while-error: strong hint to retry (shouldn't normally happen)" },
 
     // ── retry-backoff: dedicated hard-error recovery ticks ────────
-    { state: "error",        reason: "retry-backoff",  authError: false, coolDownActive: false, expected: "verify-then-restart", note: "backoff tick uses verify-then-restart" },
-    { state: "error",        reason: "retry-backoff",  authError: false, coolDownActive: true,  expected: "verify-then-restart", note: "backoff tick bypasses the 5s cool-down — the backoff schedule IS the cadence control" },
-    { state: "error",        reason: "retry-backoff",  authError: true,  coolDownActive: false, expected: "skip",                note: "auth latch still beats retry-backoff" },
-    { state: "disconnected", reason: "retry-backoff",  authError: false, coolDownActive: false, expected: "verify-then-restart" },
+    { state: "error",        reason: "retry-backoff",  authError: false, coolDownActive: false, expected: "verify-then-restart", note: "backoff tick — verify first, don't blindly reconnect to a down server" },
+    { state: "error",        reason: "retry-backoff",  authError: false, coolDownActive: true,  expected: "verify-then-restart", note: "backoff bypasses 5s cool-down — the backoff schedule IS the cadence control" },
+    { state: "error",        reason: "retry-backoff",  authError: true,  coolDownActive: false, expected: "skip",                note: "auth latch still beats retry-backoff — no point retrying bad creds" },
+    { state: "disconnected", reason: "retry-backoff",  authError: false, coolDownActive: false, expected: "verify-then-restart", note: "backoff from disconnected — same verify-first approach" },
 ];
 
 describe("decideReconnect — gateway policy table", () => {

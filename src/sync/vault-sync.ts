@@ -35,24 +35,31 @@ export interface IWriteIgnore {
 }
 
 export class VaultSync {
+    // ── In-memory caches (load → mutate → debounced flush) ───
+
     /**
-     * In-memory map of vault path → vclock at the time of the last
-     * successful sync write (dbToFile or fileToDb). Used by
-     * compareFileToDoc to detect local drift without relying on
+     * vault path → vclock at the time of the last successful sync write.
+     * Used by compareFileToDoc to detect local drift without relying on
      * cross-device mtime comparison (which breaks under clock skew).
+     *
+     * Load: eager via loadLastSyncedVclocks() at plugin init.
+     * Flush: debounced (5 s) via scheduleFlush().
      */
     private lastSyncedVclock = new Map<string, VectorClock>();
-    /** Timer handle for debounced persistence of lastSyncedVclock. */
-    private vclockFlushTimer: ReturnType<typeof setTimeout> | null = null;
-    /** Whether the in-memory map has unflushed changes. */
-    private vclockDirty = false;
+
     /**
-     * In-memory mirror of `_local/skipped-files` paths. Initialised lazily on
-     * the first `fileToDb` that might touch it, then kept in sync with the
-     * doc. Lets the hot path skip a DB read on every successful file
-     * sync (which is ~every file edit via ChangeTracker).
+     * In-memory mirror of `_local/skipped-files` paths. Lets the hot
+     * path skip a DB read on every successful file sync.
+     *
+     * Load: lazy on first fileToDb that might touch it.
+     * Writes: immediate (recordSkipped/forgetSkipped) — metadata in
+     *   the DB doc (sizeMB, skippedAt) prevents batching.
      */
     private skippedPaths: Set<string> | null = null;
+
+    /** Debounce timer for vclock persistence (at most one write every 5 s). */
+    private flushTimer: ReturnType<typeof setTimeout> | null = null;
+    private vclockDirty = false;
 
     constructor(
         private app: App,
@@ -84,11 +91,9 @@ export class VaultSync {
         }
     }
 
-    /**
-     * Flush lastSyncedVclock to the local DB. Debounced — only the latest
-     * snapshot is persisted, at most once every 5 seconds.
-     */
-    async flushLastSyncedVclocks(): Promise<void> {
+    // ── Unified flush ────────────────────────────────────
+
+    private async flushVclocks(): Promise<void> {
         this.vclockDirty = false;
         const obj: Record<string, VectorClock> = {};
         for (const [path, vc] of this.lastSyncedVclock) {
@@ -97,28 +102,28 @@ export class VaultSync {
         await this.db.putLastSyncedVclocks(obj);
     }
 
-    private scheduleVclockFlush(): void {
+    private scheduleFlush(): void {
         this.vclockDirty = true;
-        if (this.vclockFlushTimer) return;
-        this.vclockFlushTimer = setTimeout(() => {
-            this.vclockFlushTimer = null;
-            this.flushLastSyncedVclocks().catch((e) =>
-                logError(`CouchSync: failed to persist lastSyncedVclocks: ${e?.message ?? e}`),
+        if (this.flushTimer) return;
+        this.flushTimer = setTimeout(() => {
+            this.flushTimer = null;
+            this.flushVclocks().catch((e) =>
+                logError(`CouchSync: vclock flush failed: ${e?.message ?? e}`),
             );
         }, 5_000);
     }
 
     /**
      * Cancel pending flush timer and persist if dirty. Call from plugin
-     * unload to avoid losing recent vclock state.
+     * unload to avoid losing recent state.
      */
     async teardown(): Promise<void> {
-        if (this.vclockFlushTimer) {
-            clearTimeout(this.vclockFlushTimer);
-            this.vclockFlushTimer = null;
+        if (this.flushTimer) {
+            clearTimeout(this.flushTimer);
+            this.flushTimer = null;
         }
         if (this.vclockDirty) {
-            await this.flushLastSyncedVclocks();
+            await this.flushVclocks();
         }
     }
 
@@ -140,9 +145,7 @@ export class VaultSync {
         const chunkIds = chunks.map((c) => c._id);
 
         const quickCheck = await this.db.getFileDoc(file.path);
-        if (quickCheck &&
-            quickCheck.chunks.length === chunkIds.length &&
-            quickCheck.chunks.every((id, i) => id === chunkIds[i])) {
+        if (quickCheck && VaultSync.chunksEqual(quickCheck.chunks, chunkIds)) {
             return;
         }
 
@@ -151,9 +154,7 @@ export class VaultSync {
         const deviceId = this.getSettings().deviceId;
         let pushedVclock: VectorClock | undefined;
         await this.db.update<FileDoc>(makeFileId(file.path), (existing) => {
-            if (existing &&
-                existing.chunks.length === chunkIds.length &&
-                existing.chunks.every((id, i) => id === chunkIds[i])) {
+            if (existing && VaultSync.chunksEqual(existing.chunks, chunkIds)) {
                 return null;
             }
             const vc = incrementVC(existing?.vclock, deviceId);
@@ -170,7 +171,7 @@ export class VaultSync {
         });
         if (pushedVclock) {
             this.lastSyncedVclock.set(file.path, pushedVclock);
-            this.scheduleVclockFlush();
+            this.scheduleFlush();
         }
     }
 
@@ -200,13 +201,8 @@ export class VaultSync {
         if (existing && "stat" in existing) {
             const localFile = existing as TFile;
             if (localFile.stat.size === fileDoc.size) {
-                const localContent = await this.app.vault.readBinary(localFile);
-                const localChunks = await splitIntoChunks(localContent);
-                const localChunkIds = localChunks.map((c) => c._id);
-                if (
-                    localChunkIds.length === fileDoc.chunks.length &&
-                    localChunkIds.every((id, i) => id === fileDoc.chunks[i])
-                ) {
+                const ids = await this.localChunkIds(localFile);
+                if (VaultSync.chunksEqual(ids, fileDoc.chunks)) {
                     return; // Content identical, skip
                 }
             }
@@ -254,7 +250,7 @@ export class VaultSync {
 
         if (writtenFile) {
             this.lastSyncedVclock.set(vaultPath, { ...(fileDoc.vclock ?? {}) });
-            this.scheduleVclockFlush();
+            this.scheduleFlush();
         }
 
         // Record this sync-driven write as a history entry. captureSyncWrite
@@ -280,13 +276,8 @@ export class VaultSync {
      */
     async compareFileToDoc(fileDoc: FileDoc, localFile: TFile): Promise<CompareResult> {
         if (localFile.stat.size === fileDoc.size) {
-            const localContent = await this.app.vault.readBinary(localFile);
-            const localChunks = await splitIntoChunks(localContent);
-            const localChunkIds = localChunks.map((c) => c._id);
-            if (
-                localChunkIds.length === fileDoc.chunks.length &&
-                localChunkIds.every((id, i) => id === fileDoc.chunks[i])
-            ) {
+            const ids = await this.localChunkIds(localFile);
+            if (VaultSync.chunksEqual(ids, fileDoc.chunks)) {
                 return "identical";
             }
         }
@@ -301,7 +292,7 @@ export class VaultSync {
 
     async markDeleted(path: string): Promise<void> {
         this.lastSyncedVclock.delete(path);
-        this.scheduleVclockFlush();
+        this.scheduleFlush();
         await this.db.update<FileDoc>(makeFileId(path), (existing) => {
             if (!existing) return null;
             return {
@@ -359,6 +350,22 @@ export class VaultSync {
         delete doc.files[path];
         await this.db.putSkippedFiles(doc);
         this.skippedPaths?.delete(path);
+    }
+
+    /**
+     * Read a vault file's binary content, chunk it, and return just the
+     * chunk IDs. Used by fileToDb, dbToFile, and compareFileToDoc to
+     * detect content identity without materialising the full chunk docs.
+     */
+    private async localChunkIds(file: TFile): Promise<string[]> {
+        const content = await this.app.vault.readBinary(file);
+        const chunks = await splitIntoChunks(content);
+        return chunks.map((c) => c._id);
+    }
+
+    /** True when two ordered chunk-ID lists are identical. */
+    private static chunksEqual(a: string[], b: string[]): boolean {
+        return a.length === b.length && a.every((id, i) => id === b[i]);
     }
 
     private shouldSync(path: string): boolean {

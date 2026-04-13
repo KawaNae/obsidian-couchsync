@@ -123,9 +123,10 @@ export class StatusBar {
     applyPosition(): void {
         if (!this.floatingEl) return;
         const s = this.getSettings();
-        this.floatingEl.style.bottom = `${s.mobileStatusBottom}px`;
-        this.floatingEl.style.left = s.mobileStatusAlign === "left" ? `${s.mobileStatusOffset}px` : "";
-        this.floatingEl.style.right = s.mobileStatusAlign === "right" ? `${s.mobileStatusOffset}px` : "";
+        const m = s.mobileStatus;
+        this.floatingEl.style.bottom = `${m.bottom}px`;
+        this.floatingEl.style.left = m.align === "left" ? `${m.offset}px` : "";
+        this.floatingEl.style.right = m.align === "right" ? `${m.offset}px` : "";
     }
 
     destroy(): void {

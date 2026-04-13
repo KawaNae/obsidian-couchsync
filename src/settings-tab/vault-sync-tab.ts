@@ -13,7 +13,7 @@
  * tight: "everything that controls vault sync lives here".
  */
 import { type App, Notice, Setting, type ButtonComponent } from "obsidian";
-import type { ConnectionState, CouchSyncSettings } from "../settings.ts";
+import { MAX_PREVIOUS_DEVICE_IDS, type ConnectionState, type CouchSyncSettings } from "../settings.ts";
 import type { SyncEngine } from "../db/sync-engine.ts";
 import type { LocalDB } from "../db/local-db.ts";
 import { validateDeviceName } from "../utils/device-name.ts";
@@ -400,7 +400,7 @@ export class VaultSyncTab {
                         }
                         await this.deps.updateSettings({
                             deviceId: inputValue,
-                            previousDeviceIds: prev,
+                            previousDeviceIds: prev.slice(-MAX_PREVIOUS_DEVICE_IDS),
                         });
                     } else {
                         await this.deps.updateSettings({ deviceId: inputValue });

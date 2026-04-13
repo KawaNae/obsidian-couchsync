@@ -99,11 +99,27 @@ export class ConfigSync {
 
     // ── High-level operations ──────────────────────────
 
+    /**
+     * Run a config-sync operation with ProgressNotice lifecycle:
+     * update() during work, done() on success, fail() + rethrow on error.
+     */
+    private async withProgress<T>(
+        label: string,
+        op: (progress: ProgressNotice) => Promise<T>,
+    ): Promise<T> {
+        const progress = new ProgressNotice(label);
+        try {
+            return await op(progress);
+        } catch (e: any) {
+            progress.fail(`${label} failed: ${e?.message ?? e}`);
+            throw e;
+        }
+    }
+
     /** Init: delete all local config docs → scan .obsidian/ → push to remote */
     async init(): Promise<number> {
         const db = this.requireConfigDb();
-        const progress = new ProgressNotice("Config Init");
-        try {
+        return this.withProgress("Config Init", async (progress) => {
             progress.update("Deleting old config docs...");
             const deletedIds = await db.deleteByPrefix(DOC_ID.CONFIG);
 
@@ -129,17 +145,13 @@ export class ConfigSync {
 
             progress.done(`Config init: deleted ${deletedIds.length}, pushed ${scanned} file(s).`);
             return scanned;
-        } catch (e: any) {
-            progress.fail(`Config init failed: ${e?.message ?? e}`);
-            throw e;
-        }
+        });
     }
 
     /** Push: scan .obsidian/ → push config docs to remote */
     async push(): Promise<number> {
         const db = this.requireConfigDb();
-        const progress = new ProgressNotice("Config Push");
-        try {
+        return this.withProgress("Config Push", async (progress) => {
             const scanned = await this.scan((path, i, total) => {
                 progress.update(`Scanning: ${path} (${i}/${total})`);
             });
@@ -160,17 +172,13 @@ export class ConfigSync {
 
             progress.done(`Pushed ${scanned} config file(s).`);
             return scanned;
-        } catch (e: any) {
-            progress.fail(`Config push failed: ${e?.message ?? e}`);
-            throw e;
-        }
+        });
     }
 
     /** Pull: pull config docs from remote → write configSyncPaths to filesystem */
     async pull(): Promise<number> {
         const db = this.requireConfigDb();
-        const progress = new ProgressNotice("Config Pull");
-        try {
+        return this.withProgress("Config Pull", async (progress) => {
             progress.update("Pulling config from remote...");
             await this.withConfigRemote((client) =>
                 remoteCouch.pullByPrefix(db, client, DOC_ID.CONFIG),
@@ -182,10 +190,7 @@ export class ConfigSync {
 
             progress.done(`Pulled ${written} config file(s). Reload Obsidian to apply.`);
             return written;
-        } catch (e: any) {
-            progress.fail(`Config pull failed: ${e?.message ?? e}`);
-            throw e;
-        }
+        });
     }
 
     // ── Low-level operations ───────────────────────────

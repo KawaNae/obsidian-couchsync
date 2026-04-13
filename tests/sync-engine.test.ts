@@ -208,126 +208,15 @@ describe("SyncEngine state machine", () => {
     });
 });
 
-describe("SyncEngine error handling", () => {
-    afterEach(() => { vi.useRealTimers(); });
-
-    it("auth error -> state=error, isAuthBlocked=true, no retries scheduled", async () => {
-        vi.useFakeTimers();
-        try {
-            const engine = makeSyncEngine(makeMockLocalDb(), makeMockClient());
-
-            (engine as any).errorRecovery.enterHardError({
-                kind: "auth", code: 401,
-                message: "Authentication failed (401).",
-            });
-
-            expect(engine.getState()).toBe("error");
-            expect(engine.isAuthBlocked()).toBe(true);
-            expect((engine as any).errorRecovery.errorRetryTimer).toBeNull();
-
-            await vi.advanceTimersByTimeAsync(60_000);
-            expect(engine.getState()).toBe("error");
-            engine.stop();
-        } finally { vi.useRealTimers(); }
-    });
-
-    it("transient error -> reconnecting, escalates to error after 10s", async () => {
-        vi.useFakeTimers();
-        try {
-            const engine = makeSyncEngine(makeMockLocalDb(), makeMockClient());
-            const retrySpy = vi.spyOn(engine as any, "requestReconnect").mockResolvedValue(undefined);
-
-            (engine as any).errorRecovery.handleTransientError({ message: "ECONNREFUSED" });
-
-            expect(engine.getState()).toBe("reconnecting");
-            expect(engine.getLastErrorDetail()).toBeNull();
-
-            await vi.advanceTimersByTimeAsync(9_999);
-            expect(engine.getState()).toBe("reconnecting");
-
-            await vi.advanceTimersByTimeAsync(2);
-            expect(engine.getState()).toBe("error");
-            expect(engine.getLastErrorDetail()?.kind).toBe("network");
-
-            retrySpy.mockRestore();
-            engine.stop();
-        } finally { vi.useRealTimers(); }
-    });
-
-    it("transient error that recovers before 10s -> no escalation", async () => {
-        vi.useFakeTimers();
-        try {
-            const engine = makeSyncEngine(makeMockLocalDb(), makeMockClient());
-
-            (engine as any).errorRecovery.handleTransientError({ message: "ECONNREFUSED" });
-            expect(engine.getState()).toBe("reconnecting");
-
-            (engine as any).setState("syncing");
-            expect((engine as any).errorRecovery.transientErrorTimer).toBeNull();
-
-            await vi.advanceTimersByTimeAsync(11_000);
-            expect(engine.getState()).toBe("syncing");
-            expect(engine.getLastErrorDetail()).toBeNull();
-            engine.stop();
-        } finally { vi.useRealTimers(); }
-    });
-
-    it("hard error fires backoff retries at 2s, 5s, 10s schedule", async () => {
-        vi.useFakeTimers();
-        try {
-            const engine = makeSyncEngine(makeMockLocalDb(), makeMockClient());
-            const retrySpy = vi.spyOn(engine as any, "requestReconnect").mockResolvedValue(undefined);
-
-            (engine as any).errorRecovery.enterHardError({ kind: "network", message: "fake down" });
-
-            expect(retrySpy).toHaveBeenCalledTimes(0);
-            await vi.advanceTimersByTimeAsync(2_000);
-            expect(retrySpy).toHaveBeenCalledTimes(1);
-            expect(retrySpy).toHaveBeenLastCalledWith("retry-backoff");
-
-            await vi.advanceTimersByTimeAsync(5_000);
-            expect(retrySpy).toHaveBeenCalledTimes(2);
-
-            await vi.advanceTimersByTimeAsync(10_000);
-            expect(retrySpy).toHaveBeenCalledTimes(3);
-
-            retrySpy.mockRestore();
-            engine.stop();
-        } finally { vi.useRealTimers(); }
-    });
-
-    it("recovery resets backoff step to 0", async () => {
-        vi.useFakeTimers();
-        try {
-            const engine = makeSyncEngine(makeMockLocalDb(), makeMockClient());
-            const retrySpy = vi.spyOn(engine as any, "requestReconnect").mockResolvedValue(undefined);
-
-            (engine as any).errorRecovery.enterHardError({ kind: "network", message: "fake" });
-            await vi.advanceTimersByTimeAsync(2_000); // step 0
-            await vi.advanceTimersByTimeAsync(5_000); // step 1
-            expect((engine as any).errorRecovery.errorRetryStep).toBe(2);
-
-            (engine as any).setState("connected");
-            expect((engine as any).errorRecovery.errorRetryStep).toBe(0);
-            expect((engine as any).errorRecovery.errorRetryTimer).toBeNull();
-
-            retrySpy.mockClear();
-            (engine as any).errorRecovery.enterHardError({ kind: "network", message: "again" });
-            await vi.advanceTimersByTimeAsync(2_000);
-            expect(retrySpy).toHaveBeenCalledTimes(1);
-
-            retrySpy.mockRestore();
-            engine.stop();
-        } finally { vi.useRealTimers(); }
-    });
+describe("SyncEngine error integration", () => {
+    // Detailed ErrorRecovery tests live in error-recovery.test.ts.
+    // These tests verify the SyncEngine ↔ ErrorRecovery integration
+    // through public SyncEngine methods only.
 
     it("start() clears authError flag", async () => {
         const engine = makeSyncEngine(makeMockLocalDb(), makeMockClient());
 
-        (engine as any).errorRecovery.enterHardError({
-            kind: "auth", code: 401,
-            message: "Authentication failed (401).",
-        });
+        engine.markAuthError(401, "test");
         expect(engine.isAuthBlocked()).toBe(true);
 
         await engine.start();
@@ -335,24 +224,16 @@ describe("SyncEngine error handling", () => {
         engine.stop();
     });
 
-    it("classifyError heuristics", () => {
-        const engine = makeSyncEngine(makeMockLocalDb(), makeMockClient());
-        const classify = (err: any) => (engine as any).errorRecovery.classifyError(err);
+    it("catchup error from changes() enters hard error with classification", async () => {
+        const mockClient = makeMockClient({
+            changes: vi.fn().mockRejectedValue(new Error("ECONNREFUSED")),
+        });
+        const engine = makeSyncEngine(makeMockLocalDb(), mockClient);
 
-        expect(classify({ status: 401, message: "nope" }).kind).toBe("auth");
-        expect(classify({ status: 403, message: "nope" }).kind).toBe("auth");
-        expect(classify({ status: 500, message: "oops" }).kind).toBe("server");
-        expect(classify({ status: 503, message: "down" }).kind).toBe("server");
-        expect(classify({ message: "request timed out" }).kind).toBe("timeout");
-        expect(classify({ message: "ECONNREFUSED" }).kind).toBe("network");
-        expect(classify({ message: "Failed to fetch" }).kind).toBe("network");
-        expect(classify({ message: "ENOTFOUND host.example" }).kind).toBe("network");
-        expect(classify({ message: "something weird" }).kind).toBe("unknown");
-        // HTTP code takes priority over message.
-        expect(classify({ status: 401, message: "connection timed out" }).kind).toBe("auth");
-        // Code is preserved.
-        expect(classify({ status: 503, message: "down" }).code).toBe(503);
+        await engine.start();
 
+        expect(engine.getState()).toBe("error");
+        expect(engine.getLastErrorDetail()?.kind).toBe("network");
         engine.stop();
     });
 });
@@ -406,27 +287,8 @@ describe("SyncEngine catchup pull", () => {
         engine.stop();
     });
 
-    it("catchup error from changes() enters hard error with classification", async () => {
-        const mockClient = makeMockClient({
-            changes: vi.fn().mockRejectedValue(new Error("ECONNREFUSED")),
-        });
-        const engine = makeSyncEngine(makeMockLocalDb(), mockClient);
-
-        await engine.start();
-
-        expect(engine.getState()).toBe("error");
-        expect(engine.getLastErrorDetail()?.kind).toBe("network");
-        engine.stop();
-    });
-
-    it("catchup timeout message is classified as timeout kind", () => {
-        // The catchup loop throws "Catchup timed out" when 60s pass
-        // with no progress. Verify this message classifies correctly.
-        const engine = makeSyncEngine(makeMockLocalDb(), makeMockClient());
-        const detail = (engine as any).errorRecovery.classifyError(new Error("Catchup timed out"));
-        expect(detail.kind).toBe("timeout");
-        engine.stop();
-    });
+    // catchup error classification is tested in error-recovery.test.ts
+    // and the integration case is in "SyncEngine error integration" above.
 });
 
 describe("SyncEngine live sync", () => {

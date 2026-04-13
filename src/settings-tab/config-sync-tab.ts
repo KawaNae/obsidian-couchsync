@@ -388,7 +388,8 @@ export class ConfigSyncTab {
 
 // ── Suggestion list (migrated from files-tab.ts) ────────
 
-let cachedRemotePaths: { files: string[]; folders: string[] } | null = null;
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+let cachedRemotePaths: { files: string[]; folders: string[]; fetchedAt: number } | null = null;
 
 function groupPaths(paths: string[]): { files: string[]; folders: string[] } {
     const files: string[] = [];
@@ -410,10 +411,13 @@ async function loadSuggestions(suggestionsEl: HTMLElement, deps: ConfigSyncTabDe
     suggestionsEl.style.display = "block";
     const currentPaths = new Set(deps.getSettings().configSyncPaths);
 
+    const cacheExpired = cachedRemotePaths && Date.now() - cachedRemotePaths.fetchedAt > CACHE_TTL_MS;
+    if (cacheExpired) cachedRemotePaths = null;
+
     if (!cachedRemotePaths && !deps.replicator.isAuthBlocked()) {
         try {
             const rawPaths = await deps.configSync.listRemotePaths();
-            cachedRemotePaths = groupPaths(rawPaths);
+            cachedRemotePaths = { ...groupPaths(rawPaths), fetchedAt: Date.now() };
         } catch (e: any) {
             if (e?.status === 401 || e?.status === 403) {
                 deps.replicator.markAuthError(e.status, e.message ?? "Auth failed");
