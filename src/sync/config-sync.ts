@@ -46,7 +46,7 @@ export class ConfigSync {
 
     constructor(
         private app: App,
-        private configDb: ConfigLocalDB,
+        private configDb: ConfigLocalDB | null,
         private replicator: SyncEngine,
         private getSettings: () => CouchSyncSettings,
     ) {}
@@ -101,10 +101,11 @@ export class ConfigSync {
 
     /** Init: delete all local config docs → scan .obsidian/ → push to remote */
     async init(): Promise<number> {
+        const db = this.requireConfigDb();
         const progress = new ProgressNotice("Config Init");
         try {
             progress.update("Deleting old config docs...");
-            const deletedIds = await this.configDb.deleteByPrefix(DOC_ID.CONFIG);
+            const deletedIds = await db.deleteByPrefix(DOC_ID.CONFIG);
 
             const scanned = await this.scan((path, i, total) => {
                 progress.update(`Scanning: ${path} (${i}/${total})`);
@@ -116,7 +117,7 @@ export class ConfigSync {
             if (affectedIds.length > 0) {
                 await this.withConfigRemote((client) =>
                     remoteCouch.pushDocs(
-                        this.configDb,
+                        db,
                         client,
                         affectedIds,
                         (docId, n) => {
@@ -136,6 +137,7 @@ export class ConfigSync {
 
     /** Push: scan .obsidian/ → push config docs to remote */
     async push(): Promise<number> {
+        const db = this.requireConfigDb();
         const progress = new ProgressNotice("Config Push");
         try {
             const scanned = await this.scan((path, i, total) => {
@@ -146,7 +148,7 @@ export class ConfigSync {
             if (docIds.length > 0) {
                 await this.withConfigRemote((client) =>
                     remoteCouch.pushDocs(
-                        this.configDb,
+                        db,
                         client,
                         docIds,
                         (docId, n) => {
@@ -166,11 +168,12 @@ export class ConfigSync {
 
     /** Pull: pull config docs from remote → write configSyncPaths to filesystem */
     async pull(): Promise<number> {
+        const db = this.requireConfigDb();
         const progress = new ProgressNotice("Config Pull");
         try {
             progress.update("Pulling config from remote...");
             await this.withConfigRemote((client) =>
-                remoteCouch.pullByPrefix(this.configDb, client, DOC_ID.CONFIG),
+                remoteCouch.pullByPrefix(db, client, DOC_ID.CONFIG),
             );
 
             const written = await this.write((path, i, total) => {
@@ -189,6 +192,7 @@ export class ConfigSync {
 
     /** Scan entire .obsidian/ directory to local DB */
     async scan(onProgress?: (path: string, index: number, total: number) => void): Promise<number> {
+        const db = this.requireConfigDb();
         const files: string[] = [];
         await this.listFilesRecursive(".obsidian", files);
 
@@ -210,7 +214,7 @@ export class ConfigSync {
                 const data = arrayBufferToBase64(buf);
 
                 const configId = makeConfigId(file);
-                await this.configDb.update<ConfigDoc>(configId, (existing) => ({
+                await db.update<ConfigDoc>(configId, (existing) => ({
                     _id: configId,
                     type: "config",
                     data,
@@ -228,6 +232,7 @@ export class ConfigSync {
 
     /** Write config docs to filesystem, filtered by configSyncPaths */
     async write(onProgress?: (path: string, index: number, total: number) => void): Promise<number> {
+        const db = this.requireConfigDb();
         const paths = this.getSettings().configSyncPaths;
         if (paths.length === 0) return 0;
 
@@ -236,7 +241,7 @@ export class ConfigSync {
             if (p.endsWith("/")) {
                 // Prefix-range scan for everything under the folder.
                 const prefix = makeConfigId(p.replace(/\/$/, "") + "/");
-                const result = await this.configDb.allDocs({
+                const result = await db.allDocs({
                     startkey: prefix,
                     endkey: prefix + "\ufff0",
                     include_docs: true,
@@ -251,7 +256,7 @@ export class ConfigSync {
                     });
                 }
             } else {
-                const doc = await this.configDb.get(makeConfigId(p));
+                const doc = await db.get(makeConfigId(p));
                 if (doc) entries.push({ path: p, data: doc.data });
             }
         }
@@ -276,9 +281,17 @@ export class ConfigSync {
 
     // ── Utilities (public for settings UI) ─────────────
 
-    /** True when config sync has a target DB configured. */
+    /** True when config sync has a target DB configured and a local store exists. */
     isConfigured(): boolean {
-        return this.makeConfigClient() !== null;
+        return this.configDb !== null && this.makeConfigClient() !== null;
+    }
+
+    /** Return the config DB, throwing if not configured. */
+    private requireConfigDb(): ConfigLocalDB {
+        if (!this.configDb) {
+            throw new Error("Config sync not configured (no local config DB)");
+        }
+        return this.configDb;
     }
 
     /** List config file paths available on remote */
@@ -339,7 +352,7 @@ export class ConfigSync {
     // ── Private ────────────────────────────────────────
 
     private async allDocIds(): Promise<string[]> {
-        const docs = await this.configDb.allConfigDocs();
+        const docs = await this.requireConfigDb().allConfigDocs();
         return docs.map((d) => d._id);
     }
 

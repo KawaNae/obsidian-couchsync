@@ -47,7 +47,11 @@ function extractVaultPath(id: string): string {
 }
 
 export class ConflictResolver {
-    private onConcurrent: OnConcurrentConflict | null = null;
+    private onConcurrent: OnConcurrentConflict | null;
+
+    constructor(onConcurrent: OnConcurrentConflict | null = null) {
+        this.onConcurrent = onConcurrent;
+    }
 
     setOnConcurrent(handler: OnConcurrentConflict): void {
         this.onConcurrent = handler;

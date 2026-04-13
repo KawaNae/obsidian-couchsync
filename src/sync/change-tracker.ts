@@ -1,9 +1,14 @@
-import type { App, TFile } from "obsidian";
-import type { VaultSync } from "./vault-sync.ts";
+import type { App, TAbstractFile, TFile } from "obsidian";
+import type { VaultSync, IWriteIgnore } from "./vault-sync.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import { logError } from "../ui/log.ts";
 
-export class ChangeTracker {
+/** Narrow TAbstractFile to TFile by checking for the `stat` property. */
+function isTFile(file: TAbstractFile): file is TFile {
+    return "stat" in file;
+}
+
+export class ChangeTracker implements IWriteIgnore {
     private timers = new Map<string, ReturnType<typeof setTimeout>>();
     private pendingMinInterval = new Map<string, ReturnType<typeof setTimeout>>();
     private lastSyncTime = new Map<string, number>();
@@ -32,19 +37,17 @@ export class ChangeTracker {
     start(): void {
         this.eventRefs.push(
             this.app.vault.on("modify", (file) => {
-                if (file instanceof Object && "path" in file && "stat" in file) {
-                    if (this.pendingWriteIgnores.delete(file.path)) return;
-                    this.scheduleSync(file as TFile);
-                }
+                if (!isTFile(file)) return;
+                if (this.pendingWriteIgnores.delete(file.path)) return;
+                this.scheduleSync(file);
             })
         );
 
         this.eventRefs.push(
             this.app.vault.on("create", (file) => {
-                if (file instanceof Object && "stat" in file) {
-                    if (this.pendingWriteIgnores.delete((file as TFile).path)) return;
-                    this.scheduleSync(file as TFile);
-                }
+                if (!isTFile(file)) return;
+                if (this.pendingWriteIgnores.delete(file.path)) return;
+                this.scheduleSync(file);
             })
         );
 
@@ -65,9 +68,9 @@ export class ChangeTracker {
             this.app.vault.on("rename", (file, oldPath) => {
                 this.cancelPending(oldPath);
                 this.lastSyncTime.delete(oldPath);
-                if (!this.paused && file instanceof Object && "stat" in file) {
-                    this.vaultSync.handleRename(file as TFile, oldPath).catch((e) =>
-                        logError(`CouchSync: handleRename failed: ${oldPath} → ${(file as TFile).path} ${e?.message ?? e}`),
+                if (!this.paused && isTFile(file)) {
+                    this.vaultSync.handleRename(file, oldPath).catch((e) =>
+                        logError(`CouchSync: handleRename failed: ${oldPath} → ${file.path} ${e?.message ?? e}`),
                     );
                 }
             })

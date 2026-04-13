@@ -9,10 +9,10 @@ import { ConfigSync } from "./sync/config-sync.ts";
 import { SetupService } from "./sync/setup.ts";
 import { ChangeTracker } from "./sync/change-tracker.ts";
 import { Reconciler, type ReconcileReason } from "./sync/reconciler.ts";
-import { ConflictResolver } from "./conflict/conflict-resolver.ts";
+import { ConflictOrchestrator } from "./conflict/conflict-orchestrator.ts";
 import { checkInstallMarker } from "./sync/install-marker.ts";
 import { StatusBar } from "./ui/status-bar.ts";
-import { initLog, logDebug, logInfo, logError, logWarn, notify } from "./ui/log.ts";
+import { initLog, logError, logWarn, notify } from "./ui/log.ts";
 import { CouchSyncSettingTab } from "./settings-tab/index.ts";
 import { ProgressNotice } from "./ui/notices.ts";
 import { HistoryStorage } from "./history/storage.ts";
@@ -20,15 +20,8 @@ import { HistoryCapture } from "./history/history-capture.ts";
 import { HistoryManager } from "./history/history-manager.ts";
 import { DiffHistoryView, VIEW_TYPE_DIFF_HISTORY } from "./ui/history-view.ts";
 import { LogView, VIEW_TYPE_LOG } from "./ui/log-view.ts";
-import { ConsistencyReportModal } from "./ui/consistency-report-modal.ts";
-import { ConflictModal, type ConflictChoice } from "./ui/conflict-modal.ts";
-import { totalDiscrepancies } from "./sync/reconciler.ts";
-import { isDiffableText } from "./utils/binary.ts";
-import { isFileDoc } from "./types.ts";
-import type { FileDoc, CouchSyncDoc } from "./types.ts";
-import { joinChunks } from "./db/chunker.ts";
-import { incrementVC, mergeVC } from "./sync/vector-clock.ts";
-import { stripRev } from "./utils/doc.ts";
+import { migrateSettings } from "./settings-migration.ts";
+import { registerCommands } from "./commands.ts";
 
 export default class CouchSyncPlugin extends Plugin {
     settings!: CouchSyncSettings;
@@ -36,27 +29,19 @@ export default class CouchSyncPlugin extends Plugin {
     /** Null when `couchdbConfigDbName === ""` (config sync disabled) */
     configLocalDb: ConfigLocalDB | null = null;
     replicator!: SyncEngine;
-    conflictResolver!: ConflictResolver;
-    /** Null when config sync is disabled */
-    configConflictResolver: ConflictResolver | null = null;
     configSync!: ConfigSync;
     private vaultSync!: VaultSync;
     private setupService!: SetupService;
     private changeTracker!: ChangeTracker;
-    private reconciler!: Reconciler;
+    reconciler!: Reconciler;
     private historyStorage!: HistoryStorage;
     private historyCapture!: HistoryCapture;
     historyManager!: HistoryManager;
     statusBar!: StatusBar;
-    private openConflictModals = new Map<string, ConflictModal>();
+    private conflictOrchestrator!: ConflictOrchestrator;
 
     async onload(): Promise<void> {
         await this.loadSettings();
-
-        // Ensure previousDeviceIds exists (migration from pre-v0.12 settings)
-        if (!this.settings.previousDeviceIds) {
-            this.settings.previousDeviceIds = [];
-        }
 
         // Install-marker check (advisory only — does NOT regenerate deviceId).
         {
@@ -101,15 +86,12 @@ export default class CouchSyncPlugin extends Plugin {
             (msg, dur) => new Notice(`CouchSync: ${msg}`, dur),
         );
         this.replicator = new SyncEngine(this.localDb, () => this.settings, Platform.isMobile);
-        this.vaultSync = new VaultSync(this.app, this.localDb, () => this.settings);
-        // ConfigSync needs *some* ConfigLocalDB even when sync is disabled,
-        // so we satisfy the type with a stand-in backed by a throwaway store.
-        // The runtime guard `isConfigured()` blocks all DB I/O before it
-        // could touch the wrong store.
-        const configDbForSync = this.configLocalDb ?? new ConfigLocalDB(
-            new DexieStore(`${dbName}-config-stub`),
-        );
-        this.configSync = new ConfigSync(this.app, configDbForSync, this.replicator, () => this.settings);
+        this.historyStorage = new HistoryStorage(this.app.vault.getName());
+        this.historyCapture = new HistoryCapture(this.app, this.historyStorage, () => this.settings);
+        this.vaultSync = new VaultSync(this.app, this.localDb, () => this.settings, this.historyCapture);
+        this.changeTracker = new ChangeTracker(this.app, this.vaultSync, () => this.settings);
+        this.vaultSync.setWriteIgnore(this.changeTracker);
+        this.configSync = new ConfigSync(this.app, this.configLocalDb, this.replicator, () => this.settings);
         this.statusBar = new StatusBar(
             this,
             () => this.settings,
@@ -129,153 +111,19 @@ export default class CouchSyncPlugin extends Plugin {
         this.setupService = new SetupService(
             this.app, this.localDb, this.replicator, this.vaultSync, this.reconciler,
         );
-        this.changeTracker = new ChangeTracker(this.app, this.vaultSync, () => this.settings);
-        this.vaultSync.setChangeTracker(this.changeTracker);
-        this.historyStorage = new HistoryStorage(this.app.vault.getName());
-        this.historyCapture = new HistoryCapture(this.app, this.historyStorage, () => this.settings);
-        this.vaultSync.setHistoryCapture(this.historyCapture);
         this.historyManager = new HistoryManager(
             this.app.vault, this.historyStorage, this.historyCapture, () => this.settings,
         );
-        // "dominated" (remote is causally newer) is a normal update, not a
-        // conflict. History is preserved by dbToFile → captureSyncWrite.
-        // No onAutoResolved callback needed.
-        this.conflictResolver = new ConflictResolver();
-        // Concurrent (VC-incomparable) conflicts need human judgment. For
-        // now we raise a persistent Notice directing the user to history;
-        // a Side-by-side diff modal is planned for the v2 design's Phase 3
-        // work. Critically, we do NOT silently pick a winner.
-        this.conflictResolver.setOnConcurrent(async (filePath, revisions) => {
-            logWarn(
-                `CouchSync: concurrent edit on ${filePath} — ${revisions.length} revisions, none dominate`,
-            );
-            // Persist every revision as a history entry so the user can
-            // recover any version manually. Only FileDocs have chunks.
-            try {
-                const dec = new TextDecoder("utf-8");
-                for (const rev of revisions) {
-                    if (!("chunks" in rev)) continue;
-                    const chunks = await this.localDb.getChunks(rev.chunks);
-                    const buf = joinChunks(chunks);
-                    if (!isDiffableText(buf)) continue;
-                    await this.historyCapture.saveConflict(
-                        filePath,
-                        dec.decode(buf),
-                        dec.decode(buf),
-                    );
-                }
-            } catch (e) {
-                logError(`CouchSync: Failed to persist concurrent-conflict history: ${e?.message ?? e}`);
-            }
-            notify(
-                `CouchSync: concurrent edit on ${filePath.split("/").pop()} — ` +
-                    "check Diff History and manually reconcile. No version has been silently dropped.",
-                15000,
-            );
+        this.conflictOrchestrator = new ConflictOrchestrator({
+            app: this.app,
+            localDb: this.localDb,
+            replicator: this.replicator,
+            hasConfigDb: this.configLocalDb !== null,
+            historyCapture: this.historyCapture,
+            dbToFile: (doc) => this.vaultSync.dbToFile(doc),
+            getSettings: () => this.settings,
         });
-
-        // Config-side conflict resolver (only when config sync is enabled)
-        if (this.configLocalDb) {
-            this.configConflictResolver = new ConflictResolver();
-            this.configConflictResolver.setOnConcurrent(async (configPath, revisions) => {
-                logWarn(
-                    `CouchSync: concurrent config edit on ${configPath} — ${revisions.length} revisions, none dominate`,
-                );
-                notify(
-                    `CouchSync: concurrent config edit on ${configPath.split("/").pop()} — ` +
-                        "manual resolution needed. The config DB conflict tree is preserved.",
-                    15000,
-                );
-            });
-        }
-
-        // Wire ConflictResolver into SyncEngine for pull-time vclock guard.
-        this.replicator.setConflictResolver(this.conflictResolver);
-        this.replicator.onConcurrent(async (filePath, localDoc, remoteDoc) => {
-            const fileName = filePath.split("/").pop();
-
-            if (isFileDoc(localDoc) && isFileDoc(remoteDoc)) {
-                try {
-                    const dec = new TextDecoder("utf-8");
-                    const localChunks = await this.localDb.getChunks(localDoc.chunks);
-                    const localBuf = joinChunks(localChunks);
-                    const remoteChunks = await this.localDb.getChunks(remoteDoc.chunks);
-                    const remoteBuf = joinChunks(remoteChunks);
-
-                    if (isDiffableText(localBuf) && isDiffableText(remoteBuf)) {
-                        const modal = new ConflictModal(
-                            this.app, filePath,
-                            dec.decode(localBuf), dec.decode(remoteBuf),
-                        );
-                        this.openConflictModals.set(filePath, modal);
-                        const choice = await modal.waitForResult();
-                        this.openConflictModals.delete(filePath);
-
-                        // If the modal was dismissed by auto-resolve (other
-                        // device resolved first), skip resolution — the
-                        // resolved version is already applied.
-                        if (modal.wasDismissed) {
-                            logInfo(`Conflict auto-resolved for ${fileName} (other device resolved)`);
-                        } else {
-                            this.applyConflictChoice(
-                                choice, filePath, localDoc as FileDoc, remoteDoc as FileDoc,
-                            );
-                        }
-                    } else {
-                        // Binary — auto keep-local + merge vclocks for push.
-                        logInfo(`Conflict resolved: keep-local (binary) for ${fileName}`);
-                        this.applyConflictChoice(
-                            "keep-local", filePath, localDoc as FileDoc, remoteDoc as FileDoc,
-                        );
-                        notify(
-                            `CouchSync: concurrent edit on binary file ${fileName} — ` +
-                                "keeping local version. Check Diff History for details.",
-                            10000,
-                        );
-                    }
-
-                    // Save both versions to history.
-                    await this.historyCapture.saveConflict(
-                        filePath,
-                        isDiffableText(localBuf) ? dec.decode(localBuf) : "",
-                        isDiffableText(remoteBuf) ? dec.decode(remoteBuf) : "",
-                    );
-                } catch (e) {
-                    this.openConflictModals.delete(filePath);
-                    logError(`Conflict resolution error for ${fileName}: ${e?.message ?? e}`);
-                    notify(
-                        `CouchSync: conflict on ${fileName} — keeping local version due to error.`,
-                        10000,
-                    );
-                }
-            } else {
-                // ConfigDoc or unknown — keep local, merge vclocks for push.
-                if ("vclock" in localDoc && "vclock" in remoteDoc) {
-                    const deviceId = this.settings.deviceId;
-                    const merged = mergeVC(
-                        (localDoc as any).vclock ?? {},
-                        (remoteDoc as any).vclock ?? {},
-                    );
-                    const updated = { ...localDoc, vclock: incrementVC(merged, deviceId) };
-                    await this.localDb.bulkPut([stripRev(updated) as CouchSyncDoc]);
-                }
-                notify(
-                    `CouchSync: concurrent config edit on ${fileName} — keeping local version.`,
-                    8000,
-                );
-            }
-        });
-
-        // Auto-dismiss conflict modals when a resolved version arrives
-        // from another device (take-remote auto-resolve).
-        this.replicator.onAutoResolve((filePath) => {
-            const modal = this.openConflictModals.get(filePath);
-            if (modal) {
-                logInfo(`Auto-dismissing conflict modal for ${filePath.split("/").pop()}`);
-                modal.dismiss();
-                this.openConflictModals.delete(filePath);
-            }
-        });
+        this.conflictOrchestrator.register();
 
         // Pull-driven vault writes: accepted FileDocs are written directly
         // to vault in the pull path. Reconciler handles only drift detection.
@@ -297,20 +145,7 @@ export default class CouchSyncPlugin extends Plugin {
             this.activateHistoryView();
         });
 
-        this.addCommand({
-            id: "couchsync-show-history",
-            name: "Show file history",
-            callback: () => {
-                const file = this.app.workspace.getActiveFile();
-                if (file) this.showHistory(file.path);
-            },
-        });
-
-        this.addCommand({
-            id: "couchsync-show-log",
-            name: "Show sync log",
-            callback: () => this.activateLogView(),
-        });
+        registerCommands(this);
 
         this.app.workspace.onLayoutReady(async () => {
             this.historyCapture.start();
@@ -395,115 +230,6 @@ export default class CouchSyncPlugin extends Plugin {
             }
         });
 
-        // Foreground and reconnect reconcile are handled by
-        // onCatchupComplete — SyncEngine's handleVisibilityChange and
-        // reconnect both trigger catchup, which fires the callback.
-        // No independent reconcile triggers needed here.
-
-        this.addCommand({
-            id: "couchsync-force-sync",
-            name: "Force sync all files now",
-            callback: async () => {
-                const report = await this.reconciler.reconcile("manual");
-                if (this.settings.connectionState === "syncing") {
-                    // Funnel through the gateway so this command honours
-                    // the auth latch and cool-down like every other
-                    // reconnect path.
-                    await this.replicator.requestReconnect("manual");
-                }
-                const total =
-                    report.pushed.length +
-                    report.localWins.length +
-                    report.remoteWins.length +
-                    report.deleted.length +
-                    report.restored.length;
-                notify(`Force sync: ${total} change(s) applied.`);
-            },
-        });
-
-        this.addCommand({
-            id: "couchsync-verify-consistency",
-            name: "Verify consistency (vault ↔ local DB ↔ remote)",
-            callback: async () => {
-                const progress = new ProgressNotice("Verify");
-                try {
-                    if (this.settings.connectionState === "syncing") {
-                        progress.update("Pulling latest from remote...");
-                        try {
-                            await this.replicator.pullFromRemote();
-                        } catch (e) {
-                            logWarn(`CouchSync: verify pull failed, continuing with local view: ${e?.message ?? e}`);
-                        }
-                    }
-                    progress.update("Reconciling...");
-                    const report = await this.reconciler.reconcile("manual", { mode: "report" });
-                    const total = totalDiscrepancies(report);
-                    progress.done(`Verify: ${total} discrepancy(ies)`);
-                    new ConsistencyReportModal(this.app, report, async () => {
-                        await this.reconciler.reconcile("manual-repair");
-                    }).open();
-                } catch (e: any) {
-                    progress.done(`Verify failed: ${e.message ?? e}`);
-                }
-            },
-        });
-
-        // Config sync commands: each configSync.* call already owns a
-        // ProgressNotice that summarises the result in its done() — the
-        // command callbacks just invoke them and swallow the return value.
-        this.addCommand({
-            id: "couchsync-config-init",
-            name: "Init config sync (clean rebuild)",
-            callback: async () => {
-                await this.configSync.init();
-            },
-        });
-
-        this.addCommand({
-            id: "couchsync-config-push",
-            name: "Push config files to remote",
-            callback: async () => {
-                await this.configSync.push();
-            },
-        });
-
-        this.addCommand({
-            id: "couchsync-config-pull",
-            name: "Pull config files from remote",
-            callback: async () => {
-                await this.configSync.pull();
-            },
-        });
-
-        // Manual reconnect — surfaces the gateway's "manual" reason via
-        // Command Palette so users can recover from any disconnected /
-        // error state without opening Settings → Maintenance. Especially
-        // useful on mobile when the visibilitychange path didn't fire
-        // (e.g. the app was already foregrounded but the server was
-        // briefly unavailable).
-        this.addCommand({
-            id: "couchsync-reconnect",
-            name: "Reconnect sync",
-            callback: async () => {
-                if (this.replicator.isAuthBlocked()) {
-                    notify(
-                        "CouchSync: auth is blocked. Update credentials in " +
-                            "Vault Sync (Step 1) before reconnecting.",
-                        8000,
-                    );
-                    return;
-                }
-                if (this.settings.connectionState !== "syncing") {
-                    notify(
-                        "CouchSync: enable Live Sync in Vault Sync (Step 3) first.",
-                        5000,
-                    );
-                    return;
-                }
-                await this.replicator.requestReconnect("manual");
-                notify("CouchSync: reconnect requested.", 3000);
-            },
-        });
     }
 
     async onunload(): Promise<void> {
@@ -528,18 +254,7 @@ export default class CouchSyncPlugin extends Plugin {
 
     async loadSettings(): Promise<void> {
         const data = (await this.loadData()) ?? {};
-
-        // Migrate old boolean flags to connectionState enum
-        if (data.connectionState === undefined) {
-            if (data.syncEnabled) data.connectionState = "syncing";
-            else if (data.setupComplete) data.connectionState = "setupDone";
-            else if (data.connectionTested) data.connectionState = "tested";
-            else data.connectionState = "editing";
-            delete data.connectionTested;
-            delete data.setupComplete;
-            delete data.syncEnabled;
-        }
-
+        migrateSettings(data);
         this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
     }
 
@@ -598,43 +313,6 @@ export default class CouchSyncPlugin extends Plugin {
     stopSync(): void {
         this.replicator.stop();
         this.changeTracker.stop();
-    }
-
-    /**
-     * Apply user's conflict resolution choice. Merges vclocks and writes
-     * to localDB so the push loop carries the result to remote.
-     */
-    private async applyConflictChoice(
-        choice: ConflictChoice,
-        filePath: string,
-        localDoc: FileDoc,
-        remoteDoc: FileDoc,
-    ): Promise<void> {
-        const deviceId = this.settings.deviceId;
-        const fileName = filePath.split("/").pop();
-
-        if (choice === "take-remote") {
-            logInfo(`Conflict resolved: take-remote for ${fileName}`);
-            const updated = {
-                ...remoteDoc,
-                vclock: incrementVC(remoteDoc.vclock ?? {}, deviceId),
-            };
-            await this.localDb.bulkPut([stripRev(updated)]);
-            await this.replicator.ensureFileChunks(updated as FileDoc);
-            await this.vaultSync.dbToFile(updated as FileDoc);
-        } else {
-            logInfo(`Conflict resolved: keep-local for ${fileName}`);
-            const merged = mergeVC(
-                localDoc.vclock ?? {},
-                remoteDoc.vclock ?? {},
-            );
-            const updated = {
-                ...localDoc,
-                vclock: incrementVC(merged, deviceId),
-            };
-            await this.localDb.bulkPut([stripRev(updated)]);
-            logDebug(`  vclock after merge: ${JSON.stringify(updated.vclock)}`);
-        }
     }
 
     private fireReconcile(reason: ReconcileReason): void {

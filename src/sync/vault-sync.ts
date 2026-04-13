@@ -3,7 +3,6 @@ import type { LocalDB } from "../db/local-db.ts";
 import type { FileDoc } from "../types.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { HistoryCapture } from "../history/history-capture.ts";
-import type { ChangeTracker } from "./change-tracker.ts";
 import { splitIntoChunks, joinChunks } from "../db/chunker.ts";
 import { notify } from "../ui/log.ts";
 import { compareVC, incrementVC } from "./vector-clock.ts";
@@ -24,9 +23,18 @@ import { logError, logWarn } from "../ui/log.ts";
  */
 export type CompareResult = "identical" | "local-unpushed" | "remote-pending";
 
+/**
+ * Interface for the subset of ChangeTracker that VaultSync needs.
+ * Breaks the circular dependency: ChangeTracker depends on VaultSync,
+ * and VaultSync needs to mark writes as sync-driven to prevent echo.
+ */
+export interface IWriteIgnore {
+    ignoreWrite(path: string): void;
+    ignoreDelete(path: string): void;
+    clearIgnore(path: string): void;
+}
+
 export class VaultSync {
-    private historyCapture: HistoryCapture | null = null;
-    private changeTracker: ChangeTracker | null = null;
     /**
      * In-memory map of vault path → vclock at the time of the last
      * successful sync write (dbToFile or fileToDb). Used by
@@ -49,26 +57,18 @@ export class VaultSync {
     constructor(
         private app: App,
         private db: LocalDB,
-        private getSettings: () => CouchSyncSettings
+        private getSettings: () => CouchSyncSettings,
+        private historyCapture: HistoryCapture | null = null,
+        private writeIgnore: IWriteIgnore | null = null,
     ) {}
 
     /**
-     * Inject HistoryCapture after construction to avoid circular wiring at
-     * plugin init time. Once set, dbToFile() records a history entry for
-     * every sync-driven vault write so the timeline reflects true state
-     * changes, not just local edits.
+     * Inject the write-ignore interface (ChangeTracker) after construction.
+     * Necessary because ChangeTracker depends on VaultSync — a true circular
+     * dependency that cannot be resolved by constructor ordering alone.
      */
-    setHistoryCapture(historyCapture: HistoryCapture): void {
-        this.historyCapture = historyCapture;
-    }
-
-    /**
-     * Inject the ChangeTracker so dbToFile() can mark sync-driven writes as
-     * self-inflicted. Without this wiring, every remote pull would re-enter
-     * fileToDb via Obsidian's modify event and echo back to the peer.
-     */
-    setChangeTracker(changeTracker: ChangeTracker): void {
-        this.changeTracker = changeTracker;
+    setWriteIgnore(wi: IWriteIgnore): void {
+        this.writeIgnore = wi;
     }
 
     /**
@@ -183,7 +183,7 @@ export class VaultSync {
         if (fileDoc.deleted) {
             const existing = this.app.vault.getAbstractFileByPath(vaultPath);
             if (existing) {
-                this.changeTracker?.ignoreDelete(vaultPath);
+                this.writeIgnore?.ignoreDelete(vaultPath);
                 await this.app.vault.delete(existing);
             }
             return;
@@ -232,7 +232,7 @@ export class VaultSync {
         // Mark the upcoming write as sync-driven so ChangeTracker drops the
         // resulting modify event instead of echoing it back into fileToDb.
         // clearIgnore in the finally block handles the no-op write case.
-        this.changeTracker?.ignoreWrite(vaultPath);
+        this.writeIgnore?.ignoreWrite(vaultPath);
 
         let writtenFile: TFile | null = null;
         try {
@@ -249,7 +249,7 @@ export class VaultSync {
             // If the modify event never fired (e.g. the write was a no-op
             // because content matched), drop the stale fingerprint so a
             // later unrelated edit isn't silently ignored.
-            this.changeTracker?.clearIgnore(vaultPath);
+            this.writeIgnore?.clearIgnore(vaultPath);
         }
 
         if (writtenFile) {
