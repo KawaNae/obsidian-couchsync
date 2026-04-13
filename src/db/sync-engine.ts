@@ -92,8 +92,12 @@ export class SyncEngine {
     private onReconnectHandlers: (() => void)[] = [];
     private onConcurrentHandlers: OnConcurrentHandler[] = [];
     private onPullWriteHandler: ((doc: FileDoc) => Promise<void>) | null = null;
+    private onAutoResolveHandler: ((filePath: string) => void) | null = null;
     private idleCallbacks: (() => void)[] = [];
     private hasBeenIdle = false;
+
+    /** Doc IDs written by pull (bulkPut). Push loop skips these. */
+    private pullWrittenIds = new Set<string>();
 
     // ── Session management ────────────────────────────────
 
@@ -246,6 +250,14 @@ export class SyncEngine {
      */
     onPullWrite(handler: (doc: FileDoc) => Promise<void>): void {
         this.onPullWriteHandler = handler;
+    }
+
+    /**
+     * Called when a pulled doc is auto-resolved as take-remote (vclock
+     * dominance). main.ts uses this to auto-dismiss open conflict modals.
+     */
+    onAutoResolve(handler: (filePath: string) => void): void {
+        this.onAutoResolveHandler = handler;
     }
 
     /** Register callback to fire once initial sync reaches idle state. */
@@ -602,10 +614,17 @@ export class SyncEngine {
 
                 if (this.syncEpoch !== epoch) return;
 
-                // Filter to only replicated docs.
+                // Filter to replicated docs, excluding pull-written docs
+                // (they came from remote, no need to push back).
                 const toPush = localChanges.results.filter(
-                    (r) => r.doc && isReplicatedDocId(r.id) && !r.deleted,
+                    (r) => r.doc && isReplicatedDocId(r.id) && !r.deleted
+                        && !this.pullWrittenIds.has(r.id),
                 );
+
+                // Clean up pullWrittenIds for docs we've now seen.
+                for (const r of localChanges.results) {
+                    this.pullWrittenIds.delete(r.id);
+                }
 
                 if (toPush.length > 0 && this.client) {
                     const docs = toPush.map((r) => r.doc!);
@@ -613,9 +632,6 @@ export class SyncEngine {
                     this.lastHealthyAt = Date.now();
                 }
 
-                // Always advance the push checkpoint (even if no docs
-                // matched the filter — pulled docs bump the local seq
-                // and we must skip past them).
                 this.lastPushedSeq = localChanges.last_seq;
                 await this.saveCheckpoints();
             } catch (e: any) {
@@ -690,15 +706,13 @@ export class SyncEngine {
             accepted.push(remoteDoc);
         }
 
-        // Write accepted docs (including chunks) BEFORE firing concurrent
-        // handlers — the handler needs remote chunks in local DB to show
-        // the diff modal.
+        // Write accepted docs to localDB. Track their IDs so the push
+        // loop skips them (they came from remote, no need to push back).
         if (accepted.length > 0) {
             await this.localDb.bulkPut(accepted);
+            for (const doc of accepted) this.pullWrittenIds.add(doc._id);
 
-            // Pull-driven vault writes: write accepted FileDocs directly
-            // to vault. Chunks are already in localDB from the bulkPut
-            // above, so dbToFile's getChunks is guaranteed to succeed.
+            // Pull-driven vault writes + auto-resolve notification.
             if (this.onPullWriteHandler) {
                 for (const doc of accepted) {
                     if (isFileDoc(doc)) {
@@ -707,6 +721,9 @@ export class SyncEngine {
                             await this.onPullWriteHandler(doc);
                             logDebug(`  ← ${path} (take-remote)`);
                             writtenCount++;
+                            // Notify auto-resolve so main.ts can dismiss
+                            // any open conflict modal for this path.
+                            this.onAutoResolveHandler?.(path);
                         } catch (e) {
                             logError(`pull vault write failed: ${path}: ${e?.message ?? e}`);
                             writeFailCount++;
@@ -738,31 +755,23 @@ export class SyncEngine {
             logInfo(`Pull: ${parts.join(", ")}`);
         }
 
-        // Fire concurrent handlers after chunks are written.
+        // Update remote seq checkpoint (no lastPushedSeq advancement —
+        // pullWrittenIds filter handles push-skip instead).
+        this.remoteSeq = result.last_seq;
+        await this.saveCheckpoints();
+
+        // Fire concurrent handlers (non-blocking). The handlers run
+        // asynchronously — writePulledDocs returns immediately so the
+        // pull loop continues receiving. Any bulkPut inside a handler
+        // (e.g. vclock merge on keep-local) is NOT in pullWrittenIds,
+        // so the push loop will naturally pick it up.
         for (const { filePath, localDoc, remoteDoc } of concurrent) {
             for (const h of this.onConcurrentHandlers) {
-                try {
-                    await h(filePath, localDoc, remoteDoc);
-                } catch (e) {
-                    logError(`CouchSync: onConcurrent handler error: ${e?.message ?? e}`);
-                }
+                Promise.resolve(h(filePath, localDoc, remoteDoc)).catch((e: any) =>
+                    logError(`onConcurrent handler error: ${e?.message ?? e}`),
+                );
             }
         }
-
-        // Update checkpoints.
-        this.remoteSeq = result.last_seq;
-
-        // Advance lastPushedSeq past the docs we just wrote locally, so
-        // the push loop doesn't re-push them.
-        try {
-            const info = await this.localDb.info();
-            this.lastPushedSeq = info.updateSeq;
-        } catch {
-            // Non-fatal: push loop will just see these and skip them
-            // on next cycle (they already exist on remote).
-        }
-
-        await this.saveCheckpoints();
     }
 
     /**

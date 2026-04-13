@@ -12,7 +12,7 @@ import { Reconciler, type ReconcileReason } from "./sync/reconciler.ts";
 import { ConflictResolver } from "./conflict/conflict-resolver.ts";
 import { checkInstallMarker } from "./sync/install-marker.ts";
 import { StatusBar } from "./ui/status-bar.ts";
-import { initLog, logError, logWarn, notify } from "./ui/log.ts";
+import { initLog, logDebug, logInfo, logError, logWarn, notify } from "./ui/log.ts";
 import { CouchSyncSettingTab } from "./settings-tab/index.ts";
 import { ProgressNotice } from "./ui/notices.ts";
 import { HistoryStorage } from "./history/storage.ts";
@@ -21,11 +21,13 @@ import { HistoryManager } from "./history/history-manager.ts";
 import { DiffHistoryView, VIEW_TYPE_DIFF_HISTORY } from "./ui/history-view.ts";
 import { LogView, VIEW_TYPE_LOG } from "./ui/log-view.ts";
 import { ConsistencyReportModal } from "./ui/consistency-report-modal.ts";
-import { ConflictModal } from "./ui/conflict-modal.ts";
+import { ConflictModal, type ConflictChoice } from "./ui/conflict-modal.ts";
 import { totalDiscrepancies } from "./sync/reconciler.ts";
 import { isDiffableText } from "./utils/binary.ts";
 import { isFileDoc } from "./types.ts";
+import type { FileDoc } from "./types.ts";
 import { joinChunks } from "./db/chunker.ts";
+import { incrementVC, mergeVC } from "./sync/vector-clock.ts";
 
 export default class CouchSyncPlugin extends Plugin {
     settings!: CouchSyncSettings;
@@ -45,6 +47,7 @@ export default class CouchSyncPlugin extends Plugin {
     private historyCapture!: HistoryCapture;
     historyManager!: HistoryManager;
     statusBar!: StatusBar;
+    private openConflictModals = new Map<string, ConflictModal>();
 
     async onload(): Promise<void> {
         await this.loadSettings();
@@ -225,7 +228,8 @@ export default class CouchSyncPlugin extends Plugin {
         // Wire ConflictResolver into SyncEngine for pull-time vclock guard.
         this.replicator.setConflictResolver(this.conflictResolver);
         this.replicator.onConcurrent(async (filePath, localDoc, remoteDoc) => {
-            // Show side-by-side diff modal for text files.
+            const fileName = filePath.split("/").pop();
+
             if (isFileDoc(localDoc) && isFileDoc(remoteDoc)) {
                 try {
                     const dec = new TextDecoder("utf-8");
@@ -239,44 +243,74 @@ export default class CouchSyncPlugin extends Plugin {
                             this.app, filePath,
                             dec.decode(localBuf), dec.decode(remoteBuf),
                         );
+                        this.openConflictModals.set(filePath, modal);
                         const choice = await modal.waitForResult();
-                        if (choice === "take-remote") {
-                            // bulkPut skips _rev CAS check (unlike put).
-                            const { _rev, ...rest } = remoteDoc as any;
-                            await this.localDb.bulkPut([rest]);
-                            await this.vaultSync.dbToFile(remoteDoc);
+                        this.openConflictModals.delete(filePath);
+
+                        // If the modal was dismissed by auto-resolve (other
+                        // device resolved first), skip resolution — the
+                        // resolved version is already applied.
+                        if (modal.wasDismissed) {
+                            logInfo(`Conflict auto-resolved for ${fileName} (other device resolved)`);
+                        } else {
+                            this.applyConflictChoice(
+                                choice, filePath, localDoc as FileDoc, remoteDoc as FileDoc,
+                            );
                         }
-                        // keep-local: no action, next push will resolve
                     } else {
-                        // Binary file — can't diff, default to keep-local + notify
+                        // Binary — auto keep-local + merge vclocks for push.
+                        logInfo(`Conflict resolved: keep-local (binary) for ${fileName}`);
+                        this.applyConflictChoice(
+                            "keep-local", filePath, localDoc as FileDoc, remoteDoc as FileDoc,
+                        );
                         notify(
-                            `CouchSync: concurrent edit on binary file ${filePath.split("/").pop()} — ` +
+                            `CouchSync: concurrent edit on binary file ${fileName} — ` +
                                 "keeping local version. Check Diff History for details.",
                             10000,
                         );
                     }
 
-                    // Save both versions to history
+                    // Save both versions to history.
                     await this.historyCapture.saveConflict(
                         filePath,
                         isDiffableText(localBuf) ? dec.decode(localBuf) : "",
                         isDiffableText(remoteBuf) ? dec.decode(remoteBuf) : "",
                     );
                 } catch (e) {
-                    logError(`CouchSync: conflict resolution error: ${e?.message ?? e}`);
+                    this.openConflictModals.delete(filePath);
+                    logError(`Conflict resolution error for ${fileName}: ${e?.message ?? e}`);
                     notify(
-                        `CouchSync: conflict on ${filePath.split("/").pop()} — ` +
-                            "keeping local version due to error.",
+                        `CouchSync: conflict on ${fileName} — keeping local version due to error.`,
                         10000,
                     );
                 }
             } else {
-                // ConfigDoc or unknown — keep local, notify
+                // ConfigDoc or unknown — keep local, merge vclocks for push.
+                if ("vclock" in localDoc && "vclock" in remoteDoc) {
+                    const deviceId = this.settings.deviceId;
+                    const merged = mergeVC(
+                        (localDoc as any).vclock ?? {},
+                        (remoteDoc as any).vclock ?? {},
+                    );
+                    const updated = { ...localDoc, vclock: incrementVC(merged, deviceId) };
+                    const { _rev, ...rest } = updated as any;
+                    await this.localDb.bulkPut([rest]);
+                }
                 notify(
-                    `CouchSync: concurrent config edit on ${filePath.split("/").pop()} — ` +
-                        "keeping local version.",
+                    `CouchSync: concurrent config edit on ${fileName} — keeping local version.`,
                     8000,
                 );
+            }
+        });
+
+        // Auto-dismiss conflict modals when a resolved version arrives
+        // from another device (take-remote auto-resolve).
+        this.replicator.onAutoResolve((filePath) => {
+            const modal = this.openConflictModals.get(filePath);
+            if (modal) {
+                logInfo(`Auto-dismissing conflict modal for ${filePath.split("/").pop()}`);
+                modal.dismiss();
+                this.openConflictModals.delete(filePath);
             }
         });
 
@@ -613,6 +647,44 @@ export default class CouchSyncPlugin extends Plugin {
     stopSync(): void {
         this.replicator.stop();
         this.changeTracker.stop();
+    }
+
+    /**
+     * Apply user's conflict resolution choice. Merges vclocks and writes
+     * to localDB so the push loop carries the result to remote.
+     */
+    private async applyConflictChoice(
+        choice: ConflictChoice,
+        filePath: string,
+        localDoc: FileDoc,
+        remoteDoc: FileDoc,
+    ): Promise<void> {
+        const deviceId = this.settings.deviceId;
+        const fileName = filePath.split("/").pop();
+
+        if (choice === "take-remote") {
+            logInfo(`Conflict resolved: take-remote for ${fileName}`);
+            const updated = {
+                ...remoteDoc,
+                vclock: incrementVC(remoteDoc.vclock ?? {}, deviceId),
+            };
+            const { _rev, ...rest } = updated as any;
+            await this.localDb.bulkPut([rest]);
+            await this.vaultSync.dbToFile(updated as FileDoc);
+        } else {
+            logInfo(`Conflict resolved: keep-local for ${fileName}`);
+            const merged = mergeVC(
+                localDoc.vclock ?? {},
+                remoteDoc.vclock ?? {},
+            );
+            const updated = {
+                ...localDoc,
+                vclock: incrementVC(merged, deviceId),
+            };
+            const { _rev, ...rest } = updated as any;
+            await this.localDb.bulkPut([rest]);
+            logDebug(`  vclock after merge: ${JSON.stringify(updated.vclock)}`);
+        }
     }
 
     private fireReconcile(reason: ReconcileReason): void {

@@ -12,6 +12,8 @@ export type ConflictChoice = "keep-local" | "take-remote";
 export class ConflictModal extends Modal {
     private resolved = false;
     private resolve: (value: ConflictChoice) => void = () => {};
+    /** True if dismiss() was called (auto-resolve from another device). */
+    wasDismissed = false;
 
     constructor(
         app: App,
@@ -87,6 +89,16 @@ export class ConflictModal extends Modal {
             this.resolve = resolve;
             this.open();
         });
+    }
+
+    /** Dismiss from outside (e.g. other device resolved the conflict). */
+    dismiss(): void {
+        this.wasDismissed = true;
+        if (!this.resolved) {
+            this.resolved = true;
+            this.resolve("keep-local"); // value unused — caller checks wasDismissed
+        }
+        this.close();
     }
 
     private buildSideBySide(leftEl: HTMLElement, rightEl: HTMLElement): void {
