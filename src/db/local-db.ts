@@ -148,6 +148,18 @@ export class LocalDB implements ILocalStore<CouchSyncDoc> {
         return this.getStore().bulkPut(docs);
     }
 
+    /**
+     * Atomically write chunks + a FileDoc in a single transaction.
+     * See {@link DexieStore.atomicFileWrite} for details.
+     */
+    async atomicFileWrite(
+        fileId: string,
+        chunks: ChunkDoc[],
+        buildDoc: (existing: FileDoc | null) => FileDoc | null,
+    ): Promise<PutResponse | null> {
+        return this.getStore().atomicFileWrite(fileId, chunks, buildDoc);
+    }
+
     async delete(id: string): Promise<void> {
         return this.getStore().delete(id);
     }

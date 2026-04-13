@@ -149,26 +149,30 @@ export class VaultSync {
             return;
         }
 
-        await this.db.bulkPut(chunks);
-
+        // Atomic write: chunks + FileDoc in a single Dexie transaction.
+        // Prevents orphan chunks if the process crashes mid-write.
         const deviceId = this.getSettings().deviceId;
         let pushedVclock: VectorClock | undefined;
-        await this.db.update<FileDoc>(makeFileId(file.path), (existing) => {
-            if (existing && VaultSync.chunksEqual(existing.chunks, chunkIds)) {
-                return null;
-            }
-            const vc = incrementVC(existing?.vclock, deviceId);
-            pushedVclock = vc;
-            return {
-                _id: makeFileId(file.path),
-                type: "file",
-                chunks: chunkIds,
-                mtime: file.stat.mtime,
-                ctime: file.stat.ctime,
-                size: file.stat.size,
-                vclock: vc,
-            } as FileDoc;
-        });
+        await this.db.atomicFileWrite(
+            makeFileId(file.path),
+            chunks,
+            (existing) => {
+                if (existing && VaultSync.chunksEqual(existing.chunks, chunkIds)) {
+                    return null;
+                }
+                const vc = incrementVC(existing?.vclock, deviceId);
+                pushedVclock = vc;
+                return {
+                    _id: makeFileId(file.path),
+                    type: "file",
+                    chunks: chunkIds,
+                    mtime: file.stat.mtime,
+                    ctime: file.stat.ctime,
+                    size: file.stat.size,
+                    vclock: vc,
+                } as FileDoc;
+            },
+        );
         if (pushedVclock) {
             this.lastSyncedVclock.set(file.path, pushedVclock);
             this.scheduleFlush();
@@ -304,9 +308,35 @@ export class VaultSync {
         });
     }
 
+    /**
+     * Apply a remote deletion: remove the vault file and mark the DB doc
+     * as deleted. Called by the pull-delete handler when there are no
+     * unpushed local edits.
+     */
+    async applyRemoteDeletion(path: string): Promise<void> {
+        const existing = this.app.vault.getAbstractFileByPath(path);
+        if (existing) {
+            this.writeIgnore?.ignoreDelete(path);
+            await this.app.vault.delete(existing);
+        }
+        await this.markDeleted(path);
+    }
+
+    /**
+     * Check whether the local file at `path` has changes that have not
+     * been synced yet. Compares the given vclock against the last-synced
+     * snapshot. Returns false when no last-synced record exists (e.g.
+     * plugin just loaded) — conservatively assumes no unpushed changes.
+     */
+    hasUnpushedChanges(path: string, localVclock: VectorClock): boolean {
+        const lastSynced = this.lastSyncedVclock.get(path);
+        if (!lastSynced) return false;
+        return compareVC(localVclock, lastSynced) !== "equal";
+    }
+
     async handleRename(file: TFile, oldPath: string): Promise<void> {
-        await this.markDeleted(oldPath); // also clears lastSyncedVclock for oldPath
-        await this.fileToDb(file);
+        await this.fileToDb(file);        // new path first — crash-safe
+        await this.markDeleted(oldPath);  // then delete old path
     }
 
     /** Lazily populate the skipped-paths cache from the persisted doc. */

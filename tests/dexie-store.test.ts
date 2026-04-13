@@ -377,6 +377,113 @@ describe("DexieStore", () => {
 
     // ── close / destroy ─────────────────────────────────
 
+    // ── atomicFileWrite ──────────────────────────────────
+
+    describe("atomicFileWrite", () => {
+        it("writes chunks and FileDoc atomically", async () => {
+            const chunk1 = makeChunk("h1", "Y2h1bmsx");
+            const chunk2 = makeChunk("h2", "Y2h1bmsy");
+            const fileId = makeFileId("atomic.md");
+
+            const result = await store.atomicFileWrite<FileDoc>(
+                fileId,
+                [chunk1, chunk2],
+                (_existing) => ({
+                    _id: fileId,
+                    type: "file",
+                    chunks: [chunk1._id, chunk2._id],
+                    mtime: 1000,
+                    ctime: 1000,
+                    size: 10,
+                    vclock: { A: 1 },
+                }),
+            );
+
+            expect(result).not.toBeNull();
+            expect(result!.ok).toBe(true);
+
+            // Both chunks should exist.
+            const c1 = await store.get(chunk1._id);
+            const c2 = await store.get(chunk2._id);
+            expect(c1).not.toBeNull();
+            expect(c2).not.toBeNull();
+
+            // FileDoc should exist with correct chunks.
+            const doc = await store.get(fileId) as FileDoc;
+            expect(doc).not.toBeNull();
+            expect(doc.chunks).toEqual([chunk1._id, chunk2._id]);
+        });
+
+        it("skips existing chunks (content-addressed)", async () => {
+            const chunk = makeChunk("existing", "ZXhpc3Q=");
+            await store.put(chunk);
+            const fileId = makeFileId("reuse.md");
+
+            await store.atomicFileWrite<FileDoc>(
+                fileId,
+                [chunk],
+                () => ({
+                    _id: fileId,
+                    type: "file",
+                    chunks: [chunk._id],
+                    mtime: 1000,
+                    ctime: 1000,
+                    size: 5,
+                    vclock: { A: 1 },
+                }),
+            );
+
+            // FileDoc written, chunk still exists (not duplicated).
+            const doc = await store.get(fileId);
+            expect(doc).not.toBeNull();
+        });
+
+        it("aborts when buildDoc returns null — nothing written", async () => {
+            const chunk = makeChunk("unused", "dW51c2Vk");
+            const fileId = makeFileId("abort.md");
+
+            const result = await store.atomicFileWrite<FileDoc>(
+                fileId,
+                [chunk],
+                () => null,
+            );
+
+            expect(result).toBeNull();
+            // FileDoc should not exist.
+            const doc = await store.get(fileId);
+            expect(doc).toBeNull();
+            // Chunks should also not exist (abort is side-effect-free).
+            const chunkDoc = await store.get(chunk._id);
+            expect(chunkDoc).toBeNull();
+        });
+
+        it("increments version on update", async () => {
+            const fileId = makeFileId("version.md");
+            // First write
+            await store.atomicFileWrite<FileDoc>(
+                fileId,
+                [],
+                () => ({
+                    _id: fileId, type: "file", chunks: [],
+                    mtime: 1, ctime: 1, size: 0, vclock: { A: 1 },
+                }),
+            );
+
+            // Second write
+            const result = await store.atomicFileWrite<FileDoc>(
+                fileId,
+                [],
+                (existing) => ({
+                    ...existing!,
+                    mtime: 2,
+                    vclock: { A: 2 },
+                }),
+            );
+
+            expect(result!.rev).toBe("2-dexie");
+        });
+    });
+
     describe("lifecycle", () => {
         it("close is idempotent", async () => {
             await store.close();

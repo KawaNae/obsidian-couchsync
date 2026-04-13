@@ -1,8 +1,10 @@
+import { Notice } from "obsidian";
 import type CouchSyncPlugin from "./main.ts";
 import { ProgressNotice } from "./ui/notices.ts";
 import { ConsistencyReportModal } from "./ui/consistency-report-modal.ts";
 import { totalDiscrepancies } from "./sync/reconciler.ts";
 import { logWarn, notify } from "./ui/log.ts";
+import { gcOrphanChunks } from "./db/chunk-gc.ts";
 
 /**
  * Register all Command-Palette commands on the plugin.
@@ -90,6 +92,19 @@ export function registerCommands(plugin: CouchSyncPlugin): void {
         name: "Pull config files from remote",
         callback: async () => {
             await plugin.configSync.pull();
+        },
+    });
+
+    plugin.addCommand({
+        id: "couchsync-gc-chunks",
+        name: "Clean up orphan chunks",
+        callback: async () => {
+            const result = await gcOrphanChunks(plugin.localDb);
+            new Notice(
+                result.deletedChunks > 0
+                    ? `Deleted ${result.deletedChunks} orphan chunk(s) out of ${result.scannedChunks} total.`
+                    : `No orphan chunks found (${result.scannedChunks} chunks, all referenced).`,
+            );
         },
     });
 

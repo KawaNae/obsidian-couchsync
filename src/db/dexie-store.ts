@@ -239,6 +239,72 @@ async put(doc: T): Promise<PutResponse> {
         );
     }
 
+    /**
+     * Atomically write chunks + a FileDoc in a single Dexie transaction.
+     * Prevents orphan chunks on crash: either both chunks and FileDoc
+     * are committed, or neither is.
+     *
+     * Chunks are content-addressed (keyed by hash) — existing chunks
+     * are silently skipped. The FileDoc is written with CAS semantics
+     * (version counter check inside the transaction).
+     *
+     * @param fileId   The FileDoc `_id` (e.g. `"file:notes/hello.md"`).
+     * @param chunks   ChunkDocs to write (may be empty).
+     * @param buildDoc Called with the current FileDoc (or null) to produce
+     *                 the updated doc. Return null to abort the write.
+     * @returns PutResponse on success, null if buildDoc returned null.
+     */
+    async atomicFileWrite<D extends T>(
+        fileId: string,
+        chunks: T[],
+        buildDoc: (existing: D | null) => D | null,
+    ): Promise<PutResponse | null> {
+        let result: PutResponse | null = null;
+
+        await this.db.transaction("rw", this.db.docs, this.db.meta, async () => {
+            // 1. Check if the caller wants to write at all. Evaluate
+            //    buildDoc BEFORE writing chunks so an abort is truly
+            //    side-effect-free (no orphan chunks on no-op).
+            const stored = await this.db.docs.get(fileId);
+            const existingDoc = stored ? (stripInternal<D>(stored)) : null;
+            const updated = buildDoc(existingDoc);
+            if (!updated) return; // caller aborted — nothing written
+
+            // 2. Write new chunks (content-addressed → skip existing).
+            if (chunks.length > 0) {
+                const ids = chunks.map((c) => c._id);
+                const existingChunks = await this.db.docs.bulkGet(ids);
+                const existingSet = new Set(
+                    existingChunks.filter(Boolean).map((d) => d!._id),
+                );
+                const newChunks = chunks.filter((c) => !existingSet.has(c._id));
+                if (newChunks.length > 0) {
+                    const chunkSeq = await this._bumpSeq();
+                    await this.db.docs.bulkPut(
+                        newChunks.map((c) => ({
+                            ...stripRev(c),
+                            _version: 1,
+                            _localSeq: chunkSeq,
+                        })),
+                    );
+                }
+            }
+
+            // 3. CAS write for the FileDoc.
+            const newVersion = (stored?._version ?? 0) + 1;
+            const seq = await this._bumpSeq();
+            await this.db.docs.put({
+                ...stripRev(updated),
+                _id: fileId,
+                _version: newVersion,
+                _localSeq: seq,
+            });
+            result = { ok: true, id: fileId, rev: makeRev(newVersion) };
+        });
+
+        return result;
+    }
+
     async delete(id: string): Promise<void> {
         await this.db.docs.delete(id);
     }

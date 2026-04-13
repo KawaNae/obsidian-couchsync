@@ -9,7 +9,7 @@
 
 import type { CouchSyncDoc, FileDoc, ChunkDoc } from "../types.ts";
 import { stripRev } from "../utils/doc.ts";
-import { isReplicatedDocId } from "../types/doc-id.ts";
+import { isReplicatedDocId, isFileDocId } from "../types/doc-id.ts";
 import type { LocalDB } from "./local-db.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { ICouchClient, ChangesResult } from "./interfaces.ts";
@@ -47,6 +47,16 @@ export type OnConcurrentHandler = (
     remoteDoc: CouchSyncDoc,
 ) => void | Promise<void>;
 
+/** Tracks a doc ID written by pull so the push loop can distinguish
+ *  the pull echo from a genuine post-pull user edit. */
+interface PullWriteRecord {
+    /** localDb updateSeq immediately after bulkPut. Any local change
+     *  with seq <= this value is the pull echo; seq > this is a new edit. */
+    seq: number;
+    /** Date.now() at insertion — used for TTL-based cleanup. */
+    addedAt: number;
+}
+
 // ── Constants ────────────────────────────────────────────
 
 const HEALTH_CHECK_INTERVAL = 30000; // 30s
@@ -54,7 +64,7 @@ const CATCHUP_IDLE_TIMEOUT_MS = 60000; // abort catchup after 60s of no progress
 
 /** Build identifier, logged at start(). Lets us verify on mobile that a
  *  deployed plugin update actually reached the device. */
-const BUILD_TAG = "sync-engine-v0.13.0";
+const BUILD_TAG = "sync-engine-v0.15.0";
 
 /** How often to check for local changes to push. */
 const PUSH_POLL_INTERVAL_MS = 2000;
@@ -86,19 +96,30 @@ export class SyncEngine {
     private onReconnectHandlers: (() => void)[] = [];
     private onConcurrentHandlers: OnConcurrentHandler[] = [];
     private onPullWriteHandler: ((doc: FileDoc) => Promise<void>) | null = null;
+    /** Returns true if local has unpushed changes (→ concurrent conflict). */
+    private onPullDeleteHandler:
+        ((path: string, localDoc: FileDoc) => Promise<boolean>) | null = null;
     private onAutoResolveHandler: ((filePath: string) => void) | null = null;
     private onCatchupCompleteHandler: (() => void) | null = null;
     private onCatchupFailedHandler: (() => void) | null = null;
     private idleCallbacks: (() => void)[] = [];
     private hasBeenIdle = false;
 
-    /** Doc IDs written by pull (bulkPut). Push loop skips these. */
-    private pullWrittenIds = new Set<string>();
+    /** Doc IDs written by pull (bulkPut). Push loop uses seq comparison
+     *  to distinguish pull echoes from genuine post-pull edits. */
+    private pullWrittenIds = new Map<string, PullWriteRecord>();
+    private static readonly PULL_WRITTEN_TTL_MS = 60_000;
     /** Doc IDs recently pushed. Pull skips logging for these (echo suppression). */
     private recentlyPushedIds = new Set<string>();
     /** Last remote update_seq seen by stall detection. Compared against
      *  our consumed remoteSeq to detect a stalled pull loop. */
     private lastObservedRemoteSeq: number | string = 0;
+
+    // ── Pull loop retry state ────────────────────────────
+    private pullRetryMs = 2_000;
+    private lastPullErrorMsg: string | null = null;
+    private static readonly PULL_RETRY_MIN_MS = 2_000;
+    private static readonly PULL_RETRY_MAX_MS = 30_000;
 
     // ── Session management ────────────────────────────────
 
@@ -280,6 +301,15 @@ export class SyncEngine {
      */
     onPullWrite(handler: (doc: FileDoc) => Promise<void>): void {
         this.onPullWriteHandler = handler;
+    }
+
+    /**
+     * Called when a remote deletion is detected in the changes feed.
+     * The handler returns true if local has unpushed edits (→ concurrent
+     * conflict), false if the deletion was applied successfully.
+     */
+    onPullDelete(handler: (path: string, localDoc: FileDoc) => Promise<boolean>): void {
+        this.onPullDeleteHandler = handler;
     }
 
     /**
@@ -471,6 +501,9 @@ export class SyncEngine {
         this.idleCallbacks = [];
         this.deniedWarningEmitted = false;
         this.lastObservedRemoteSeq = 0;
+        this.pullWrittenIds.clear();
+        this.pullRetryMs = SyncEngine.PULL_RETRY_MIN_MS;
+        this.lastPullErrorMsg = null;
         // lastHealthyAt and lastErrorDetail intentionally NOT reset.
     }
 
@@ -615,6 +648,8 @@ export class SyncEngine {
                 if (this.syncEpoch !== epoch) return;
 
                 if (result.results.length > 0) {
+                    this.pullRetryMs = SyncEngine.PULL_RETRY_MIN_MS;
+                    this.lastPullErrorMsg = null;
                     this.setState("syncing");
                     await this.writePulledDocs(result);
                     if (this.syncEpoch !== epoch) return;
@@ -631,14 +666,20 @@ export class SyncEngine {
                 if (detail.kind === "auth" || detail.kind === "server") {
                     this.errorRecovery.handleTransientError(e);
                 } else if (this.state !== "reconnecting" && this.state !== "error") {
-                    // Network/timeout errors on longpoll are expected during
-                    // reconnect/error. Only log when state is healthy.
-                    logDebug(
-                        `pullLoop: ${detail.kind} error, retrying — ${detail.message}`,
-                    );
+                    // Deduplicate consecutive identical error messages.
+                    if (detail.message !== this.lastPullErrorMsg) {
+                        this.lastPullErrorMsg = detail.message;
+                        logDebug(
+                            `pullLoop: ${detail.kind} error, retrying — ${detail.message}`,
+                        );
+                    }
                 }
 
-                await this.delay(2000, epoch);
+                await this.delay(this.pullRetryMs, epoch);
+                this.pullRetryMs = Math.min(
+                    this.pullRetryMs * 2,
+                    SyncEngine.PULL_RETRY_MAX_MS,
+                );
             }
         }
     }
@@ -657,16 +698,27 @@ export class SyncEngine {
 
                 if (this.syncEpoch !== epoch) return;
 
-                // Filter to replicated docs, excluding pull-written docs
-                // (they came from remote, no need to push back).
-                const toPush = localChanges.results.filter(
-                    (r) => r.doc && isReplicatedDocId(r.id) && !r.deleted
-                        && !this.pullWrittenIds.has(r.id),
-                );
+                // Filter to replicated docs. For pull-written docs, use
+                // seq comparison: if the local change's seq is greater than
+                // the seq recorded at pull time, it's a genuine post-pull
+                // user edit and must be pushed.
+                const toPush = localChanges.results.filter((r) => {
+                    if (!r.doc || !isReplicatedDocId(r.id) || r.deleted) return false;
+                    const record = this.pullWrittenIds.get(r.id);
+                    if (!record) return true;
+                    const rSeq = typeof r.seq === "number" ? r.seq : parseInt(String(r.seq), 10);
+                    return rSeq > record.seq;
+                });
 
-                // Clean up pullWrittenIds for docs we've now seen.
+                // Clean up pullWrittenIds: remove seen IDs + TTL expiry.
+                const now = Date.now();
                 for (const r of localChanges.results) {
                     this.pullWrittenIds.delete(r.id);
+                }
+                for (const [id, rec] of this.pullWrittenIds) {
+                    if (now - rec.addedAt > SyncEngine.PULL_WRITTEN_TTL_MS) {
+                        this.pullWrittenIds.delete(id);
+                    }
                 }
 
                 if (toPush.length > 0 && this.client) {
@@ -708,9 +760,18 @@ export class SyncEngine {
         let chunkCount = 0;
         let writtenCount = 0;
         let writeFailCount = 0;
+        let deletedCount = 0;
 
         for (const row of result.results) {
-            if (!row.doc || row.deleted) continue;
+            // Handle remote deletions (CouchDB tombstones).
+            if (row.deleted) {
+                if (isFileDocId(row.id)) {
+                    await this.handlePulledDeletion(row.id, concurrent);
+                    deletedCount++;
+                }
+                continue;
+            }
+            if (!row.doc) continue;
             const remoteDoc = stripRev(row.doc) as CouchSyncDoc;
 
             // Skip echo: docs we just pushed come back via changes feed.
@@ -743,6 +804,11 @@ export class SyncEngine {
                         const filePath = isFileDoc(remoteDoc)
                             ? filePathFromId(remoteDoc._id)
                             : configPathFromId(remoteDoc._id);
+                        // Ensure remote chunks are available locally so the
+                        // conflict modal can display the remote content.
+                        if (isFileDoc(remoteDoc)) {
+                            await this.ensureChunks(remoteDoc);
+                        }
                         logDebug(`  ⚡ ${filePath} (concurrent)`);
                         concurrent.push({ filePath, localDoc, remoteDoc });
                         continue; // keep local, don't write remote
@@ -754,11 +820,17 @@ export class SyncEngine {
             accepted.push(remoteDoc);
         }
 
-        // Write accepted docs to localDB. Track their IDs so the push
-        // loop skips them (they came from remote, no need to push back).
+        // Write accepted docs to localDB. Track their IDs with the
+        // current local seq so the push loop can distinguish pull echoes
+        // from genuine post-pull user edits.
         if (accepted.length > 0) {
             await this.localDb.bulkPut(accepted);
-            for (const doc of accepted) this.pullWrittenIds.add(doc._id);
+            const { updateSeq } = await this.localDb.info();
+            const seq = typeof updateSeq === "number" ? updateSeq : parseInt(String(updateSeq), 10);
+            const now = Date.now();
+            for (const doc of accepted) {
+                this.pullWrittenIds.set(doc._id, { seq, addedAt: now });
+            }
 
             // Pull-driven vault writes + auto-resolve notification.
             if (this.onPullWriteHandler) {
@@ -793,10 +865,12 @@ export class SyncEngine {
         }
 
         // Summary log — only when there's something to report.
-        const hasActivity = writtenCount > 0 || keepLocalCount > 0 || concurrent.length > 0 || writeFailCount > 0;
+        const hasActivity = writtenCount > 0 || keepLocalCount > 0
+            || concurrent.length > 0 || writeFailCount > 0 || deletedCount > 0;
         if (hasActivity) {
             const parts: string[] = [];
             if (writtenCount > 0) parts.push(`${writtenCount} written`);
+            if (deletedCount > 0) parts.push(`${deletedCount} deleted`);
             if (keepLocalCount > 0) parts.push(`${keepLocalCount} keep-local`);
             if (concurrent.length > 0) parts.push(`${concurrent.length} concurrent`);
             if (writeFailCount > 0) parts.push(`${writeFailCount} failed`);
@@ -819,6 +893,36 @@ export class SyncEngine {
                 Promise.resolve(h(filePath, localDoc, remoteDoc)).catch((e: any) =>
                     logError(`onConcurrent handler error: ${e?.message ?? e}`),
                 );
+            }
+        }
+    }
+
+    /**
+     * Handle a remote deletion detected in the changes feed.
+     * Delegates to onPullDeleteHandler which checks for unpushed local
+     * edits and either applies the deletion or signals a concurrent conflict.
+     */
+    private async handlePulledDeletion(
+        docId: string,
+        concurrent: Array<{ filePath: string; localDoc: CouchSyncDoc; remoteDoc: CouchSyncDoc }>,
+    ): Promise<void> {
+        const path = filePathFromId(docId);
+        const localDoc = await this.localDb.get<FileDoc>(docId);
+
+        // No local doc or already deleted — nothing to do.
+        if (!localDoc || !isFileDoc(localDoc) || localDoc.deleted) return;
+
+        if (this.onPullDeleteHandler) {
+            const hasUnpushed = await this.onPullDeleteHandler(path, localDoc);
+            if (hasUnpushed) {
+                // Remote deletion vs local edit → concurrent conflict.
+                const tombstone: FileDoc = {
+                    _id: docId, type: "file", chunks: [],
+                    mtime: localDoc.mtime, ctime: localDoc.ctime,
+                    size: 0, deleted: true, vclock: {},
+                };
+                concurrent.push({ filePath: path, localDoc, remoteDoc: tombstone });
+                logDebug(`  ⚡ ${path} (concurrent: remote-deleted vs local-edit)`);
             }
         }
     }
@@ -947,6 +1051,9 @@ export class SyncEngine {
         }
 
         // Connected / syncing: stall detection via update_seq comparison.
+        // CouchDB 3.x cluster returns opaque seq strings (e.g. "1771-g1AAAA…")
+        // where the opaque suffix can differ between info() and _changes even
+        // for the same logical position. Compare only the numeric prefix.
         if (!this.client) return;
         const sessionEpoch = this.syncEpoch;
         try {
@@ -954,13 +1061,14 @@ export class SyncEngine {
             if (this.syncEpoch !== sessionEpoch) return;
 
             const currentRemoteSeq = info.update_seq;
-            const seqStr = String(currentRemoteSeq);
-            const localSeqStr = String(this.remoteSeq);
+            const remoteNum = SyncEngine.seqNumericPrefix(currentRemoteSeq);
+            const consumedNum = SyncEngine.seqNumericPrefix(this.remoteSeq);
 
-            if (seqStr !== localSeqStr && seqStr === String(this.lastObservedRemoteSeq)) {
-                // Remote seq hasn't changed since last check, but differs
-                // from what we've consumed — the pull loop is stalled.
-                logDebug(`health: stall detected (remote=${seqStr}, consumed=${localSeqStr})`);
+            if (remoteNum !== consumedNum
+                && remoteNum === SyncEngine.seqNumericPrefix(this.lastObservedRemoteSeq)) {
+                // Remote seq hasn't changed since last check, but its
+                // numeric prefix exceeds what we've consumed — stalled.
+                logDebug(`health: stall detected (remote=${remoteNum}, consumed=${consumedNum})`);
                 await this.requestReconnect("stalled");
                 return;
             }
@@ -1049,5 +1157,17 @@ export class SyncEngine {
             }
             setTimeout(resolve, ms);
         });
+    }
+
+    /**
+     * Extract the numeric prefix from a CouchDB sequence value.
+     * CouchDB 3.x clusters return opaque strings like "1771-g1AAAACReJzL…".
+     * The opaque suffix can differ between `info()` and `_changes` for the
+     * same logical position, so only the numeric prefix is safe to compare.
+     */
+    private static seqNumericPrefix(seq: number | string): number {
+        if (typeof seq === "number") return seq;
+        const n = parseInt(seq, 10);
+        return Number.isNaN(n) ? 0 : n;
     }
 }

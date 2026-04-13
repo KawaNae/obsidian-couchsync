@@ -22,6 +22,7 @@ import { DiffHistoryView, VIEW_TYPE_DIFF_HISTORY } from "./ui/history-view.ts";
 import { LogView, VIEW_TYPE_LOG } from "./ui/log-view.ts";
 import { migrateSettings } from "./settings-migration.ts";
 import { registerCommands } from "./commands.ts";
+import { gcOrphanChunks } from "./db/chunk-gc.ts";
 
 export default class CouchSyncPlugin extends Plugin {
     settings!: CouchSyncSettings;
@@ -131,10 +132,29 @@ export default class CouchSyncPlugin extends Plugin {
             await this.vaultSync.dbToFile(doc);
         });
 
+        // Pull-driven deletions: if the remote deleted a file, apply
+        // locally unless there are unpushed local edits (→ concurrent).
+        this.replicator.onPullDelete(async (path, localDoc) => {
+            if (this.vaultSync.hasUnpushedChanges(path, localDoc.vclock)) {
+                return true; // → concurrent conflict
+            }
+            await this.vaultSync.applyRemoteDeletion(path);
+            return false;
+        });
+
         // Reconcile AFTER catchup completes — never concurrent with pull.
         // This ordering guarantees reconcile sees the latest DB state.
         this.replicator.onCatchupComplete(() => this.fireReconcile("onload"));
         this.replicator.onCatchupFailed(() => this.fireReconcile("onload"));
+
+        // Run orphan-chunk GC once after the first idle (catchup done,
+        // no pending pull/push). Cleans up chunks left by pre-v0.15
+        // non-atomic writes and stale content changes.
+        this.replicator.onceIdle(() => {
+            gcOrphanChunks(this.localDb).catch((e) =>
+                logError(`Chunk GC failed: ${e?.message ?? e}`),
+            );
+        });
 
         this.addSettingTab(new CouchSyncSettingTab(this.app, this));
 
