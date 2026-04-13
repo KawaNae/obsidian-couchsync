@@ -12,6 +12,7 @@ import { ProgressNotice } from "../ui/notices.ts";
 import { arrayBufferToBase64, base64ToArrayBuffer } from "../db/chunker.ts";
 import { incrementVC } from "./vector-clock.ts";
 import { CouchClient, makeCouchClient } from "../db/couch-client.ts";
+import { logError } from "../ui/log.ts";
 import * as remoteCouch from "../db/remote-couch.ts";
 
 /**
@@ -219,7 +220,7 @@ export class ConfigSync {
                 } as ConfigDoc));
                 count++;
             } catch (e) {
-                console.error(`CouchSync: Failed to scan config ${file}:`, e);
+                logError(`CouchSync: Failed to scan config ${file}: ${e?.message ?? e}`);
             }
         }
         return count;
@@ -267,7 +268,7 @@ export class ConfigSync {
                 await this.app.vault.adapter.writeBinary(path, buf);
                 count++;
             } catch (e) {
-                console.error(`CouchSync: Failed to write config ${path}:`, e);
+                logError(`CouchSync: Failed to write config ${path}: ${e?.message ?? e}`);
             }
         }
         return count;

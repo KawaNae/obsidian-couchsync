@@ -1,6 +1,7 @@
 import type { App, TFile } from "obsidian";
 import type { VaultSync } from "./vault-sync.ts";
 import type { CouchSyncSettings } from "../settings.ts";
+import { logError } from "../ui/log.ts";
 
 export class ChangeTracker {
     private timers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -54,7 +55,7 @@ export class ChangeTracker {
                 if (this.pendingDeleteIgnores.delete(file.path)) return;
                 if (!this.paused) {
                     this.vaultSync.markDeleted(file.path).catch((e) =>
-                        console.error("CouchSync: markDeleted failed:", file.path, e),
+                        logError(`CouchSync: markDeleted failed: ${file.path} ${e?.message ?? e}`),
                     );
                 }
             })
@@ -66,7 +67,7 @@ export class ChangeTracker {
                 this.lastSyncTime.delete(oldPath);
                 if (!this.paused && file instanceof Object && "stat" in file) {
                     this.vaultSync.handleRename(file as TFile, oldPath).catch((e) =>
-                        console.error("CouchSync: handleRename failed:", oldPath, "→", (file as TFile).path, e),
+                        logError(`CouchSync: handleRename failed: ${oldPath} → ${(file as TFile).path} ${e?.message ?? e}`),
                     );
                 }
             })
@@ -159,7 +160,7 @@ export class ChangeTracker {
     private runSync(file: TFile): void {
         this.lastSyncTime.set(file.path, Date.now());
         this.vaultSync.fileToDb(file).catch((e) => {
-            console.error(`CouchSync: Failed to sync ${file.path}:`, e);
+            logError(`CouchSync: Failed to sync ${file.path}: ${e?.message ?? e}`);
         });
     }
 

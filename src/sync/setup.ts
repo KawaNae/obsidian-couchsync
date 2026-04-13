@@ -4,6 +4,7 @@ import type { SyncEngine } from "../db/sync-engine.ts";
 import type { VaultSync } from "./vault-sync.ts";
 import type { Reconciler } from "./reconciler.ts";
 import { filePathFromId, parseDocId } from "../types/doc-id.ts";
+import { logError } from "../ui/log.ts";
 
 /**
  * Format a doc `_id` for progress display. Files show their vault path,
@@ -84,7 +85,7 @@ export class SetupService {
                     await this.vaultSync.dbToFile(fileDoc);
                     vaultFiles++;
                 } catch (e) {
-                    console.error(`CouchSync: Failed to write ${vaultPath}:`, e);
+                    logError(`CouchSync: Failed to write ${vaultPath}: ${e?.message ?? e}`);
                 }
             }
 
@@ -125,7 +126,7 @@ export class SetupService {
                 await this.vaultSync.fileToDb(file);
                 synced++;
             } catch (e) {
-                console.error(`CouchSync: Failed to scan ${file.path}:`, e);
+                logError(`CouchSync: Failed to scan ${file.path}: ${e?.message ?? e}`);
             }
         }
         return synced;

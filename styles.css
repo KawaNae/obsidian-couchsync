@@ -310,3 +310,118 @@
 .diff-line-removed { background-color: rgba(220, 0, 0, 0.15); }
 .diff-line-removed .diff-line-num { color: var(--color-red); }
 .diff-line-placeholder { background-color: var(--background-secondary); opacity: 0.5; }
+
+/* ─── Log View ──────────────────────────────────────────── */
+
+.couchsync-log-view { padding: 0; display: flex; flex-direction: column; height: 100%; }
+
+.couchsync-log-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--background-modifier-border);
+    flex-shrink: 0;
+}
+
+.couchsync-log-filters {
+    display: flex;
+    gap: 4px;
+}
+
+.couchsync-log-filter-btn {
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 0.8em;
+    cursor: pointer;
+    border: 1px solid var(--background-modifier-border);
+    background: var(--background-primary);
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+
+.couchsync-log-filter-btn:hover {
+    background: var(--background-modifier-hover);
+    color: var(--text-normal);
+}
+
+.couchsync-log-filter-btn.is-active {
+    background: var(--interactive-accent);
+    color: var(--text-on-accent);
+    border-color: var(--interactive-accent);
+}
+
+.couchsync-log-actions {
+    display: flex;
+    gap: 4px;
+}
+
+.couchsync-log-action-btn {
+    padding: 4px;
+    border-radius: 4px;
+    cursor: pointer;
+    border: 1px solid var(--background-modifier-border);
+    background: var(--background-primary);
+    color: var(--text-muted);
+    display: flex;
+    align-items: center;
+}
+
+.couchsync-log-action-btn:hover {
+    background: var(--background-modifier-hover);
+    color: var(--text-normal);
+}
+
+.couchsync-log-list {
+    flex: 1;
+    overflow-y: auto;
+    font-family: var(--font-monospace);
+    font-size: 0.8em;
+    line-height: 1.6;
+}
+
+.couchsync-log-entry {
+    display: flex;
+    gap: 8px;
+    padding: 2px 8px;
+    border-bottom: 1px solid var(--background-modifier-border-hover, rgba(0,0,0,0.03));
+}
+
+.couchsync-log-entry:hover {
+    background: var(--background-modifier-hover);
+}
+
+.couchsync-log-time {
+    flex-shrink: 0;
+    color: var(--text-faint);
+    font-variant-numeric: tabular-nums;
+}
+
+.couchsync-log-level {
+    flex-shrink: 0;
+    width: 3.5em;
+    text-transform: uppercase;
+    font-weight: 600;
+    font-size: 0.85em;
+    line-height: 1.9;
+}
+
+.couchsync-log-message {
+    flex: 1;
+    min-width: 0;
+    word-break: break-word;
+    color: var(--text-normal);
+}
+
+/* Level-specific colours */
+.couchsync-log-debug .couchsync-log-level { color: var(--text-faint); }
+.couchsync-log-debug .couchsync-log-message { color: var(--text-muted); }
+
+.couchsync-log-info .couchsync-log-level { color: var(--color-blue, var(--text-accent)); }
+
+.couchsync-log-error {
+    background: rgba(220, 0, 0, 0.06);
+}
+.couchsync-log-error .couchsync-log-level { color: var(--text-error); }
+.couchsync-log-error .couchsync-log-message { color: var(--text-error); }
