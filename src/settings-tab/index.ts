@@ -129,8 +129,6 @@ export class CouchSyncSettingTab extends PluginSettingTab {
                 localDb: this.plugin.localDb,
                 configLocalDb: this.plugin.configLocalDb,
                 replicator: this.plugin.replicator,
-                conflictResolver: this.plugin.conflictResolver,
-                configConflictResolver: this.plugin.configConflictResolver,
                 statusBar: this.plugin.statusBar,
                 onRestart: () => {
                     const app = this.plugin.app as any;

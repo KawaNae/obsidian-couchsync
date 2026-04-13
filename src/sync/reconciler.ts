@@ -117,6 +117,7 @@ export class Reconciler {
         private vaultSync: VaultSync,
         private getSettings: () => CouchSyncSettings,
         private notify: ReconcileNotify = () => {},
+        private ensureChunks: (doc: FileDoc) => Promise<void> = async () => {},
     ) {}
 
     isRunning(): boolean {
@@ -230,7 +231,7 @@ export class Reconciler {
                         report.deleted.push(path);
                     }
                 } else {
-                    if (await this.tryStep(path, "restore", () => this.vaultSync.dbToFile(doc), mode)) {
+                    if (await this.tryStep(path, "restore", async () => { await this.ensureChunks(doc); await this.vaultSync.dbToFile(doc); }, mode)) {
                         report.restored.push(path);
                     }
                 }
@@ -253,7 +254,7 @@ export class Reconciler {
                         report.localWins.push(path);
                     }
                 } else {
-                    if (await this.tryStep(path, "pull", () => this.vaultSync.dbToFile(doc), mode)) {
+                    if (await this.tryStep(path, "pull", async () => { await this.ensureChunks(doc); await this.vaultSync.dbToFile(doc); }, mode)) {
                         report.remoteWins.push(path);
                     }
                 }

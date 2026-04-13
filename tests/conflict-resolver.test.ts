@@ -40,18 +40,15 @@ describe("ConflictResolver — resolveOnPull (Phase 2)", () => {
         expect(verdict).toBe("take-remote");
     });
 
-    it("fires onAutoResolved when remote dominates", async () => {
-        const onAuto = vi.fn();
-        const resolver = new ConflictResolver(onAuto);
+    it("returns take-remote without callback when remote dominates (not a conflict)", async () => {
+        const resolver = new ConflictResolver();
         const local = makeFile("doc.md", { A: 1, B: 1 });
         const remote = makeFile("doc.md", { A: 2, B: 1 });
 
-        await resolver.resolveOnPull(local, remote);
+        const verdict = await resolver.resolveOnPull(local, remote);
 
-        expect(onAuto).toHaveBeenCalledTimes(1);
-        expect(onAuto.mock.calls[0][0]).toBe("doc.md");
-        expect(onAuto.mock.calls[0][1]).toBe(remote); // winner
-        expect(onAuto.mock.calls[0][2]).toEqual([local]); // losers
+        expect(verdict).toBe("take-remote");
+        // No onAutoResolved — dominated is a normal update, not a conflict.
     });
 
     it("returns keep-local when local dominates remote", async () => {
@@ -145,11 +142,4 @@ describe("ConflictResolver — resolveOnPull (Phase 2)", () => {
         expect(verdict).toBe("take-remote");
     });
 
-    it("resolveIfConflicted is a no-op (backward compat)", async () => {
-        const resolver = new ConflictResolver();
-        const doc = makeFile("legacy.md", { A: 1 });
-        // No _conflicts → false immediately
-        const result = await resolver.resolveIfConflicted(doc as any);
-        expect(result).toBe(false);
-    });
 });

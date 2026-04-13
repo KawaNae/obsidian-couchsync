@@ -25,9 +25,10 @@ import { ConflictModal, type ConflictChoice } from "./ui/conflict-modal.ts";
 import { totalDiscrepancies } from "./sync/reconciler.ts";
 import { isDiffableText } from "./utils/binary.ts";
 import { isFileDoc } from "./types.ts";
-import type { FileDoc } from "./types.ts";
+import type { FileDoc, CouchSyncDoc } from "./types.ts";
 import { joinChunks } from "./db/chunker.ts";
 import { incrementVC, mergeVC } from "./sync/vector-clock.ts";
+import { stripRev } from "./utils/doc.ts";
 
 export default class CouchSyncPlugin extends Plugin {
     settings!: CouchSyncSettings;
@@ -123,6 +124,7 @@ export default class CouchSyncPlugin extends Plugin {
             this.vaultSync,
             () => this.settings,
             (msg) => notify(msg),
+            (doc) => this.replicator.ensureFileChunks(doc),
         );
         this.setupService = new SetupService(
             this.app, this.localDb, this.replicator, this.vaultSync, this.reconciler,
@@ -135,38 +137,10 @@ export default class CouchSyncPlugin extends Plugin {
         this.historyManager = new HistoryManager(
             this.app.vault, this.historyStorage, this.historyCapture, () => this.settings,
         );
-        this.conflictResolver = new ConflictResolver(
-            async (filePath, winnerDoc, loserDocs) => {
-                // ConflictResolver passes us either FileDoc or ConfigDoc;
-                // history capture only knows about file content, so we
-                // narrow to FileDoc here. ConfigDoc auto-resolutions
-                // are silently logged via the resolver's console.log.
-                if (!("chunks" in winnerDoc)) return;
-                try {
-                    const winnerChunks = await this.localDb.getChunks(winnerDoc.chunks);
-                    const winnerBuf = joinChunks(winnerChunks);
-                    if (!isDiffableText(winnerBuf)) return;
-                    const dec = new TextDecoder("utf-8");
-                    const winnerText = dec.decode(winnerBuf);
-                    for (const loser of loserDocs) {
-                        if (!("chunks" in loser)) continue;
-                        const loserChunks = await this.localDb.getChunks(loser.chunks);
-                        const loserBuf = joinChunks(loserChunks);
-                        if (!isDiffableText(loserBuf)) continue;
-                        await this.historyCapture.saveConflict(
-                            filePath,
-                            dec.decode(loserBuf),
-                            winnerText,
-                        );
-                    }
-                    notify(
-                        `Conflict auto-resolved: ${filePath.split("/").pop()}. Losing version(s) saved to history.`,
-                    );
-                } catch (e) {
-                    logError(`CouchSync: Failed to save conflict to history: ${e?.message ?? e}`);
-                }
-            },
-        );
+        // "dominated" (remote is causally newer) is a normal update, not a
+        // conflict. History is preserved by dbToFile → captureSyncWrite.
+        // No onAutoResolved callback needed.
+        this.conflictResolver = new ConflictResolver();
         // Concurrent (VC-incomparable) conflicts need human judgment. For
         // now we raise a persistent Notice directing the user to history;
         // a Side-by-side diff modal is planned for the v2 design's Phase 3
@@ -202,17 +176,7 @@ export default class CouchSyncPlugin extends Plugin {
 
         // Config-side conflict resolver (only when config sync is enabled)
         if (this.configLocalDb) {
-            this.configConflictResolver = new ConflictResolver(
-                async (configPath, winnerDoc, _loserDocs) => {
-                    // ConfigDoc auto-resolution: log + Notice. History
-                    // capture is text-oriented (vault notes), so we don't
-                    // try to push binary config blobs into Dexie.
-                    notify(
-                        `Config conflict auto-resolved: ${configPath.split("/").pop()}.`,
-                        5000,
-                    );
-                },
-            );
+            this.configConflictResolver = new ConflictResolver();
             this.configConflictResolver.setOnConcurrent(async (configPath, revisions) => {
                 logWarn(
                     `CouchSync: concurrent config edit on ${configPath} — ${revisions.length} revisions, none dominate`,
@@ -293,8 +257,7 @@ export default class CouchSyncPlugin extends Plugin {
                         (remoteDoc as any).vclock ?? {},
                     );
                     const updated = { ...localDoc, vclock: incrementVC(merged, deviceId) };
-                    const { _rev, ...rest } = updated as any;
-                    await this.localDb.bulkPut([rest]);
+                    await this.localDb.bulkPut([stripRev(updated) as CouchSyncDoc]);
                 }
                 notify(
                     `CouchSync: concurrent config edit on ${fileName} — keeping local version.`,
@@ -656,8 +619,8 @@ export default class CouchSyncPlugin extends Plugin {
                 ...remoteDoc,
                 vclock: incrementVC(remoteDoc.vclock ?? {}, deviceId),
             };
-            const { _rev, ...rest } = updated as any;
-            await this.localDb.bulkPut([rest]);
+            await this.localDb.bulkPut([stripRev(updated)]);
+            await this.replicator.ensureFileChunks(updated as FileDoc);
             await this.vaultSync.dbToFile(updated as FileDoc);
         } else {
             logInfo(`Conflict resolved: keep-local for ${fileName}`);
@@ -669,8 +632,7 @@ export default class CouchSyncPlugin extends Plugin {
                 ...localDoc,
                 vclock: incrementVC(merged, deviceId),
             };
-            const { _rev, ...rest } = updated as any;
-            await this.localDb.bulkPut([rest]);
+            await this.localDb.bulkPut([stripRev(updated)]);
             logDebug(`  vclock after merge: ${JSON.stringify(updated.vclock)}`);
         }
     }

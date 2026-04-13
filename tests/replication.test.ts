@@ -35,24 +35,12 @@ describe("ConflictResolver — resolveOnPull", () => {
         const localDoc = makeFile("note.md", "loser", 2000, { A: 2 });
         const remoteDoc = makeFile("note.md", "winner", 5000, { A: 3 });
 
-        let callbackArgs: { filePath: string; winnerVC: any; loserCount: number } | null = null;
+        const resolver = new ConflictResolver();
 
-        const resolver = new ConflictResolver(
-            async (filePath, winner, losers) => {
-                callbackArgs = {
-                    filePath,
-                    winnerVC: winner.vclock,
-                    loserCount: losers.length,
-                };
-            },
-        );
+        const verdict = await resolver.resolveOnPull(localDoc, remoteDoc);
 
-        await resolver.resolveOnPull(localDoc, remoteDoc);
-
-        expect(callbackArgs).not.toBeNull();
-        expect(callbackArgs!.filePath).toBe("note.md");
-        expect(callbackArgs!.winnerVC).toEqual({ A: 3 });
-        expect(callbackArgs!.loserCount).toBe(1);
+        // dominated = normal update, not a conflict. No callback.
+        expect(verdict).toBe("take-remote");
     });
 
     it("raises onConcurrent callback when VCs are incomparable", async () => {

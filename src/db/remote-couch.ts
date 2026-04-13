@@ -10,6 +10,7 @@
 
 import type { ICouchClient, ILocalStore } from "./interfaces.ts";
 import type { CouchSyncDoc } from "../types.ts";
+import { stripRev } from "../utils/doc.ts";
 
 export type ProgressCallback = (docId: string, count: number) => void;
 
@@ -35,8 +36,7 @@ export async function pushDocs(
     for (const row of result.rows) {
         if (row.doc && !row.value?.deleted) {
             // Strip local _rev — remote will assign its own.
-            const { _rev, ...rest } = row.doc as any;
-            docs.push(rest);
+            docs.push(stripRev(row.doc));
         }
     }
     if (docs.length === 0) return 0;
@@ -92,10 +92,7 @@ export async function pullByPrefix(
     if (docs.length === 0) return 0;
 
     // Strip remote _rev before writing to local.
-    const localDocs = docs.map((d) => {
-        const { _rev, ...rest } = d as any;
-        return rest as CouchSyncDoc;
-    });
+    const localDocs = docs.map((d) => stripRev(d) as CouchSyncDoc);
 
     const results = await local.bulkPut(localDocs);
     return results.filter((r) => r.ok).length;
@@ -141,11 +138,10 @@ export async function pushAll(
     onProgress?: ProgressCallback,
 ): Promise<number> {
     const result = await local.allDocs({ include_docs: true });
-    const docs: any[] = [];
+    const docs: Array<CouchSyncDoc & { _rev?: string }> = [];
     for (const row of result.rows) {
         if (row.doc && !row.value?.deleted) {
-            const { _rev, ...rest } = row.doc as any;
-            docs.push(rest);
+            docs.push(stripRev(row.doc) as CouchSyncDoc);
         }
     }
     if (docs.length === 0) return 0;
@@ -199,10 +195,7 @@ export async function pullAll(
     if (docs.length === 0) return { written: 0, docs: [] };
 
     // Strip remote _rev before writing to local.
-    const localDocs = docs.map((d) => {
-        const { _rev, ...rest } = d as any;
-        return rest as CouchSyncDoc;
-    });
+    const localDocs = docs.map((d) => stripRev(d) as CouchSyncDoc);
 
     const results = await local.bulkPut(localDocs);
     let total = 0;

@@ -16,6 +16,7 @@ import { type App, Notice, Setting, type ButtonComponent } from "obsidian";
 import type { ConnectionState, CouchSyncSettings } from "../settings.ts";
 import type { SyncEngine } from "../db/sync-engine.ts";
 import type { LocalDB } from "../db/local-db.ts";
+import { validateDeviceName } from "../utils/device-name.ts";
 
 export interface VaultSyncTabDeps {
     app: App;
@@ -434,17 +435,6 @@ export class VaultSyncTab {
     }
 }
 
-const DEVICE_NAME_RE = /^[a-z0-9][a-z0-9-]{0,28}[a-z0-9]$/;
-
-function validateDeviceName(name: string): string | null {
-    if (!name) return "Device name is required.";
-    if (name.length < 2) return "Device name must be at least 2 characters.";
-    if (name.length > 30) return "Device name must be 30 characters or fewer.";
-    if (!DEVICE_NAME_RE.test(name)) {
-        return "Use lowercase letters, numbers, and hyphens only (e.g. desktop, iphone-pro).";
-    }
-    return null;
-}
 
 /**
  * Render the "Skipped large files" section. Async — fetches the

@@ -37,16 +37,13 @@ describe("ConflictResolver — ConfigDoc support (Phase 2)", () => {
         expect(verdict).toBe("take-remote");
     });
 
-    it("fires onAutoResolved with .obsidian path for ConfigDoc", async () => {
-        const onAuto = vi.fn();
-        const resolver = new ConflictResolver(onAuto);
+    it("returns take-remote for ConfigDoc when remote dominates (no callback)", async () => {
+        const resolver = new ConflictResolver();
         const local = makeConfig(".obsidian/appearance.json", { A: 1, B: 1 });
         const remote = makeConfig(".obsidian/appearance.json", { A: 2, B: 1 });
 
-        await resolver.resolveOnPull(local, remote);
-
-        expect(onAuto).toHaveBeenCalledTimes(1);
-        expect(onAuto.mock.calls[0][0]).toBe(".obsidian/appearance.json");
+        const verdict = await resolver.resolveOnPull(local, remote);
+        expect(verdict).toBe("take-remote");
     });
 
     it("returns concurrent for ConfigDoc when VCs are incomparable", async () => {

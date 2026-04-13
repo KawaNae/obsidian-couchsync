@@ -18,6 +18,7 @@ import type {
     AllDocsRow,
     LocalChangesResult,
 } from "./interfaces.ts";
+import { stripRev } from "../utils/doc.ts";
 
 // ── Stored document shape ───────────────────────────────
 
@@ -113,7 +114,8 @@ export class DexieStore<T extends { _id: string; _rev?: string } = any>
     }
 
 async put(doc: T): Promise<PutResponse> {
-        const { _rev, ...body } = doc as any;
+        const _rev = doc._rev;
+        const body = stripRev(doc);
         const id: string = body._id;
         if (!id) throw new Error("Document must have an _id");
 
@@ -137,7 +139,7 @@ async put(doc: T): Promise<PutResponse> {
     async bulkPut(docs: T[]): Promise<PutResponse[]> {
         if (docs.length === 0) return [];
 
-        const ids = docs.map((d) => (d as any)._id as string);
+        const ids = docs.map((d) => d._id);
         const existingDocs = await this.db.docs.bulkGet(ids);
         const existingMap = new Map<string, StoredDoc>();
         for (const doc of existingDocs) {
@@ -150,13 +152,14 @@ async put(doc: T): Promise<PutResponse> {
         const seq = await this._bumpSeq();
 
         for (let i = 0; i < docs.length; i++) {
-            const { _rev, ...body } = docs[i] as any;
+            const _rev = docs[i]._rev;
+            const body = stripRev(docs[i]);
             const id: string = body._id;
             const existing = existingMap.get(id);
 
             if (existing) {
                 // Content-addressed chunks: tolerate 409 silently
-                if ((docs[i] as any).type === "chunk") {
+                if ("type" in docs[i] && (docs[i] as any).type === "chunk") {
                     responses.push({
                         ok: true,
                         id,
@@ -201,7 +204,7 @@ async put(doc: T): Promise<PutResponse> {
             const updated = fn(existing);
             if (!updated) return null;
 
-            const { _rev, ...body } = updated as any;
+            const body = stripRev(updated);
             const expectedVersion = stored?._version ?? 0;
             const newVersion = expectedVersion + 1;
 

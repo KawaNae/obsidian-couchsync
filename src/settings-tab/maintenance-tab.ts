@@ -3,7 +3,6 @@ import type { CouchSyncSettings } from "../settings.ts";
 import type { LocalDB } from "../db/local-db.ts";
 import type { ConfigLocalDB } from "../db/config-local-db.ts";
 import type { SyncEngine } from "../db/sync-engine.ts";
-import type { ConflictResolver } from "../conflict/conflict-resolver.ts";
 import type { StatusBar } from "../ui/status-bar.ts";
 import { DOC_ID } from "../types/doc-id.ts";
 
@@ -14,10 +13,6 @@ interface MaintenanceTabDeps {
     /** Null when config sync is not configured (`couchdbConfigDbName === ""`) */
     configLocalDb: ConfigLocalDB | null;
     replicator: SyncEngine;
-    /** ConflictResolver bound to the vault DB */
-    conflictResolver: ConflictResolver;
-    /** ConflictResolver bound to the config DB (null when config sync disabled) */
-    configConflictResolver: ConflictResolver | null;
     statusBar: StatusBar;
     onRestart: () => void;
 }
@@ -84,30 +79,6 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
     // Troubleshooting
     el.createEl("h3", { text: "Troubleshooting" });
 
-    new Setting(el)
-        .setName("Resolve all conflicts")
-        .setDesc(
-            "Scan both vault and config databases for conflicted documents and " +
-                "auto-resolve those whose Vector Clocks determine a causal winner. " +
-                "Concurrent edits (no dominator) are left for manual resolution.",
-        )
-        .addButton((btn) =>
-            btn.setButtonText("Resolve").onClick(async () => {
-                btn.setButtonText("Resolving...");
-                btn.setDisabled(true);
-                const vaultCount = await deps.conflictResolver.scanConflicts();
-                const configCount = deps.configConflictResolver
-                    ? await deps.configConflictResolver.scanConflicts()
-                    : 0;
-                const total = vaultCount + configCount;
-                new Notice(
-                    `CouchSync: Auto-resolved ${total} conflict(s) ` +
-                        `(vault: ${vaultCount}, config: ${configCount}).`,
-                );
-                btn.setButtonText("Resolve");
-                btn.setDisabled(false);
-            })
-        );
 
     // ── Migration: legacy configs in vault DB ───────────────
     // Detect orphan `config:*` docs left in the vault DB after the

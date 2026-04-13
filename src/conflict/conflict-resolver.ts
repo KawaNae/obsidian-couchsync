@@ -1,5 +1,4 @@
-import type { CouchSyncDoc, FileDoc, ConfigDoc } from "../types.ts";
-import { isFileDoc, isConfigDoc } from "../types.ts";
+import type { FileDoc, ConfigDoc } from "../types.ts";
 import { compareVC } from "../sync/vector-clock.ts";
 import { filePathFromId, configPathFromId } from "../types/doc-id.ts";
 import { logDebug, logWarn } from "../ui/log.ts";
@@ -37,17 +36,6 @@ export type OnConcurrentConflict = (
 ) => void | Promise<void>;
 
 /**
- * Fired when a conflict auto-resolved (one revision dominated the rest).
- * `vaultPath` is the bare vault path. `winner` is the dominating revision,
- * `losers` are the superseded revisions.
- */
-export type OnAutoResolved = (
-    vaultPath: string,
-    winner: ResolvableDoc,
-    losers: ResolvableDoc[],
-) => void | Promise<void>;
-
-/**
  * Extract the user-facing path from a doc id. Throws for unknown id
  * shapes — that should never happen because we filter by `isFileDoc ||
  * isConfigDoc` before calling, and the schema guard rejects bare ids.
@@ -61,16 +49,8 @@ function extractVaultPath(id: string): string {
 export class ConflictResolver {
     private onConcurrent: OnConcurrentConflict | null = null;
 
-    constructor(
-        private onAutoResolved: OnAutoResolved | null = null,
-    ) {}
-
     setOnConcurrent(handler: OnConcurrentConflict): void {
         this.onConcurrent = handler;
-    }
-
-    setOnAutoResolved(handler: OnAutoResolved): void {
-        this.onAutoResolved = handler;
     }
 
     /**
@@ -103,18 +83,8 @@ export class ConflictResolver {
                 return "keep-local";
 
             case "dominated":
-                // Remote dominates local — take remote.
-                if (this.onAutoResolved) {
-                    try {
-                        await this.onAutoResolved(vaultPath, remoteDoc, [localDoc]);
-                    } catch (e) {
-                        console.error(
-                            `CouchSync: onAutoResolved callback failed for ${vaultPath}:`,
-                            e,
-                        );
-                    }
-                }
-                logDebug(`auto-resolved: remote dominates local for ${vaultPath}`);
+                // Remote dominates local — normal update, not a conflict.
+                // History is preserved by dbToFile → captureSyncWrite.
                 return "take-remote";
 
             case "dominates":
@@ -138,29 +108,6 @@ export class ConflictResolver {
         }
     }
 
-    /**
-     * Legacy no-op: _conflicts trees are not used. Conflict resolution
-     * happens via resolveOnPull() during the pull path.
-     */
-    async resolveIfConflicted(doc: CouchSyncDoc): Promise<boolean> {
-        if (!(doc as any)._conflicts || (doc as any)._conflicts.length === 0) return false;
-        if (!isFileDoc(doc) && !isConfigDoc(doc)) return false;
-
-        const vaultPath = extractVaultPath(doc._id);
-        logDebug(
-            `resolveIfConflicted: ignoring _conflicts tree for ${vaultPath} ` +
-            `(use resolveOnPull instead)`,
-        );
-        return false;
-    }
-
-    /**
-     * Legacy no-op: returns 0. Conflict resolution uses resolveOnPull().
-     * Called by the Maintenance tab's "Scan Conflicts" button.
-     */
-    async scanConflicts(): Promise<number> {
-        return 0;
-    }
 }
 
 /** Test helper exported for unit tests. Not part of the public API. */

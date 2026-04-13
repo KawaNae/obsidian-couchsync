@@ -7,7 +7,8 @@
  *   - CouchClient.info() for health probes
  */
 
-import type { CouchSyncDoc, FileDoc } from "../types.ts";
+import type { CouchSyncDoc, FileDoc, ChunkDoc } from "../types.ts";
+import { stripRev } from "../utils/doc.ts";
 import { isReplicatedDocId } from "../types/doc-id.ts";
 import type { LocalDB } from "./local-db.ts";
 import type { CouchSyncSettings } from "../settings.ts";
@@ -100,6 +101,10 @@ export class SyncEngine {
 
     /** Doc IDs written by pull (bulkPut). Push loop skips these. */
     private pullWrittenIds = new Set<string>();
+    /** Doc IDs recently pushed. Pull skips logging for these (echo suppression). */
+    private recentlyPushedIds = new Set<string>();
+    /** Track probe state for change-only logging. */
+    private lastProbeOk = true;
 
     // ── Session management ────────────────────────────────
 
@@ -169,6 +174,37 @@ export class SyncEngine {
     }
 
     private conflictResolver?: ConflictResolver;
+
+    /**
+     * FileDoc が参照する chunk が全て localDB に存在することを保証する。
+     * 不足分はリモートから fetch して localDB に保存する。
+     * client が null の場合は何もしない（オフライン時は既存エラーに委ねる）。
+     */
+    private async ensureChunks(fileDoc: FileDoc): Promise<void> {
+        const existing = await this.localDb.getChunks(fileDoc.chunks);
+        const existingIds = new Set(existing.map((c) => c._id));
+        const missing = fileDoc.chunks.filter((id) => !existingIds.has(id));
+        if (missing.length === 0) return;
+
+        if (!this.client) {
+            logWarn(
+                `missing ${missing.length} chunk(s) for ${filePathFromId(fileDoc._id)} but no remote client`,
+            );
+            return;
+        }
+
+        logDebug(
+            `  fetching ${missing.length} missing chunk(s) from remote for ${filePathFromId(fileDoc._id)}`,
+        );
+        const fetched = await this.client.bulkGet<ChunkDoc>(missing);
+        if (fetched.length > 0) {
+            await this.localDb.bulkPut(fetched);
+        }
+    }
+
+    async ensureFileChunks(fileDoc: FileDoc): Promise<void> {
+        return this.ensureChunks(fileDoc);
+    }
 
     // ── Public API: State ─────────────────────────────────
 
@@ -602,8 +638,9 @@ export class SyncEngine {
 
                 if (detail.kind === "auth" || detail.kind === "server") {
                     this.handleTransientError(e);
-                } else {
-                    // Network/timeout errors on longpoll are expected.
+                } else if (this.state !== "reconnecting" && this.state !== "error") {
+                    // Network/timeout errors on longpoll are expected during
+                    // reconnect/error. Only log when state is healthy.
                     logDebug(
                         `pullLoop: ${detail.kind} error, retrying — ${detail.message}`,
                     );
@@ -682,8 +719,13 @@ export class SyncEngine {
 
         for (const row of result.results) {
             if (!row.doc || row.deleted) continue;
-            const { _rev, ...rest } = row.doc as any;
-            const remoteDoc = rest as CouchSyncDoc;
+            const remoteDoc = stripRev(row.doc) as CouchSyncDoc;
+
+            // Skip echo: docs we just pushed come back via changes feed.
+            if (this.recentlyPushedIds.has(remoteDoc._id)) {
+                this.recentlyPushedIds.delete(remoteDoc._id);
+                continue;
+            }
 
             // ChunkDocs have no vclock — always accept.
             if (!isFileDoc(remoteDoc) && !isConfigDoc(remoteDoc)) {
@@ -732,6 +774,7 @@ export class SyncEngine {
                     if (isFileDoc(doc)) {
                         const path = filePathFromId(doc._id);
                         try {
+                            await this.ensureChunks(doc);
                             await this.onPullWriteHandler(doc);
                             logDebug(`  ← ${path} (take-remote)`);
                             writtenCount++;
@@ -797,10 +840,9 @@ export class SyncEngine {
         if (!this.client || docs.length === 0) return;
 
         // Strip local _rev, prepare docs for remote.
-        const prepared: any[] = docs.map((d) => {
-            const { _rev, ...rest } = d as any;
-            return rest;
-        });
+        const prepared: Array<CouchSyncDoc & { _rev?: string }> = docs.map(
+            (d) => stripRev(d) as CouchSyncDoc,
+        );
 
         // Fetch current remote revisions for threading.
         const remoteResult = await this.client.allDocs<CouchSyncDoc>({
@@ -845,11 +887,15 @@ export class SyncEngine {
                 const path = isFile ? filePathFromId(doc._id) : doc._id;
                 logDebug(`  → ${path} (conflict, will resolve on next pull)`);
                 conflictCount++;
-            } else if (isFile) {
-                logDebug(`  → ${filePathFromId(doc._id)}`);
-                fileCount++;
-            } else if (isChunk) {
-                chunkCount++;
+            } else {
+                // Success — track for echo suppression in pull.
+                this.recentlyPushedIds.add(doc._id);
+                if (isFile) {
+                    logDebug(`  → ${filePathFromId(doc._id)}`);
+                    fileCount++;
+                } else if (isChunk) {
+                    chunkCount++;
+                }
             }
         }
 
@@ -1051,10 +1097,14 @@ export class SyncEngine {
             ]);
             if (this.syncEpoch !== sessionEpoch) return false;
             this.lastHealthyAt = Date.now();
-            logDebug(`health: probe ok state=${this.state}`);
+            if (!this.lastProbeOk) {
+                logDebug(`health: recovered, state=${this.state}`);
+                this.lastProbeOk = true;
+            }
             return true;
         } catch (e: any) {
             if (this.syncEpoch !== sessionEpoch) return false;
+            this.lastProbeOk = false;
             logDebug(`health: probe failed ${e?.message ?? e}`);
             this.enterHardError(this.classifyError(e));
             return false;
