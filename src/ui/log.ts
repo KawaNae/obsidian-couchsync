@@ -1,6 +1,20 @@
+/**
+ * Unified logging and notification system.
+ *
+ * All log functions write to an in-memory ring buffer (visible in Log View)
+ * regardless of settings. The `verboseNotice` setting controls only whether
+ * console output and Obsidian Notices are emitted for debug/info levels.
+ *
+ *   logDebug(msg)   → buffer(debug) + console(verbose)
+ *   logInfo(msg)    → buffer(info)  + console(verbose) + notice(verbose)
+ *   logWarn(msg)    → buffer(warn)  + console(always)
+ *   logError(msg)   → buffer(error) + console(always)  + notice(always)
+ *   notify(msg, d?) → buffer(info)  + notice(always)   — user-facing
+ */
+
 // ── Types ────────────────────────────────────────────────
 
-export type LogLevel = "debug" | "info" | "error";
+export type LogLevel = "debug" | "info" | "warn" | "error";
 
 export interface LogEntry {
     timestamp: number;
@@ -38,7 +52,7 @@ export function onLogEntry(fn: (entry: LogEntry) => void): () => void {
 
 // ── Init / settings ─────────────────────────────────────
 
-type SettingsGetter = () => { showVerboseLog: boolean };
+type SettingsGetter = () => { verboseNotice: boolean };
 type NoticeFunc = (message: string, durationMs: number) => void;
 
 let _getSettings: SettingsGetter | null = null;
@@ -58,32 +72,40 @@ export function initLog(
 }
 
 function isVerbose(): boolean {
-    return _getSettings?.().showVerboseLog ?? false;
+    return _getSettings?.().verboseNotice ?? false;
 }
 
 // ── Log functions ───────────────────────────────────────
 
-/** Verbose console.log — gated behind showVerboseLog. Always buffered. */
-export function logVerbose(message: string): void {
+/** Debug-level log. Always buffered. Console output only when verbose. */
+export function logDebug(message: string): void {
     pushEntry("debug", message);
     if (isVerbose()) console.log(message);
 }
 
-/**
- * Verbose console.log + Obsidian Notice. Use for events the user
- * wants to see on mobile (reconnect decisions, state transitions).
- * Both the console log and the notice are gated behind showVerboseLog.
- * Always buffered.
- */
-export function logNotice(message: string, durationMs = 4000): void {
+/** Info-level log. Always buffered. Console + Notice only when verbose. */
+export function logInfo(message: string, durationMs = 4000): void {
     pushEntry("info", message);
     if (!isVerbose()) return;
     console.log(message);
     _showNotice?.(message, durationMs);
 }
 
-/** Error-level log. Always goes to console.error AND the ring buffer. */
+/** Warn-level log. Always buffered + console.warn. */
+export function logWarn(message: string): void {
+    pushEntry("warn", message);
+    console.warn(message);
+}
+
+/** Error-level log. Always buffered + console.error + Notice. */
 export function logError(message: string): void {
     pushEntry("error", message);
     console.error(message);
+    _showNotice?.(message, 8000);
+}
+
+/** User-facing notice. Always buffered (info) + Notice. */
+export function notify(message: string, durationMs = 5000): void {
+    pushEntry("info", message);
+    _showNotice?.(message, durationMs);
 }

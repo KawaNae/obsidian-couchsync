@@ -24,7 +24,7 @@ import {
     type SyncErrorDetail,
     type SyncErrorKind,
 } from "./reconnect-policy.ts";
-import { logVerbose, logNotice, logError } from "../ui/log.ts";
+import { logDebug, logInfo, logWarn, logError } from "../ui/log.ts";
 
 // ── Re-exports ──────────────────────────────────────────
 
@@ -265,7 +265,7 @@ export class SyncEngine {
      */
     async start(): Promise<void> {
         if (this.running) return;
-        logVerbose(`sync-engine start (build=${BUILD_TAG})`);
+        logDebug(`sync-engine start (build=${BUILD_TAG})`);
         // An explicit start() call means the user is trying again — assume
         // they've fixed their credentials.
         this.authError = false;
@@ -295,7 +295,7 @@ export class SyncEngine {
             coolDownActive: Date.now() - this.lastRestartTime < 5000,
         });
 
-        logVerbose(`reconnect: reason=${reason} state=${this.state} → ${decision}`);
+        logDebug(`reconnect: reason=${reason} state=${this.state} → ${decision}`);
 
         if (decision === "skip") return;
 
@@ -306,7 +306,7 @@ export class SyncEngine {
             this.setState("reconnecting");
         }
 
-        logNotice(`Reconnect (${reason}): restarting`);
+        logInfo(`Reconnect (${reason}): restarting`);
         await this.restart();
     }
 
@@ -449,7 +449,7 @@ export class SyncEngine {
         try {
             await this.loadCheckpoints();
         } catch (e) {
-            logVerbose(`checkpoint load error: ${e}`);
+            logDebug(`checkpoint load error: ${e}`);
             // Start from 0 if meta is unavailable.
         }
 
@@ -488,7 +488,7 @@ export class SyncEngine {
         client: ICouchClient,
         epoch: number,
     ): Promise<void> {
-        logVerbose("catchup: starting HTTP changes pull");
+        logDebug("catchup: starting HTTP changes pull");
 
         let lastProgressAt = Date.now();
 
@@ -497,7 +497,7 @@ export class SyncEngine {
 
             // Check idle timeout.
             if (Date.now() - lastProgressAt > CATCHUP_IDLE_TIMEOUT_MS) {
-                logNotice("Catchup timed out (no progress for 60s)");
+                logInfo("Catchup timed out (no progress for 60s)");
                 throw new Error("Catchup timed out");
             }
 
@@ -512,13 +512,14 @@ export class SyncEngine {
             if (result.results.length > 0) {
                 lastProgressAt = Date.now();
                 await this.writePulledDocs(result);
-                logVerbose(
+                logDebug(
                     `catchup: batch ${result.results.length} docs, seq=${result.last_seq}`,
                 );
             } else {
                 // No more changes — catchup complete.
-                logNotice(
-                    `Catchup complete: seq=${result.last_seq}`,
+                const seq = String(result.last_seq);
+                logInfo(
+                    `Catchup complete (seq=${seq.length > 20 ? seq.slice(0, 20) + "…" : seq})`,
                 );
                 // Update seq even on empty result (last_seq may advance).
                 this.remoteSeq = result.last_seq;
@@ -577,7 +578,7 @@ export class SyncEngine {
                     this.handleTransientError(e);
                 } else {
                     // Network/timeout errors on longpoll are expected.
-                    logVerbose(
+                    logDebug(
                         `pullLoop: ${detail.kind} error, retrying — ${detail.message}`,
                     );
                 }
@@ -621,7 +622,7 @@ export class SyncEngine {
                 if (this.syncEpoch !== epoch) return;
                 // Push errors are logged but don't escalate — the next
                 // cycle will retry.
-                logVerbose(`push error: ${e?.message ?? e}`);
+                logDebug(`push error: ${e?.message ?? e}`);
             }
 
             await this.delay(PUSH_POLL_INTERVAL_MS, epoch);
@@ -644,6 +645,10 @@ export class SyncEngine {
             localDoc: CouchSyncDoc;
             remoteDoc: CouchSyncDoc;
         }> = [];
+        let keepLocalCount = 0;
+        let chunkCount = 0;
+        let writtenCount = 0;
+        let writeFailCount = 0;
 
         for (const row of result.results) {
             if (!row.doc || row.deleted) continue;
@@ -653,6 +658,7 @@ export class SyncEngine {
             // ChunkDocs have no vclock — always accept.
             if (!isFileDoc(remoteDoc) && !isConfigDoc(remoteDoc)) {
                 accepted.push(remoteDoc);
+                chunkCount++;
                 continue;
             }
 
@@ -664,14 +670,16 @@ export class SyncEngine {
                         localDoc, remoteDoc,
                     );
                     if (verdict === "keep-local") {
-                        logVerbose(`pull: keep-local for ${remoteDoc._id}`);
+                        const path = isFileDoc(remoteDoc) ? filePathFromId(remoteDoc._id) : configPathFromId(remoteDoc._id);
+                        logDebug(`  × ${path} (keep-local)`);
+                        keepLocalCount++;
                         continue;
                     }
                     if (verdict === "concurrent") {
-                        logVerbose(`pull: concurrent conflict for ${remoteDoc._id}`);
                         const filePath = isFileDoc(remoteDoc)
                             ? filePathFromId(remoteDoc._id)
                             : configPathFromId(remoteDoc._id);
+                        logDebug(`  ⚡ ${filePath} (concurrent)`);
                         concurrent.push({ filePath, localDoc, remoteDoc });
                         continue; // keep local, don't write remote
                     }
@@ -694,10 +702,14 @@ export class SyncEngine {
             if (this.onPullWriteHandler) {
                 for (const doc of accepted) {
                     if (isFileDoc(doc)) {
+                        const path = filePathFromId(doc._id);
                         try {
                             await this.onPullWriteHandler(doc);
+                            logDebug(`  ← ${path} (take-remote)`);
+                            writtenCount++;
                         } catch (e) {
-                            logError(`CouchSync: pull vault write failed for ${doc._id}: ${e?.message ?? e}`);
+                            logError(`pull vault write failed: ${path}: ${e?.message ?? e}`);
+                            writeFailCount++;
                         }
                     }
                 }
@@ -708,10 +720,22 @@ export class SyncEngine {
                     try {
                         handler(doc);
                     } catch (e) {
-                        logError(`CouchSync: onChange handler error: ${e?.message ?? e}`);
+                        logError(`onChange handler error: ${e?.message ?? e}`);
                     }
                 }
             }
+        }
+
+        // Summary log — only when there's something to report.
+        const hasActivity = writtenCount > 0 || keepLocalCount > 0 || concurrent.length > 0 || writeFailCount > 0;
+        if (hasActivity) {
+            const parts: string[] = [];
+            if (writtenCount > 0) parts.push(`${writtenCount} written`);
+            if (keepLocalCount > 0) parts.push(`${keepLocalCount} keep-local`);
+            if (concurrent.length > 0) parts.push(`${concurrent.length} concurrent`);
+            if (writeFailCount > 0) parts.push(`${writeFailCount} failed`);
+            if (chunkCount > 0) parts.push(`${chunkCount} chunks`);
+            logInfo(`Pull: ${parts.join(", ")}`);
         }
 
         // Fire concurrent handlers after chunks are written.
@@ -772,23 +796,48 @@ export class SyncEngine {
 
         const results = await this.client.bulkDocs(prepared);
 
-        // Log denied docs (permission rejection per-doc).
-        for (const res of results) {
+        // Count results and log per-file details.
+        let fileCount = 0;
+        let chunkCount = 0;
+        let deniedCount = 0;
+        let conflictCount = 0;
+
+        for (let i = 0; i < results.length; i++) {
+            const res = results[i];
+            const doc = prepared[i];
+            const isFile = doc._id?.startsWith("file:");
+            const isChunk = doc._id?.startsWith("chunk:");
+
             if (res.error === "forbidden") {
-                logVerbose(`denied: push rejected for ${res.id}: ${res.reason}`);
+                const path = isFile ? filePathFromId(doc._id) : doc._id;
+                logDebug(`  → ${path} (denied: ${res.reason})`);
+                deniedCount++;
                 if (!this.deniedWarningEmitted) {
                     this.deniedWarningEmitted = true;
                     this.emitError(
                         "Some documents were denied — check CouchDB _security permissions.",
                     );
                 }
+            } else if (res.error === "conflict") {
+                const path = isFile ? filePathFromId(doc._id) : doc._id;
+                logDebug(`  → ${path} (conflict, will resolve on next pull)`);
+                conflictCount++;
+            } else if (isFile) {
+                logDebug(`  → ${filePathFromId(doc._id)}`);
+                fileCount++;
+            } else if (isChunk) {
+                chunkCount++;
             }
-            // 409 conflicts are expected — the doc was updated on the
-            // remote between our rev fetch and the push. Will be resolved
-            // on next pull cycle.
-            if (res.error === "conflict") {
-                logVerbose(`push conflict for ${res.id} — will resolve on next pull`);
-            }
+        }
+
+        // Summary — only when files were pushed.
+        if (fileCount > 0 || deniedCount > 0 || conflictCount > 0) {
+            const parts: string[] = [];
+            if (fileCount > 0) parts.push(`${fileCount} files`);
+            if (chunkCount > 0) parts.push(`${chunkCount} chunks`);
+            if (deniedCount > 0) parts.push(`${deniedCount} denied`);
+            if (conflictCount > 0) parts.push(`${conflictCount} conflicts`);
+            logInfo(`Push: ${parts.join(", ")}`);
         }
     }
 
@@ -800,7 +849,7 @@ export class SyncEngine {
         const pushSeq = await meta.getMeta<number | string>(META_PUSH_SEQ);
         if (remoteSeq !== null) this.remoteSeq = remoteSeq;
         if (pushSeq !== null) this.lastPushedSeq = pushSeq;
-        logVerbose(`checkpoints loaded: remoteSeq=${this.remoteSeq} pushSeq=${this.lastPushedSeq}`);
+        logDebug(`checkpoints loaded: remoteSeq=${this.remoteSeq} pushSeq=${this.lastPushedSeq}`);
     }
 
     private async saveCheckpoints(): Promise<void> {
@@ -809,7 +858,7 @@ export class SyncEngine {
             await meta.putMeta(META_REMOTE_SEQ, this.remoteSeq);
             await meta.putMeta(META_PUSH_SEQ, this.lastPushedSeq);
         } catch (e) {
-            logVerbose(`checkpoint save error: ${e}`);
+            logDebug(`checkpoint save error: ${e}`);
         }
     }
 
@@ -853,7 +902,7 @@ export class SyncEngine {
      */
     private handleTransientError(err: any): void {
         const detail = this.classifyError(err);
-        logVerbose(
+        logDebug(
             `transient error: kind=${detail.kind} code=${detail.code ?? "-"} msg=${detail.message}`,
         );
 
@@ -869,7 +918,7 @@ export class SyncEngine {
         this.transientErrorTimer = setTimeout(() => {
             this.transientErrorTimer = null;
             if (this.state === "reconnecting") {
-                logVerbose(`transient escalated to hard error after ${TRANSIENT_ESCALATION_MS}ms`);
+                logDebug(`transient escalated to hard error after ${TRANSIENT_ESCALATION_MS}ms`);
                 this.enterHardError(detail);
             }
         }, TRANSIENT_ESCALATION_MS);
@@ -899,7 +948,7 @@ export class SyncEngine {
         if (this.errorRetryTimer) clearTimeout(this.errorRetryTimer);
         const idx = Math.min(this.errorRetryStep, ERROR_RETRY_DELAYS_MS.length - 1);
         const delay = ERROR_RETRY_DELAYS_MS[idx];
-        logVerbose(`error retry scheduled in ${delay}ms (step ${this.errorRetryStep})`);
+        logDebug(`error retry scheduled in ${delay}ms (step ${this.errorRetryStep})`);
         this.errorRetryTimer = setTimeout(async () => {
             this.errorRetryTimer = null;
             this.errorRetryStep++;
@@ -979,11 +1028,11 @@ export class SyncEngine {
             ]);
             if (this.syncEpoch !== sessionEpoch) return false;
             this.lastHealthyAt = Date.now();
-            logVerbose(`health: probe ok state=${this.state}`);
+            logDebug(`health: probe ok state=${this.state}`);
             return true;
         } catch (e: any) {
             if (this.syncEpoch !== sessionEpoch) return false;
-            logVerbose(`health: probe failed ${e?.message ?? e}`);
+            logDebug(`health: probe failed ${e?.message ?? e}`);
             this.enterHardError(this.classifyError(e));
             return false;
         } finally {

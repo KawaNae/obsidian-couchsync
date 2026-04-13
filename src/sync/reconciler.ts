@@ -5,7 +5,7 @@ import type { CouchSyncSettings } from "../settings.ts";
 import type { FileDoc } from "../types.ts";
 import { latestDevice } from "./vector-clock.ts";
 import { filePathFromId } from "../types/doc-id.ts";
-import { logVerbose, logError } from "../ui/log.ts";
+import { logDebug, logInfo, logWarn, logError } from "../ui/log.ts";
 
 /**
  * Margin absorbing local filesystem clock jitter when asking "has any vault
@@ -203,7 +203,7 @@ export class Reconciler {
         const allPaths = new Set<string>([...vaultByPath.keys(), ...dbByPath.keys()]);
         const deviceId = this.getSettings().deviceId;
 
-        logVerbose(
+        logDebug(
             `reconcile (${reason}, ${mode}) — ${vaultByPath.size} vault, ${dbByPath.size} db, manifest=${manifestPaths?.size ?? "null"}`,
         );
 
@@ -279,17 +279,20 @@ export class Reconciler {
         // silently wipe a vault.
         if (mode === "apply" && report.deleted.length > vaultFiles.length * LARGE_DELETE_RATIO) {
             const msg = `Large deletion detected: ${report.deleted.length} files removed (>${Math.floor(LARGE_DELETE_RATIO * 100)}% of vault). Verify with consistency check.`;
-            console.warn(`CouchSync: ${msg}`);
+            logWarn(`CouchSync: ${msg}`);
             this.notify(msg);
         }
 
         const total = totalDiscrepancies(report);
         if (total > 0) {
-            logVerbose(
-                `reconcile (${reason}) — ${total} change(s): ` +
-                    `pushed=${report.pushed.length} pulled=${report.remoteWins.length + report.restored.length} ` +
-                    `deleted=${report.deleted.length} localWins=${report.localWins.length}`,
-            );
+            const parts: string[] = [];
+            if (report.remoteWins.length + report.restored.length > 0)
+                parts.push(`${report.remoteWins.length + report.restored.length} pulled`);
+            if (report.pushed.length + report.localWins.length > 0)
+                parts.push(`${report.pushed.length + report.localWins.length} pushed`);
+            if (report.deleted.length > 0)
+                parts.push(`${report.deleted.length} deleted`);
+            logInfo(`Reconcile (${reason}): ${parts.join(", ")}`);
             if (mode === "apply") {
                 if (MANUAL_REASONS.has(reason)) {
                     // User-driven: always confirm with a toast.

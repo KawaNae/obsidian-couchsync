@@ -5,7 +5,7 @@ import type { CouchSyncSettings } from "../settings.ts";
 import type { HistoryCapture } from "../history/history-capture.ts";
 import type { ChangeTracker } from "./change-tracker.ts";
 import { splitIntoChunks, joinChunks } from "../db/chunker.ts";
-import { showNotice } from "../ui/notices.ts";
+import { notify } from "../ui/log.ts";
 import { compareVC, incrementVC } from "./vector-clock.ts";
 import type { VectorClock } from "./vector-clock.ts";
 import { makeFileId, filePathFromId } from "../types/doc-id.ts";
@@ -345,7 +345,7 @@ export class VaultSync {
         await this.db.putSkippedFiles(doc);
         (await this.loadSkippedCache()).add(path);
         if (isNew) {
-            showNotice(
+            notify(
                 `Skipped "${path}" — ${roundedSize} MB exceeds ${limitMB} MB limit. ` +
                     `Raise the limit in settings to sync it.`,
                 8000,

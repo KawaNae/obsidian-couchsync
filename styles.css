@@ -329,24 +329,27 @@
     gap: 4px;
 }
 
-.couchsync-log-filter-btn {
+.couchsync-log-view button.couchsync-log-filter-btn {
     padding: 2px 8px;
     border-radius: 4px;
     font-size: 0.8em;
     cursor: pointer;
-    border: 1px solid var(--background-modifier-border);
-    background: var(--background-primary);
+    border: 1px solid transparent;
+    background: transparent;
     color: var(--text-muted);
     text-transform: uppercase;
     letter-spacing: 0.03em;
+    margin: 0;
+    min-height: unset;
+    box-shadow: none;
 }
 
-.couchsync-log-filter-btn:hover {
+.couchsync-log-view button.couchsync-log-filter-btn:hover {
     background: var(--background-modifier-hover);
     color: var(--text-normal);
 }
 
-.couchsync-log-filter-btn.is-active {
+.couchsync-log-view button.couchsync-log-filter-btn.is-active {
     background: var(--interactive-accent);
     color: var(--text-on-accent);
     border-color: var(--interactive-accent);
@@ -357,18 +360,21 @@
     gap: 4px;
 }
 
-.couchsync-log-action-btn {
+.couchsync-log-view button.couchsync-log-action-btn {
     padding: 4px;
     border-radius: 4px;
     cursor: pointer;
-    border: 1px solid var(--background-modifier-border);
-    background: var(--background-primary);
+    border: 1px solid transparent;
+    background: transparent;
     color: var(--text-muted);
     display: flex;
     align-items: center;
+    margin: 0;
+    min-height: unset;
+    box-shadow: none;
 }
 
-.couchsync-log-action-btn:hover {
+.couchsync-log-view button.couchsync-log-action-btn:hover {
     background: var(--background-modifier-hover);
     color: var(--text-normal);
 }
@@ -419,6 +425,12 @@
 .couchsync-log-debug .couchsync-log-message { color: var(--text-muted); }
 
 .couchsync-log-info .couchsync-log-level { color: var(--color-blue, var(--text-accent)); }
+
+.couchsync-log-warn {
+    background: rgba(220, 160, 0, 0.06);
+}
+.couchsync-log-warn .couchsync-log-level { color: var(--color-orange, var(--text-warning)); }
+.couchsync-log-warn .couchsync-log-message { color: var(--text-normal); }
 
 .couchsync-log-error {
     background: rgba(220, 0, 0, 0.06);

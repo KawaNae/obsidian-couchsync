@@ -5,7 +5,7 @@ import type { CouchSyncSettings } from "../settings.ts";
 import type { HistorySource } from "./types.ts";
 import { minimatch } from "../utils/minimatch.ts";
 import { isDiffableText } from "../utils/binary.ts";
-import { logVerbose } from "../ui/log.ts";
+import { logDebug } from "../ui/log.ts";
 
 export class HistoryCapture {
     private debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -178,7 +178,7 @@ export class HistoryCapture {
 
             await this.storage.saveSnapshot(file.path, currentContent);
             this.lastCaptureTime.set(file.path, Date.now());
-            logVerbose(`History captured for ${file.path} (${source})`);
+            logDebug(`History captured for ${file.path} (${source})`);
             (this.app.workspace as any).trigger("couchsync:diff-saved", file.path);
         } catch (e) {
             console.error("CouchSync: Failed to capture history:", e);

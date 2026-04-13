@@ -4,6 +4,7 @@ import type { HistoryStorage } from "./storage.ts";
 import type { HistoryCapture } from "./history-capture.ts";
 import type { HistoryEntry } from "./types.ts";
 import type { CouchSyncSettings } from "../settings.ts";
+import { logWarn } from "../ui/log.ts";
 
 export class HistoryManager {
     private cleanupInterval: ReturnType<typeof setInterval> | null = null;
@@ -42,7 +43,7 @@ export class HistoryManager {
         for (const diff of diffsToReverse) {
             const result = this.diffEngine.applyPatchReverse(content, diff.patches);
             if (!result.ok) {
-                console.warn("CouchSync: Patch reverse failed at", diff.timestamp);
+                logWarn(`CouchSync: Patch reverse failed at ${diff.timestamp}`);
                 return null;
             }
             content = result.text;

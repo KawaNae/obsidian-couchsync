@@ -1,12 +1,5 @@
 import { Notice } from "obsidian";
-
-export function showNotice(message: string, durationMs: number = 5000): void {
-    new Notice(`CouchSync: ${message}`, durationMs);
-}
-
-export function showError(message: string): void {
-    new Notice(`CouchSync Error: ${message}`, 10000);
-}
+import { notify, logError } from "./log.ts";
 
 /**
  * A Notice that can be updated in-place.
@@ -27,16 +20,11 @@ export class ProgressNotice {
 
     done(summary: string, durationMs: number = 5000): void {
         this.notice.hide();
-        new Notice(`CouchSync: ${summary}`, durationMs);
+        notify(summary, durationMs);
     }
 
-    /**
-     * Dismiss the progress notice and surface an error toast. Use instead
-     * of done() from a catch block so the user sees a single failure notice
-     * rather than a hung progress bar plus a second error notice.
-     */
     fail(message: string, durationMs: number = 10000): void {
         this.notice.hide();
-        new Notice(`CouchSync Error: ${message}`, durationMs);
+        logError(message);
     }
 }

@@ -43,7 +43,7 @@ export interface CouchSyncSettings {
     historyExcludePatterns: string[];
 
     // Maintenance
-    showVerboseLog: boolean;
+    verboseNotice: boolean;
 
     // Internal
     connectionState: ConnectionState;
@@ -85,7 +85,7 @@ export const DEFAULT_SETTINGS: CouchSyncSettings = {
 
     historyExcludePatterns: [],
 
-    showVerboseLog: false,
+    verboseNotice: false,
 
     connectionState: "editing",
     deviceId: "",

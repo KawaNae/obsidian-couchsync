@@ -2,7 +2,7 @@ import type { CouchSyncDoc, FileDoc, ConfigDoc } from "../types.ts";
 import { isFileDoc, isConfigDoc } from "../types.ts";
 import { compareVC } from "../sync/vector-clock.ts";
 import { filePathFromId, configPathFromId } from "../types/doc-id.ts";
-import { logVerbose } from "../ui/log.ts";
+import { logDebug, logWarn } from "../ui/log.ts";
 
 /**
  * Resolves conflicts using Vector Clock causality.
@@ -114,12 +114,12 @@ export class ConflictResolver {
                         );
                     }
                 }
-                logVerbose(`auto-resolved: remote dominates local for ${vaultPath}`);
+                logDebug(`auto-resolved: remote dominates local for ${vaultPath}`);
                 return "take-remote";
 
             case "dominates":
                 // Local dominates remote — keep local (push pending).
-                logVerbose(`keep-local: local dominates remote for ${vaultPath}`);
+                logDebug(`keep-local: local dominates remote for ${vaultPath}`);
                 return "keep-local";
 
             case "concurrent":
@@ -127,7 +127,7 @@ export class ConflictResolver {
                 if (this.onConcurrent) {
                     await this.onConcurrent(vaultPath, [localDoc, remoteDoc]);
                 } else {
-                    console.warn(
+                    logWarn(
                         `CouchSync: concurrent conflict on ${vaultPath} but no handler registered.`,
                     );
                 }
@@ -147,7 +147,7 @@ export class ConflictResolver {
         if (!isFileDoc(doc) && !isConfigDoc(doc)) return false;
 
         const vaultPath = extractVaultPath(doc._id);
-        logVerbose(
+        logDebug(
             `resolveIfConflicted: ignoring _conflicts tree for ${vaultPath} ` +
             `(use resolveOnPull instead)`,
         );

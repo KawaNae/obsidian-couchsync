@@ -1,4 +1,4 @@
-import { Platform, Plugin } from "obsidian";
+import { Notice, Platform, Plugin } from "obsidian";
 import { type CouchSyncSettings, DEFAULT_SETTINGS } from "./settings.ts";
 import { LocalDB } from "./db/local-db.ts";
 import { ConfigLocalDB } from "./db/config-local-db.ts";
@@ -12,9 +12,9 @@ import { Reconciler, type ReconcileReason } from "./sync/reconciler.ts";
 import { ConflictResolver } from "./conflict/conflict-resolver.ts";
 import { checkInstallMarker } from "./sync/install-marker.ts";
 import { StatusBar } from "./ui/status-bar.ts";
-import { initLog, logError } from "./ui/log.ts";
+import { initLog, logError, logWarn, notify } from "./ui/log.ts";
 import { CouchSyncSettingTab } from "./settings-tab/index.ts";
-import { showNotice, ProgressNotice } from "./ui/notices.ts";
+import { ProgressNotice } from "./ui/notices.ts";
 import { HistoryStorage } from "./history/storage.ts";
 import { HistoryCapture } from "./history/history-capture.ts";
 import { HistoryManager } from "./history/history-manager.ts";
@@ -65,7 +65,7 @@ export default class CouchSyncPlugin extends Plugin {
                 generateUuid: () => crypto.randomUUID(),
             });
             if (result.markerMismatch) {
-                showNotice(
+                notify(
                     "CouchSync: this vault may have been copied from another installation. " +
                         "Please verify your device name in Settings → Vault Sync.",
                     10000,
@@ -92,7 +92,10 @@ export default class CouchSyncPlugin extends Plugin {
             );
         }
 
-        initLog(() => this.settings, showNotice);
+        initLog(
+            () => this.settings,
+            (msg, dur) => new Notice(`CouchSync: ${msg}`, dur),
+        );
         this.replicator = new SyncEngine(this.localDb, () => this.settings, Platform.isMobile);
         this.vaultSync = new VaultSync(this.app, this.localDb, () => this.settings);
         // ConfigSync needs *some* ConfigLocalDB even when sync is disabled,
@@ -110,13 +113,13 @@ export default class CouchSyncPlugin extends Plugin {
             () => this.replicator.getLastErrorDetail(),
         );
         this.replicator.onStateChange((state) => this.statusBar.update(state));
-        this.replicator.onError((msg) => showNotice(msg, 8000));
+        this.replicator.onError((msg) => notify(msg, 8000));
         this.reconciler = new Reconciler(
             this.app,
             this.localDb,
             this.vaultSync,
             () => this.settings,
-            (msg) => showNotice(msg),
+            (msg) => notify(msg),
         );
         this.setupService = new SetupService(
             this.app, this.localDb, this.replicator, this.vaultSync, this.reconciler,
@@ -153,7 +156,7 @@ export default class CouchSyncPlugin extends Plugin {
                             winnerText,
                         );
                     }
-                    showNotice(
+                    notify(
                         `Conflict auto-resolved: ${filePath.split("/").pop()}. Losing version(s) saved to history.`,
                     );
                 } catch (e) {
@@ -166,7 +169,7 @@ export default class CouchSyncPlugin extends Plugin {
         // a Side-by-side diff modal is planned for the v2 design's Phase 3
         // work. Critically, we do NOT silently pick a winner.
         this.conflictResolver.setOnConcurrent(async (filePath, revisions) => {
-            console.warn(
+            logWarn(
                 `CouchSync: concurrent edit on ${filePath} — ${revisions.length} revisions, none dominate`,
             );
             // Persist every revision as a history entry so the user can
@@ -187,7 +190,7 @@ export default class CouchSyncPlugin extends Plugin {
             } catch (e) {
                 logError(`CouchSync: Failed to persist concurrent-conflict history: ${e?.message ?? e}`);
             }
-            showNotice(
+            notify(
                 `CouchSync: concurrent edit on ${filePath.split("/").pop()} — ` +
                     "check Diff History and manually reconcile. No version has been silently dropped.",
                 15000,
@@ -201,17 +204,17 @@ export default class CouchSyncPlugin extends Plugin {
                     // ConfigDoc auto-resolution: log + Notice. History
                     // capture is text-oriented (vault notes), so we don't
                     // try to push binary config blobs into Dexie.
-                    showNotice(
+                    notify(
                         `Config conflict auto-resolved: ${configPath.split("/").pop()}.`,
                         5000,
                     );
                 },
             );
             this.configConflictResolver.setOnConcurrent(async (configPath, revisions) => {
-                console.warn(
+                logWarn(
                     `CouchSync: concurrent config edit on ${configPath} — ${revisions.length} revisions, none dominate`,
                 );
-                showNotice(
+                notify(
                     `CouchSync: concurrent config edit on ${configPath.split("/").pop()} — ` +
                         "manual resolution needed. The config DB conflict tree is preserved.",
                     15000,
@@ -246,7 +249,7 @@ export default class CouchSyncPlugin extends Plugin {
                         // keep-local: no action, next push will resolve
                     } else {
                         // Binary file — can't diff, default to keep-local + notify
-                        showNotice(
+                        notify(
                             `CouchSync: concurrent edit on binary file ${filePath.split("/").pop()} — ` +
                                 "keeping local version. Check Diff History for details.",
                             10000,
@@ -261,7 +264,7 @@ export default class CouchSyncPlugin extends Plugin {
                     );
                 } catch (e) {
                     logError(`CouchSync: conflict resolution error: ${e?.message ?? e}`);
-                    showNotice(
+                    notify(
                         `CouchSync: conflict on ${filePath.split("/").pop()} — ` +
                             "keeping local version due to error.",
                         10000,
@@ -269,7 +272,7 @@ export default class CouchSyncPlugin extends Plugin {
                 }
             } else {
                 // ConfigDoc or unknown — keep local, notify
-                showNotice(
+                notify(
                     `CouchSync: concurrent config edit on ${filePath.split("/").pop()} — ` +
                         "keeping local version.",
                     8000,
@@ -334,8 +337,8 @@ export default class CouchSyncPlugin extends Plugin {
                         : `CouchSync: old schema detected in vault DB (${vaultLegacy}). ` +
                             "Open Settings → Maintenance → Delete local vault database, " +
                             "then re-run Init or Clone. Sync is paused until then.";
-                    showNotice(message, 15000);
-                    console.warn(
+                    notify(message, 15000);
+                    logWarn(
                         `CouchSync: blocking replicator.start() — legacy vault doc: ${vaultLegacy}`,
                     );
                     this.fireReconcile("onload");
@@ -345,13 +348,13 @@ export default class CouchSyncPlugin extends Plugin {
                 if (this.configLocalDb) {
                     const configLegacy = await this.configLocalDb.findLegacyConfigDoc();
                     if (configLegacy) {
-                        showNotice(
+                        notify(
                             `CouchSync: old schema detected in config DB (${configLegacy}). ` +
                                 "Open Settings → Maintenance → Delete local config database, " +
                                 "then re-run Config Init or Pull. Sync is paused until then.",
                             15000,
                         );
-                        console.warn(
+                        logWarn(
                             `CouchSync: blocking replicator.start() — legacy config doc: ${configLegacy}`,
                         );
                         this.fireReconcile("onload");
@@ -363,13 +366,13 @@ export default class CouchSyncPlugin extends Plugin {
             }
 
             if (!this.settings.deviceId) {
-                showNotice(
+                notify(
                     "CouchSync: デバイス名を設定してください（Settings → Vault Sync）。" +
                         "設定するまで同期は開始されません。",
                     15000,
                 );
             } else if (this.isLegacyDeviceId(this.settings.deviceId)) {
-                showNotice(
+                notify(
                     "CouchSync: デバイス名を設定してください（Settings → Vault Sync）。" +
                         "現在は自動生成 ID を使用中です。",
                     10000,
@@ -429,7 +432,7 @@ export default class CouchSyncPlugin extends Plugin {
                     report.remoteWins.length +
                     report.deleted.length +
                     report.restored.length;
-                showNotice(`Force sync: ${total} change(s) applied.`);
+                notify(`Force sync: ${total} change(s) applied.`);
             },
         });
 
@@ -444,7 +447,7 @@ export default class CouchSyncPlugin extends Plugin {
                         try {
                             await this.replicator.pullFromRemote();
                         } catch (e) {
-                            console.warn("CouchSync: verify pull failed, continuing with local view:", e);
+                            logWarn(`CouchSync: verify pull failed, continuing with local view: ${e?.message ?? e}`);
                         }
                     }
                     progress.update("Reconciling...");
@@ -498,7 +501,7 @@ export default class CouchSyncPlugin extends Plugin {
             name: "Reconnect sync",
             callback: async () => {
                 if (this.replicator.isAuthBlocked()) {
-                    showNotice(
+                    notify(
                         "CouchSync: auth is blocked. Update credentials in " +
                             "Vault Sync (Step 1) before reconnecting.",
                         8000,
@@ -506,14 +509,14 @@ export default class CouchSyncPlugin extends Plugin {
                     return;
                 }
                 if (this.settings.connectionState !== "syncing") {
-                    showNotice(
+                    notify(
                         "CouchSync: enable Live Sync in Vault Sync (Step 3) first.",
                         5000,
                     );
                     return;
                 }
                 await this.replicator.requestReconnect("manual");
-                showNotice("CouchSync: reconnect requested.", 3000);
+                notify("CouchSync: reconnect requested.", 3000);
             },
         });
     }
@@ -597,7 +600,7 @@ export default class CouchSyncPlugin extends Plugin {
     async startSync(): Promise<void> {
         if (this.settings.connectionState !== "syncing") return;
         if (!this.settings.deviceId) {
-            showNotice("CouchSync: デバイス名を設定してから同期を開始してください。");
+            notify("CouchSync: デバイス名を設定してから同期を開始してください。");
             return;
         }
         await this.vaultSync.loadLastSyncedVclocks();

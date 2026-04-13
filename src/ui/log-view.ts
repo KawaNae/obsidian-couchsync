@@ -10,7 +10,7 @@ import { formatTime } from "../utils/format.ts";
 
 export const VIEW_TYPE_LOG = "couchsync-log-view";
 
-const LEVEL_LABELS: readonly LogLevel[] = ["debug", "info", "error"];
+const LEVEL_LABELS: readonly LogLevel[] = ["debug", "info", "warn", "error"];
 
 export class LogView extends ItemView {
     private filter: LogLevel | "all" = "all";
@@ -125,7 +125,9 @@ export class LogView extends ItemView {
 
     private matchesFilter(entry: LogEntry): boolean {
         if (this.filter === "all") return true;
+        if (this.filter === "debug") return true; // same as all
         if (this.filter === "info") return entry.level !== "debug";
-        return entry.level === this.filter;
+        if (this.filter === "warn") return entry.level === "warn" || entry.level === "error";
+        return entry.level === this.filter; // "error"
     }
 }

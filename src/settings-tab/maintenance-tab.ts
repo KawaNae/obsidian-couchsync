@@ -73,11 +73,11 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
     el.createEl("h3", { text: "Logging" });
 
     new Setting(el)
-        .setName("Verbose logging")
-        .setDesc("Show detailed sync logs in the console and reconnect notifications.")
+        .setName("Verbose notice")
+        .setDesc("ONにすると、debug/infoレベルのログもコンソールとNoticeに表示します。OFFでもLog Viewには全て記録されます。")
         .addToggle((toggle) =>
-            toggle.setValue(settings.showVerboseLog).onChange(async (value) => {
-                await deps.updateSettings({ showVerboseLog: value });
+            toggle.setValue(settings.verboseNotice).onChange(async (value) => {
+                await deps.updateSettings({ verboseNotice: value });
             })
         );
 
