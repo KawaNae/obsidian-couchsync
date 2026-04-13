@@ -52,7 +52,7 @@ const PROBE_TIMEOUT_MS = 5000; // fresh-HTTP probe in checkHealth()
 
 /** Build identifier, logged at start(). Lets us verify on mobile that a
  *  deployed plugin update actually reached the device. */
-const BUILD_TAG = "sync-engine-v0.12.0";
+const BUILD_TAG = "sync-engine-v0.13.0";
 
 /** How long to keep a transient error in `reconnecting` state before
  *  escalating to hard `error`. */
