@@ -9,6 +9,7 @@ import { showNotice } from "../ui/notices.ts";
 import { compareVC, incrementVC } from "./vector-clock.ts";
 import type { VectorClock } from "./vector-clock.ts";
 import { makeFileId, filePathFromId } from "../types/doc-id.ts";
+import { logError } from "../ui/log.ts";
 
 /**
  * Result of comparing a vault file against its local DB record.
@@ -102,7 +103,7 @@ export class VaultSync {
         this.vclockFlushTimer = setTimeout(() => {
             this.vclockFlushTimer = null;
             this.flushLastSyncedVclocks().catch((e) =>
-                console.error("CouchSync: failed to persist lastSyncedVclocks:", e),
+                logError(`CouchSync: failed to persist lastSyncedVclocks: ${e?.message ?? e}`),
             );
         }, 5_000);
     }
@@ -220,8 +221,10 @@ export class VaultSync {
             .filter((c): c is NonNullable<typeof c> => c != null);
 
         if (orderedChunks.length !== fileDoc.chunks.length) {
-            console.warn(`CouchSync: Missing chunks for ${vaultPath}`);
-            return;
+            const missing = fileDoc.chunks.filter(id => !chunkMap.has(id));
+            throw new Error(
+                `Missing ${missing.length} chunk(s) for ${vaultPath}: ${missing.join(", ")}`,
+            );
         }
 
         const content = joinChunks(orderedChunks);

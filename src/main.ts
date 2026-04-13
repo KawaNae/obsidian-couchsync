@@ -12,13 +12,14 @@ import { Reconciler, type ReconcileReason } from "./sync/reconciler.ts";
 import { ConflictResolver } from "./conflict/conflict-resolver.ts";
 import { checkInstallMarker } from "./sync/install-marker.ts";
 import { StatusBar } from "./ui/status-bar.ts";
-import { initLog } from "./ui/log.ts";
+import { initLog, logError } from "./ui/log.ts";
 import { CouchSyncSettingTab } from "./settings-tab/index.ts";
 import { showNotice, ProgressNotice } from "./ui/notices.ts";
 import { HistoryStorage } from "./history/storage.ts";
 import { HistoryCapture } from "./history/history-capture.ts";
 import { HistoryManager } from "./history/history-manager.ts";
 import { DiffHistoryView, VIEW_TYPE_DIFF_HISTORY } from "./ui/history-view.ts";
+import { LogView, VIEW_TYPE_LOG } from "./ui/log-view.ts";
 import { ConsistencyReportModal } from "./ui/consistency-report-modal.ts";
 import { ConflictModal } from "./ui/conflict-modal.ts";
 import { totalDiscrepancies } from "./sync/reconciler.ts";
@@ -156,7 +157,7 @@ export default class CouchSyncPlugin extends Plugin {
                         `Conflict auto-resolved: ${filePath.split("/").pop()}. Losing version(s) saved to history.`,
                     );
                 } catch (e) {
-                    console.error("CouchSync: Failed to save conflict to history:", e);
+                    logError(`CouchSync: Failed to save conflict to history: ${e?.message ?? e}`);
                 }
             },
         );
@@ -184,7 +185,7 @@ export default class CouchSyncPlugin extends Plugin {
                     );
                 }
             } catch (e) {
-                console.error("CouchSync: Failed to persist concurrent-conflict history:", e);
+                logError(`CouchSync: Failed to persist concurrent-conflict history: ${e?.message ?? e}`);
             }
             showNotice(
                 `CouchSync: concurrent edit on ${filePath.split("/").pop()} — ` +
@@ -259,7 +260,7 @@ export default class CouchSyncPlugin extends Plugin {
                         isDiffableText(remoteBuf) ? dec.decode(remoteBuf) : "",
                     );
                 } catch (e) {
-                    console.error("CouchSync: conflict resolution error:", e);
+                    logError(`CouchSync: conflict resolution error: ${e?.message ?? e}`);
                     showNotice(
                         `CouchSync: conflict on ${filePath.split("/").pop()} — ` +
                             "keeping local version due to error.",
@@ -276,15 +277,17 @@ export default class CouchSyncPlugin extends Plugin {
             }
         });
 
-        // Reconciler runs after every replication batch. The cursor + manifest
-        // short-circuit makes the steady-state cost negligible.
-        // In the SyncEngine architecture, Reconciler is the SOLE vault write
-        // path — there is no onChange→dbToFile direct shortcut.
-        this.replicator.onPaused(() => this.fireReconcile("paused"));
+        // Pull-driven vault writes: accepted FileDocs are written directly
+        // to vault in the pull path. Reconciler handles only drift detection
+        // (onload, foreground, reconnect, manual).
+        this.replicator.onPullWrite(async (doc) => {
+            await this.vaultSync.dbToFile(doc);
+        });
 
         this.addSettingTab(new CouchSyncSettingTab(this.app, this));
 
         this.registerView(VIEW_TYPE_DIFF_HISTORY, (leaf) => new DiffHistoryView(leaf, this));
+        this.registerView(VIEW_TYPE_LOG, (leaf) => new LogView(leaf));
 
         this.addRibbonIcon("history", "Diff History", () => {
             this.activateHistoryView();
@@ -297,6 +300,12 @@ export default class CouchSyncPlugin extends Plugin {
                 const file = this.app.workspace.getActiveFile();
                 if (file) this.showHistory(file.path);
             },
+        });
+
+        this.addCommand({
+            id: "couchsync-show-log",
+            name: "Show sync log",
+            callback: () => this.activateLogView(),
         });
 
         this.app.workspace.onLayoutReady(async () => {
@@ -350,7 +359,7 @@ export default class CouchSyncPlugin extends Plugin {
                     }
                 }
             } catch (e) {
-                console.error("CouchSync: schema guard probe failed:", e);
+                logError(`CouchSync: schema guard probe failed: ${e?.message ?? e}`);
             }
 
             if (!this.settings.deviceId) {
@@ -523,7 +532,7 @@ export default class CouchSyncPlugin extends Plugin {
             try {
                 await this.configLocalDb.close();
             } catch (e) {
-                console.error("CouchSync: failed to close config local DB:", e);
+                logError(`CouchSync: failed to close config local DB: ${e?.message ?? e}`);
             }
             this.configLocalDb = null;
         }
@@ -605,8 +614,21 @@ export default class CouchSyncPlugin extends Plugin {
 
     private fireReconcile(reason: ReconcileReason): void {
         this.reconciler.reconcile(reason).catch((e) =>
-            console.error(`CouchSync: ${reason} reconcile failed:`, e),
+            logError(`CouchSync: ${reason} reconcile failed: ${e?.message ?? e}`),
         );
+    }
+
+    async activateLogView(): Promise<void> {
+        const existing = this.app.workspace.getLeavesOfType(VIEW_TYPE_LOG);
+        if (existing.length > 0) {
+            this.app.workspace.revealLeaf(existing[0]);
+            return;
+        }
+        const leaf = this.app.workspace.getRightLeaf(false);
+        if (leaf) {
+            await leaf.setViewState({ type: VIEW_TYPE_LOG, active: true });
+            this.app.workspace.revealLeaf(leaf);
+        }
     }
 
     async activateHistoryView(): Promise<void> {

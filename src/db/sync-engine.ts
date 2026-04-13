@@ -7,7 +7,7 @@
  *   - CouchClient.info() for health probes
  */
 
-import type { CouchSyncDoc } from "../types.ts";
+import type { CouchSyncDoc, FileDoc } from "../types.ts";
 import { isReplicatedDocId } from "../types/doc-id.ts";
 import type { LocalDB } from "./local-db.ts";
 import type { CouchSyncSettings } from "../settings.ts";
@@ -24,7 +24,7 @@ import {
     type SyncErrorDetail,
     type SyncErrorKind,
 } from "./reconnect-policy.ts";
-import { logVerbose, logNotice } from "../ui/log.ts";
+import { logVerbose, logNotice, logError } from "../ui/log.ts";
 
 // ── Re-exports ──────────────────────────────────────────
 
@@ -91,6 +91,7 @@ export class SyncEngine {
     private onPausedHandlers: (() => void)[] = [];
     private onReconnectHandlers: (() => void)[] = [];
     private onConcurrentHandlers: OnConcurrentHandler[] = [];
+    private onPullWriteHandler: ((doc: FileDoc) => Promise<void>) | null = null;
     private idleCallbacks: (() => void)[] = [];
     private hasBeenIdle = false;
 
@@ -235,6 +236,16 @@ export class SyncEngine {
 
     onConcurrent(handler: OnConcurrentHandler): void {
         this.onConcurrentHandlers.push(handler);
+    }
+
+    /**
+     * Register a handler for pull-driven vault writes. Called for each
+     * accepted FileDoc after bulkPut (chunks already in localDB).
+     * This is the primary vault write path for pulled documents —
+     * Reconciler handles only drift detection.
+     */
+    onPullWrite(handler: (doc: FileDoc) => Promise<void>): void {
+        this.onPullWriteHandler = handler;
     }
 
     /** Register callback to fire once initial sync reaches idle state. */
@@ -526,10 +537,10 @@ export class SyncEngine {
     private startLiveSync(epoch: number): void {
         // State is already "connected" — just start the loops.
         this.pullLoop(epoch).catch((e) =>
-            console.error("CouchSync: pullLoop unexpected exit:", e),
+            logError(`CouchSync: pullLoop unexpected exit: ${e?.message ?? e}`),
         );
         this.pushLoop(epoch).catch((e) =>
-            console.error("CouchSync: pushLoop unexpected exit:", e),
+            logError(`CouchSync: pushLoop unexpected exit: ${e?.message ?? e}`),
         );
     }
 
@@ -677,12 +688,27 @@ export class SyncEngine {
         if (accepted.length > 0) {
             await this.localDb.bulkPut(accepted);
 
+            // Pull-driven vault writes: write accepted FileDocs directly
+            // to vault. Chunks are already in localDB from the bulkPut
+            // above, so dbToFile's getChunks is guaranteed to succeed.
+            if (this.onPullWriteHandler) {
+                for (const doc of accepted) {
+                    if (isFileDoc(doc)) {
+                        try {
+                            await this.onPullWriteHandler(doc);
+                        } catch (e) {
+                            logError(`CouchSync: pull vault write failed for ${doc._id}: ${e?.message ?? e}`);
+                        }
+                    }
+                }
+            }
+
             for (const doc of accepted) {
                 for (const handler of this.onChangeHandlers) {
                     try {
                         handler(doc);
                     } catch (e) {
-                        console.error("CouchSync: onChange handler error:", e);
+                        logError(`CouchSync: onChange handler error: ${e?.message ?? e}`);
                     }
                 }
             }
@@ -694,7 +720,7 @@ export class SyncEngine {
                 try {
                     await h(filePath, localDoc, remoteDoc);
                 } catch (e) {
-                    console.error("CouchSync: onConcurrent handler error:", e);
+                    logError(`CouchSync: onConcurrent handler error: ${e?.message ?? e}`);
                 }
             }
         }
@@ -880,7 +906,7 @@ export class SyncEngine {
             try {
                 await this.requestReconnect("retry-backoff");
             } catch (e) {
-                console.error("CouchSync: retry reconnect failed:", e);
+                logError(`CouchSync: retry reconnect failed: ${e?.message ?? e}`);
             }
             if (this.state === "error") {
                 this.scheduleErrorRetry();
@@ -918,7 +944,7 @@ export class SyncEngine {
             try {
                 await this.requestReconnect("periodic-tick");
             } catch (e) {
-                console.error("CouchSync: Health check error:", e);
+                logError(`CouchSync: Health check error: ${e?.message ?? e}`);
             }
             return;
         }
@@ -975,7 +1001,7 @@ export class SyncEngine {
         }
         for (const handler of this.onPausedHandlers) {
             try { handler(); } catch (e) {
-                console.error("CouchSync: onPaused handler error:", e);
+                logError(`CouchSync: onPaused handler error: ${e?.message ?? e}`);
             }
         }
     }
@@ -1039,7 +1065,7 @@ export class SyncEngine {
                 try {
                     handler();
                 } catch (e) {
-                    console.error("CouchSync: onReconnect handler error:", e);
+                    logError(`CouchSync: onReconnect handler error: ${e?.message ?? e}`);
                 }
             }
         }

@@ -5,7 +5,7 @@ import type { CouchSyncSettings } from "../settings.ts";
 import type { FileDoc } from "../types.ts";
 import { latestDevice } from "./vector-clock.ts";
 import { filePathFromId } from "../types/doc-id.ts";
-import { logVerbose } from "../ui/log.ts";
+import { logVerbose, logError } from "../ui/log.ts";
 
 /**
  * Margin absorbing local filesystem clock jitter when asking "has any vault
@@ -105,6 +105,9 @@ export function totalDiscrepancies(report: ReconcileReport): number {
  */
 export class Reconciler {
     private currentRun: Promise<ReconcileReport> | null = null;
+    /** When a reconcile is requested while one is in flight, the reason
+     *  is queued here so a fresh run starts after the current one ends. */
+    private pendingReason: ReconcileReason | null = null;
     private autoPendingTotal = 0;
     private autoPendingTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -127,21 +130,32 @@ export class Reconciler {
             this.autoPendingTimer = null;
         }
         this.autoPendingTotal = 0;
+        this.pendingReason = null;
     }
 
     async reconcile(
         reason: ReconcileReason,
         opts: { mode?: ReconcileMode } = {},
     ): Promise<ReconcileReport> {
-        // Coalesce concurrent calls onto the in-flight promise so callers
-        // (especially the verify command) get a real result instead of an
-        // empty report.
-        if (this.currentRun) return this.currentRun;
+        // If a run is in flight, queue a re-run instead of dropping the
+        // request. The old coalesce approach returned the in-flight promise,
+        // which meant data written after the run started was never processed.
+        if (this.currentRun) {
+            this.pendingReason = reason;
+            return this.currentRun;
+        }
         this.currentRun = this.runOnce(reason, opts.mode ?? "apply");
         try {
             return await this.currentRun;
         } finally {
             this.currentRun = null;
+            if (this.pendingReason) {
+                const next = this.pendingReason;
+                this.pendingReason = null;
+                this.reconcile(next).catch((e) =>
+                    logError(`CouchSync: queued ${next} reconcile failed: ${e?.message ?? e}`),
+                );
+            }
         }
     }
 
@@ -229,7 +243,7 @@ export class Reconciler {
                 try {
                     cmp = await this.vaultSync.compareFileToDoc(doc, file);
                 } catch (e) {
-                    console.error(`CouchSync: reconcile compare failed for ${path}:`, e);
+                    logError(`CouchSync: reconcile compare failed for ${path}: ${e?.message ?? e}`);
                     continue;
                 }
                 if (cmp === "identical") {
@@ -321,7 +335,7 @@ export class Reconciler {
             await op();
             return true;
         } catch (e) {
-            console.error(`CouchSync: reconcile ${label} failed for ${path}:`, e);
+            logError(`CouchSync: reconcile ${label} failed for ${path}: ${e?.message ?? e}`);
             return false;
         }
     }
