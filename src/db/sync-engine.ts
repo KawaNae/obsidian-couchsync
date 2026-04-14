@@ -1050,8 +1050,12 @@ export class SyncEngine {
                 if (legacyRemote !== null) meta.push({ op: "put", key: META_REMOTE_SEQ, value: legacyRemote });
                 if (legacyPush !== null) meta.push({ op: "put", key: META_PUSH_SEQ, value: legacyPush });
                 await docsStore.runWrite({ meta });
-                await legacy.deleteMeta(META_REMOTE_SEQ);
-                await legacy.deleteMeta(META_PUSH_SEQ);
+                await legacy.runWrite({
+                    meta: [
+                        { op: "delete", key: META_REMOTE_SEQ },
+                        { op: "delete", key: META_PUSH_SEQ },
+                    ],
+                });
                 remoteSeq = legacyRemote;
                 pushSeq = legacyPush;
                 logDebug("checkpoints migrated from legacy metaStore");

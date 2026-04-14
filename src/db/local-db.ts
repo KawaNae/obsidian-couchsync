@@ -1,5 +1,5 @@
 import type { CouchSyncDoc, FileDoc, ChunkDoc } from "../types.ts";
-import type { ILocalStore, PutResponse, AllDocsOpts, AllDocsResult, LocalChangesResult } from "./interfaces.ts";
+import type { IDocStore, AllDocsOpts, AllDocsResult, LocalChangesResult } from "./interfaces.ts";
 import { DexieStore, SyncDB, VCLOCK_KEY_PREFIX, vclockMetaKey } from "./dexie-store.ts";
 import type { WriteTransaction, WriteBuilder } from "./write-transaction.ts";
 import type { VectorClock } from "../sync/vector-clock.ts";
@@ -45,7 +45,7 @@ export interface SkippedFilesDoc {
     files: Record<string, { sizeMB: number; skippedAt: number }>;
 }
 
-export class LocalDB implements ILocalStore<CouchSyncDoc> {
+export class LocalDB implements IDocStore<CouchSyncDoc> {
     private store: DexieStore<CouchSyncDoc> | null = null;
     private dbName: string;
     /** Dexie store for local metadata (scan cursor, vault manifest, etc.). */
@@ -116,8 +116,8 @@ export class LocalDB implements ILocalStore<CouchSyncDoc> {
     }
 
     /**
-     * Delete every document with a given `_id` prefix from the vault DB.
-     * Returns the IDs of the deleted documents.
+     * Delete every document with a given `_id` prefix from the vault DB
+     * in a single atomic tx. Returns the IDs of the deleted documents.
      */
     async deleteAllByPrefix(prefix: string): Promise<string[]> {
         const result = await this.getStore().allDocs({
@@ -126,46 +126,12 @@ export class LocalDB implements ILocalStore<CouchSyncDoc> {
         });
         if (result.rows.length === 0) return [];
         const ids = result.rows.map((row) => row.id);
-        for (const id of ids) {
-            await this.getStore().delete(id);
-        }
+        await this.getStore().runWrite({ deletes: ids });
         return ids;
     }
 
     async get<T extends CouchSyncDoc>(id: string): Promise<T | null> {
         return this.getStore().get(id) as Promise<T | null>;
-    }
-
-    async put(doc: CouchSyncDoc): Promise<PutResponse> {
-        return this.getStore().put(doc);
-    }
-
-    async update<T extends CouchSyncDoc>(
-        id: string,
-        fn: (existing: T | null) => T | null,
-        maxRetries = 3,
-    ): Promise<PutResponse | null> {
-        return this.getStore().update(id, fn, maxRetries);
-    }
-
-    async bulkPut(docs: CouchSyncDoc[]): Promise<PutResponse[]> {
-        return this.getStore().bulkPut(docs);
-    }
-
-    /**
-     * Atomically write chunks + a FileDoc in a single transaction.
-     * See {@link DexieStore.atomicFileWrite} for details.
-     */
-    async atomicFileWrite(
-        fileId: string,
-        chunks: ChunkDoc[],
-        buildDoc: (existing: FileDoc | null) => FileDoc | null,
-    ): Promise<PutResponse | null> {
-        return this.getStore().atomicFileWrite(fileId, chunks, buildDoc);
-    }
-
-    async delete(id: string): Promise<void> {
-        return this.getStore().delete(id);
     }
 
     async allDocs(opts?: AllDocsOpts): Promise<AllDocsResult<CouchSyncDoc>> {
@@ -254,7 +220,9 @@ export class LocalDB implements ILocalStore<CouchSyncDoc> {
     }
 
     async putScanCursor(cursor: ScanCursor): Promise<void> {
-        await this.getMetaStore().putMeta(SCAN_CURSOR_ID, cursor);
+        await this.getMetaStore().runWrite({
+            meta: [{ op: "put", key: SCAN_CURSOR_ID, value: cursor }],
+        });
     }
 
     async getVaultManifest(): Promise<VaultManifest | null> {
@@ -267,7 +235,9 @@ export class LocalDB implements ILocalStore<CouchSyncDoc> {
     }
 
     async putVaultManifest(manifest: VaultManifest): Promise<void> {
-        await this.getMetaStore().putMeta(VAULT_MANIFEST_ID, manifest);
+        await this.getMetaStore().runWrite({
+            meta: [{ op: "put", key: VAULT_MANIFEST_ID, value: manifest }],
+        });
     }
 
     async getSkippedFiles(): Promise<SkippedFilesDoc> {
@@ -276,7 +246,9 @@ export class LocalDB implements ILocalStore<CouchSyncDoc> {
     }
 
     async putSkippedFiles(doc: SkippedFilesDoc): Promise<void> {
-        await this.getMetaStore().putMeta(SKIPPED_FILES_ID, doc);
+        await this.getMetaStore().runWrite({
+            meta: [{ op: "put", key: SKIPPED_FILES_ID, value: doc }],
+        });
     }
 
     /**
@@ -316,7 +288,9 @@ export class LocalDB implements ILocalStore<CouchSyncDoc> {
             if (newVclocks.length > 0) {
                 await this.getStore().runWrite({ vclocks: newVclocks });
             }
-            await legacyMeta.deleteMeta(LAST_SYNCED_VCLOCKS_ID);
+            await legacyMeta.runWrite({
+                meta: [{ op: "delete", key: LAST_SYNCED_VCLOCKS_ID }],
+            });
         }
 
         return out;
