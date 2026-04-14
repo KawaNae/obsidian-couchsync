@@ -1,5 +1,5 @@
 /**
- * SyncEngine — sync loop using CouchClient HTTP + ILocalStore.
+ * SyncEngine — sync loop using CouchClient HTTP + IDocStore.
  *
  *   - CouchClient.changes() + bulkGet() for catchup pull
  *   - CouchClient.changesLongpoll() loop for live pull

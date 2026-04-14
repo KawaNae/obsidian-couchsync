@@ -1,8 +1,8 @@
 /**
- * Tests for the stateless remote-couch helpers (Phase 2).
+ * Tests for the stateless remote-couch helpers.
  *
- * Phase 2 replaces PouchDB replication with ILocalStore + ICouchClient
- * abstractions. Tests use in-memory stubs for both sides.
+ * Replaces PouchDB replication with IDocStore + ICouchClient abstractions.
+ * Tests use in-memory stubs for both sides.
  */
 
 import { describe, it, expect, beforeEach } from "vitest";
@@ -16,38 +16,23 @@ import {
 } from "../src/db/remote-couch.ts";
 import type { CouchSyncDoc, FileDoc } from "../src/types.ts";
 import type {
-    ILocalStore,
+    IDocStore,
     ICouchClient,
-    PutResponse,
     AllDocsResult,
     AllDocsRow,
     BulkDocsResult,
 } from "../src/db/interfaces.ts";
 import { makeFileId, makeChunkId } from "../src/types/doc-id.ts";
 
-// ── In-memory ILocalStore stub ──────────────────────────
+// ── In-memory IDocStore stub ────────────────────────────
 
-function createLocalStub(): ILocalStore<CouchSyncDoc> & { _docs: Map<string, any> } {
+function createLocalStub(): IDocStore<CouchSyncDoc> & { _docs: Map<string, any> } {
     const _docs = new Map<string, any>();
     let _rev = 0;
-    return {
+    const stub: any = {
         _docs,
         get: async (id: string) => _docs.get(id) ?? null,
-        put: async (doc: any) => {
-            const rev = `${++_rev}-stub`;
-            _docs.set(doc._id, { ...doc, _rev: rev });
-            return { ok: true, id: doc._id, rev };
-        },
-        bulkPut: async (docs: any[]) => {
-            const results: PutResponse[] = [];
-            for (const doc of docs) {
-                const rev = `${++_rev}-stub`;
-                _docs.set(doc._id, { ...doc, _rev: rev });
-                results.push({ ok: true, id: doc._id, rev });
-            }
-            return results;
-        },
-        runWrite: (async (arg: any) => {
+        runWrite: async (arg: any) => {
             const tx = typeof arg === "function" ? await arg({
                 get: async (id: string) => _docs.get(id) ?? null,
                 getMeta: async () => null,
@@ -69,9 +54,7 @@ function createLocalStub(): ILocalStore<CouchSyncDoc> & { _docs: Map<string, any
             if (tx.deletes) for (const id of tx.deletes) _docs.delete(id);
             if (tx.onCommit) await tx.onCommit();
             return typeof arg === "function" ? true : undefined;
-        }) as any,
-        update: async () => null,
-        delete: async (id: string) => { _docs.delete(id); },
+        },
         allDocs: async (opts?: any) => {
             let entries = Array.from(_docs.entries());
             if (opts?.keys) {
@@ -89,10 +72,12 @@ function createLocalStub(): ILocalStore<CouchSyncDoc> & { _docs: Map<string, any
             }));
             return { rows } as AllDocsResult<CouchSyncDoc>;
         },
+        changes: async () => ({ results: [], last_seq: 0 }),
         info: async () => ({ updateSeq: 0 }),
         close: async () => {},
         destroy: async () => { _docs.clear(); },
     };
+    return stub;
 }
 
 // ── In-memory ICouchClient stub ─────────────────────────
@@ -150,7 +135,12 @@ function makeFileDoc(path: string, body: string): FileDoc {
     };
 }
 
-describe("remote-couch (Phase 2 — ILocalStore + ICouchClient)", () => {
+/** Shorthand: seed a doc into a local stub. */
+async function seed(local: IDocStore<CouchSyncDoc>, doc: CouchSyncDoc): Promise<void> {
+    await local.runWrite({ docs: [{ doc }] });
+}
+
+describe("remote-couch (IDocStore + ICouchClient)", () => {
     let local: ReturnType<typeof createLocalStub>;
     let remote: ReturnType<typeof createRemoteStub>;
 
@@ -161,9 +151,9 @@ describe("remote-couch (Phase 2 — ILocalStore + ICouchClient)", () => {
 
     describe("pushDocs", () => {
         it("pushes specified docs to remote and reports progress", async () => {
-            await local.put(makeFileDoc("a.md", "alpha"));
-            await local.put(makeFileDoc("b.md", "beta"));
-            await local.put(makeFileDoc("c.md", "gamma"));
+            await seed(local, makeFileDoc("a.md", "alpha"));
+            await seed(local, makeFileDoc("b.md", "beta"));
+            await seed(local, makeFileDoc("c.md", "gamma"));
 
             const seen: string[] = [];
             const written = await pushDocs(
@@ -241,8 +231,8 @@ describe("remote-couch (Phase 2 — ILocalStore + ICouchClient)", () => {
 
     describe("pushAll", () => {
         it("pushes every local doc to remote", async () => {
-            await local.put(makeFileDoc("a.md", "1"));
-            await local.put(makeFileDoc("b.md", "2"));
+            await seed(local, makeFileDoc("a.md", "1"));
+            await seed(local, makeFileDoc("b.md", "2"));
 
             const seen: string[] = [];
             const written = await pushAll(local, remote, (id) => seen.push(id));

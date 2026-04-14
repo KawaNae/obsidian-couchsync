@@ -1,25 +1,26 @@
 /**
- * DexieStore — Dexie-based ILocalStore implementation.
+ * DexieStore — Dexie-based `IDocStore` implementation.
  *
- * Every write goes through `runTx()` which:
+ * Post-Step C refactor: the only write entry point is `runWrite`. It
  *   - opens a single rw transaction over `docs` and `meta`
  *   - bumps `_update_seq` exactly once per call (atomic batch = one seq)
  *   - normalises Dexie/IDB exceptions into typed `DbError`
  *   - retries `AbortError` with short exponential backoff
  *   - escalates `QuotaExceededError` to the caller immediately
  *
- * The public `runWrite(tx)` API expresses an atomic compound write
- * (docs + chunks + deletes + per-path vclocks + arbitrary meta) and is
- * used by VaultSync / SyncEngine to keep file content and lastSyncedVclock
- * in lock-step. The familiar `put` / `bulkPut` / `update` / `atomicFileWrite`
- * / `delete` / `putMeta` / `deleteMeta` methods are thin shims composed on
- * top of `runTx`, sharing the same retry and error-normalisation path.
+ * Two call shapes:
+ *
+ *  - `runWrite(tx)` — pre-built `WriteTransaction`. Single commit, no CAS
+ *    retry. Suitable when the caller already has every value needed.
+ *  - `runWrite(builder, opts?)` — builder receives a fresh `WriteSnapshot`
+ *    and returns the tx to commit. On `DbError(kind:"conflict")` (vclock
+ *    CAS failure) the store re-snapshots and calls the builder again up
+ *    to `maxAttempts` times, so callers never hand-roll a retry loop.
  */
 
 import Dexie, { type Table } from "dexie";
 import type {
-    ILocalStore,
-    PutResponse,
+    IDocStore,
     AllDocsOpts,
     AllDocsResult,
     AllDocsRow,
@@ -117,7 +118,7 @@ function vclocksEqual(a: VectorClock | undefined, b: VectorClock): boolean {
 // ── DexieStore ──────────────────────────────────────────
 
 export class DexieStore<T extends { _id: string; _rev?: string } = any>
-    implements ILocalStore<T>
+    implements IDocStore<T>
 {
     private db: SyncDB;
     private _closed = false;
@@ -351,215 +352,12 @@ export class DexieStore<T extends { _id: string; _rev?: string } = any>
         });
     }
 
-    // ── ILocalStore implementation (shims over runTx) ───
+    // ── IDocStore implementation ────────────────────────
 
     async get(id: string): Promise<T | null> {
         const stored = await this.db.docs.get(id);
         if (!stored) return null;
         return stripInternal<T>(stored);
-    }
-
-    async put(doc: T): Promise<PutResponse> {
-        const _rev = doc._rev;
-        const body = stripRev(doc);
-        const id: string = body._id;
-        if (!id) throw new Error("Document must have an _id");
-
-        return await this.runTx(async ({ seq }) => {
-            const existing = await this.db.docs.get(id);
-            if (existing) {
-                if (!_rev || makeRev(existing._version) !== _rev) {
-                    throw new DbError(
-                        "conflict",
-                        null,
-                        `Document update conflict: ${id}`,
-                    );
-                }
-                const newVersion = existing._version + 1;
-                await this.db.docs.put({
-                    ...body,
-                    _id: id,
-                    _version: newVersion,
-                    _localSeq: seq,
-                });
-                return { ok: true, id, rev: makeRev(newVersion) };
-            }
-            await this.db.docs.put({
-                ...body,
-                _id: id,
-                _version: 1,
-                _localSeq: seq,
-            });
-            return { ok: true, id, rev: makeRev(1) };
-        });
-    }
-
-    async bulkPut(docs: T[]): Promise<PutResponse[]> {
-        if (docs.length === 0) return [];
-
-        return await this.runTx(async ({ seq }) => {
-            const ids = docs.map((d) => d._id);
-            const existingDocs = await this.db.docs.bulkGet(ids);
-            const existingMap = new Map<string, StoredDoc>();
-            for (const d of existingDocs) {
-                if (d) existingMap.set(d._id, d);
-            }
-
-            const toWrite: StoredDoc[] = [];
-            const responses: PutResponse[] = [];
-
-            for (const d of docs) {
-                const body = stripRev(d);
-                const id: string = body._id;
-                const existing = existingMap.get(id);
-
-                if (existing) {
-                    // Content-addressed chunks: silently skip duplicates.
-                    if ("type" in d && (d as any).type === "chunk") {
-                        responses.push({
-                            ok: true,
-                            id,
-                            rev: makeRev(existing._version),
-                        });
-                        continue;
-                    }
-                    const newVersion = existing._version + 1;
-                    toWrite.push({
-                        ...body,
-                        _id: id,
-                        _version: newVersion,
-                        _localSeq: seq,
-                    });
-                    responses.push({ ok: true, id, rev: makeRev(newVersion) });
-                } else {
-                    toWrite.push({
-                        ...body,
-                        _id: id,
-                        _version: 1,
-                        _localSeq: seq,
-                    });
-                    responses.push({ ok: true, id, rev: makeRev(1) });
-                }
-            }
-
-            if (toWrite.length > 0) {
-                await this.db.docs.bulkPut(toWrite);
-            }
-            return responses;
-        });
-    }
-
-    async update<D extends T>(
-        id: string,
-        fn: (existing: D | null) => D | null,
-        maxRetries = 3,
-    ): Promise<PutResponse | null> {
-        for (let attempt = 0; attempt <= maxRetries; attempt++) {
-            // Read outside the tx so the user fn (which may be async or
-            // touch other state) doesn't extend the rw lock.
-            const stored = await this.db.docs.get(id);
-            const existing = stored ? stripInternal<D>(stored) : null;
-            const updated = fn(existing);
-            if (!updated) return null;
-
-            const body = stripRev(updated);
-            const expectedVersion = stored?._version ?? 0;
-            const newVersion = expectedVersion + 1;
-
-            try {
-                return await this.runTx(async ({ seq }) => {
-                    const current = await this.db.docs.get(id);
-                    const currentVersion = current?._version ?? 0;
-                    if (currentVersion !== expectedVersion) {
-                        throw new DbError(
-                            "conflict",
-                            null,
-                            `Document update conflict: ${id}`,
-                        );
-                    }
-                    await this.db.docs.put({
-                        ...body,
-                        _id: id,
-                        _version: newVersion,
-                        _localSeq: seq,
-                    });
-                    return { ok: true, id, rev: makeRev(newVersion) };
-                });
-            } catch (e) {
-                if (e instanceof DbError && e.kind === "conflict" && attempt < maxRetries) {
-                    continue;
-                }
-                throw e;
-            }
-        }
-        throw new DbError(
-            "conflict",
-            null,
-            `update failed after ${maxRetries} retries due to repeated conflict for ${id}`,
-        );
-    }
-
-    /**
-     * Atomically write chunks + a FileDoc in a single transaction.
-     *
-     * Equivalent to `runWrite` with computed `chunks` and `docs` fields,
-     * but exposes a `buildDoc` callback so the caller can inspect the
-     * existing FileDoc and decide whether to write at all (returns null
-     * to abort — guaranteed side-effect-free).
-     *
-     * @param fileId   The FileDoc `_id` (e.g. `"file:notes/hello.md"`).
-     * @param chunks   ChunkDocs to write (may be empty).
-     * @param buildDoc Called with the current FileDoc (or null) to produce
-     *                 the updated doc. Return null to abort.
-     * @returns PutResponse on success, null if buildDoc returned null.
-     */
-    async atomicFileWrite<D extends T>(
-        fileId: string,
-        chunks: T[],
-        buildDoc: (existing: D | null) => D | null,
-    ): Promise<PutResponse | null> {
-        return await this.runTx(async ({ seq }) => {
-            const stored = await this.db.docs.get(fileId);
-            const existingDoc = stored ? stripInternal<D>(stored) : null;
-            const updated = buildDoc(existingDoc);
-            if (!updated) return null;
-
-            // Chunks: content-addressed put-if-absent.
-            if (chunks.length > 0) {
-                const ids = chunks.map((c) => c._id);
-                const existingChunks = await this.db.docs.bulkGet(ids);
-                const have = new Set(
-                    existingChunks
-                        .filter((d): d is StoredDoc => !!d)
-                        .map((d) => d._id),
-                );
-                const fresh = chunks.filter((c) => !have.has(c._id));
-                if (fresh.length > 0) {
-                    await this.db.docs.bulkPut(
-                        fresh.map((c) => ({
-                            ...stripRev(c),
-                            _version: 1,
-                            _localSeq: seq,
-                        })),
-                    );
-                }
-            }
-
-            const newVersion = (stored?._version ?? 0) + 1;
-            await this.db.docs.put({
-                ...stripRev(updated),
-                _id: fileId,
-                _version: newVersion,
-                _localSeq: seq,
-            });
-            return { ok: true, id: fileId, rev: makeRev(newVersion) };
-        });
-    }
-
-    async delete(id: string): Promise<void> {
-        await this.runTx(async () => {
-            await this.db.docs.delete(id);
-        });
     }
 
     async changes(
@@ -645,23 +443,11 @@ export class DexieStore<T extends { _id: string; _rev?: string } = any>
         this._closed = true;
     }
 
-    // ── Meta table helpers ──────────────────────────────
+    // ── Meta table read helpers (IMetaReader) ───────────
 
     async getMeta<V = any>(key: string): Promise<V | null> {
         const row = await this.db.meta.get(key);
         return row ? (row.value as V) : null;
-    }
-
-    async putMeta<V = any>(key: string, value: V): Promise<void> {
-        await this.runTx(async () => {
-            await this.db.meta.put({ key, value });
-        });
-    }
-
-    async deleteMeta(key: string): Promise<void> {
-        await this.runTx(async () => {
-            await this.db.meta.delete(key);
-        });
     }
 
     /**

@@ -1,14 +1,14 @@
 /**
  * Stateless helpers for one-shot remote CouchDB operations.
  *
- * Each function takes ICouchClient + ILocalStore; production callers
+ * Each function takes ICouchClient + IDocStore; production callers
  * pass a CouchClient and LocalDB/ConfigLocalDB.
  *
  * The helpers remain stateless — construct, call, discard. Callers own
  * the lifecycle of both the local store and the remote client.
  */
 
-import type { ICouchClient, ILocalStore } from "./interfaces.ts";
+import type { ICouchClient, IDocStore } from "./interfaces.ts";
 import type { CouchSyncDoc } from "../types.ts";
 import { stripRev } from "../utils/doc.ts";
 
@@ -20,7 +20,7 @@ export type ProgressCallback = (docId: string, count: number) => void;
  * Returns the count of docs written. Skips work if the id list is empty.
  */
 export async function pushDocs(
-    local: ILocalStore<CouchSyncDoc>,
+    local: IDocStore<CouchSyncDoc>,
     remote: ICouchClient,
     docIds: string[],
     onProgress?: ProgressCallback,
@@ -73,7 +73,7 @@ export async function pushDocs(
  * file/chunk space. Returns the count of docs written locally.
  */
 export async function pullByPrefix(
-    local: ILocalStore<CouchSyncDoc>,
+    local: IDocStore<CouchSyncDoc>,
     remote: ICouchClient,
     prefix: string,
 ): Promise<number> {
@@ -135,7 +135,7 @@ export async function destroyRemote(
  * during Init to seed the remote from a freshly-scanned vault.
  */
 export async function pushAll(
-    local: ILocalStore<CouchSyncDoc>,
+    local: IDocStore<CouchSyncDoc>,
     remote: ICouchClient,
     onProgress?: ProgressCallback,
 ): Promise<number> {
@@ -180,7 +180,7 @@ export async function pushAll(
  * e.g. SetupService writing files to the vault during Clone).
  */
 export async function pullAll(
-    local: ILocalStore<CouchSyncDoc>,
+    local: IDocStore<CouchSyncDoc>,
     remote: ICouchClient,
     onProgress?: ProgressCallback,
 ): Promise<{ written: number; docs: CouchSyncDoc[] }> {

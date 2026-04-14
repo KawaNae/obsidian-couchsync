@@ -39,6 +39,11 @@ function makeChunk(hash: string): ChunkDoc {
     };
 }
 
+/** Shorthand: seed a doc via runWrite. */
+async function put(store: DexieStore<CouchSyncDoc>, doc: CouchSyncDoc): Promise<void> {
+    await store.runWrite({ docs: [{ doc }] });
+}
+
 describe("gcOrphanChunks", () => {
     let store: DexieStore<CouchSyncDoc>;
     let db: LocalDB;
@@ -55,9 +60,9 @@ describe("gcOrphanChunks", () => {
     it("deletes unreferenced chunks", async () => {
         const c1 = makeChunk("used1");
         const c2 = makeChunk("orphan1");
-        await store.put(c1);
-        await store.put(c2);
-        await store.put(makeFile("a.md", [c1._id]));
+        await put(store, c1);
+        await put(store, c2);
+        await put(store, makeFile("a.md", [c1._id]));
 
         const result = await gcOrphanChunks(db);
 
@@ -74,9 +79,9 @@ describe("gcOrphanChunks", () => {
     it("keeps all chunks when none are orphaned", async () => {
         const c1 = makeChunk("ref1");
         const c2 = makeChunk("ref2");
-        await store.put(c1);
-        await store.put(c2);
-        await store.put(makeFile("a.md", [c1._id, c2._id]));
+        await put(store, c1);
+        await put(store, c2);
+        await put(store, makeFile("a.md", [c1._id, c2._id]));
 
         const result = await gcOrphanChunks(db);
 
@@ -86,8 +91,8 @@ describe("gcOrphanChunks", () => {
 
     it("treats chunks from deleted FileDocs as orphans", async () => {
         const c1 = makeChunk("dead");
-        await store.put(c1);
-        await store.put(makeFile("deleted.md", [c1._id], { deleted: true }));
+        await put(store, c1);
+        await put(store, makeFile("deleted.md", [c1._id], { deleted: true }));
 
         const result = await gcOrphanChunks(db);
 
@@ -105,9 +110,9 @@ describe("gcOrphanChunks", () => {
 
     it("keeps chunk shared by multiple FileDocs even if one is deleted", async () => {
         const c1 = makeChunk("shared");
-        await store.put(c1);
-        await store.put(makeFile("alive.md", [c1._id]));
-        await store.put(makeFile("dead.md", [c1._id], { deleted: true }));
+        await put(store, c1);
+        await put(store, makeFile("alive.md", [c1._id]));
+        await put(store, makeFile("dead.md", [c1._id], { deleted: true }));
 
         const result = await gcOrphanChunks(db);
 

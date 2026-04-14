@@ -23,11 +23,17 @@ describe("vclock per-path migration", () => {
         db.open();
         // Seed the legacy doc directly via metaStore.
         const meta = db.getMetaStore();
-        await meta.putMeta("_local/last-synced-vclocks", {
-            clocks: {
-                "alpha.md": { A: 1, B: 2 },
-                "sub/beta.md": { A: 3 },
-            },
+        await meta.runWrite({
+            meta: [{
+                op: "put",
+                key: "_local/last-synced-vclocks",
+                value: {
+                    clocks: {
+                        "alpha.md": { A: 1, B: 2 },
+                        "sub/beta.md": { A: 3 },
+                    },
+                },
+            }],
         });
 
         // First load — should migrate.
@@ -70,8 +76,12 @@ describe("vclock per-path migration", () => {
             vclocks: [{ path: "shared.md", op: "set", clock: { A: 9 } }],
         });
         // Now seed legacy with a stale value for the same path.
-        await db.getMetaStore().putMeta("_local/last-synced-vclocks", {
-            clocks: { "shared.md": { A: 1 } },
+        await db.getMetaStore().runWrite({
+            meta: [{
+                op: "put",
+                key: "_local/last-synced-vclocks",
+                value: { clocks: { "shared.md": { A: 1 } } },
+            }],
         });
         const loaded = await db.loadAllSyncedVclocks();
         // Per-path wins.

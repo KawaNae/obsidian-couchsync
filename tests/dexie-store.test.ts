@@ -1,15 +1,19 @@
 /**
- * Tests for DexieStore — Dexie-based ILocalStore implementation.
+ * Tests for DexieStore — Dexie-based IDocStore implementation.
  *
- * Covers all ILocalStore methods plus DexieStore-specific features
- * (meta table, CAS semantics). Uses fake-indexeddb for Node/Vitest.
+ * Post-Step C refactor: the only write path is `runWrite`. These tests
+ * cover the full surface: builder + fixed-tx forms, atomic batch of
+ * docs/chunks/deletes/vclocks/meta, CAS semantics, lifecycle.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { createTestStore } from "./helpers/dexie-test-store.ts";
 import { DexieStore } from "../src/db/dexie-store.ts";
+import { DbError } from "../src/db/write-transaction.ts";
 import type { FileDoc, ChunkDoc, ConfigDoc, CouchSyncDoc } from "../src/types.ts";
 import { makeFileId, makeChunkId, makeConfigId } from "../src/types/doc-id.ts";
+
+// ── Test fixtures ────────────────────────────────────────
 
 function makeFile(path: string, vc: Record<string, number> = { A: 1 }): FileDoc {
     return {
@@ -42,6 +46,13 @@ function makeConfig(path: string, vc: Record<string, number> = { test: 1 }): Con
     };
 }
 
+/** Shorthand: single-doc put via fixed-tx runWrite. */
+async function put(store: DexieStore<CouchSyncDoc>, doc: CouchSyncDoc): Promise<void> {
+    await store.runWrite({ docs: [{ doc }] });
+}
+
+// ── Suite ────────────────────────────────────────────────
+
 describe("DexieStore", () => {
     let store: DexieStore<CouchSyncDoc>;
 
@@ -53,16 +64,12 @@ describe("DexieStore", () => {
         await store.destroy();
     });
 
-    // ── get / put ───────────────────────────────────────
+    // ── get + runWrite(tx) ──────────────────────────────
 
-    describe("get / put", () => {
+    describe("runWrite (fixed tx) + get", () => {
         it("round-trips a FileDoc", async () => {
             const file = makeFile("hello.md");
-            const resp = await store.put(file);
-            expect(resp.ok).toBe(true);
-            expect(resp.id).toBe(file._id);
-            expect(resp.rev).toBe("1-dexie");
-
+            await put(store, file);
             const got = await store.get(file._id);
             expect(got).not.toBeNull();
             expect(got!._id).toBe(file._id);
@@ -73,7 +80,7 @@ describe("DexieStore", () => {
 
         it("round-trips a ChunkDoc", async () => {
             const chunk = makeChunk("abc123", "QUFB");
-            await store.put(chunk);
+            await put(store, chunk);
             const got = await store.get(chunk._id);
             expect(got).not.toBeNull();
             expect((got as ChunkDoc).data).toBe("QUFB");
@@ -81,412 +88,186 @@ describe("DexieStore", () => {
 
         it("round-trips a ConfigDoc", async () => {
             const config = makeConfig(".obsidian/app.json");
-            await store.put(config);
+            await put(store, config);
             const got = await store.get(config._id);
             expect(got).not.toBeNull();
             expect(got!.type).toBe("config");
         });
 
         it("returns null for missing doc", async () => {
-            const got = await store.get("nonexistent");
-            expect(got).toBeNull();
+            expect(await store.get("nonexistent")).toBeNull();
         });
 
-        it("updates existing doc (increments version)", async () => {
-            const file = makeFile("a.md", { A: 1 });
-            const r1 = await store.put(file);
-            expect(r1.rev).toBe("1-dexie");
-
-            const existing = await store.get(file._id);
-            const r2 = await store.put({ ...existing!, vclock: { A: 2 } } as CouchSyncDoc);
-            expect(r2.rev).toBe("2-dexie");
-
-            const got = await store.get(file._id);
+        it("overwrites existing doc without CAS by default", async () => {
+            await put(store, makeFile("a.md", { A: 1 }));
+            await put(store, makeFile("a.md", { A: 2 }));
+            const got = await store.get(makeFileId("a.md"));
             expect((got as FileDoc).vclock).toEqual({ A: 2 });
+            expect(got!._rev).toBe("2-dexie");
         });
 
-        it("put without _rev on existing doc conflicts (CAS)", async () => {
-            await store.put(makeFile("a.md", { A: 1 }));
-            // Put again without fetching _rev — stale write
+        it("vclock CAS rejects stale writes", async () => {
+            await put(store, makeFile("a.md", { A: 1 }));
             await expect(
-                store.put(makeFile("a.md", { A: 2 })),
-            ).rejects.toThrow(/conflict/i);
-        });
-
-        it("throws on missing _id", async () => {
-            await expect(
-                store.put({ type: "file" } as any),
-            ).rejects.toThrow(/_id/);
-        });
-    });
-
-    // ── update (CAS) ────────────────────────────────────
-
-    describe("update (CAS)", () => {
-        it("creates a new doc when none exists", async () => {
-            const resp = await store.update<FileDoc>(makeFileId("new.md"), (existing) => {
-                expect(existing).toBeNull();
-                return makeFile("new.md");
-            });
-            expect(resp).not.toBeNull();
-            expect(resp!.rev).toBe("1-dexie");
-
-            const got = await store.get(makeFileId("new.md"));
+                store.runWrite({
+                    docs: [{
+                        doc: makeFile("a.md", { A: 2 }),
+                        expectedVclock: { A: 99 }, // wrong
+                    }],
+                }),
+            ).rejects.toMatchObject({ kind: "conflict" });
+            const got = await store.get(makeFileId("a.md"));
             expect((got as FileDoc).vclock).toEqual({ A: 1 });
         });
-
-        it("reads existing and applies update", async () => {
-            await store.put(makeFile("a.md", { A: 1 }));
-            await store.update<FileDoc>(makeFileId("a.md"), (existing) => ({
-                ...existing!,
-                vclock: { A: 2 },
-            }));
-            const got = await store.get(makeFileId("a.md"));
-            expect((got as FileDoc).vclock).toEqual({ A: 2 });
-        });
-
-        it("skips write when fn returns null", async () => {
-            await store.put(makeFile("a.md", { A: 1 }));
-            const result = await store.update<FileDoc>(makeFileId("a.md"), () => null);
-            expect(result).toBeNull();
-        });
-
-        it("retries on concurrent write", async () => {
-            await store.put(makeFile("a.md", { A: 1 }));
-            let callCount = 0;
-
-            await store.update<FileDoc>(makeFileId("a.md"), (existing) => {
-                callCount++;
-                if (callCount === 1) {
-                    // Simulate concurrent write by directly mutating DB
-                    store.getDexie().docs.put({
-                        ...(existing as any),
-                        _id: makeFileId("a.md"),
-                        _version: 2,
-                        vclock: { A: 99 },
-                    });
-                }
-                return { ...existing!, vclock: { A: callCount * 10 } };
-            });
-
-            expect(callCount).toBe(2);
-            const got = await store.get(makeFileId("a.md"));
-            expect((got as FileDoc).vclock).toEqual({ A: 20 });
-        });
-
-        it("throws after exhausting retries", async () => {
-            await store.put(makeFile("a.md", { A: 1 }));
-            let callCount = 0;
-
-            await expect(
-                store.update<FileDoc>(
-                    makeFileId("a.md"),
-                    (existing) => {
-                        callCount++;
-                        // Always cause a version mismatch
-                        store.getDexie().docs.put({
-                            ...(existing as any),
-                            _id: makeFileId("a.md"),
-                            _version: 100 + callCount,
-                            vclock: { A: callCount * 100 },
-                        });
-                        return { ...existing!, vclock: { A: callCount } };
-                    },
-                    2,
-                ),
-            ).rejects.toThrow(/conflict/i);
-
-            expect(callCount).toBe(3);
-        });
     });
 
-    // ── bulkPut ─────────────────────────────────────────
+    // ── chunks (content-addressed put-if-absent) ────────
 
-    describe("bulkPut", () => {
-        it("writes multiple docs at once", async () => {
-            const chunks: ChunkDoc[] = [
-                makeChunk("aaa", "AAAA"),
-                makeChunk("bbb", "BBBB"),
-            ];
-            const results = await store.bulkPut(chunks);
-            expect(results).toHaveLength(2);
-            expect(results[0].ok).toBe(true);
-            expect(results[1].ok).toBe(true);
+    describe("chunks", () => {
+        it("writes fresh chunks via runWrite.chunks", async () => {
+            const chunks = [makeChunk("aaa", "AAAA"), makeChunk("bbb", "BBBB")];
+            await store.runWrite({ chunks });
+            expect(await store.get(chunks[0]._id)).not.toBeNull();
+            expect(await store.get(chunks[1]._id)).not.toBeNull();
         });
 
-        it("tolerates duplicate content-addressed chunks", async () => {
+        it("skips duplicate content-addressed chunks silently", async () => {
             const chunk = makeChunk("ccc", "CCCC");
-            await store.put(chunk);
-            // Same chunk ID again — should tolerate silently
-            const results = await store.bulkPut([chunk]);
-            expect(results).toHaveLength(1);
-            expect(results[0].ok).toBe(true);
+            await store.runWrite({ chunks: [chunk] });
+            // Same chunk id again — no throw, no version bump.
+            await store.runWrite({ chunks: [chunk] });
+            const got = await store.get(chunk._id);
+            expect(got!._rev).toBe("1-dexie"); // still version 1
         });
 
-        it("updates existing docs (increments version)", async () => {
-            await store.put(makeFile("a.md", { A: 1 }));
-            await store.bulkPut([makeFile("a.md", { A: 2 })]);
-            const got = await store.get(makeFileId("a.md"));
-            expect((got as FileDoc).vclock).toEqual({ A: 2 });
-        });
-
-        it("returns empty for empty input", async () => {
-            const results = await store.bulkPut([]);
-            expect(results).toEqual([]);
+        it("empty tx still consumes one _update_seq (opaque marker)", async () => {
+            // A no-op runWrite still opens a tx and bumps seq — documented
+            // behaviour so callers can't rely on seq as a "real write" counter.
+            const before = await store.info();
+            await store.runWrite({});
+            const after = await store.info();
+            expect((after.updateSeq as number) - (before.updateSeq as number)).toBe(1);
         });
     });
 
-    // ── delete ──────────────────────────────────────────
+    // ── deletes ─────────────────────────────────────────
 
-    describe("delete", () => {
+    describe("deletes", () => {
         it("removes an existing doc", async () => {
-            await store.put(makeFile("a.md"));
-            await store.delete(makeFileId("a.md"));
-            const got = await store.get(makeFileId("a.md"));
-            expect(got).toBeNull();
+            await put(store, makeFile("a.md"));
+            await store.runWrite({ deletes: [makeFileId("a.md")] });
+            expect(await store.get(makeFileId("a.md"))).toBeNull();
         });
 
-        it("is a no-op for nonexistent doc", async () => {
-            await expect(store.delete("nonexistent")).resolves.toBeUndefined();
-        });
-    });
-
-    // ── allDocs ─────────────────────────────────────────
-
-    describe("allDocs", () => {
-        it("returns all docs sorted by _id", async () => {
-            await store.put(makeFile("b.md"));
-            await store.put(makeFile("a.md"));
-            await store.put(makeFile("c.md"));
-
-            const result = await store.allDocs();
-            expect(result.rows).toHaveLength(3);
-            expect(result.rows[0].id).toBe(makeFileId("a.md"));
-            expect(result.rows[1].id).toBe(makeFileId("b.md"));
-            expect(result.rows[2].id).toBe(makeFileId("c.md"));
+        it("is a no-op for nonexistent id", async () => {
+            await expect(
+                store.runWrite({ deletes: ["nonexistent"] }),
+            ).resolves.toBeUndefined();
         });
 
-        it("includes docs when include_docs is true", async () => {
-            await store.put(makeFile("a.md"));
-            const result = await store.allDocs({ include_docs: true });
-            expect(result.rows[0].doc).not.toBeUndefined();
-            expect(result.rows[0].doc!._id).toBe(makeFileId("a.md"));
-        });
-
-        it("omits docs when include_docs is false", async () => {
-            await store.put(makeFile("a.md"));
-            const result = await store.allDocs();
-            expect(result.rows[0].doc).toBeUndefined();
-        });
-
-        it("range query with startkey/endkey", async () => {
-            await store.put(makeFile("a.md"));
-            await store.put(makeConfig(".obsidian/app.json"));
-            await store.put(makeChunk("xxx", "data"));
-
-            const result = await store.allDocs({
-                startkey: "file:",
-                endkey: "file:\ufff0",
+        it("batches multiple deletes in one tx (one seq bump)", async () => {
+            await put(store, makeFile("a.md"));
+            await put(store, makeFile("b.md"));
+            await put(store, makeFile("c.md"));
+            const before = await store.info();
+            await store.runWrite({
+                deletes: [makeFileId("a.md"), makeFileId("b.md"), makeFileId("c.md")],
             });
-            expect(result.rows).toHaveLength(1);
-            expect(result.rows[0].id).toBe(makeFileId("a.md"));
+            const after = await store.info();
+            expect((after.updateSeq as number) - (before.updateSeq as number)).toBe(1);
+            expect(await store.get(makeFileId("a.md"))).toBeNull();
+            expect(await store.get(makeFileId("b.md"))).toBeNull();
+            expect(await store.get(makeFileId("c.md"))).toBeNull();
         });
+    });
 
-        it("keys query fetches specific docs", async () => {
-            await store.put(makeFile("a.md"));
-            await store.put(makeFile("b.md"));
-            await store.put(makeFile("c.md"));
+    // ── runWrite (builder form) ─────────────────────────
 
-            const result = await store.allDocs({
-                keys: [makeFileId("a.md"), makeFileId("c.md")],
+    describe("runWrite (builder)", () => {
+        it("builder sees snapshot and commits", async () => {
+            const fileId = makeFileId("b.md");
+            const committed = await store.runWrite(async (snap) => {
+                expect(await snap.get(fileId)).toBeNull();
+                return { docs: [{ doc: makeFile("b.md", { A: 1 }) }] };
             });
-            expect(result.rows).toHaveLength(2);
+            expect(committed).toBe(true);
+            expect(await store.get(fileId)).not.toBeNull();
         });
 
-        it("keys query omits missing docs", async () => {
-            await store.put(makeFile("a.md"));
-            const result = await store.allDocs({
-                keys: [makeFileId("a.md"), makeFileId("missing.md")],
+        it("null return is a side-effect-free no-op", async () => {
+            const before = await store.info();
+            const committed = await store.runWrite(async () => null);
+            expect(committed).toBe(false);
+            const after = await store.info();
+            expect(after.updateSeq).toBe(before.updateSeq);
+        });
+
+        it("retries on vclock CAS conflict", async () => {
+            const fileId = makeFileId("race.md");
+            await put(store, makeFile("race.md", { A: 1 }));
+            let calls = 0;
+            const committed = await store.runWrite(async (snap) => {
+                calls++;
+                const cur = (await snap.get(fileId)) as FileDoc;
+                const stale = calls === 1 ? { A: 0 } : cur.vclock;
+                return {
+                    docs: [{
+                        doc: { ...cur, vclock: { A: (cur.vclock.A ?? 0) + 1 } },
+                        expectedVclock: stale,
+                    }],
+                };
             });
-            expect(result.rows).toHaveLength(1);
+            expect(committed).toBe(true);
+            expect(calls).toBe(2);
+            const got = (await store.get(fileId)) as FileDoc;
+            expect(got.vclock).toEqual({ A: 2 });
         });
 
-        it("limit constrains result count", async () => {
-            await store.put(makeFile("a.md"));
-            await store.put(makeFile("b.md"));
-            await store.put(makeFile("c.md"));
-
-            const result = await store.allDocs({ limit: 2 });
-            expect(result.rows).toHaveLength(2);
+        it("throws DbError(conflict) after exhausting maxAttempts", async () => {
+            await put(store, makeFile("exh.md", { A: 1 }));
+            await expect(
+                store.runWrite(
+                    async () => ({
+                        docs: [{
+                            doc: makeFile("exh.md", { A: 2 }),
+                            expectedVclock: { ghost: 99 },
+                        }],
+                    }),
+                    { maxAttempts: 2 },
+                ),
+            ).rejects.toMatchObject({ kind: "conflict", recovery: "fail" });
         });
 
-        it("returns empty for empty store", async () => {
-            const result = await store.allDocs();
-            expect(result.rows).toEqual([]);
+        it("onCommit fires once after a successful commit", async () => {
+            let fired = 0;
+            await store.runWrite(async () => ({
+                meta: [{ op: "put", key: "k", value: 1 }],
+                onCommit: () => { fired++; },
+            }));
+            expect(fired).toBe(1);
         });
 
-        it("row.value.rev matches doc version", async () => {
-            await store.put(makeFile("a.md"));
-            const result = await store.allDocs();
-            expect(result.rows[0].value.rev).toBe("1-dexie");
-        });
-    });
-
-    // ── info ────────────────────────────────────────────
-
-    describe("info", () => {
-        it("returns updateSeq (doc count as default)", async () => {
-            const info = await store.info();
-            expect(info.updateSeq).toBe(0);
-        });
-
-        it("updateSeq reflects written docs", async () => {
-            await store.put(makeFile("a.md"));
-            const info = await store.info();
-            // put() internally bumps the seq counter
-            expect(info.updateSeq).toBe(1);
-        });
-    });
-
-    // ── meta table ──────────────────────────────────────
-
-    describe("meta table", () => {
-        it("round-trips a meta value", async () => {
-            await store.putMeta("scan-cursor", { lastScanStartedAt: 1000 });
-            const got = await store.getMeta("scan-cursor");
-            expect(got).toEqual({ lastScanStartedAt: 1000 });
-        });
-
-        it("returns null for missing key", async () => {
-            const got = await store.getMeta("nonexistent");
-            expect(got).toBeNull();
-        });
-
-        it("overwrites existing meta", async () => {
-            await store.putMeta("key", "v1");
-            await store.putMeta("key", "v2");
-            expect(await store.getMeta("key")).toBe("v2");
-        });
-
-        it("deletes meta", async () => {
-            await store.putMeta("key", "value");
-            await store.deleteMeta("key");
-            expect(await store.getMeta("key")).toBeNull();
+        it("onCommit does NOT fire when the builder aborts", async () => {
+            let fired = 0;
+            await expect(
+                store.runWrite(
+                    async () => ({
+                        docs: [{
+                            doc: makeFile("z.md"),
+                            expectedVclock: { ghost: 7 },
+                        }],
+                        onCommit: () => { fired++; },
+                    }),
+                    { maxAttempts: 1 },
+                ),
+            ).rejects.toThrow();
+            expect(fired).toBe(0);
         });
     });
 
-    // ── close / destroy ─────────────────────────────────
+    // ── compound atomic batch ───────────────────────────
 
-    // ── atomicFileWrite ──────────────────────────────────
-
-    describe("atomicFileWrite", () => {
-        it("writes chunks and FileDoc atomically", async () => {
-            const chunk1 = makeChunk("h1", "Y2h1bmsx");
-            const chunk2 = makeChunk("h2", "Y2h1bmsy");
-            const fileId = makeFileId("atomic.md");
-
-            const result = await store.atomicFileWrite<FileDoc>(
-                fileId,
-                [chunk1, chunk2],
-                (_existing) => ({
-                    _id: fileId,
-                    type: "file",
-                    chunks: [chunk1._id, chunk2._id],
-                    mtime: 1000,
-                    ctime: 1000,
-                    size: 10,
-                    vclock: { A: 1 },
-                }),
-            );
-
-            expect(result).not.toBeNull();
-            expect(result!.ok).toBe(true);
-
-            // Both chunks should exist.
-            const c1 = await store.get(chunk1._id);
-            const c2 = await store.get(chunk2._id);
-            expect(c1).not.toBeNull();
-            expect(c2).not.toBeNull();
-
-            // FileDoc should exist with correct chunks.
-            const doc = await store.get(fileId) as FileDoc;
-            expect(doc).not.toBeNull();
-            expect(doc.chunks).toEqual([chunk1._id, chunk2._id]);
-        });
-
-        it("skips existing chunks (content-addressed)", async () => {
-            const chunk = makeChunk("existing", "ZXhpc3Q=");
-            await store.put(chunk);
-            const fileId = makeFileId("reuse.md");
-
-            await store.atomicFileWrite<FileDoc>(
-                fileId,
-                [chunk],
-                () => ({
-                    _id: fileId,
-                    type: "file",
-                    chunks: [chunk._id],
-                    mtime: 1000,
-                    ctime: 1000,
-                    size: 5,
-                    vclock: { A: 1 },
-                }),
-            );
-
-            // FileDoc written, chunk still exists (not duplicated).
-            const doc = await store.get(fileId);
-            expect(doc).not.toBeNull();
-        });
-
-        it("aborts when buildDoc returns null — nothing written", async () => {
-            const chunk = makeChunk("unused", "dW51c2Vk");
-            const fileId = makeFileId("abort.md");
-
-            const result = await store.atomicFileWrite<FileDoc>(
-                fileId,
-                [chunk],
-                () => null,
-            );
-
-            expect(result).toBeNull();
-            // FileDoc should not exist.
-            const doc = await store.get(fileId);
-            expect(doc).toBeNull();
-            // Chunks should also not exist (abort is side-effect-free).
-            const chunkDoc = await store.get(chunk._id);
-            expect(chunkDoc).toBeNull();
-        });
-
-        it("increments version on update", async () => {
-            const fileId = makeFileId("version.md");
-            // First write
-            await store.atomicFileWrite<FileDoc>(
-                fileId,
-                [],
-                () => ({
-                    _id: fileId, type: "file", chunks: [],
-                    mtime: 1, ctime: 1, size: 0, vclock: { A: 1 },
-                }),
-            );
-
-            // Second write
-            const result = await store.atomicFileWrite<FileDoc>(
-                fileId,
-                [],
-                (existing) => ({
-                    ...existing!,
-                    mtime: 2,
-                    vclock: { A: 2 },
-                }),
-            );
-
-            expect(result!.rev).toBe("2-dexie");
-        });
-    });
-
-    // ── runWrite (atomic compound batch) ────────────────
-
-    describe("runWrite", () => {
+    describe("runWrite atomic batch", () => {
         it("writes docs + chunks + vclocks + meta in one tx", async () => {
             const fileId = makeFileId("compound.md");
             const chunk = makeChunk("ch1", "Y2g=");
@@ -505,9 +286,8 @@ describe("DexieStore", () => {
             ).toMatchObject({ value: { A: 1 } });
         });
 
-        it("a single tx bumps _update_seq exactly once", async () => {
+        it("bumps _update_seq exactly once per compound tx", async () => {
             const before = await store.info();
-            const fileId = makeFileId("seq.md");
             await store.runWrite({
                 chunks: [makeChunk("a", "QQ=="), makeChunk("b", "Qg==")],
                 docs: [{ doc: { ...makeFile("seq.md"), chunks: ["chunk:a", "chunk:b"] } }],
@@ -515,25 +295,6 @@ describe("DexieStore", () => {
             });
             const after = await store.info();
             expect((after.updateSeq as number) - (before.updateSeq as number)).toBe(1);
-        });
-
-        it("vclock CAS rejects mismatch", async () => {
-            const fileId = makeFileId("cas.md");
-            await store.runWrite({
-                docs: [{ doc: makeFile("cas.md", { A: 1 }) }],
-                vclocks: [{ path: "cas.md", op: "set", clock: { A: 1 } }],
-            });
-            await expect(
-                store.runWrite({
-                    docs: [{
-                        doc: makeFile("cas.md", { A: 2 }),
-                        expectedVclock: { A: 99 }, // wrong
-                    }],
-                }),
-            ).rejects.toThrow(/CAS failed/);
-            // Original doc untouched.
-            const got = await store.get(fileId);
-            expect((got as FileDoc).vclock).toEqual({ A: 1 });
         });
 
         it("vclock op delete removes the meta entry", async () => {
@@ -547,7 +308,213 @@ describe("DexieStore", () => {
             expect(await store.getDexie().meta.get("_local/vclock/p")).toBeUndefined();
         });
 
-        it("getMetaByPrefix returns all per-path vclocks", async () => {
+        it("classifies thrown errors as DbError with recovery", async () => {
+            try {
+                await store.runWrite({
+                    docs: [{
+                        doc: makeFile("err.md"),
+                        expectedVclock: { ghost: 42 },
+                    }],
+                });
+                throw new Error("expected throw");
+            } catch (e: any) {
+                expect(e).toBeInstanceOf(DbError);
+                expect(e.kind).toBe("conflict");
+                expect(e.recovery).toBe("fail");
+            }
+        });
+    });
+
+    // ── chunk-equivalent of atomicFileWrite (builder) ──
+
+    describe("atomic file write (builder form)", () => {
+        it("writes chunks + FileDoc atomically via runWrite builder", async () => {
+            const chunk1 = makeChunk("h1", "Y2h1bmsx");
+            const chunk2 = makeChunk("h2", "Y2h1bmsy");
+            const fileId = makeFileId("atomic.md");
+
+            const committed = await store.runWrite(async () => ({
+                chunks: [chunk1, chunk2],
+                docs: [{
+                    doc: {
+                        _id: fileId,
+                        type: "file",
+                        chunks: [chunk1._id, chunk2._id],
+                        mtime: 1000,
+                        ctime: 1000,
+                        size: 10,
+                        vclock: { A: 1 },
+                    } as FileDoc,
+                }],
+            }));
+            expect(committed).toBe(true);
+
+            expect(await store.get(chunk1._id)).not.toBeNull();
+            expect(await store.get(chunk2._id)).not.toBeNull();
+            const doc = (await store.get(fileId)) as FileDoc;
+            expect(doc.chunks).toEqual([chunk1._id, chunk2._id]);
+        });
+
+        it("aborting via null return writes nothing — no orphan chunks", async () => {
+            const chunk = makeChunk("unused", "dW51c2Vk");
+            const fileId = makeFileId("abort.md");
+            const committed = await store.runWrite(async () => null);
+            expect(committed).toBe(false);
+            expect(await store.get(fileId)).toBeNull();
+            expect(await store.get(chunk._id)).toBeNull();
+        });
+
+        it("increments version on subsequent write", async () => {
+            const fileId = makeFileId("version.md");
+            await store.runWrite({
+                docs: [{
+                    doc: {
+                        _id: fileId, type: "file", chunks: [],
+                        mtime: 1, ctime: 1, size: 0, vclock: { A: 1 },
+                    } as FileDoc,
+                }],
+            });
+            const first = await store.get(fileId);
+            expect(first!._rev).toBe("1-dexie");
+
+            await store.runWrite(async (snap) => {
+                const existing = (await snap.get(fileId)) as FileDoc;
+                return {
+                    docs: [{
+                        doc: { ...existing, mtime: 2, vclock: { A: 2 } },
+                        expectedVclock: existing.vclock,
+                    }],
+                };
+            });
+            const second = await store.get(fileId);
+            expect(second!._rev).toBe("2-dexie");
+        });
+    });
+
+    // ── allDocs ─────────────────────────────────────────
+
+    describe("allDocs", () => {
+        it("returns all docs sorted by _id", async () => {
+            await put(store, makeFile("b.md"));
+            await put(store, makeFile("a.md"));
+            await put(store, makeFile("c.md"));
+
+            const result = await store.allDocs();
+            expect(result.rows).toHaveLength(3);
+            expect(result.rows[0].id).toBe(makeFileId("a.md"));
+            expect(result.rows[1].id).toBe(makeFileId("b.md"));
+            expect(result.rows[2].id).toBe(makeFileId("c.md"));
+        });
+
+        it("includes docs when include_docs is true", async () => {
+            await put(store, makeFile("a.md"));
+            const result = await store.allDocs({ include_docs: true });
+            expect(result.rows[0].doc).not.toBeUndefined();
+            expect(result.rows[0].doc!._id).toBe(makeFileId("a.md"));
+        });
+
+        it("omits docs when include_docs is false", async () => {
+            await put(store, makeFile("a.md"));
+            const result = await store.allDocs();
+            expect(result.rows[0].doc).toBeUndefined();
+        });
+
+        it("range query with startkey/endkey", async () => {
+            await put(store, makeFile("a.md"));
+            await put(store, makeConfig(".obsidian/app.json"));
+            await put(store, makeChunk("xxx", "data"));
+
+            const result = await store.allDocs({
+                startkey: "file:",
+                endkey: "file:\ufff0",
+            });
+            expect(result.rows).toHaveLength(1);
+            expect(result.rows[0].id).toBe(makeFileId("a.md"));
+        });
+
+        it("keys query fetches specific docs", async () => {
+            await put(store, makeFile("a.md"));
+            await put(store, makeFile("b.md"));
+            await put(store, makeFile("c.md"));
+
+            const result = await store.allDocs({
+                keys: [makeFileId("a.md"), makeFileId("c.md")],
+            });
+            expect(result.rows).toHaveLength(2);
+        });
+
+        it("keys query omits missing docs", async () => {
+            await put(store, makeFile("a.md"));
+            const result = await store.allDocs({
+                keys: [makeFileId("a.md"), makeFileId("missing.md")],
+            });
+            expect(result.rows).toHaveLength(1);
+        });
+
+        it("limit constrains result count", async () => {
+            await put(store, makeFile("a.md"));
+            await put(store, makeFile("b.md"));
+            await put(store, makeFile("c.md"));
+
+            const result = await store.allDocs({ limit: 2 });
+            expect(result.rows).toHaveLength(2);
+        });
+
+        it("returns empty for empty store", async () => {
+            const result = await store.allDocs();
+            expect(result.rows).toEqual([]);
+        });
+
+        it("row.value.rev matches doc version", async () => {
+            await put(store, makeFile("a.md"));
+            const result = await store.allDocs();
+            expect(result.rows[0].value.rev).toBe("1-dexie");
+        });
+    });
+
+    // ── info ────────────────────────────────────────────
+
+    describe("info", () => {
+        it("returns updateSeq 0 on empty store", async () => {
+            const info = await store.info();
+            expect(info.updateSeq).toBe(0);
+        });
+
+        it("updateSeq advances on each runWrite", async () => {
+            await put(store, makeFile("a.md"));
+            const info = await store.info();
+            expect(info.updateSeq).toBe(1);
+        });
+    });
+
+    // ── meta read + prefix ──────────────────────────────
+
+    describe("meta read surface", () => {
+        it("round-trips a meta value via runWrite + getMeta", async () => {
+            await store.runWrite({
+                meta: [{ op: "put", key: "scan-cursor", value: { lastScanStartedAt: 1000 } }],
+            });
+            expect(await store.getMeta("scan-cursor"))
+                .toEqual({ lastScanStartedAt: 1000 });
+        });
+
+        it("returns null for missing key", async () => {
+            expect(await store.getMeta("nonexistent")).toBeNull();
+        });
+
+        it("runWrite overwrites existing meta", async () => {
+            await store.runWrite({ meta: [{ op: "put", key: "k", value: "v1" }] });
+            await store.runWrite({ meta: [{ op: "put", key: "k", value: "v2" }] });
+            expect(await store.getMeta("k")).toBe("v2");
+        });
+
+        it("runWrite can delete meta", async () => {
+            await store.runWrite({ meta: [{ op: "put", key: "k", value: "value" }] });
+            await store.runWrite({ meta: [{ op: "delete", key: "k" }] });
+            expect(await store.getMeta("k")).toBeNull();
+        });
+
+        it("getMetaByPrefix returns all matching entries", async () => {
             await store.runWrite({
                 vclocks: [
                     { path: "a.md", op: "set", clock: { A: 1 } },
@@ -559,43 +526,21 @@ describe("DexieStore", () => {
             expect(map.get("_local/vclock/a.md")).toEqual({ A: 1 });
             expect(map.get("_local/vclock/sub/b.md")).toEqual({ B: 2 });
         });
-
-        it("classifies thrown errors as DbError", async () => {
-            // Force a synthetic conflict via expectedVclock CAS failure.
-            try {
-                await store.runWrite({
-                    docs: [{
-                        doc: makeFile("err.md"),
-                        expectedVclock: { ghost: 42 },
-                    }],
-                });
-                throw new Error("expected throw");
-            } catch (e: any) {
-                expect(e.constructor.name).toBe("DbError");
-                expect(e.kind).toBe("conflict");
-            }
-        });
-
-        it("deletes via runWrite remove the doc", async () => {
-            const fileId = makeFileId("dele.md");
-            await store.put(makeFile("dele.md"));
-            await store.runWrite({ deletes: [fileId] });
-            expect(await store.get(fileId)).toBeNull();
-        });
     });
+
+    // ── lifecycle ───────────────────────────────────────
 
     describe("lifecycle", () => {
         it("close is idempotent", async () => {
             await store.close();
-            await store.close(); // no throw
+            await store.close();
         });
 
         it("destroy removes the database", async () => {
-            await store.put(makeFile("a.md"));
+            await put(store, makeFile("a.md"));
             await store.destroy();
-            // Create a new store with the same name — should be empty
-            // (can't actually verify because name was unique, but destroy
-            // should not throw)
+            // destroy should not throw; we can't verify absence because
+            // the DB name was unique per test.
         });
     });
 });
