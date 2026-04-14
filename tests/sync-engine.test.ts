@@ -55,15 +55,58 @@ function makeMockClient(overrides?: Partial<ICouchClient>): ICouchClient {
 }
 
 function makeMockLocalDb(overrides?: any): any {
-    const metaStore: Record<string, any> = {};
+    const docsMeta: Record<string, any> = {};
+    const legacyMeta: Record<string, any> = {};
+
+    // Simulate the docs store: runWrite accepts either a fixed tx or a
+    // builder. Mimics the real DexieStore: meta puts land in docsMeta,
+    // `docs` flow into the `bulkPut` mock so existing assertions still
+    // observe pulled writes. Fires onCommit synchronously after.
+    const bulkPut = vi.fn().mockResolvedValue([]);
+    const applyTx = async (tx: any) => {
+        if (!tx) return;
+        if (tx.meta) {
+            for (const m of tx.meta) {
+                if (m.op === "put") docsMeta[m.key] = m.value;
+                else delete docsMeta[m.key];
+            }
+        }
+        if (tx.docs && tx.docs.length > 0) {
+            // Call bulkPut mock with the bare doc array (old shape) so
+            // existing assertions continue to work.
+            await bulkPut(tx.docs.map((d: any) => d.doc));
+        }
+        if (tx.onCommit) await tx.onCommit();
+    };
+    const runWrite = vi.fn(async (arg: any, _opts?: any) => {
+        if (typeof arg === "function") {
+            // Builder form: invoke once with a minimal snapshot.
+            const built = await arg({
+                get: async () => null,
+                getMeta: async (k: string) => docsMeta[k] ?? null,
+                getMetaByPrefix: async () => [],
+            });
+            if (!built) return false;
+            await applyTx(built);
+            return true;
+        }
+        await applyTx(arg);
+    });
+    const docsStore = {
+        getMeta: vi.fn(async (key: string) => docsMeta[key] ?? null),
+        runWrite,
+    };
     return {
-        bulkPut: vi.fn().mockResolvedValue([]),
+        bulkPut,
         changes: vi.fn().mockResolvedValue({ results: [], last_seq: 0 }),
         info: vi.fn().mockResolvedValue({ updateSeq: 0 }),
         getChunks: vi.fn().mockResolvedValue([]),
+        runWrite,
+        getStore: () => docsStore,
         getMetaStore: () => ({
-            getMeta: vi.fn(async (key: string) => metaStore[key] ?? null),
-            putMeta: vi.fn(async (key: string, value: any) => { metaStore[key] = value; }),
+            getMeta: vi.fn(async (key: string) => legacyMeta[key] ?? null),
+            putMeta: vi.fn(async (key: string, value: any) => { legacyMeta[key] = value; }),
+            deleteMeta: vi.fn(async (key: string) => { delete legacyMeta[key]; }),
         }),
         allDocs: vi.fn().mockResolvedValue({ rows: [] }),
         ...overrides,

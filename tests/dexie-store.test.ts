@@ -484,6 +484,106 @@ describe("DexieStore", () => {
         });
     });
 
+    // ── runWrite (atomic compound batch) ────────────────
+
+    describe("runWrite", () => {
+        it("writes docs + chunks + vclocks + meta in one tx", async () => {
+            const fileId = makeFileId("compound.md");
+            const chunk = makeChunk("ch1", "Y2g=");
+            await store.runWrite({
+                chunks: [chunk],
+                docs: [{ doc: { ...makeFile("compound.md", { A: 1 }), chunks: [chunk._id] } }],
+                vclocks: [{ path: "compound.md", op: "set", clock: { A: 1 } }],
+                meta: [{ op: "put", key: "marker", value: 42 }],
+            });
+
+            expect(await store.get(fileId)).not.toBeNull();
+            expect(await store.get(chunk._id)).not.toBeNull();
+            expect(await store.getMeta("marker")).toBe(42);
+            expect(
+                await store.getDexie().meta.get("_local/vclock/compound.md"),
+            ).toMatchObject({ value: { A: 1 } });
+        });
+
+        it("a single tx bumps _update_seq exactly once", async () => {
+            const before = await store.info();
+            const fileId = makeFileId("seq.md");
+            await store.runWrite({
+                chunks: [makeChunk("a", "QQ=="), makeChunk("b", "Qg==")],
+                docs: [{ doc: { ...makeFile("seq.md"), chunks: ["chunk:a", "chunk:b"] } }],
+                vclocks: [{ path: "seq.md", op: "set", clock: { A: 1 } }],
+            });
+            const after = await store.info();
+            expect((after.updateSeq as number) - (before.updateSeq as number)).toBe(1);
+        });
+
+        it("vclock CAS rejects mismatch", async () => {
+            const fileId = makeFileId("cas.md");
+            await store.runWrite({
+                docs: [{ doc: makeFile("cas.md", { A: 1 }) }],
+                vclocks: [{ path: "cas.md", op: "set", clock: { A: 1 } }],
+            });
+            await expect(
+                store.runWrite({
+                    docs: [{
+                        doc: makeFile("cas.md", { A: 2 }),
+                        expectedVclock: { A: 99 }, // wrong
+                    }],
+                }),
+            ).rejects.toThrow(/CAS failed/);
+            // Original doc untouched.
+            const got = await store.get(fileId);
+            expect((got as FileDoc).vclock).toEqual({ A: 1 });
+        });
+
+        it("vclock op delete removes the meta entry", async () => {
+            await store.runWrite({
+                vclocks: [{ path: "p", op: "set", clock: { A: 5 } }],
+            });
+            expect(await store.getDexie().meta.get("_local/vclock/p")).toBeDefined();
+            await store.runWrite({
+                vclocks: [{ path: "p", op: "delete" }],
+            });
+            expect(await store.getDexie().meta.get("_local/vclock/p")).toBeUndefined();
+        });
+
+        it("getMetaByPrefix returns all per-path vclocks", async () => {
+            await store.runWrite({
+                vclocks: [
+                    { path: "a.md", op: "set", clock: { A: 1 } },
+                    { path: "sub/b.md", op: "set", clock: { B: 2 } },
+                ],
+            });
+            const rows = await store.getMetaByPrefix("_local/vclock/");
+            const map = new Map(rows.map((r) => [r.key, r.value]));
+            expect(map.get("_local/vclock/a.md")).toEqual({ A: 1 });
+            expect(map.get("_local/vclock/sub/b.md")).toEqual({ B: 2 });
+        });
+
+        it("classifies thrown errors as DbError", async () => {
+            // Force a synthetic conflict via expectedVclock CAS failure.
+            try {
+                await store.runWrite({
+                    docs: [{
+                        doc: makeFile("err.md"),
+                        expectedVclock: { ghost: 42 },
+                    }],
+                });
+                throw new Error("expected throw");
+            } catch (e: any) {
+                expect(e.constructor.name).toBe("DbError");
+                expect(e.kind).toBe("conflict");
+            }
+        });
+
+        it("deletes via runWrite remove the doc", async () => {
+            const fileId = makeFileId("dele.md");
+            await store.put(makeFile("dele.md"));
+            await store.runWrite({ deletes: [fileId] });
+            expect(await store.get(fileId)).toBeNull();
+        });
+    });
+
     describe("lifecycle", () => {
         it("close is idempotent", async () => {
             await store.close();

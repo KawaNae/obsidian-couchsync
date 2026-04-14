@@ -1,6 +1,8 @@
 import type { CouchSyncDoc, FileDoc, ChunkDoc } from "../types.ts";
 import type { ILocalStore, PutResponse, AllDocsOpts, AllDocsResult, LocalChangesResult } from "./interfaces.ts";
-import { DexieStore, SyncDB } from "./dexie-store.ts";
+import { DexieStore, SyncDB, VCLOCK_KEY_PREFIX, vclockMetaKey } from "./dexie-store.ts";
+import type { WriteTransaction, WriteBuilder } from "./write-transaction.ts";
+import type { VectorClock } from "../sync/vector-clock.ts";
 import {
     ID_RANGE,
     makeFileId,
@@ -70,7 +72,9 @@ export class LocalDB implements ILocalStore<CouchSyncDoc> {
         }
     }
 
-    private getStore(): DexieStore<CouchSyncDoc> {
+    /** Exposed for sync-engine's checkpoint migration. Other callers should
+     *  prefer `runWrite` / `get` / etc. on `LocalDB` itself. */
+    getStore(): DexieStore<CouchSyncDoc> {
         if (!this.store) throw new Error("Database not opened");
         return this.store;
     }
@@ -275,13 +279,74 @@ export class LocalDB implements ILocalStore<CouchSyncDoc> {
         await this.getMetaStore().putMeta(SKIPPED_FILES_ID, doc);
     }
 
-    async getLastSyncedVclocks(): Promise<Record<string, Record<string, number>> | null> {
-        const doc = await this.getMetaStore().getMeta<{ clocks: Record<string, Record<string, number>> }>(LAST_SYNCED_VCLOCKS_ID);
-        return doc?.clocks ?? null;
+    /**
+     * Load every per-path lastSyncedVclock from the docs store's meta
+     * table. Per-path entries (`_local/vclock/<path>`) are written in the
+     * same Dexie transaction as the FileDoc / chunks they refer to, so
+     * the on-disk view never lags behind the doc state.
+     *
+     * Performs a one-shot migration from the legacy single-doc layout
+     * (`_local/last-synced-vclocks`, formerly stored on the *separate*
+     * meta store) when detected, so existing vaults upgrade transparently.
+     */
+    async loadAllSyncedVclocks(): Promise<Map<string, VectorClock>> {
+        const out = new Map<string, VectorClock>();
+
+        const rows = await this.getStore().getMetaByPrefix<VectorClock>(
+            VCLOCK_KEY_PREFIX,
+        );
+        for (const { key, value } of rows) {
+            const path = key.slice(VCLOCK_KEY_PREFIX.length);
+            out.set(path, value);
+        }
+
+        // One-shot migration: legacy single-doc lived on the *meta* store.
+        const legacyMeta = this.getMetaStore();
+        const legacy = await legacyMeta.getMeta<{ clocks: Record<string, VectorClock> }>(
+            LAST_SYNCED_VCLOCKS_ID,
+        );
+        if (legacy?.clocks) {
+            const newVclocks: Array<{ path: string; op: "set"; clock: VectorClock }> = [];
+            for (const [path, vc] of Object.entries(legacy.clocks)) {
+                if (!out.has(path)) {
+                    out.set(path, vc);
+                    newVclocks.push({ path, op: "set", clock: vc });
+                }
+            }
+            if (newVclocks.length > 0) {
+                await this.getStore().runWrite({ vclocks: newVclocks });
+            }
+            await legacyMeta.deleteMeta(LAST_SYNCED_VCLOCKS_ID);
+        }
+
+        return out;
     }
 
-    async putLastSyncedVclocks(clocks: Record<string, Record<string, number>>): Promise<void> {
-        await this.getMetaStore().putMeta(LAST_SYNCED_VCLOCKS_ID, { clocks });
+    /**
+     * Atomic compound write against the docs store.
+     *
+     * Overloads:
+     *  - `runWrite(tx)` — legacy, pre-built tx; caller handles CAS retries
+     *  - `runWrite(builder, opts?)` — builder receives a snapshot; CAS
+     *    conflicts trigger internal re-snapshot + retry up to `maxAttempts`
+     *    (default 5). Returns `true` on commit, `false` if the builder
+     *    returned `null` (explicit no-op).
+     */
+    runWrite(
+        builder: WriteBuilder<CouchSyncDoc>,
+        opts?: { maxAttempts?: number },
+    ): Promise<boolean>;
+    runWrite(tx: WriteTransaction<CouchSyncDoc>): Promise<void>;
+    runWrite(
+        arg: WriteBuilder<CouchSyncDoc> | WriteTransaction<CouchSyncDoc>,
+        opts?: { maxAttempts?: number },
+    ): Promise<void | boolean> {
+        return (this.getStore().runWrite as any)(arg, opts);
+    }
+
+    /** Compose a vclock meta key (`_local/vclock/<path>`). Exposed for tests. */
+    static vclockMetaKey(path: string): string {
+        return vclockMetaKey(path);
     }
 
     async destroy(): Promise<void> {

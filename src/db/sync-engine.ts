@@ -25,9 +25,10 @@ import {
     type SyncErrorDetail,
     type SyncErrorKind,
 } from "./reconnect-policy.ts";
-import { logDebug, logInfo, logWarn, logError } from "../ui/log.ts";
+import { logDebug, logInfo, logWarn, logError, notify } from "../ui/log.ts";
 import { ErrorRecovery } from "./error-recovery.ts";
 import { EnvListeners } from "./env-listeners.ts";
+import { DbError } from "./write-transaction.ts";
 
 // ── Re-exports ──────────────────────────────────────────
 
@@ -661,6 +662,13 @@ export class SyncEngine {
             } catch (e: any) {
                 if (this.syncEpoch !== epoch) return;
 
+                if (e instanceof DbError) {
+                    this.handleLocalDbError(e, "pull write");
+                    if (e.recovery === "halt") return; // teardown already invoked
+                    await this.delay(this.pullRetryMs, epoch);
+                    continue;
+                }
+
                 const detail = this.errorRecovery.classifyError(e);
 
                 if (detail.kind === "auth" || detail.kind === "server") {
@@ -731,9 +739,14 @@ export class SyncEngine {
                 await this.saveCheckpoints();
             } catch (e: any) {
                 if (this.syncEpoch !== epoch) return;
-                // Push errors are logged but don't escalate — the next
-                // cycle will retry.
-                logDebug(`push error: ${e?.message ?? e}`);
+                if (e instanceof DbError) {
+                    this.handleLocalDbError(e, "push loop");
+                    if (e.recovery === "halt") return;
+                } else {
+                    // Push errors are logged but don't escalate — the next
+                    // cycle will retry.
+                    logDebug(`push error: ${e?.message ?? e}`);
+                }
             }
 
             await this.delay(PUSH_POLL_INTERVAL_MS, epoch);
@@ -820,48 +833,63 @@ export class SyncEngine {
             accepted.push(remoteDoc);
         }
 
-        // Write accepted docs to localDB. Track their IDs with the
-        // current local seq so the push loop can distinguish pull echoes
-        // from genuine post-pull user edits.
+        // Atomic commit: accepted docs + META_REMOTE_SEQ in one rw tx.
+        // Crash between the two is impossible — remote changes and the
+        // checkpoint advance together or neither. pullWrittenIds / vault
+        // writes are in-memory / filesystem side effects, so they happen
+        // *after* the tx via onCommit.
+        const nextRemoteSeq = result.last_seq;
         if (accepted.length > 0) {
-            await this.localDb.bulkPut(accepted);
-            const { updateSeq } = await this.localDb.info();
-            const seq = typeof updateSeq === "number" ? updateSeq : parseInt(String(updateSeq), 10);
-            const now = Date.now();
-            for (const doc of accepted) {
-                this.pullWrittenIds.set(doc._id, { seq, addedAt: now });
-            }
+            await this.localDb.runWrite({
+                // bulkPut semantics: docs here are accepted from the remote
+                // and must overwrite local rows (the CAS decision was made
+                // upstream in resolveOnPull). No expectedVclock → unconditional.
+                docs: accepted.map((d) => ({ doc: d })),
+                meta: [{ op: "put", key: META_REMOTE_SEQ, value: nextRemoteSeq }],
+                onCommit: async () => {
+                    const { updateSeq } = await this.localDb.info();
+                    const seq = typeof updateSeq === "number"
+                        ? updateSeq
+                        : parseInt(String(updateSeq), 10);
+                    const now = Date.now();
+                    for (const doc of accepted) {
+                        this.pullWrittenIds.set(doc._id, { seq, addedAt: now });
+                    }
 
-            // Pull-driven vault writes + auto-resolve notification.
-            if (this.onPullWriteHandler) {
-                for (const doc of accepted) {
-                    if (isFileDoc(doc)) {
-                        const path = filePathFromId(doc._id);
-                        try {
-                            await this.ensureChunks(doc);
-                            await this.onPullWriteHandler(doc);
-                            logDebug(`  ← ${path} (take-remote)`);
-                            writtenCount++;
-                            // Notify auto-resolve so main.ts can dismiss
-                            // any open conflict modal for this path.
-                            this.onAutoResolveHandler?.(path);
-                        } catch (e) {
-                            logError(`pull vault write failed: ${path}: ${e?.message ?? e}`);
-                            writeFailCount++;
+                    if (this.onPullWriteHandler) {
+                        for (const doc of accepted) {
+                            if (isFileDoc(doc)) {
+                                const path = filePathFromId(doc._id);
+                                try {
+                                    await this.ensureChunks(doc);
+                                    await this.onPullWriteHandler(doc);
+                                    logDebug(`  ← ${path} (take-remote)`);
+                                    writtenCount++;
+                                    this.onAutoResolveHandler?.(path);
+                                } catch (e: any) {
+                                    logError(`pull vault write failed: ${path}: ${e?.message ?? e}`);
+                                    writeFailCount++;
+                                }
+                            }
                         }
                     }
-                }
-            }
 
-            for (const doc of accepted) {
-                for (const handler of this.onChangeHandlers) {
-                    try {
-                        handler(doc);
-                    } catch (e) {
-                        logError(`onChange handler error: ${e?.message ?? e}`);
+                    for (const doc of accepted) {
+                        for (const handler of this.onChangeHandlers) {
+                            try {
+                                handler(doc);
+                            } catch (e: any) {
+                                logError(`onChange handler error: ${e?.message ?? e}`);
+                            }
+                        }
                     }
-                }
-            }
+                },
+            });
+            this.remoteSeq = nextRemoteSeq;
+        } else {
+            // No docs to apply — just advance the checkpoint (1 small meta write).
+            this.remoteSeq = nextRemoteSeq;
+            await this.saveCheckpoints();
         }
 
         // Summary log — only when there's something to report.
@@ -877,11 +905,6 @@ export class SyncEngine {
             if (chunkCount > 0) parts.push(`${chunkCount} chunks`);
             logInfo(`Pull: ${parts.join(", ")}`);
         }
-
-        // Update remote seq checkpoint (no lastPushedSeq advancement —
-        // pullWrittenIds filter handles push-skip instead).
-        this.remoteSeq = result.last_seq;
-        await this.saveCheckpoints();
 
         // Fire concurrent handlers (non-blocking). The handlers run
         // asynchronously — writePulledDocs returns immediately so the
@@ -1009,9 +1032,30 @@ export class SyncEngine {
     // ── Internal: Checkpoints ─────────────────────────────
 
     private async loadCheckpoints(): Promise<void> {
-        const meta = this.localDb.getMetaStore();
-        const remoteSeq = await meta.getMeta<number | string>(META_REMOTE_SEQ);
-        const pushSeq = await meta.getMeta<number | string>(META_PUSH_SEQ);
+        // Checkpoints live in the docs-store meta so they can sit in the
+        // same rw tx as pull-written docs. Migrate from the legacy metaStore
+        // location transparently on first load.
+        const docsStore = this.localDb.getStore();
+        let remoteSeq = await docsStore.getMeta<number | string>(META_REMOTE_SEQ);
+        let pushSeq = await docsStore.getMeta<number | string>(META_PUSH_SEQ);
+
+        if (remoteSeq === null && pushSeq === null) {
+            const legacy = this.localDb.getMetaStore();
+            const legacyRemote = await legacy.getMeta<number | string>(META_REMOTE_SEQ);
+            const legacyPush = await legacy.getMeta<number | string>(META_PUSH_SEQ);
+            if (legacyRemote !== null || legacyPush !== null) {
+                const meta: Array<{ op: "put"; key: string; value: unknown }> = [];
+                if (legacyRemote !== null) meta.push({ op: "put", key: META_REMOTE_SEQ, value: legacyRemote });
+                if (legacyPush !== null) meta.push({ op: "put", key: META_PUSH_SEQ, value: legacyPush });
+                await docsStore.runWrite({ meta });
+                await legacy.deleteMeta(META_REMOTE_SEQ);
+                await legacy.deleteMeta(META_PUSH_SEQ);
+                remoteSeq = legacyRemote;
+                pushSeq = legacyPush;
+                logDebug("checkpoints migrated from legacy metaStore");
+            }
+        }
+
         if (remoteSeq !== null) this.remoteSeq = remoteSeq;
         if (pushSeq !== null) this.lastPushedSeq = pushSeq;
         logDebug(`checkpoints loaded: remoteSeq=${this.remoteSeq} pushSeq=${this.lastPushedSeq}`);
@@ -1019,12 +1063,39 @@ export class SyncEngine {
 
     private async saveCheckpoints(): Promise<void> {
         try {
-            const meta = this.localDb.getMetaStore();
-            await meta.putMeta(META_REMOTE_SEQ, this.remoteSeq);
-            await meta.putMeta(META_PUSH_SEQ, this.lastPushedSeq);
+            // Both sequence checkpoints land in the docs store so a later
+            // pull-commit refactor can inline them into the same tx.
+            await this.localDb.getStore().runWrite({
+                meta: [
+                    { op: "put", key: META_REMOTE_SEQ, value: this.remoteSeq },
+                    { op: "put", key: META_PUSH_SEQ, value: this.lastPushedSeq },
+                ],
+            });
         } catch (e) {
-            logDebug(`checkpoint save error: ${e}`);
+            this.handleLocalDbError(e, "checkpoint save");
         }
+    }
+
+    /**
+     * Triage a local-DB error from any sync-loop write.
+     *  - `recovery: "halt"` (typically quota): show the user-facing message
+     *    once and tear down the sync loops.
+     *  - Anything else: log at warn and let the caller's retry loop handle it.
+     */
+    private handleLocalDbError(e: unknown, context: string): void {
+        if (e instanceof DbError && e.recovery === "halt") {
+            if (this.state !== "error") {
+                if (e.userMessage) notify(e.userMessage, 15000);
+                logError(`local DB halt during ${context}: ${e.kind} — ${e.message}`);
+                this.teardown();
+            }
+            return;
+        }
+        if (e instanceof DbError) {
+            logWarn(`local DB error during ${context}: ${e.kind} — ${e.message}`);
+            return;
+        }
+        logDebug(`local DB error during ${context}: ${(e as any)?.message ?? e}`);
     }
 
     // ── Internal: Stall detection ──────────────────────────

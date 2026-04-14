@@ -1,12 +1,19 @@
 /**
  * DexieStore — Dexie-based ILocalStore implementation.
  *
- * Stores documents in Dexie (IndexedDB). Used as the local storage
- * backend by LocalDB and ConfigLocalDB.
+ * Every write goes through `runTx()` which:
+ *   - opens a single rw transaction over `docs` and `meta`
+ *   - bumps `_update_seq` exactly once per call (atomic batch = one seq)
+ *   - normalises Dexie/IDB exceptions into typed `DbError`
+ *   - retries `AbortError` with short exponential backoff
+ *   - escalates `QuotaExceededError` to the caller immediately
  *
- *   - `_rev` is replaced by `_version` (integer CAS counter).
- *     PutResponse.rev is synthesized as `"${_version}-dexie"`.
- *   - No revision tree, no conflict tree. CAS via _version check.
+ * The public `runWrite(tx)` API expresses an atomic compound write
+ * (docs + chunks + deletes + per-path vclocks + arbitrary meta) and is
+ * used by VaultSync / SyncEngine to keep file content and lastSyncedVclock
+ * in lock-step. The familiar `put` / `bulkPut` / `update` / `atomicFileWrite`
+ * / `delete` / `putMeta` / `deleteMeta` methods are thin shims composed on
+ * top of `runTx`, sharing the same retry and error-normalisation path.
  */
 
 import Dexie, { type Table } from "dexie";
@@ -19,6 +26,15 @@ import type {
     LocalChangesResult,
 } from "./interfaces.ts";
 import { stripRev } from "../utils/doc.ts";
+import {
+    DbError,
+    classifyDexieError,
+    toDbError,
+    type WriteTransaction,
+    type WriteBuilder,
+    type WriteSnapshot,
+} from "./write-transaction.ts";
+import type { VectorClock } from "../sync/vector-clock.ts";
 
 // ── Stored document shape ───────────────────────────────
 
@@ -29,17 +45,34 @@ export interface StoredDoc {
     /** CAS version counter. Incremented on every write. */
     _version: number;
     /** Monotonic local sequence number for change tracking. Set on every
-     *  write via `_bumpSeq()`. SyncEngine's push loop queries docs with
-     *  `_localSeq > lastPushedSeq` to find unpushed changes. */
+     *  write to the seq allocated by the enclosing `runTx`. SyncEngine's
+     *  push loop queries docs with `_localSeq > lastPushedSeq` to find
+     *  unpushed changes. */
     _localSeq?: number;
-    /** The document body (everything except _id/_rev/_version). */
+    /** The document body. */
     [key: string]: any;
 }
 
-/** Key-value metadata row (scan cursor, vault manifest, etc.). */
+/** Key-value metadata row (scan cursor, vault manifest, vclocks…). */
 export interface LocalMeta {
     key: string;
     value: any;
+}
+
+// ── Per-path vclock meta key convention ─────────────────
+
+/** Prefix for `_local/vclock/<path>` entries written by `runWrite`. */
+export const VCLOCK_KEY_PREFIX = "_local/vclock/";
+export function vclockMetaKey(path: string): string {
+    return VCLOCK_KEY_PREFIX + path;
+}
+
+// ── Retry policy for transient AbortError ───────────────
+
+const ABORT_RETRY_DELAYS_MS: readonly number[] = [100, 200, 400];
+
+function sleep(ms: number): Promise<void> {
+    return new Promise((r) => setTimeout(r, ms));
 }
 
 // ── Dexie database schema ───────────────────────────────
@@ -54,7 +87,6 @@ export class SyncDB extends Dexie {
             docs: "_id, type",
             meta: "key",
         });
-        // v2: add _localSeq index for change tracking (SyncEngine push loop).
         this.version(2).stores({
             docs: "_id, type, _localSeq",
             meta: "key",
@@ -70,16 +102,16 @@ function makeRev(version: number): string {
 
 function stripInternal<T>(stored: StoredDoc): T {
     const { _version, _localSeq, ...doc } = stored;
-    // Synthesize _rev from _version for consumers that expect it
     return { ...doc, _rev: makeRev(_version) } as unknown as T;
 }
 
-/** Conflict error with CouchDB-style 409 shape. */
-function conflict409(id: string): Error {
-    const err = new Error(`Document update conflict: ${id}`) as any;
-    err.status = 409;
-    err.name = "conflict";
-    return err;
+function vclocksEqual(a: VectorClock | undefined, b: VectorClock): boolean {
+    if (!a) return Object.keys(b).length === 0;
+    const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+    for (const k of keys) {
+        if ((a[k] ?? 0) !== (b[k] ?? 0)) return false;
+    }
+    return true;
 }
 
 // ── DexieStore ──────────────────────────────────────────
@@ -105,7 +137,221 @@ export class DexieStore<T extends { _id: string; _rev?: string } = any>
         return this.db;
     }
 
-    // ── ILocalStore implementation ──────────────────────
+    // ── Core: single-tx + single-seq + retry/normalise ──
+
+    /**
+     * Run `work` inside one rw transaction across `docs` and `meta`.
+     * Allocates exactly one `_update_seq` value (passed as `seq`) so every
+     * write inside the tx shares it. Catches Dexie/IDB exceptions, maps
+     * them to `DbError`, and retries transient `AbortError` with a short
+     * exponential backoff.
+     */
+    private async runTx<R>(
+        work: (ctx: { seq: number }) => Promise<R>,
+    ): Promise<R> {
+        let attempt = 0;
+        // eslint-disable-next-line no-constant-condition
+        while (true) {
+            try {
+                let result!: R;
+                await this.db.transaction(
+                    "rw",
+                    this.db.docs,
+                    this.db.meta,
+                    async () => {
+                        const existing = await this.db.meta.get("_update_seq");
+                        const seq = ((existing?.value as number) ?? 0) + 1;
+                        await this.db.meta.put({ key: "_update_seq", value: seq });
+                        result = await work({ seq });
+                    },
+                );
+                return result;
+            } catch (e) {
+                const kind = classifyDexieError(e);
+                if (kind === "abort" && attempt < ABORT_RETRY_DELAYS_MS.length) {
+                    await sleep(ABORT_RETRY_DELAYS_MS[attempt]);
+                    attempt++;
+                    continue;
+                }
+                throw toDbError(e);
+            }
+        }
+    }
+
+    /**
+     * Builder-style atomic write. Reads a snapshot (outside any tx), passes
+     * it to `builder` to compute a `WriteTransaction`, then commits that tx.
+     * On CAS conflict (`expectedVclock` mismatch) re-snapshots and re-runs
+     * `builder` up to `maxAttempts` times.
+     *
+     * Returns `true` on commit, `false` when the builder returned `null`
+     * (explicit no-op) or every attempt hit a conflict.
+     */
+    async runWrite(
+        builder: WriteBuilder<T>,
+        opts?: { maxAttempts?: number },
+    ): Promise<boolean>;
+    /**
+     * @deprecated Legacy atomic batch write accepting a pre-built tx.
+     * New callers should use the builder form so CAS retries are
+     * structurally handled. Retained during Step B migration.
+     */
+    async runWrite(tx: WriteTransaction<T>): Promise<void>;
+    async runWrite(
+        arg: WriteBuilder<T> | WriteTransaction<T>,
+        opts?: { maxAttempts?: number },
+    ): Promise<void | boolean> {
+        if (typeof arg === "function") {
+            return await this.runWriteBuilder(arg as WriteBuilder<T>, opts);
+        }
+        const tx = arg as WriteTransaction<T>;
+        await this.runWriteTx(tx);
+        if (tx.onCommit) await tx.onCommit();
+    }
+
+    /** Snapshot view used by builders. Reads go straight to Dexie. */
+    private snapshot(): WriteSnapshot<T> {
+        return {
+            get: async (id: string) => {
+                const stored = await this.db.docs.get(id);
+                return stored ? stripInternal<T>(stored) : null;
+            },
+            getMeta: async <V = any,>(key: string) => {
+                const row = await this.db.meta.get(key);
+                return row ? (row.value as V) : null;
+            },
+            getMetaByPrefix: <V = any,>(prefix: string) =>
+                this.getMetaByPrefix<V>(prefix),
+        };
+    }
+
+    private async runWriteBuilder(
+        builder: WriteBuilder<T>,
+        opts?: { maxAttempts?: number },
+    ): Promise<boolean> {
+        const maxAttempts = opts?.maxAttempts ?? 5;
+        let lastConflict: DbError | null = null;
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+            const snap = this.snapshot();
+            const built = await builder(snap);
+            if (!built) return false;
+            try {
+                await this.runWriteTx(built);
+            } catch (e) {
+                if (e instanceof DbError && e.kind === "conflict") {
+                    lastConflict = e;
+                    continue;
+                }
+                throw e;
+            }
+            if (built.onCommit) await built.onCommit();
+            return true;
+        }
+        throw (
+            lastConflict ??
+            new DbError(
+                "conflict",
+                null,
+                `runWrite gave up after ${maxAttempts} CAS conflicts`,
+            )
+        );
+    }
+
+    /**
+     * Structured atomic batch write. All listed mutations land in a single
+     * rw transaction with one `_update_seq`. Used by VaultSync / SyncEngine
+     * to bind FileDoc + chunks + lastSyncedVclock together so a crash
+     * cannot leave the on-disk state in a half-applied window.
+     */
+    private async runWriteTx(tx: WriteTransaction<T>): Promise<void> {
+        await this.runTx(async ({ seq }) => {
+            // 1. chunks: content-addressed put-if-absent.
+            if (tx.chunks && tx.chunks.length > 0) {
+                const ids = tx.chunks.map((c) => c._id);
+                const existing = await this.db.docs.bulkGet(ids);
+                const have = new Set(
+                    existing.filter((d): d is StoredDoc => !!d).map((d) => d._id),
+                );
+                const fresh = tx.chunks.filter((c) => !have.has(c._id));
+                if (fresh.length > 0) {
+                    await this.db.docs.bulkPut(
+                        fresh.map((c) => ({
+                            ...stripRev(c),
+                            _version: 1,
+                            _localSeq: seq,
+                        })),
+                    );
+                }
+            }
+
+            // 2. docs: upsert with optional vclock-based CAS.
+            if (tx.docs && tx.docs.length > 0) {
+                const ids = tx.docs.map((d) => d.doc._id);
+                const existingDocs = await this.db.docs.bulkGet(ids);
+                const existingMap = new Map<string, StoredDoc>();
+                for (const d of existingDocs) {
+                    if (d) existingMap.set(d._id, d);
+                }
+                const toWrite: StoredDoc[] = [];
+                for (const { doc, expectedVclock } of tx.docs) {
+                    const id = doc._id;
+                    const stored = existingMap.get(id);
+                    if (expectedVclock !== undefined) {
+                        const currentVc = (stored as any)?.vclock as
+                            | VectorClock
+                            | undefined;
+                        if (!vclocksEqual(currentVc, expectedVclock)) {
+                            throw new DbError(
+                                "conflict",
+                                null,
+                                `vclock CAS failed for ${id}`,
+                            );
+                        }
+                    }
+                    const newVersion = (stored?._version ?? 0) + 1;
+                    toWrite.push({
+                        ...stripRev(doc),
+                        _id: id,
+                        _version: newVersion,
+                        _localSeq: seq,
+                    });
+                }
+                if (toWrite.length > 0) {
+                    await this.db.docs.bulkPut(toWrite);
+                }
+            }
+
+            // 3. deletes: physical removal.
+            if (tx.deletes && tx.deletes.length > 0) {
+                await this.db.docs.bulkDelete(tx.deletes);
+            }
+
+            // 4. per-path vclock meta updates.
+            if (tx.vclocks && tx.vclocks.length > 0) {
+                for (const v of tx.vclocks) {
+                    const key = vclockMetaKey(v.path);
+                    if (v.op === "set") {
+                        await this.db.meta.put({ key, value: v.clock });
+                    } else {
+                        await this.db.meta.delete(key);
+                    }
+                }
+            }
+
+            // 5. arbitrary meta writes (checkpoints, manifests, cursors…).
+            if (tx.meta && tx.meta.length > 0) {
+                for (const m of tx.meta) {
+                    if (m.op === "put") {
+                        await this.db.meta.put({ key: m.key, value: m.value });
+                    } else {
+                        await this.db.meta.delete(m.key);
+                    }
+                }
+            }
+        });
+    }
+
+    // ── ILocalStore implementation (shims over runTx) ───
 
     async get(id: string): Promise<T | null> {
         const stored = await this.db.docs.get(id);
@@ -113,83 +359,94 @@ export class DexieStore<T extends { _id: string; _rev?: string } = any>
         return stripInternal<T>(stored);
     }
 
-async put(doc: T): Promise<PutResponse> {
+    async put(doc: T): Promise<PutResponse> {
         const _rev = doc._rev;
         const body = stripRev(doc);
         const id: string = body._id;
         if (!id) throw new Error("Document must have an _id");
 
-        const existing = await this.db.docs.get(id);
-        const seq = await this._bumpSeq();
-        if (existing) {
-            // CAS: caller must provide _rev matching current version.
-            // Missing _rev on an existing doc is a conflict (CouchDB semantics).
-            if (!_rev || makeRev(existing._version) !== _rev) {
-                throw conflict409(id);
+        return await this.runTx(async ({ seq }) => {
+            const existing = await this.db.docs.get(id);
+            if (existing) {
+                if (!_rev || makeRev(existing._version) !== _rev) {
+                    throw new DbError(
+                        "conflict",
+                        null,
+                        `Document update conflict: ${id}`,
+                    );
+                }
+                const newVersion = existing._version + 1;
+                await this.db.docs.put({
+                    ...body,
+                    _id: id,
+                    _version: newVersion,
+                    _localSeq: seq,
+                });
+                return { ok: true, id, rev: makeRev(newVersion) };
             }
-            const newVersion = existing._version + 1;
-            await this.db.docs.put({ ...body, _id: id, _version: newVersion, _localSeq: seq });
-            return { ok: true, id, rev: makeRev(newVersion) };
-        } else {
-            await this.db.docs.put({ ...body, _id: id, _version: 1, _localSeq: seq });
+            await this.db.docs.put({
+                ...body,
+                _id: id,
+                _version: 1,
+                _localSeq: seq,
+            });
             return { ok: true, id, rev: makeRev(1) };
-        }
+        });
     }
 
     async bulkPut(docs: T[]): Promise<PutResponse[]> {
         if (docs.length === 0) return [];
 
-        const ids = docs.map((d) => d._id);
-        const existingDocs = await this.db.docs.bulkGet(ids);
-        const existingMap = new Map<string, StoredDoc>();
-        for (const doc of existingDocs) {
-            if (doc) existingMap.set(doc._id, doc);
-        }
-
-        const toWrite: StoredDoc[] = [];
-        const responses: PutResponse[] = [];
-        const errors: Array<{ id: string; message: string }> = [];
-        const seq = await this._bumpSeq();
-
-        for (let i = 0; i < docs.length; i++) {
-            const _rev = docs[i]._rev;
-            const body = stripRev(docs[i]);
-            const id: string = body._id;
-            const existing = existingMap.get(id);
-
-            if (existing) {
-                // Content-addressed chunks: tolerate 409 silently
-                if ("type" in docs[i] && (docs[i] as any).type === "chunk") {
-                    responses.push({
-                        ok: true,
-                        id,
-                        rev: makeRev(existing._version),
-                    });
-                    continue;
-                }
-                const newVersion = existing._version + 1;
-                toWrite.push({ ...body, _id: id, _version: newVersion, _localSeq: seq });
-                responses.push({ ok: true, id, rev: makeRev(newVersion) });
-            } else {
-                toWrite.push({ ...body, _id: id, _version: 1, _localSeq: seq });
-                responses.push({ ok: true, id, rev: makeRev(1) });
+        return await this.runTx(async ({ seq }) => {
+            const ids = docs.map((d) => d._id);
+            const existingDocs = await this.db.docs.bulkGet(ids);
+            const existingMap = new Map<string, StoredDoc>();
+            for (const d of existingDocs) {
+                if (d) existingMap.set(d._id, d);
             }
-        }
 
-        if (toWrite.length > 0) {
-            await this.db.docs.bulkPut(toWrite);
-        }
+            const toWrite: StoredDoc[] = [];
+            const responses: PutResponse[] = [];
 
-        if (errors.length > 0) {
-            const summary = errors
-                .map((e) => `${e.id}: ${e.message}`)
-                .join("; ");
-            throw new Error(
-                `bulkPut partial failure (${errors.length}/${docs.length}): ${summary}`,
-            );
-        }
+            for (const d of docs) {
+                const body = stripRev(d);
+                const id: string = body._id;
+                const existing = existingMap.get(id);
 
-        return responses;
+                if (existing) {
+                    // Content-addressed chunks: silently skip duplicates.
+                    if ("type" in d && (d as any).type === "chunk") {
+                        responses.push({
+                            ok: true,
+                            id,
+                            rev: makeRev(existing._version),
+                        });
+                        continue;
+                    }
+                    const newVersion = existing._version + 1;
+                    toWrite.push({
+                        ...body,
+                        _id: id,
+                        _version: newVersion,
+                        _localSeq: seq,
+                    });
+                    responses.push({ ok: true, id, rev: makeRev(newVersion) });
+                } else {
+                    toWrite.push({
+                        ...body,
+                        _id: id,
+                        _version: 1,
+                        _localSeq: seq,
+                    });
+                    responses.push({ ok: true, id, rev: makeRev(1) });
+                }
+            }
+
+            if (toWrite.length > 0) {
+                await this.db.docs.bulkPut(toWrite);
+            }
+            return responses;
+        });
     }
 
     async update<D extends T>(
@@ -197,10 +454,11 @@ async put(doc: T): Promise<PutResponse> {
         fn: (existing: D | null) => D | null,
         maxRetries = 3,
     ): Promise<PutResponse | null> {
-        let lastErr: any;
         for (let attempt = 0; attempt <= maxRetries; attempt++) {
+            // Read outside the tx so the user fn (which may be async or
+            // touch other state) doesn't extend the rw lock.
             const stored = await this.db.docs.get(id);
-            const existing = stored ? (stripInternal<D>(stored)) : null;
+            const existing = stored ? stripInternal<D>(stored) : null;
             const updated = fn(existing);
             if (!updated) return null;
 
@@ -209,13 +467,15 @@ async put(doc: T): Promise<PutResponse> {
             const newVersion = expectedVersion + 1;
 
             try {
-                let success = false;
-                const seq = await this._bumpSeq();
-                await this.db.transaction("rw", this.db.docs, async () => {
+                return await this.runTx(async ({ seq }) => {
                     const current = await this.db.docs.get(id);
                     const currentVersion = current?._version ?? 0;
                     if (currentVersion !== expectedVersion) {
-                        throw conflict409(id);
+                        throw new DbError(
+                            "conflict",
+                            null,
+                            `Document update conflict: ${id}`,
+                        );
                     }
                     await this.db.docs.put({
                         ...body,
@@ -223,35 +483,34 @@ async put(doc: T): Promise<PutResponse> {
                         _version: newVersion,
                         _localSeq: seq,
                     });
-                    success = true;
-                });
-                if (success) {
                     return { ok: true, id, rev: makeRev(newVersion) };
+                });
+            } catch (e) {
+                if (e instanceof DbError && e.kind === "conflict" && attempt < maxRetries) {
+                    continue;
                 }
-            } catch (e: any) {
-                lastErr = e;
-                if (e?.status === 409 && attempt < maxRetries) continue;
                 throw e;
             }
         }
-        throw new Error(
-            `update failed after ${maxRetries} retries for ${id}: status=${lastErr?.status}`,
+        throw new DbError(
+            "conflict",
+            null,
+            `update failed after ${maxRetries} retries due to repeated conflict for ${id}`,
         );
     }
 
     /**
-     * Atomically write chunks + a FileDoc in a single Dexie transaction.
-     * Prevents orphan chunks on crash: either both chunks and FileDoc
-     * are committed, or neither is.
+     * Atomically write chunks + a FileDoc in a single transaction.
      *
-     * Chunks are content-addressed (keyed by hash) — existing chunks
-     * are silently skipped. The FileDoc is written with CAS semantics
-     * (version counter check inside the transaction).
+     * Equivalent to `runWrite` with computed `chunks` and `docs` fields,
+     * but exposes a `buildDoc` callback so the caller can inspect the
+     * existing FileDoc and decide whether to write at all (returns null
+     * to abort — guaranteed side-effect-free).
      *
      * @param fileId   The FileDoc `_id` (e.g. `"file:notes/hello.md"`).
      * @param chunks   ChunkDocs to write (may be empty).
      * @param buildDoc Called with the current FileDoc (or null) to produce
-     *                 the updated doc. Return null to abort the write.
+     *                 the updated doc. Return null to abort.
      * @returns PutResponse on success, null if buildDoc returned null.
      */
     async atomicFileWrite<D extends T>(
@@ -259,66 +518,60 @@ async put(doc: T): Promise<PutResponse> {
         chunks: T[],
         buildDoc: (existing: D | null) => D | null,
     ): Promise<PutResponse | null> {
-        let result: PutResponse | null = null;
-
-        await this.db.transaction("rw", this.db.docs, this.db.meta, async () => {
-            // 1. Check if the caller wants to write at all. Evaluate
-            //    buildDoc BEFORE writing chunks so an abort is truly
-            //    side-effect-free (no orphan chunks on no-op).
+        return await this.runTx(async ({ seq }) => {
             const stored = await this.db.docs.get(fileId);
-            const existingDoc = stored ? (stripInternal<D>(stored)) : null;
+            const existingDoc = stored ? stripInternal<D>(stored) : null;
             const updated = buildDoc(existingDoc);
-            if (!updated) return; // caller aborted — nothing written
+            if (!updated) return null;
 
-            // 2. Write new chunks (content-addressed → skip existing).
+            // Chunks: content-addressed put-if-absent.
             if (chunks.length > 0) {
                 const ids = chunks.map((c) => c._id);
                 const existingChunks = await this.db.docs.bulkGet(ids);
-                const existingSet = new Set(
-                    existingChunks.filter(Boolean).map((d) => d!._id),
+                const have = new Set(
+                    existingChunks
+                        .filter((d): d is StoredDoc => !!d)
+                        .map((d) => d._id),
                 );
-                const newChunks = chunks.filter((c) => !existingSet.has(c._id));
-                if (newChunks.length > 0) {
-                    const chunkSeq = await this._bumpSeq();
+                const fresh = chunks.filter((c) => !have.has(c._id));
+                if (fresh.length > 0) {
                     await this.db.docs.bulkPut(
-                        newChunks.map((c) => ({
+                        fresh.map((c) => ({
                             ...stripRev(c),
                             _version: 1,
-                            _localSeq: chunkSeq,
+                            _localSeq: seq,
                         })),
                     );
                 }
             }
 
-            // 3. CAS write for the FileDoc.
             const newVersion = (stored?._version ?? 0) + 1;
-            const seq = await this._bumpSeq();
             await this.db.docs.put({
                 ...stripRev(updated),
                 _id: fileId,
                 _version: newVersion,
                 _localSeq: seq,
             });
-            result = { ok: true, id: fileId, rev: makeRev(newVersion) };
+            return { ok: true, id: fileId, rev: makeRev(newVersion) };
         });
-
-        return result;
     }
 
     async delete(id: string): Promise<void> {
-        await this.db.docs.delete(id);
+        await this.runTx(async () => {
+            await this.db.docs.delete(id);
+        });
     }
 
     async changes(
         since?: number | string,
         opts?: { include_docs?: boolean },
     ): Promise<LocalChangesResult<T>> {
-        const sinceNum = typeof since === "string" ? parseInt(since, 10) || 0 : (since ?? 0);
+        const sinceNum =
+            typeof since === "string" ? parseInt(since, 10) || 0 : (since ?? 0);
         const rows = await this.db.docs
             .where("_localSeq")
             .above(sinceNum)
             .toArray();
-        // Sort by _localSeq ascending for deterministic order
         rows.sort((a, b) => (a._localSeq ?? 0) - (b._localSeq ?? 0));
         const results = rows.map((stored) => ({
             id: stored._id,
@@ -330,17 +583,15 @@ async put(doc: T): Promise<PutResponse> {
         return { results, last_seq: lastSeq };
     }
 
-async allDocs(opts?: AllDocsOpts): Promise<AllDocsResult<T>> {
+    async allDocs(opts?: AllDocsOpts): Promise<AllDocsResult<T>> {
         let collection: StoredDoc[];
 
         if (opts?.keys) {
-            // Fetch specific keys
             const results = await this.db.docs.bulkGet(opts.keys);
             collection = results.filter(
                 (d): d is StoredDoc => d !== undefined,
             );
         } else if (opts?.startkey && opts?.endkey) {
-            // Range query
             let query = this.db.docs
                 .where("_id")
                 .between(opts.startkey, opts.endkey, true, true);
@@ -377,25 +628,9 @@ async allDocs(opts?: AllDocsOpts): Promise<AllDocsResult<T>> {
     }
 
     async info(): Promise<{ updateSeq: number | string }> {
-        // Use the doc count as a rough proxy for update sequence.
-        // A more accurate approach would maintain a monotonic counter
-        // in the meta table, but doc count is sufficient for the
-        // reconciler's "has anything changed?" check.
         const count = await this.db.docs.count();
-        // Read the actual sequence counter from meta if available
         const seqMeta = await this.db.meta.get("_update_seq");
         return { updateSeq: seqMeta?.value ?? count };
-    }
-
-    /**
-     * Increment and return the update sequence counter. Called after
-     * every write operation that changes doc state.
-     */
-    async _bumpSeq(): Promise<number> {
-        const existing = await this.db.meta.get("_update_seq");
-        const next = ((existing?.value as number) ?? 0) + 1;
-        await this.db.meta.put({ key: "_update_seq", value: next });
-        return next;
     }
 
     async close(): Promise<void> {
@@ -418,10 +653,28 @@ async allDocs(opts?: AllDocsOpts): Promise<AllDocsResult<T>> {
     }
 
     async putMeta<V = any>(key: string, value: V): Promise<void> {
-        await this.db.meta.put({ key, value });
+        await this.runTx(async () => {
+            await this.db.meta.put({ key, value });
+        });
     }
 
     async deleteMeta(key: string): Promise<void> {
-        await this.db.meta.delete(key);
+        await this.runTx(async () => {
+            await this.db.meta.delete(key);
+        });
+    }
+
+    /**
+     * Return all meta entries whose key starts with `prefix`. Used to read
+     * the per-path vclock store (`_local/vclock/...`).
+     */
+    async getMetaByPrefix<V = any>(
+        prefix: string,
+    ): Promise<Array<{ key: string; value: V }>> {
+        const rows = await this.db.meta
+            .where("key")
+            .startsWith(prefix)
+            .toArray();
+        return rows.map((r) => ({ key: r.key, value: r.value as V }));
     }
 }
