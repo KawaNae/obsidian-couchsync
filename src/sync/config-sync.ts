@@ -219,14 +219,18 @@ export class ConfigSync {
                 const data = arrayBufferToBase64(buf);
 
                 const configId = makeConfigId(file);
-                await db.update<ConfigDoc>(configId, (existing) => ({
-                    _id: configId,
-                    type: "config",
-                    data,
-                    mtime: stat.mtime,
-                    size: stat.size,
-                    vclock: incrementVC(existing?.vclock, deviceId),
-                } as ConfigDoc));
+                await db.runWrite(async (snap) => {
+                    const existing = (await snap.get(configId)) as ConfigDoc | null;
+                    const doc: ConfigDoc = {
+                        _id: configId,
+                        type: "config",
+                        data,
+                        mtime: stat.mtime,
+                        size: stat.size,
+                        vclock: incrementVC(existing?.vclock, deviceId),
+                    };
+                    return { docs: [{ doc }] };
+                });
                 count++;
             } catch (e) {
                 logError(`CouchSync: Failed to scan config ${file}: ${e?.message ?? e}`);

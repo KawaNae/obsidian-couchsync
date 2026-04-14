@@ -5,39 +5,52 @@
  * live in a separate store (and a separate remote CouchDB), which lets
  * device pools (e.g. mobile vs desktop) maintain independent `.obsidian/`
  * configurations against the same shared vault.
+ *
+ * Post-Step C refactor: self-contained facade over a single `DexieStore`.
+ * Writes flow through `runWrite` (builder or fixed tx); there are no
+ * `put`/`update`/`bulkPut` shims. Query surface is the subset config-sync
+ * and remote-couch actually need.
  */
 
 import type { ConfigDoc, CouchSyncDoc } from "../types.ts";
-import type { ILocalStore, PutResponse, AllDocsOpts, AllDocsResult, LocalChangesResult } from "./interfaces.ts";
+import type {
+    IDocStore,
+    AllDocsOpts,
+    AllDocsResult,
+    LocalChangesResult,
+} from "./interfaces.ts";
 import type { DexieStore } from "./dexie-store.ts";
 import type { WriteTransaction, WriteBuilder } from "./write-transaction.ts";
 import { ID_RANGE, isConfigDocId } from "../types/doc-id.ts";
 
-export class ConfigLocalDB implements ILocalStore<CouchSyncDoc> {
+export class ConfigLocalDB implements IDocStore<CouchSyncDoc> {
     constructor(private store: DexieStore<CouchSyncDoc>) {}
+
+    // ── Read surface ────────────────────────────────────
 
     async get(id: string): Promise<ConfigDoc | null> {
         return this.store.get(id) as Promise<ConfigDoc | null>;
     }
 
-    async put(doc: CouchSyncDoc): Promise<PutResponse> {
-        return this.store.put(doc);
+    async allDocs(opts?: AllDocsOpts): Promise<AllDocsResult<CouchSyncDoc>> {
+        return this.store.allDocs(opts);
     }
 
-    async update<T extends CouchSyncDoc>(
-        id: string,
-        fn: (existing: T | null) => T | null,
-        maxRetries = 3,
-    ): Promise<PutResponse | null> {
-        return this.store.update(id, fn, maxRetries);
+    async changes(
+        since?: number | string,
+        opts?: { include_docs?: boolean },
+    ): Promise<LocalChangesResult<CouchSyncDoc>> {
+        return this.store.changes(since, opts);
     }
 
-    async bulkPut(docs: CouchSyncDoc[]): Promise<PutResponse[]> {
-        return this.store.bulkPut(docs);
+    async info(): Promise<{ updateSeq: number | string }> {
+        return this.store.info();
     }
+
+    // ── Write surface ───────────────────────────────────
 
     /**
-     * Atomic compound write. Mirrors `LocalDB.runWrite` overloads so
+     * Atomic compound write. Mirrors `DexieStore.runWrite` overloads so
      * config-sync and remote-couch can target either store uniformly.
      */
     runWrite(
@@ -52,13 +65,7 @@ export class ConfigLocalDB implements ILocalStore<CouchSyncDoc> {
         return (this.store.runWrite as any)(arg, opts);
     }
 
-    async allDocs(opts?: AllDocsOpts): Promise<AllDocsResult<CouchSyncDoc>> {
-        return this.store.allDocs(opts);
-    }
-
-    async info(): Promise<{ updateSeq: number | string }> {
-        return this.store.info();
-    }
+    // ── Lifecycle ───────────────────────────────────────
 
     async close(): Promise<void> {
         await this.store.close();
@@ -68,16 +75,7 @@ export class ConfigLocalDB implements ILocalStore<CouchSyncDoc> {
         await this.store.destroy();
     }
 
-    async delete(id: string): Promise<void> {
-        return this.store.delete(id);
-    }
-
-    async changes(
-        since?: number | string,
-        opts?: { include_docs?: boolean },
-    ): Promise<LocalChangesResult<CouchSyncDoc>> {
-        return this.store.changes(since, opts);
-    }
+    // ── Domain helpers ──────────────────────────────────
 
     /**
      * Return every ConfigDoc in the store. Uses a `config:` range query.
@@ -99,7 +97,8 @@ export class ConfigLocalDB implements ILocalStore<CouchSyncDoc> {
     }
 
     /**
-     * Delete all documents with the given ID prefix. Returns deleted IDs.
+     * Delete all documents with the given ID prefix in a single rw tx.
+     * Returns deleted IDs.
      */
     async deleteByPrefix(prefix: string): Promise<string[]> {
         const result = await this.store.allDocs({
@@ -108,9 +107,7 @@ export class ConfigLocalDB implements ILocalStore<CouchSyncDoc> {
         });
         if (result.rows.length === 0) return [];
         const ids = result.rows.map((row) => row.id);
-        for (const id of ids) {
-            await this.store.delete(id);
-        }
+        await this.store.runWrite({ deletes: ids });
         return ids;
     }
 

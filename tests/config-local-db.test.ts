@@ -24,6 +24,11 @@ function makeConfig(path: string, vclock: Record<string, number> = { test: 1 }):
     };
 }
 
+/** Shorthand: single-doc put via runWrite. */
+function put(db: ConfigLocalDB, doc: CouchSyncDoc): Promise<void> {
+    return db.runWrite({ docs: [{ doc }] });
+}
+
 describe("ConfigLocalDB", () => {
     let store: DexieStore<CouchSyncDoc>;
     let db: ConfigLocalDB;
@@ -37,9 +42,9 @@ describe("ConfigLocalDB", () => {
         await store.destroy().catch(() => {});
     });
 
-    describe("get / put", () => {
+    describe("runWrite + get", () => {
         it("round-trips a config doc", async () => {
-            await db.put(makeConfig(".obsidian/app.json"));
+            await put(db, makeConfig(".obsidian/app.json"));
             const got = await db.get(makeConfigId(".obsidian/app.json"));
             expect(got).not.toBeNull();
             expect(got!._id).toBe(makeConfigId(".obsidian/app.json"));
@@ -52,66 +57,84 @@ describe("ConfigLocalDB", () => {
             expect(got).toBeNull();
         });
 
-        it("put without _rev on existing doc conflicts", async () => {
-            await db.put(makeConfig(".obsidian/app.json", { A: 1 }));
-            await expect(
-                db.put(makeConfig(".obsidian/app.json", { A: 2 })),
-            ).rejects.toThrow(/conflict/i);
-        });
-
-        it("update performs CAS read-modify-write", async () => {
-            await db.put(makeConfig(".obsidian/app.json", { A: 1 }));
-            await db.update<ConfigDoc>(makeConfigId(".obsidian/app.json"), (existing) => ({
-                ...existing!,
-                vclock: { A: 2 },
-            }));
+        it("overwrites existing doc without CAS by default", async () => {
+            await put(db, makeConfig(".obsidian/app.json", { A: 1 }));
+            await put(db, makeConfig(".obsidian/app.json", { A: 2 }));
             const got = await db.get(makeConfigId(".obsidian/app.json"));
             expect(got!.vclock).toEqual({ A: 2 });
         });
 
-        it("update returns null when fn returns null", async () => {
-            await db.put(makeConfig(".obsidian/app.json", { A: 1 }));
-            const result = await db.update<ConfigDoc>(
-                makeConfigId(".obsidian/app.json"),
-                () => null,
-            );
-            expect(result).toBeNull();
+        it("expectedVclock CAS rejects stale writes", async () => {
+            await put(db, makeConfig(".obsidian/app.json", { A: 1 }));
+            await expect(
+                db.runWrite({
+                    docs: [{
+                        doc: makeConfig(".obsidian/app.json", { A: 2 }),
+                        expectedVclock: { A: 99 }, // wrong
+                    }],
+                }),
+            ).rejects.toMatchObject({ kind: "conflict" });
+            const got = await db.get(makeConfigId(".obsidian/app.json"));
+            expect(got!.vclock).toEqual({ A: 1 });
+        });
+
+        it("builder form performs read-then-update atomically", async () => {
+            await put(db, makeConfig(".obsidian/app.json", { A: 1 }));
+            const committed = await db.runWrite(async (snap) => {
+                const existing = (await snap.get(makeConfigId(".obsidian/app.json"))) as ConfigDoc | null;
+                return {
+                    docs: [{
+                        doc: { ...existing!, vclock: { A: 2 } },
+                        expectedVclock: existing!.vclock,
+                    }],
+                };
+            });
+            expect(committed).toBe(true);
+            const got = await db.get(makeConfigId(".obsidian/app.json"));
+            expect(got!.vclock).toEqual({ A: 2 });
+        });
+
+        it("builder returning null is a no-op", async () => {
+            const before = await db.info();
+            const committed = await db.runWrite(async () => null);
+            expect(committed).toBe(false);
+            const after = await db.info();
+            expect(after.updateSeq).toBe(before.updateSeq);
         });
     });
 
-    describe("bulkPut", () => {
-        it("writes multiple config docs at once", async () => {
-            await db.bulkPut([
-                makeConfig(".obsidian/a.json"),
-                makeConfig(".obsidian/b.json"),
-                makeConfig(".obsidian/c.json"),
-            ]);
+    describe("multi-doc runWrite", () => {
+        it("writes multiple config docs in one tx", async () => {
+            await db.runWrite({
+                docs: [
+                    { doc: makeConfig(".obsidian/a.json") },
+                    { doc: makeConfig(".obsidian/b.json") },
+                    { doc: makeConfig(".obsidian/c.json") },
+                ],
+            });
             const all = await db.allConfigDocs();
             expect(all.length).toBe(3);
-        });
-
-        it("preserves revs for already-existing docs", async () => {
-            await db.put(makeConfig(".obsidian/a.json", { A: 1 }));
-            await db.bulkPut([makeConfig(".obsidian/a.json", { A: 2 })]);
-            const got = await db.get(makeConfigId(".obsidian/a.json"));
-            expect(got!.vclock).toEqual({ A: 2 });
         });
     });
 
     describe("allConfigDocs", () => {
         it("returns only ConfigDocs (range-bounded)", async () => {
-            await db.put(makeConfig(".obsidian/x.json"));
-            await db.put(makeConfig(".obsidian/y.json"));
-            // Insert an off-prefix doc directly via DexieStore
-            await store.put({
-                _id: makeFileId("intruder.md"),
-                type: "file",
-                chunks: [],
-                mtime: 0,
-                ctime: 0,
-                size: 0,
-                vclock: {},
-            } as CouchSyncDoc);
+            await put(db, makeConfig(".obsidian/x.json"));
+            await put(db, makeConfig(".obsidian/y.json"));
+            // Insert an off-prefix doc directly via the underlying store.
+            await store.runWrite({
+                docs: [{
+                    doc: {
+                        _id: makeFileId("intruder.md"),
+                        type: "file",
+                        chunks: [],
+                        mtime: 0,
+                        ctime: 0,
+                        size: 0,
+                        vclock: {},
+                    } as CouchSyncDoc,
+                }],
+            });
 
             const all = await db.allConfigDocs();
             expect(all.length).toBe(2);
@@ -125,9 +148,9 @@ describe("ConfigLocalDB", () => {
     });
 
     describe("deleteByPrefix", () => {
-        it("deletes all configs and returns their ids", async () => {
-            await db.put(makeConfig(".obsidian/a.json"));
-            await db.put(makeConfig(".obsidian/b.json"));
+        it("deletes all configs in one tx and returns their ids", async () => {
+            await put(db, makeConfig(".obsidian/a.json"));
+            await put(db, makeConfig(".obsidian/b.json"));
             const deleted = await db.deleteByPrefix("config:");
             expect(deleted.length).toBe(2);
             const all = await db.allConfigDocs();
@@ -146,34 +169,42 @@ describe("ConfigLocalDB", () => {
         });
 
         it("returns null when all configs have vclock", async () => {
-            await db.put(makeConfig(".obsidian/a.json", { A: 1 }));
-            await db.put(makeConfig(".obsidian/b.json", { A: 1 }));
+            await put(db, makeConfig(".obsidian/a.json", { A: 1 }));
+            await put(db, makeConfig(".obsidian/b.json", { A: 1 }));
             expect(await db.findLegacyConfigDoc()).toBeNull();
         });
 
         it("returns the id of a config without vclock", async () => {
-            // Insert a malformed legacy doc via DexieStore
-            await store.put({
-                _id: makeConfigId(".obsidian/legacy.json"),
-                type: "config",
-                data: "",
-                mtime: 0,
-                size: 0,
-            } as unknown as CouchSyncDoc);
+            // Insert a malformed legacy doc via the underlying store.
+            await store.runWrite({
+                docs: [{
+                    doc: {
+                        _id: makeConfigId(".obsidian/legacy.json"),
+                        type: "config",
+                        data: "",
+                        mtime: 0,
+                        size: 0,
+                    } as unknown as CouchSyncDoc,
+                }],
+            });
             const found = await db.findLegacyConfigDoc();
             expect(found).toBe(makeConfigId(".obsidian/legacy.json"));
         });
 
         it("returns the id of a non-config doc accidentally living here", async () => {
-            await store.put({
-                _id: makeFileId("wrong-place.md"),
-                type: "file",
-                chunks: [],
-                mtime: 0,
-                ctime: 0,
-                size: 0,
-                vclock: { A: 1 },
-            } as CouchSyncDoc);
+            await store.runWrite({
+                docs: [{
+                    doc: {
+                        _id: makeFileId("wrong-place.md"),
+                        type: "file",
+                        chunks: [],
+                        mtime: 0,
+                        ctime: 0,
+                        size: 0,
+                        vclock: { A: 1 },
+                    } as CouchSyncDoc,
+                }],
+            });
             const found = await db.findLegacyConfigDoc();
             expect(found).toBe(makeFileId("wrong-place.md"));
         });
