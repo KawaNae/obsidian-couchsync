@@ -3,10 +3,26 @@
  *
  * Every file outside `src/db/` references these interfaces. Concrete
  * implementations: DexieStore (local), CouchClient (remote).
+ *
+ * ### API hierarchy (post-Step C refactor)
+ *
+ * - `IDocStore<T>` is the minimal atomic-write local store: `get` + query +
+ *   `runWrite` (builder or fixed tx) + lifecycle. **All** mutations go
+ *   through `runWrite`, never a convenience shim.
+ * - `IMetaReader` exposes the key/value meta side (checkpoints, vclock
+ *   cache, cursors). Writes land via `IDocStore.runWrite({ meta: [...] })`.
+ * - `ILocalStore<T>` is an alias for `IDocStore<T>` retained for
+ *   incremental migration; prefer `IDocStore` in new code.
  */
+
+import type {
+    WriteBuilder,
+    WriteTransaction,
+} from "./write-transaction.ts";
 
 // ── Response types ───────────────────────────────────────
 
+/** @deprecated Retained for backward compatibility during Step C migration. */
 export interface PutResponse {
     ok: boolean;
     id: string;
@@ -47,16 +63,14 @@ export interface LocalChangesResult<T> {
     last_seq: number | string;
 }
 
-export interface ILocalStore<T = any> {
+/**
+ * Minimal atomic-write local store. Every mutation goes through
+ * `runWrite` — either a pre-built tx (one write, no CAS retry) or a
+ * builder that receives a fresh snapshot and returns the tx to commit
+ * (CAS retry on conflict happens inside the store).
+ */
+export interface IDocStore<T = any> {
     get(id: string): Promise<T | null>;
-    put(doc: T): Promise<PutResponse>;
-    bulkPut(docs: T[]): Promise<PutResponse[]>;
-    update<D extends T>(
-        id: string,
-        fn: (existing: D | null) => D | null,
-        maxRetries?: number,
-    ): Promise<PutResponse | null>;
-    delete(id: string): Promise<void>;
     allDocs(opts?: AllDocsOpts): Promise<AllDocsResult<T>>;
     info(): Promise<{ updateSeq: number | string }>;
     /**
@@ -64,9 +78,33 @@ export interface ILocalStore<T = any> {
      * push loop to detect local writes that need uploading to the remote.
      */
     changes(since?: number | string, opts?: { include_docs?: boolean }): Promise<LocalChangesResult<T>>;
+    /** Builder form: CAS retry on `DbError(kind:"conflict")` up to `maxAttempts`. */
+    runWrite(
+        builder: WriteBuilder<T>,
+        opts?: { maxAttempts?: number },
+    ): Promise<boolean>;
+    /** Fixed-tx form: a single commit, no retry. */
+    runWrite(tx: WriteTransaction<T>): Promise<void>;
     close(): Promise<void>;
     destroy(): Promise<void>;
 }
+
+/**
+ * Read side of the key/value meta table. Writes go through the host's
+ * `runWrite({ meta: [...] })`.
+ */
+export interface IMetaReader {
+    getMeta<V = any>(key: string): Promise<V | null>;
+    getMetaByPrefix<V = any>(
+        prefix: string,
+    ): Promise<Array<{ key: string; value: V }>>;
+}
+
+/**
+ * @deprecated Alias for `IDocStore<T>` retained during Step C migration.
+ * New code should import `IDocStore` directly.
+ */
+export type ILocalStore<T = any> = IDocStore<T>;
 
 // ── ICouchClient ─────────────────────────────────────────
 

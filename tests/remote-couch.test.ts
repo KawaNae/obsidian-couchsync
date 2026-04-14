@@ -47,6 +47,29 @@ function createLocalStub(): ILocalStore<CouchSyncDoc> & { _docs: Map<string, any
             }
             return results;
         },
+        runWrite: (async (arg: any) => {
+            const tx = typeof arg === "function" ? await arg({
+                get: async (id: string) => _docs.get(id) ?? null,
+                getMeta: async () => null,
+                getMetaByPrefix: async () => [],
+            }) : arg;
+            if (!tx) return false;
+            if (tx.docs) {
+                for (const { doc } of tx.docs) {
+                    _docs.set(doc._id, { ...doc, _rev: `${++_rev}-stub` });
+                }
+            }
+            if (tx.chunks) {
+                for (const c of tx.chunks) {
+                    if (!_docs.has(c._id)) {
+                        _docs.set(c._id, { ...c, _rev: `${++_rev}-stub` });
+                    }
+                }
+            }
+            if (tx.deletes) for (const id of tx.deletes) _docs.delete(id);
+            if (tx.onCommit) await tx.onCommit();
+            return typeof arg === "function" ? true : undefined;
+        }) as any,
         update: async () => null,
         delete: async (id: string) => { _docs.delete(id); },
         allDocs: async (opts?: any) => {

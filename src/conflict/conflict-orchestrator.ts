@@ -175,7 +175,9 @@ export class ConflictOrchestrator {
                     (remoteDoc as any).vclock ?? {},
                 );
                 const updated = { ...localDoc, vclock: incrementVC(merged, deviceId) };
-                await localDb.bulkPut([stripRev(updated) as CouchSyncDoc]);
+                await localDb.runWrite({
+                    docs: [{ doc: stripRev(updated) as CouchSyncDoc }],
+                });
             }
             notify(
                 `CouchSync: concurrent config edit on ${fileName} — keeping local version.`,
@@ -204,7 +206,9 @@ export class ConflictOrchestrator {
                 ...remoteDoc,
                 vclock: incrementVC(remoteDoc.vclock ?? {}, deviceId),
             };
-            await localDb.bulkPut([stripRev(updated)]);
+            await localDb.runWrite({
+                docs: [{ doc: stripRev(updated) as CouchSyncDoc }],
+            });
             await replicator.ensureFileChunks(updated as FileDoc);
             await this.deps.dbToFile(updated as FileDoc);
         } else {
@@ -217,7 +221,9 @@ export class ConflictOrchestrator {
                 ...localDoc,
                 vclock: incrementVC(merged, deviceId),
             };
-            await localDb.bulkPut([stripRev(updated)]);
+            await localDb.runWrite({
+                docs: [{ doc: stripRev(updated) as CouchSyncDoc }],
+            });
             logDebug(`  vclock after merge: ${JSON.stringify(updated.vclock)}`);
         }
     }

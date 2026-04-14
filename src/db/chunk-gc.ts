@@ -35,13 +35,15 @@ export async function gcOrphanChunks(db: LocalDB): Promise<GcResult> {
         endkey: ID_RANGE.chunk.endkey,
     });
 
-    // 3. Delete orphans (not referenced by any live FileDoc).
+    // 3. Delete orphans (not referenced by any live FileDoc). All in one
+    //    rw tx so a crash mid-GC cannot leave _update_seq inconsistent —
+    //    either every orphan is gone or none of them are.
     const orphanIds = allChunks.rows
         .filter((r) => !referenced.has(r.id))
         .map((r) => r.id);
 
-    for (const id of orphanIds) {
-        await db.delete(id);
+    if (orphanIds.length > 0) {
+        await db.runWrite({ deletes: orphanIds });
     }
 
     const result: GcResult = {

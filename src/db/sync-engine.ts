@@ -212,7 +212,9 @@ export class SyncEngine {
         );
         const fetched = await this.client.bulkGet<ChunkDoc>(missing);
         if (fetched.length > 0) {
-            await this.localDb.bulkPut(fetched);
+            // Chunks are content-addressed: put-if-absent handled inside
+            // runWrite when passed via the `chunks` field.
+            await this.localDb.runWrite({ chunks: fetched });
         }
     }
 

@@ -94,8 +94,10 @@ export async function pullByPrefix(
     // Strip remote _rev before writing to local.
     const localDocs = docs.map((d) => stripRev(d) as CouchSyncDoc);
 
-    const results = await local.bulkPut(localDocs);
-    return results.filter((r) => r.ok).length;
+    await local.runWrite({
+        docs: localDocs.map((doc) => ({ doc })),
+    });
+    return localDocs.length;
 }
 
 /**
@@ -197,13 +199,13 @@ export async function pullAll(
     // Strip remote _rev before writing to local.
     const localDocs = docs.map((d) => stripRev(d) as CouchSyncDoc);
 
-    const results = await local.bulkPut(localDocs);
+    await local.runWrite({
+        docs: localDocs.map((doc) => ({ doc })),
+    });
     let total = 0;
-    for (const res of results) {
-        if (res.ok) {
-            total++;
-            onProgress?.(res.id, total);
-        }
+    for (const doc of localDocs) {
+        total++;
+        onProgress?.(doc._id, total);
     }
     return { written: total, docs };
 }

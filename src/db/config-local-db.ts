@@ -10,6 +10,7 @@
 import type { ConfigDoc, CouchSyncDoc } from "../types.ts";
 import type { ILocalStore, PutResponse, AllDocsOpts, AllDocsResult, LocalChangesResult } from "./interfaces.ts";
 import type { DexieStore } from "./dexie-store.ts";
+import type { WriteTransaction, WriteBuilder } from "./write-transaction.ts";
 import { ID_RANGE, isConfigDocId } from "../types/doc-id.ts";
 
 export class ConfigLocalDB implements ILocalStore<CouchSyncDoc> {
@@ -33,6 +34,22 @@ export class ConfigLocalDB implements ILocalStore<CouchSyncDoc> {
 
     async bulkPut(docs: CouchSyncDoc[]): Promise<PutResponse[]> {
         return this.store.bulkPut(docs);
+    }
+
+    /**
+     * Atomic compound write. Mirrors `LocalDB.runWrite` overloads so
+     * config-sync and remote-couch can target either store uniformly.
+     */
+    runWrite(
+        builder: WriteBuilder<CouchSyncDoc>,
+        opts?: { maxAttempts?: number },
+    ): Promise<boolean>;
+    runWrite(tx: WriteTransaction<CouchSyncDoc>): Promise<void>;
+    runWrite(
+        arg: WriteBuilder<CouchSyncDoc> | WriteTransaction<CouchSyncDoc>,
+        opts?: { maxAttempts?: number },
+    ): Promise<void | boolean> {
+        return (this.store.runWrite as any)(arg, opts);
     }
 
     async allDocs(opts?: AllDocsOpts): Promise<AllDocsResult<CouchSyncDoc>> {
