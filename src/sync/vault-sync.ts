@@ -9,7 +9,7 @@ import { compareVC, incrementVC } from "./vector-clock.ts";
 import type { VectorClock } from "./vector-clock.ts";
 import { makeFileId, filePathFromId } from "../types/doc-id.ts";
 import { toPathKey, type PathKey } from "../utils/path.ts";
-import { logWarn } from "../ui/log.ts";
+import { logDebug, logWarn } from "../ui/log.ts";
 import { DbError } from "../db/write-transaction.ts";
 
 /**
@@ -112,7 +112,7 @@ export class VaultSync {
         // inside the store. This function only decides WHAT to write based
         // on the current doc state.
         try {
-            await this.db.runWrite(
+            await this.db.runWriteBuilder(
                 async (snap) => {
                     const existing = (await snap.get(fileId)) as FileDoc | null;
                     if (existing && VaultSync.chunksEqual(existing.chunks, chunkIds)) {
@@ -150,6 +150,12 @@ export class VaultSync {
 
     async dbToFile(fileDoc: FileDoc): Promise<void> {
         const vaultPath = filePathFromId(fileDoc._id);
+
+        // Deletion tombstones pass through the filter — deletions are always applied.
+        if (!fileDoc.deleted && !this.shouldSync(vaultPath)) {
+            logDebug(`dbToFile: skipped filtered path ${vaultPath}`);
+            return;
+        }
 
         if (fileDoc.deleted) {
             const existing = this.app.vault.getAbstractFileByPath(vaultPath);
@@ -208,7 +214,7 @@ export class VaultSync {
             // Persist the vclock in the docs store's meta so it lives in
             // the same IDB as the FileDoc itself. Pure meta write — no CAS
             // needed, so pass a fixed tx rather than a builder.
-            await this.db.runWrite({
+            await this.db.runWriteTx({
                 vclocks: [{ path: vaultPath, op: "set", clock }],
             });
             this.lastSyncedVclock.set(toPathKey(vaultPath), clock);
@@ -243,7 +249,7 @@ export class VaultSync {
         const fileId = makeFileId(path);
         const deviceId = this.getSettings().deviceId;
         try {
-            await this.db.runWrite(
+            await this.db.runWriteBuilder(
                 async (snap) => {
                     const existing = (await snap.get(fileId)) as FileDoc | null;
                     if (!existing || existing.deleted) {

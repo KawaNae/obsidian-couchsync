@@ -32,12 +32,29 @@ function createLocalStub(): IDocStore<CouchSyncDoc> & { _docs: Map<string, any> 
     const stub: any = {
         _docs,
         get: async (id: string) => _docs.get(id) ?? null,
-        runWrite: async (arg: any) => {
-            const tx = typeof arg === "function" ? await arg({
+        runWriteTx: async (tx: any) => {
+            if (!tx) return;
+            if (tx.docs) {
+                for (const { doc } of tx.docs) {
+                    _docs.set(doc._id, { ...doc, _rev: `${++_rev}-stub` });
+                }
+            }
+            if (tx.chunks) {
+                for (const c of tx.chunks) {
+                    if (!_docs.has(c._id)) {
+                        _docs.set(c._id, { ...c, _rev: `${++_rev}-stub` });
+                    }
+                }
+            }
+            if (tx.deletes) for (const id of tx.deletes) _docs.delete(id);
+            if (tx.onCommit) await tx.onCommit();
+        },
+        runWriteBuilder: async (builder: any, opts?: any) => {
+            const tx = await builder({
                 get: async (id: string) => _docs.get(id) ?? null,
                 getMeta: async () => null,
                 getMetaByPrefix: async () => [],
-            }) : arg;
+            });
             if (!tx) return false;
             if (tx.docs) {
                 for (const { doc } of tx.docs) {
@@ -53,7 +70,7 @@ function createLocalStub(): IDocStore<CouchSyncDoc> & { _docs: Map<string, any> 
             }
             if (tx.deletes) for (const id of tx.deletes) _docs.delete(id);
             if (tx.onCommit) await tx.onCommit();
-            return typeof arg === "function" ? true : undefined;
+            return true;
         },
         allDocs: async (opts?: any) => {
             let entries = Array.from(_docs.entries());
@@ -137,7 +154,7 @@ function makeFileDoc(path: string, body: string): FileDoc {
 
 /** Shorthand: seed a doc into a local stub. */
 async function seed(local: IDocStore<CouchSyncDoc>, doc: CouchSyncDoc): Promise<void> {
-    await local.runWrite({ docs: [{ doc }] });
+    await local.runWriteTx({ docs: [{ doc }] });
 }
 
 describe("remote-couch (IDocStore + ICouchClient)", () => {

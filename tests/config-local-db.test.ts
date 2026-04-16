@@ -24,9 +24,9 @@ function makeConfig(path: string, vclock: Record<string, number> = { test: 1 }):
     };
 }
 
-/** Shorthand: single-doc put via runWrite. */
+/** Shorthand: single-doc put via runWriteTx. */
 function put(db: ConfigLocalDB, doc: CouchSyncDoc): Promise<void> {
-    return db.runWrite({ docs: [{ doc }] });
+    return db.runWriteTx({ docs: [{ doc }] });
 }
 
 describe("ConfigLocalDB", () => {
@@ -67,7 +67,7 @@ describe("ConfigLocalDB", () => {
         it("expectedVclock CAS rejects stale writes", async () => {
             await put(db, makeConfig(".obsidian/app.json", { A: 1 }));
             await expect(
-                db.runWrite({
+                db.runWriteTx({
                     docs: [{
                         doc: makeConfig(".obsidian/app.json", { A: 2 }),
                         expectedVclock: { A: 99 }, // wrong
@@ -80,7 +80,7 @@ describe("ConfigLocalDB", () => {
 
         it("builder form performs read-then-update atomically", async () => {
             await put(db, makeConfig(".obsidian/app.json", { A: 1 }));
-            const committed = await db.runWrite(async (snap) => {
+            const committed = await db.runWriteBuilder(async (snap) => {
                 const existing = (await snap.get(makeConfigId(".obsidian/app.json"))) as ConfigDoc | null;
                 return {
                     docs: [{
@@ -96,7 +96,7 @@ describe("ConfigLocalDB", () => {
 
         it("builder returning null is a no-op", async () => {
             const before = await db.info();
-            const committed = await db.runWrite(async () => null);
+            const committed = await db.runWriteBuilder(async () => null);
             expect(committed).toBe(false);
             const after = await db.info();
             expect(after.updateSeq).toBe(before.updateSeq);
@@ -105,7 +105,7 @@ describe("ConfigLocalDB", () => {
 
     describe("multi-doc runWrite", () => {
         it("writes multiple config docs in one tx", async () => {
-            await db.runWrite({
+            await db.runWriteTx({
                 docs: [
                     { doc: makeConfig(".obsidian/a.json") },
                     { doc: makeConfig(".obsidian/b.json") },
@@ -122,7 +122,7 @@ describe("ConfigLocalDB", () => {
             await put(db, makeConfig(".obsidian/x.json"));
             await put(db, makeConfig(".obsidian/y.json"));
             // Insert an off-prefix doc directly via the underlying store.
-            await store.runWrite({
+            await store.runWriteTx({
                 docs: [{
                     doc: {
                         _id: makeFileId("intruder.md"),
@@ -176,7 +176,7 @@ describe("ConfigLocalDB", () => {
 
         it("returns the id of a config without vclock", async () => {
             // Insert a malformed legacy doc via the underlying store.
-            await store.runWrite({
+            await store.runWriteTx({
                 docs: [{
                     doc: {
                         _id: makeConfigId(".obsidian/legacy.json"),
@@ -192,7 +192,7 @@ describe("ConfigLocalDB", () => {
         });
 
         it("returns the id of a non-config doc accidentally living here", async () => {
-            await store.runWrite({
+            await store.runWriteTx({
                 docs: [{
                     doc: {
                         _id: makeFileId("wrong-place.md"),

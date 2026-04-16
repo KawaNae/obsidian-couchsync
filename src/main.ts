@@ -119,7 +119,6 @@ export default class CouchSyncPlugin extends Plugin {
             app: this.app,
             localDb: this.localDb,
             replicator: this.replicator,
-            hasConfigDb: this.configLocalDb !== null,
             historyCapture: this.historyCapture,
             dbToFile: (doc) => this.vaultSync.dbToFile(doc),
             getSettings: () => this.settings,

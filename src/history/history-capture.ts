@@ -5,7 +5,7 @@ import type { CouchSyncSettings } from "../settings.ts";
 import type { HistorySource } from "./types.ts";
 import { minimatch } from "../utils/minimatch.ts";
 import { isDiffableText } from "../utils/binary.ts";
-import { logDebug } from "../ui/log.ts";
+import { logDebug, logError } from "../ui/log.ts";
 
 export class HistoryCapture {
     private debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -79,11 +79,20 @@ export class HistoryCapture {
         }
     }
 
-    async saveConflict(filePath: string, loserContent: string, winnerContent: string): Promise<void> {
+    async saveConflict(
+        filePath: string,
+        localContent: string,
+        remoteContent: string,
+        winner: "local" | "remote",
+    ): Promise<void> {
+        const winnerContent = winner === "local" ? localContent : remoteContent;
+        const loserContent = winner === "local" ? remoteContent : localContent;
         const patch = this.diffEngine.computePatch(winnerContent, loserContent);
         const hash = await computeHash(winnerContent);
         const { added, removed } = this.diffEngine.computeLineDiff(winnerContent, loserContent);
         await this.storage.saveDiff(filePath, patch, hash, added, removed, true);
+        // Update snapshot to winner content so subsequent diffs have correct baseline.
+        await this.storage.saveSnapshot(filePath, winnerContent);
     }
 
     /**
@@ -181,7 +190,7 @@ export class HistoryCapture {
             logDebug(`History captured for ${file.path} (${source})`);
             (this.app.workspace as any).trigger("couchsync:diff-saved", file.path);
         } catch (e) {
-            console.error("CouchSync: Failed to capture history:", e);
+            logError(`CouchSync: Failed to capture history: ${e?.message ?? e}`);
         }
     }
 }

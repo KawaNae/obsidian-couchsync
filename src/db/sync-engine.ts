@@ -39,7 +39,6 @@ export type {
     SyncErrorKind,
 } from "./reconnect-policy.ts";
 
-export type OnChangeHandler = (doc: CouchSyncDoc) => void;
 export type OnStateChangeHandler = (state: SyncState) => void;
 export type OnErrorHandler = (message: string) => void;
 export type OnConcurrentHandler = (
@@ -65,7 +64,7 @@ const CATCHUP_IDLE_TIMEOUT_MS = 60000; // abort catchup after 60s of no progress
 
 /** Build identifier, logged at start(). Lets us verify on mobile that a
  *  deployed plugin update actually reached the device. */
-const BUILD_TAG = "sync-engine-v0.15.0";
+const BUILD_TAG = "sync-engine-v0.17.0";
 
 /** How often to check for local changes to push. */
 const PUSH_POLL_INTERVAL_MS = 2000;
@@ -90,7 +89,6 @@ export class SyncEngine {
 
     // ── Event handlers ────────────────────────────────────
 
-    private onChangeHandlers: OnChangeHandler[] = [];
     private onStateChangeHandlers: OnStateChangeHandler[] = [];
     private onErrorHandlers: OnErrorHandler[] = [];
     private onPausedHandlers: (() => void)[] = [];
@@ -214,7 +212,7 @@ export class SyncEngine {
         if (fetched.length > 0) {
             // Chunks are content-addressed: put-if-absent handled inside
             // runWrite when passed via the `chunks` field.
-            await this.localDb.runWrite({ chunks: fetched });
+            await this.localDb.runWriteTx({ chunks: fetched });
         }
     }
 
@@ -271,10 +269,6 @@ export class SyncEngine {
     }
 
     // ── Public API: Event handlers ────────────────────────
-
-    onChange(handler: OnChangeHandler): void {
-        this.onChangeHandlers.push(handler);
-    }
 
     onStateChange(handler: OnStateChangeHandler): void {
         this.onStateChangeHandlers.push(handler);
@@ -842,7 +836,7 @@ export class SyncEngine {
         // *after* the tx via onCommit.
         const nextRemoteSeq = result.last_seq;
         if (accepted.length > 0) {
-            await this.localDb.runWrite({
+            await this.localDb.runWriteTx({
                 // bulkPut semantics: docs here are accepted from the remote
                 // and must overwrite local rows (the CAS decision was made
                 // upstream in resolveOnPull). No expectedVclock → unconditional.
@@ -876,15 +870,6 @@ export class SyncEngine {
                         }
                     }
 
-                    for (const doc of accepted) {
-                        for (const handler of this.onChangeHandlers) {
-                            try {
-                                handler(doc);
-                            } catch (e: any) {
-                                logError(`onChange handler error: ${e?.message ?? e}`);
-                            }
-                        }
-                    }
                 },
             });
             this.remoteSeq = nextRemoteSeq;
@@ -1049,8 +1034,8 @@ export class SyncEngine {
                 const meta: Array<{ op: "put"; key: string; value: unknown }> = [];
                 if (legacyRemote !== null) meta.push({ op: "put", key: META_REMOTE_SEQ, value: legacyRemote });
                 if (legacyPush !== null) meta.push({ op: "put", key: META_PUSH_SEQ, value: legacyPush });
-                await docsStore.runWrite({ meta });
-                await legacy.runWrite({
+                await docsStore.runWriteTx({ meta });
+                await legacy.runWriteTx({
                     meta: [
                         { op: "delete", key: META_REMOTE_SEQ },
                         { op: "delete", key: META_PUSH_SEQ },
@@ -1071,7 +1056,7 @@ export class SyncEngine {
         try {
             // Both sequence checkpoints land in the docs store so a later
             // pull-commit refactor can inline them into the same tx.
-            await this.localDb.getStore().runWrite({
+            await this.localDb.getStore().runWriteTx({
                 meta: [
                     { op: "put", key: META_REMOTE_SEQ, value: this.remoteSeq },
                     { op: "put", key: META_PUSH_SEQ, value: this.lastPushedSeq },

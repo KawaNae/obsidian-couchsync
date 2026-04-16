@@ -54,14 +54,10 @@ describe("VC integration — two peers", () => {
         // A writes "v3" based on v1 (unaware of v2) → concurrent with B
         const aDoc = makeFile("note.md", "v3", DEVICE_A, v1.vclock);
 
-        const onConcurrent = vi.fn();
         const resolver = new ConflictResolver();
-        resolver.setOnConcurrent(onConcurrent);
 
         const verdict = await resolver.resolveOnPull(aDoc, bDoc);
         expect(verdict).toBe("concurrent");
-        expect(onConcurrent).toHaveBeenCalled();
-        expect(onConcurrent.mock.calls[0][0]).toBe("note.md");
     });
 
     it("Scenario Offline-Return: auto-resolves in favour of the dominator when one side is a strict extension", async () => {
@@ -80,13 +76,10 @@ describe("VC integration — two peers", () => {
         }
 
         // When B pulls A's latest, A dominates → take-remote
-        const onConcurrent = vi.fn();
         const resolver = new ConflictResolver();
-        resolver.setOnConcurrent(onConcurrent);
 
         const verdict = await resolver.resolveOnPull(bDoc, aDoc);
         expect(verdict).toBe("take-remote");
-        expect(onConcurrent).not.toHaveBeenCalled();
     });
 
     it("Scenario Mtime-Lies: mtime disagreement with VC must not influence winner", async () => {

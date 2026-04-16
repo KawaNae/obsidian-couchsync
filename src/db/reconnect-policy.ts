@@ -28,7 +28,6 @@ export type SyncErrorKind =
     | "network"   // unreachable, DNS, connection refused, fetch failed
     | "timeout"   // catchup idle timeout, request timeout
     | "server"    // 5xx
-    | "denied"    // per-doc permission rejection (warning-only, does not promote state)
     | "unknown";
 
 export interface SyncErrorDetail {

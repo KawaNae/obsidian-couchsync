@@ -47,19 +47,13 @@ describe("ConflictResolver — ConfigDoc support (Phase 2)", () => {
     });
 
     it("returns concurrent for ConfigDoc when VCs are incomparable", async () => {
-        const onConcurrent = vi.fn();
         const resolver = new ConflictResolver();
-        resolver.setOnConcurrent(onConcurrent);
 
         const local = makeConfig(".obsidian/hotkeys.json", { mobile: 1, desktop: 0 });
         const remote = makeConfig(".obsidian/hotkeys.json", { mobile: 0, desktop: 1 });
 
         const verdict = await resolver.resolveOnPull(local, remote);
         expect(verdict).toBe("concurrent");
-
-        expect(onConcurrent).toHaveBeenCalledTimes(1);
-        expect(onConcurrent.mock.calls[0][0]).toBe(".obsidian/hotkeys.json");
-        expect(onConcurrent.mock.calls[0][1].length).toBe(2);
     });
 
     it("does not consult mtime when VCs decide the winner", async () => {

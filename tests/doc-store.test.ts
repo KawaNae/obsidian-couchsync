@@ -1,5 +1,5 @@
 /**
- * Tests for the builder-form `DexieStore.runWrite(builder)` API.
+ * Tests for the builder-form `DexieStore.runWriteBuilder(builder)` API.
  *
  * Focused on the new invariants:
  *   - builder sees a fresh snapshot; returning null is a no-op
@@ -42,7 +42,7 @@ afterEach(async () => {
 describe("runWrite(builder)", () => {
     it("commits a tx built from the snapshot", async () => {
         const fileId = makeFileId("a.md");
-        const committed = await store.runWrite(async (snap) => {
+        const committed = await store.runWriteBuilder(async (snap) => {
             const existing = await snap.get(fileId);
             expect(existing).toBeNull();
             return {
@@ -57,7 +57,7 @@ describe("runWrite(builder)", () => {
 
     it("returns false (no-op) when builder returns null", async () => {
         const before = await store.info();
-        const committed = await store.runWrite(async () => null);
+        const committed = await store.runWriteBuilder(async () => null);
         expect(committed).toBe(false);
         const after = await store.info();
         expect(after.updateSeq).toBe(before.updateSeq);
@@ -65,7 +65,7 @@ describe("runWrite(builder)", () => {
 
     it("fires onCommit once, after the tx succeeds", async () => {
         let fired = 0;
-        await store.runWrite(async () => ({
+        await store.runWriteBuilder(async () => ({
             meta: [{ op: "put", key: "k", value: 1 }],
             onCommit: () => { fired++; },
         }));
@@ -75,12 +75,12 @@ describe("runWrite(builder)", () => {
 
     it("does NOT fire onCommit when builder aborts", async () => {
         let fired = 0;
-        await store.runWrite(async () => null);
+        await store.runWriteBuilder(async () => null);
         // builder returned null → no onCommit even if the tx object had one
         // (null means "no tx at all"). Explicit check below: a builder that
         // returns a tx with onCommit, but the commit fails → onCommit skipped.
         await expect(
-            store.runWrite(async () => ({
+            store.runWriteBuilder(async () => ({
                 docs: [{
                     doc: makeFile("z.md", { Z: 99 }),
                     expectedVclock: { ghost: 42 }, // will CAS-fail
@@ -95,14 +95,14 @@ describe("runWrite(builder)", () => {
         const path = "race.md";
         const fileId = makeFileId(path);
         // Seed.
-        await store.runWrite({
+        await store.runWriteTx({
             docs: [{ doc: makeFile(path, { A: 1 }) }],
         });
 
         // Builder that reads, and on first call supplies a stale expectedVclock
         // to force a conflict; on second call supplies the fresh one.
         let calls = 0;
-        const committed = await store.runWrite(async (snap) => {
+        const committed = await store.runWriteBuilder(async (snap) => {
             calls++;
             const current = await snap.get(fileId);
             const curVc = (current as FileDoc).vclock ?? {};
@@ -122,11 +122,11 @@ describe("runWrite(builder)", () => {
 
     it("throws DbError(conflict) when CAS exhaustion", async () => {
         const fileId = makeFileId("exh.md");
-        await store.runWrite({
+        await store.runWriteTx({
             docs: [{ doc: makeFile("exh.md", { A: 1 }) }],
         });
         await expect(
-            store.runWrite(async () => ({
+            store.runWriteBuilder(async () => ({
                 docs: [{
                     doc: makeFile("exh.md", { A: 2 }),
                     expectedVclock: { ghost: 99 }, // always wrong
@@ -135,10 +135,9 @@ describe("runWrite(builder)", () => {
         ).rejects.toMatchObject({ kind: "conflict", recovery: "fail" });
     });
 
-    it("still exposes legacy runWrite(tx) form", async () => {
-        // Regression: the polymorphic overload must not break pre-builder callers.
+    it("runWriteTx commits a pre-built tx", async () => {
         const fileId = makeFileId("legacy.md");
-        await store.runWrite({
+        await store.runWriteTx({
             docs: [{ doc: makeFile("legacy.md", { A: 1 }) }],
             meta: [{ op: "put", key: "lgc", value: true }],
         });

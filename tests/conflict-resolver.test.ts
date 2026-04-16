@@ -60,14 +60,13 @@ describe("ConflictResolver — resolveOnPull (Phase 2)", () => {
         expect(verdict).toBe("keep-local");
     });
 
-    it("does NOT fire onAutoResolved when local dominates", async () => {
-        const onAuto = vi.fn();
-        const resolver = new ConflictResolver(onAuto);
+    it("returns keep-local when local dominates (no side effects)", async () => {
+        const resolver = new ConflictResolver();
         const local = makeFile("doc.md", { A: 2 });
         const remote = makeFile("doc.md", { A: 1 });
 
-        await resolver.resolveOnPull(local, remote);
-        expect(onAuto).not.toHaveBeenCalled();
+        const verdict = await resolver.resolveOnPull(local, remote);
+        expect(verdict).toBe("keep-local");
     });
 
     it("returns keep-local when vclocks are equal", async () => {
@@ -81,8 +80,6 @@ describe("ConflictResolver — resolveOnPull (Phase 2)", () => {
 
     it("returns concurrent when vclocks are incomparable", async () => {
         const resolver = new ConflictResolver();
-        const onConcurrent = vi.fn();
-        resolver.setOnConcurrent(onConcurrent);
 
         const local = makeFile("doc.md", { A: 1, B: 0 }, "chunk:local");
         const remote = makeFile("doc.md", { A: 0, B: 1 }, "chunk:remote");
@@ -91,26 +88,11 @@ describe("ConflictResolver — resolveOnPull (Phase 2)", () => {
         expect(verdict).toBe("concurrent");
     });
 
-    it("fires onConcurrent with path and both revisions", async () => {
-        const onConcurrent = vi.fn();
+    it("returns concurrent for multiple incomparable paths", async () => {
         const resolver = new ConflictResolver();
-        resolver.setOnConcurrent(onConcurrent);
 
         const local = makeFile("concurrent.md", { A: 1 });
         const remote = makeFile("concurrent.md", { B: 1 });
-
-        await resolver.resolveOnPull(local, remote);
-
-        expect(onConcurrent).toHaveBeenCalledTimes(1);
-        const [path, revs] = onConcurrent.mock.calls[0];
-        expect(path).toBe("concurrent.md");
-        expect(revs).toEqual([local, remote]);
-    });
-
-    it("returns concurrent even without onConcurrent handler", async () => {
-        const resolver = new ConflictResolver();
-        const local = makeFile("no-handler.md", { A: 1 });
-        const remote = makeFile("no-handler.md", { B: 1 });
 
         const verdict = await resolver.resolveOnPull(local, remote);
         expect(verdict).toBe("concurrent");
@@ -118,8 +100,6 @@ describe("ConflictResolver — resolveOnPull (Phase 2)", () => {
 
     it("does NOT use mtime as a tiebreaker", async () => {
         const resolver = new ConflictResolver();
-        const onConcurrent = vi.fn();
-        resolver.setOnConcurrent(onConcurrent);
 
         const local = makeFile("tiebreak.md", { A: 1, B: 0 });
         local.mtime = 9999; // very new
@@ -128,7 +108,6 @@ describe("ConflictResolver — resolveOnPull (Phase 2)", () => {
 
         const verdict = await resolver.resolveOnPull(local, remote);
         expect(verdict).toBe("concurrent");
-        expect(onConcurrent).toHaveBeenCalled();
     });
 
     it("handles missing vclock as empty", async () => {

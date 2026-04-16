@@ -43,7 +43,7 @@ export async function gcOrphanChunks(db: LocalDB): Promise<GcResult> {
         .map((r) => r.id);
 
     if (orphanIds.length > 0) {
-        await db.runWrite({ deletes: orphanIds });
+        await db.runWriteTx({ deletes: orphanIds });
     }
 
     const result: GcResult = {

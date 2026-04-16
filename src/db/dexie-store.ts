@@ -1,21 +1,23 @@
 /**
  * DexieStore — Dexie-based `IDocStore` implementation.
  *
- * Post-Step C refactor: the only write entry point is `runWrite`. It
+ * Post-Step C refactor: the write entry points are `runWriteBuilder` and
+ * `runWriteTx`. They
  *   - opens a single rw transaction over `docs` and `meta`
  *   - bumps `_update_seq` exactly once per call (atomic batch = one seq)
  *   - normalises Dexie/IDB exceptions into typed `DbError`
  *   - retries `AbortError` with short exponential backoff
  *   - escalates `QuotaExceededError` to the caller immediately
  *
- * Two call shapes:
+ * Two named methods:
  *
- *  - `runWrite(tx)` — pre-built `WriteTransaction`. Single commit, no CAS
- *    retry. Suitable when the caller already has every value needed.
- *  - `runWrite(builder, opts?)` — builder receives a fresh `WriteSnapshot`
- *    and returns the tx to commit. On `DbError(kind:"conflict")` (vclock
- *    CAS failure) the store re-snapshots and calls the builder again up
- *    to `maxAttempts` times, so callers never hand-roll a retry loop.
+ *  - `runWriteTx(tx)` — pre-built `WriteTransaction`. Single commit, no
+ *    CAS retry. Suitable when the caller already has every value needed.
+ *  - `runWriteBuilder(builder, opts?)` — builder receives a fresh
+ *    `WriteSnapshot` and returns the tx to commit. On
+ *    `DbError(kind:"conflict")` (vclock CAS failure) the store
+ *    re-snapshots and calls the builder again up to `maxAttempts` times,
+ *    so callers never hand-roll a retry loop.
  */
 
 import Dexie, { type Table } from "dexie";
@@ -189,27 +191,6 @@ export class DexieStore<T extends { _id: string; _rev?: string } = any>
      * Returns `true` on commit, `false` when the builder returned `null`
      * (explicit no-op) or every attempt hit a conflict.
      */
-    async runWrite(
-        builder: WriteBuilder<T>,
-        opts?: { maxAttempts?: number },
-    ): Promise<boolean>;
-    /**
-     * @deprecated Legacy atomic batch write accepting a pre-built tx.
-     * New callers should use the builder form so CAS retries are
-     * structurally handled. Retained during Step B migration.
-     */
-    async runWrite(tx: WriteTransaction<T>): Promise<void>;
-    async runWrite(
-        arg: WriteBuilder<T> | WriteTransaction<T>,
-        opts?: { maxAttempts?: number },
-    ): Promise<void | boolean> {
-        if (typeof arg === "function") {
-            return await this.runWriteBuilder(arg as WriteBuilder<T>, opts);
-        }
-        const tx = arg as WriteTransaction<T>;
-        await this.runWriteTx(tx);
-        if (tx.onCommit) await tx.onCommit();
-    }
 
     /** Snapshot view used by builders. Reads go straight to Dexie. */
     private snapshot(): WriteSnapshot<T> {
@@ -227,7 +208,7 @@ export class DexieStore<T extends { _id: string; _rev?: string } = any>
         };
     }
 
-    private async runWriteBuilder(
+    async runWriteBuilder(
         builder: WriteBuilder<T>,
         opts?: { maxAttempts?: number },
     ): Promise<boolean> {
@@ -246,7 +227,7 @@ export class DexieStore<T extends { _id: string; _rev?: string } = any>
                 }
                 throw e;
             }
-            if (built.onCommit) await built.onCommit();
+            // onCommit is already called by runWriteTx.
             return true;
         }
         throw (
@@ -260,12 +241,12 @@ export class DexieStore<T extends { _id: string; _rev?: string } = any>
     }
 
     /**
-     * Structured atomic batch write. All listed mutations land in a single
-     * rw transaction with one `_update_seq`. Used by VaultSync / SyncEngine
-     * to bind FileDoc + chunks + lastSyncedVclock together so a crash
-     * cannot leave the on-disk state in a half-applied window.
+     * Simple atomic batch write. All listed mutations land in a single
+     * rw transaction with one `_update_seq`. No CAS retry — the caller
+     * already has every value needed. Used for meta-only writes, deletes,
+     * and unconditional upserts (e.g. pull-accepted docs).
      */
-    private async runWriteTx(tx: WriteTransaction<T>): Promise<void> {
+    async runWriteTx(tx: WriteTransaction<T>): Promise<void> {
         await this.runTx(async ({ seq }) => {
             // 1. chunks: content-addressed put-if-absent.
             if (tx.chunks && tx.chunks.length > 0) {
@@ -351,6 +332,8 @@ export class DexieStore<T extends { _id: string; _rev?: string } = any>
                 }
             }
         });
+
+        if (tx.onCommit) await tx.onCommit();
     }
 
     // ── IDocStore implementation ────────────────────────

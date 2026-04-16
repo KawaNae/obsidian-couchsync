@@ -39,9 +39,9 @@ function makeChunk(hash: string): ChunkDoc {
     };
 }
 
-/** Shorthand: seed a doc via runWrite. */
+/** Shorthand: seed a doc via runWriteTx. */
 async function put(store: DexieStore<CouchSyncDoc>, doc: CouchSyncDoc): Promise<void> {
-    await store.runWrite({ docs: [{ doc }] });
+    await store.runWriteTx({ docs: [{ doc }] });
 }
 
 describe("gcOrphanChunks", () => {

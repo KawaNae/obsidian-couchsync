@@ -1,9 +1,10 @@
 import { describe, it, expect } from "vitest";
 import {
     checkInstallMarker,
-    INSTALL_MARKER_KEY,
     type InstallMarkerStorage,
 } from "../src/sync/install-marker.ts";
+
+const MARKER_KEY = "couchsync.installMarker";
 
 function memStorage(initial: Record<string, string> = {}): InstallMarkerStorage & {
     dump(): Record<string, string>;
@@ -35,12 +36,12 @@ describe("checkInstallMarker (advisory only)", () => {
         });
         expect(result.markerMismatch).toBe(false);
         expect(result.nextInstallMarker).toBe("uuid-1");
-        expect(storage.dump()[INSTALL_MARKER_KEY]).toBe("uuid-1");
+        expect(storage.dump()[MARKER_KEY]).toBe("uuid-1");
     });
 
     it("match (same install): no mismatch, marker stable", () => {
         uuidCounter = 0;
-        const storage = memStorage({ [INSTALL_MARKER_KEY]: "install-XYZ" });
+        const storage = memStorage({ [MARKER_KEY]: "install-XYZ" });
         const result = checkInstallMarker({
             lastInstallMarker: "install-XYZ",
             storage,
@@ -53,7 +54,7 @@ describe("checkInstallMarker (advisory only)", () => {
 
     it("mismatch (vault cloned to new install): reports mismatch but does NOT regenerate deviceId", () => {
         uuidCounter = 0;
-        const storage = memStorage({ [INSTALL_MARKER_KEY]: "install-NEW" });
+        const storage = memStorage({ [MARKER_KEY]: "install-NEW" });
         const result = checkInstallMarker({
             lastInstallMarker: "install-OLD",
             storage,
@@ -74,12 +75,12 @@ describe("checkInstallMarker (advisory only)", () => {
         });
         expect(result.markerMismatch).toBe(true);
         expect(result.nextInstallMarker).toBe("uuid-1");
-        expect(storage.dump()[INSTALL_MARKER_KEY]).toBe("uuid-1");
+        expect(storage.dump()[MARKER_KEY]).toBe("uuid-1");
     });
 
     it("does not mutate storage on match", () => {
         uuidCounter = 0;
-        const storage = memStorage({ [INSTALL_MARKER_KEY]: "same-marker" });
+        const storage = memStorage({ [MARKER_KEY]: "same-marker" });
         const before = storage.dump();
         checkInstallMarker({
             lastInstallMarker: "same-marker",

@@ -11,13 +11,12 @@ import { joinChunks } from "../db/chunker.ts";
 import { isDiffableText } from "../utils/binary.ts";
 import { incrementVC, mergeVC } from "../sync/vector-clock.ts";
 import { stripRev } from "../utils/doc.ts";
-import { logDebug, logInfo, logError, logWarn, notify } from "../ui/log.ts";
+import { logDebug, logInfo, logError, notify } from "../ui/log.ts";
 
 export interface ConflictOrchestratorDeps {
     app: App;
     localDb: LocalDB;
     replicator: SyncEngine;
-    hasConfigDb: boolean;
     historyCapture: HistoryCapture;
     dbToFile: (doc: FileDoc) => Promise<void>;
     getSettings: () => CouchSyncSettings;
@@ -32,7 +31,6 @@ export interface ConflictOrchestratorDeps {
  */
 export class ConflictOrchestrator {
     private openConflictModals = new Map<string, ConflictModal>();
-    configConflictResolver: ConflictResolver | null = null;
 
     constructor(private deps: ConflictOrchestratorDeps) {}
 
@@ -41,51 +39,10 @@ export class ConflictOrchestrator {
      * ConflictResolver instances. Call once during plugin init.
      */
     register(): void {
-        const { replicator, historyCapture } = this.deps;
+        const { replicator } = this.deps;
 
-        // Create conflict resolvers with their onConcurrent handlers.
-        const conflictResolver = new ConflictResolver(async (filePath, revisions) => {
-            logWarn(
-                `CouchSync: concurrent edit on ${filePath} — ${revisions.length} revisions, none dominate`,
-            );
-            try {
-                const dec = new TextDecoder("utf-8");
-                for (const rev of revisions) {
-                    if (!("chunks" in rev)) continue;
-                    const chunks = await this.deps.localDb.getChunks(rev.chunks);
-                    const buf = joinChunks(chunks);
-                    if (!isDiffableText(buf)) continue;
-                    await historyCapture.saveConflict(
-                        filePath,
-                        dec.decode(buf),
-                        dec.decode(buf),
-                    );
-                }
-            } catch (e: any) {
-                logError(`CouchSync: Failed to persist concurrent-conflict history: ${e?.message ?? e}`);
-            }
-            notify(
-                `CouchSync: concurrent edit on ${filePath.split("/").pop()} — ` +
-                    "check Diff History and manually reconcile. No version has been silently dropped.",
-                15000,
-            );
-        });
-
-        // Config-side conflict resolver (only when config sync is enabled).
-        // Not yet wired to a replicator — config sync uses one-shot
-        // push/pull, not live-sync. The resolver is kept for future use.
-        if (this.deps.hasConfigDb) {
-            this.configConflictResolver = new ConflictResolver(async (configPath, revisions) => {
-                logWarn(
-                    `CouchSync: concurrent config edit on ${configPath} — ${revisions.length} revisions, none dominate`,
-                );
-                notify(
-                    `CouchSync: concurrent config edit on ${configPath.split("/").pop()} — ` +
-                        "manual resolution needed. The config DB conflict tree is preserved.",
-                    15000,
-                );
-            });
-        }
+        // ConflictResolver is a pure vclock comparison utility — no callbacks.
+        const conflictResolver = new ConflictResolver();
 
         // Wire ConflictResolver into SyncEngine for pull-time vclock guard.
         replicator.setConflictResolver(conflictResolver);
@@ -138,6 +95,15 @@ export class ConflictOrchestrator {
                         await this.applyConflictChoice(
                             choice, filePath, localDoc, remoteDoc,
                         );
+                        // Record conflict history AFTER choice is applied,
+                        // with correct winner/loser assignment.
+                        const winner = choice === "take-remote" ? "remote" as const : "local" as const;
+                        await historyCapture.saveConflict(
+                            filePath,
+                            dec.decode(localBuf),
+                            dec.decode(remoteBuf),
+                            winner,
+                        );
                     }
                 } else {
                     // Binary — auto keep-local + merge vclocks for push.
@@ -145,19 +111,19 @@ export class ConflictOrchestrator {
                     await this.applyConflictChoice(
                         "keep-local", filePath, localDoc, remoteDoc,
                     );
+                    // Record conflict history for binary files too.
+                    await historyCapture.saveConflict(
+                        filePath,
+                        isDiffableText(localBuf) ? dec.decode(localBuf) : "",
+                        isDiffableText(remoteBuf) ? dec.decode(remoteBuf) : "",
+                        "local",
+                    );
                     notify(
                         `CouchSync: concurrent edit on binary file ${fileName} — ` +
                             "keeping local version. Check Diff History for details.",
                         10000,
                     );
                 }
-
-                // Save both versions to history.
-                await historyCapture.saveConflict(
-                    filePath,
-                    isDiffableText(localBuf) ? dec.decode(localBuf) : "",
-                    isDiffableText(remoteBuf) ? dec.decode(remoteBuf) : "",
-                );
             } catch (e: any) {
                 this.openConflictModals.delete(filePath);
                 logError(`Conflict resolution error for ${fileName}: ${e?.message ?? e}`);
@@ -175,7 +141,7 @@ export class ConflictOrchestrator {
                     (remoteDoc as any).vclock ?? {},
                 );
                 const updated = { ...localDoc, vclock: incrementVC(merged, deviceId) };
-                await localDb.runWrite({
+                await localDb.runWriteTx({
                     docs: [{ doc: stripRev(updated) as CouchSyncDoc }],
                 });
             }
@@ -206,7 +172,7 @@ export class ConflictOrchestrator {
                 ...remoteDoc,
                 vclock: incrementVC(remoteDoc.vclock ?? {}, deviceId),
             };
-            await localDb.runWrite({
+            await localDb.runWriteTx({
                 docs: [{ doc: stripRev(updated) as CouchSyncDoc }],
             });
             await replicator.ensureFileChunks(updated as FileDoc);
@@ -221,7 +187,7 @@ export class ConflictOrchestrator {
                 ...localDoc,
                 vclock: incrementVC(merged, deviceId),
             };
-            await localDb.runWrite({
+            await localDb.runWriteTx({
                 docs: [{ doc: stripRev(updated) as CouchSyncDoc }],
             });
             logDebug(`  vclock after merge: ${JSON.stringify(updated.vclock)}`);

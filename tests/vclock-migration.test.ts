@@ -23,7 +23,7 @@ describe("vclock per-path migration", () => {
         db.open();
         // Seed the legacy doc directly via metaStore.
         const meta = db.getMetaStore();
-        await meta.runWrite({
+        await meta.runWriteTx({
             meta: [{
                 op: "put",
                 key: "_local/last-synced-vclocks",
@@ -58,7 +58,7 @@ describe("vclock per-path migration", () => {
     it("second load returns same map without re-migrating", async () => {
         db = new LocalDB(`mig2-${Date.now()}`);
         db.open();
-        await db.runWrite({
+        await db.runWriteTx({
             vclocks: [
                 { path: "x.md", op: "set", clock: { A: 1 } },
             ],
@@ -72,11 +72,11 @@ describe("vclock per-path migration", () => {
     it("per-path values supersede legacy on conflict", async () => {
         db = new LocalDB(`mig3-${Date.now()}`);
         db.open();
-        await db.runWrite({
+        await db.runWriteTx({
             vclocks: [{ path: "shared.md", op: "set", clock: { A: 9 } }],
         });
         // Now seed legacy with a stale value for the same path.
-        await db.getMetaStore().runWrite({
+        await db.getMetaStore().runWriteTx({
             meta: [{
                 op: "put",
                 key: "_local/last-synced-vclocks",

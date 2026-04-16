@@ -71,4 +71,3 @@ export function checkInstallMarker(input: MarkerCheckInput): MarkerCheckResult {
     };
 }
 
-export const INSTALL_MARKER_KEY = MARKER_KEY;

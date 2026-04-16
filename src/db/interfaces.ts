@@ -7,10 +7,10 @@
  * ### API hierarchy
  *
  * - `IDocStore<T>` is the minimal atomic-write local store: `get` + query +
- *   `runWrite` (builder or fixed tx) + lifecycle. **All** mutations go
- *   through `runWrite`, never a convenience shim.
+ *   `runWriteBuilder` / `runWriteTx` + lifecycle. **All** mutations go
+ *   through these two methods, never a convenience shim.
  * - `IMetaReader` exposes the key/value meta side (checkpoints, vclock
- *   cache, cursors). Writes land via `IDocStore.runWrite({ meta: [...] })`.
+ *   cache, cursors). Writes land via `IDocStore.runWriteTx({ meta: [...] })`.
  */
 
 import type {
@@ -54,9 +54,8 @@ export interface LocalChangesResult<T> {
 
 /**
  * Minimal atomic-write local store. Every mutation goes through
- * `runWrite` — either a pre-built tx (one write, no CAS retry) or a
- * builder that receives a fresh snapshot and returns the tx to commit
- * (CAS retry on conflict happens inside the store).
+ * `runWriteBuilder` (CAS retry on conflict) or `runWriteTx` (single
+ * commit, no retry).
  */
 export interface IDocStore<T = any> {
     get(id: string): Promise<T | null>;
@@ -68,12 +67,12 @@ export interface IDocStore<T = any> {
      */
     changes(since?: number | string, opts?: { include_docs?: boolean }): Promise<LocalChangesResult<T>>;
     /** Builder form: CAS retry on `DbError(kind:"conflict")` up to `maxAttempts`. */
-    runWrite(
+    runWriteBuilder(
         builder: WriteBuilder<T>,
         opts?: { maxAttempts?: number },
     ): Promise<boolean>;
-    /** Fixed-tx form: a single commit, no retry. */
-    runWrite(tx: WriteTransaction<T>): Promise<void>;
+    /** Simple atomic batch write — a single commit, no CAS retry. */
+    runWriteTx(tx: WriteTransaction<T>): Promise<void>;
     close(): Promise<void>;
     destroy(): Promise<void>;
 }

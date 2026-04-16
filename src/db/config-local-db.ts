@@ -7,7 +7,7 @@
  * configurations against the same shared vault.
  *
  * Post-Step C refactor: self-contained facade over a single `DexieStore`.
- * Writes flow through `runWrite` (builder or fixed tx); there are no
+ * Writes flow through `runWriteBuilder` / `runWriteTx`; there are no
  * `put`/`update`/`bulkPut` shims. Query surface is the subset config-sync
  * and remote-couch actually need.
  */
@@ -49,20 +49,17 @@ export class ConfigLocalDB implements IDocStore<CouchSyncDoc> {
 
     // ── Write surface ───────────────────────────────────
 
-    /**
-     * Atomic compound write. Mirrors `DexieStore.runWrite` overloads so
-     * config-sync and remote-couch can target either store uniformly.
-     */
-    runWrite(
+    /** Builder-style atomic write with CAS retry. */
+    async runWriteBuilder(
         builder: WriteBuilder<CouchSyncDoc>,
         opts?: { maxAttempts?: number },
-    ): Promise<boolean>;
-    runWrite(tx: WriteTransaction<CouchSyncDoc>): Promise<void>;
-    runWrite(
-        arg: WriteBuilder<CouchSyncDoc> | WriteTransaction<CouchSyncDoc>,
-        opts?: { maxAttempts?: number },
-    ): Promise<void | boolean> {
-        return (this.store.runWrite as any)(arg, opts);
+    ): Promise<boolean> {
+        return this.store.runWriteBuilder(builder, opts);
+    }
+
+    /** Simple atomic batch write (no CAS retry needed). */
+    async runWriteTx(tx: WriteTransaction<CouchSyncDoc>): Promise<void> {
+        return this.store.runWriteTx(tx);
     }
 
     // ── Lifecycle ───────────────────────────────────────
@@ -107,7 +104,7 @@ export class ConfigLocalDB implements IDocStore<CouchSyncDoc> {
         });
         if (result.rows.length === 0) return [];
         const ids = result.rows.map((row) => row.id);
-        await this.store.runWrite({ deletes: ids });
+        await this.store.runWriteTx({ deletes: ids });
         return ids;
     }
 

@@ -74,7 +74,7 @@ export class LocalDB implements IDocStore<CouchSyncDoc> {
     }
 
     /** Exposed for sync-engine's checkpoint migration. Other callers should
-     *  prefer `runWrite` / `get` / etc. on `LocalDB` itself. */
+     *  prefer `runWriteBuilder` / `runWriteTx` / `get` / etc. on `LocalDB` itself. */
     getStore(): DexieStore<CouchSyncDoc> {
         if (!this.store) throw new Error("Database not opened");
         return this.store;
@@ -111,11 +111,6 @@ export class LocalDB implements IDocStore<CouchSyncDoc> {
         return null;
     }
 
-    /** @deprecated Use {@link findLegacyVaultDoc} instead. */
-    async findLegacyFileDoc(): Promise<string | null> {
-        return this.findLegacyVaultDoc();
-    }
-
     /**
      * Delete every document with a given `_id` prefix from the vault DB
      * in a single atomic tx. Returns the IDs of the deleted documents.
@@ -127,7 +122,7 @@ export class LocalDB implements IDocStore<CouchSyncDoc> {
         });
         if (result.rows.length === 0) return [];
         const ids = result.rows.map((row) => row.id);
-        await this.getStore().runWrite({ deletes: ids });
+        await this.getStore().runWriteTx({ deletes: ids });
         return ids;
     }
 
@@ -221,7 +216,7 @@ export class LocalDB implements IDocStore<CouchSyncDoc> {
     }
 
     async putScanCursor(cursor: ScanCursor): Promise<void> {
-        await this.getMetaStore().runWrite({
+        await this.getMetaStore().runWriteTx({
             meta: [{ op: "put", key: SCAN_CURSOR_ID, value: cursor }],
         });
     }
@@ -236,7 +231,7 @@ export class LocalDB implements IDocStore<CouchSyncDoc> {
     }
 
     async putVaultManifest(manifest: VaultManifest): Promise<void> {
-        await this.getMetaStore().runWrite({
+        await this.getMetaStore().runWriteTx({
             meta: [{ op: "put", key: VAULT_MANIFEST_ID, value: manifest }],
         });
     }
@@ -247,7 +242,7 @@ export class LocalDB implements IDocStore<CouchSyncDoc> {
     }
 
     async putSkippedFiles(doc: SkippedFilesDoc): Promise<void> {
-        await this.getMetaStore().runWrite({
+        await this.getMetaStore().runWriteTx({
             meta: [{ op: "put", key: SKIPPED_FILES_ID, value: doc }],
         });
     }
@@ -293,16 +288,16 @@ export class LocalDB implements IDocStore<CouchSyncDoc> {
                 }
             }
             if (newVclocks.length > 0) {
-                await this.getStore().runWrite({ vclocks: newVclocks });
+                await this.getStore().runWriteTx({ vclocks: newVclocks });
             }
-            await legacyMeta.runWrite({
+            await legacyMeta.runWriteTx({
                 meta: [{ op: "delete", key: LAST_SYNCED_VCLOCKS_ID }],
             });
         }
 
         // Stale-key cleanup: delete non-normalized keys, re-write with normalized keys.
         if (staleKeys.length > 0) {
-            await this.getStore().runWrite({
+            await this.getStore().runWriteTx({
                 meta: staleKeys.map((key) => ({ op: "delete" as const, key })),
             });
             const rewriteOps = [...out.entries()].map(([pathKey, clock]) => ({
@@ -310,32 +305,23 @@ export class LocalDB implements IDocStore<CouchSyncDoc> {
                 op: "set" as const,
                 clock,
             }));
-            await this.getStore().runWrite({ vclocks: rewriteOps });
+            await this.getStore().runWriteTx({ vclocks: rewriteOps });
         }
 
         return out;
     }
 
-    /**
-     * Atomic compound write against the docs store.
-     *
-     * Overloads:
-     *  - `runWrite(tx)` — legacy, pre-built tx; caller handles CAS retries
-     *  - `runWrite(builder, opts?)` — builder receives a snapshot; CAS
-     *    conflicts trigger internal re-snapshot + retry up to `maxAttempts`
-     *    (default 5). Returns `true` on commit, `false` if the builder
-     *    returned `null` (explicit no-op).
-     */
-    runWrite(
+    /** Builder-style atomic write with CAS retry. */
+    async runWriteBuilder(
         builder: WriteBuilder<CouchSyncDoc>,
         opts?: { maxAttempts?: number },
-    ): Promise<boolean>;
-    runWrite(tx: WriteTransaction<CouchSyncDoc>): Promise<void>;
-    runWrite(
-        arg: WriteBuilder<CouchSyncDoc> | WriteTransaction<CouchSyncDoc>,
-        opts?: { maxAttempts?: number },
-    ): Promise<void | boolean> {
-        return (this.getStore().runWrite as any)(arg, opts);
+    ): Promise<boolean> {
+        return this.getStore().runWriteBuilder(builder, opts);
+    }
+
+    /** Simple atomic batch write (no CAS retry needed). */
+    async runWriteTx(tx: WriteTransaction<CouchSyncDoc>): Promise<void> {
+        return this.getStore().runWriteTx(tx);
     }
 
     /** Compose a vclock meta key (`_local/vclock/<path>`). Exposed for tests. */

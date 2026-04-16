@@ -13,7 +13,9 @@ import { logDebug, logWarn } from "../ui/log.ts";
  * on the returned verdict:
  *   - "take-remote": overwrite local with remote
  *   - "keep-local": skip (local is newer, will be pushed eventually)
- *   - "concurrent": invoke onConcurrent callback for human resolution
+ *   - "concurrent": enqueue for human resolution via SyncEngine.onConcurrent
+ *
+ * Pure vclock comparison — no side effects, no callbacks.
  *
  * Two-instance pattern: one instance for vault DB (FileDoc), one for
  * config DB (ConfigDoc).
@@ -24,16 +26,6 @@ type ResolvableDoc = FileDoc | ConfigDoc;
 
 /** Result of a pull-time conflict check. */
 export type PullVerdict = "take-remote" | "keep-local" | "concurrent";
-
-/**
- * Fired when a pull-time comparison yields concurrent (VC-incomparable)
- * edits. The `vaultPath` argument is the bare vault path (for FileDoc)
- * or the `.obsidian/...` path (for ConfigDoc).
- */
-export type OnConcurrentConflict = (
-    vaultPath: string,
-    revisions: ResolvableDoc[],
-) => void | Promise<void>;
 
 /**
  * Extract the user-facing path from a doc id. Throws for unknown id
@@ -47,25 +39,12 @@ function extractVaultPath(id: string): string {
 }
 
 export class ConflictResolver {
-    private onConcurrent: OnConcurrentConflict | null;
-
-    constructor(onConcurrent: OnConcurrentConflict | null = null) {
-        this.onConcurrent = onConcurrent;
-    }
-
-    setOnConcurrent(handler: OnConcurrentConflict): void {
-        this.onConcurrent = handler;
-    }
-
     /**
      * Compare a local doc against a remote doc during pull. Returns
      * a verdict telling the caller what to do.
      *
-     * If the verdict is "take-remote" and onAutoResolved is registered,
-     * fires the callback with the remote doc as winner and local as loser.
-     *
-     * If the verdict is "concurrent" and onConcurrent is registered,
-     * fires the callback so the UI can surface it.
+     * No side effects — the caller (SyncEngine) is responsible for
+     * acting on the verdict (enqueuing concurrent conflicts, etc.).
      */
     async resolveOnPull(
         localDoc: ResolvableDoc | null,
@@ -98,26 +77,13 @@ export class ConflictResolver {
 
             case "concurrent":
                 // Neither dominates — true conflict, needs human judgment.
-                if (this.onConcurrent) {
-                    await this.onConcurrent(vaultPath, [localDoc, remoteDoc]);
-                } else {
-                    logWarn(
-                        `CouchSync: concurrent conflict on ${vaultPath} but no handler registered.`,
-                    );
-                }
+                logWarn(
+                    `CouchSync: concurrent conflict on ${vaultPath} — enqueued for resolution.`,
+                );
                 return "concurrent";
 
             default:
                 return "keep-local";
         }
     }
-
-}
-
-/** Test helper exported for unit tests. Not part of the public API. */
-export function _compareVCForTest(
-    a: ResolvableDoc,
-    b: ResolvableDoc,
-): ReturnType<typeof compareVC> {
-    return compareVC(a.vclock ?? {}, b.vclock ?? {});
 }

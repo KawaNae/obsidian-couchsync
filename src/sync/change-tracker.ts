@@ -12,8 +12,6 @@ export class ChangeTracker implements IWriteIgnore {
     private timers = new Map<string, ReturnType<typeof setTimeout>>();
     private pendingMinInterval = new Map<string, ReturnType<typeof setTimeout>>();
     private lastSyncTime = new Map<string, number>();
-    private paused = false;
-    private pendingQueue: TFile[] = [];
     private eventRefs: ReturnType<App["vault"]["on"]>[] = [];
     /**
      * Paths whose next `modify` / `create` event should be treated as a
@@ -56,11 +54,9 @@ export class ChangeTracker implements IWriteIgnore {
                 this.cancelPending(file.path);
                 this.lastSyncTime.delete(file.path);
                 if (this.pendingDeleteIgnores.delete(file.path)) return;
-                if (!this.paused) {
-                    this.vaultSync.markDeleted(file.path).catch((e) =>
-                        logError(`CouchSync: markDeleted failed: ${file.path} ${e?.message ?? e}`),
-                    );
-                }
+                this.vaultSync.markDeleted(file.path).catch((e) =>
+                    logError(`CouchSync: markDeleted failed: ${file.path} ${e?.message ?? e}`),
+                );
             })
         );
 
@@ -68,7 +64,7 @@ export class ChangeTracker implements IWriteIgnore {
             this.app.vault.on("rename", (file, oldPath) => {
                 this.cancelPending(oldPath);
                 this.lastSyncTime.delete(oldPath);
-                if (!this.paused && isTFile(file)) {
+                if (isTFile(file)) {
                     this.vaultSync.handleRename(file, oldPath).catch((e) =>
                         logError(`CouchSync: handleRename failed: ${oldPath} → ${file.path} ${e?.message ?? e}`),
                     );
@@ -86,20 +82,8 @@ export class ChangeTracker implements IWriteIgnore {
         this.timers.clear();
         for (const timer of this.pendingMinInterval.values()) clearTimeout(timer);
         this.pendingMinInterval.clear();
-        this.pendingQueue = [];
     }
 
-    pause(): void {
-        this.paused = true;
-    }
-
-    resume(): void {
-        this.paused = false;
-        const queued = this.pendingQueue.splice(0);
-        for (const file of queued) {
-            this.scheduleSync(file);
-        }
-    }
 
     /**
      * Mark the next `modify` / `create` event on `path` as sync-driven so
@@ -122,13 +106,6 @@ export class ChangeTracker implements IWriteIgnore {
     }
 
     private scheduleSync(file: TFile): void {
-        if (this.paused) {
-            if (!this.pendingQueue.some((f) => f.path === file.path)) {
-                this.pendingQueue.push(file);
-            }
-            return;
-        }
-
         this.cancelPending(file.path);
 
         const debounceMs = this.getSettings().syncDebounceMs;

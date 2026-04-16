@@ -210,6 +210,7 @@ export class Reconciler {
         const vaultByPath = new Map<PathKey, TFile>(
             vaultFiles.map((f) => [toPathKey(f.path), f]),
         );
+        const seqBeforeScan = (await this.localDb.info()).updateSeq;
         const dbDocs = await this.localDb.allFileDocs();
         const dbByPath = new Map<PathKey, FileDoc>(
             dbDocs.map((d) => [toPathKey(filePathFromId(d._id)), d]),
@@ -288,11 +289,10 @@ export class Reconciler {
                 updatedAt: Date.now(),
             };
             await this.localDb.putVaultManifest(newManifest);
-            const finalSeq = (await this.localDb.info()).updateSeq;
             await this.localDb.putScanCursor({
                 lastScanStartedAt: startedAt,
                 lastScanCompletedAt: Date.now(),
-                lastSeenUpdateSeq: finalSeq,
+                lastSeenUpdateSeq: seqBeforeScan,
             });
         }
 

@@ -314,7 +314,7 @@ export class ConfigSync {
                 const data = arrayBufferToBase64(buf);
 
                 const configId = makeConfigId(file);
-                await db.runWrite(async (snap) => {
+                await db.runWriteBuilder(async (snap) => {
                     const existing = (await snap.get(configId)) as ConfigDoc | null;
                     const doc: ConfigDoc = {
                         _id: configId,

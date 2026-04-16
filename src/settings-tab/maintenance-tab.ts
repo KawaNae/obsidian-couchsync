@@ -5,6 +5,7 @@ import type { ConfigLocalDB } from "../db/config-local-db.ts";
 import type { SyncEngine } from "../db/sync-engine.ts";
 import type { StatusBar } from "../ui/status-bar.ts";
 import { DOC_ID } from "../types/doc-id.ts";
+import { logError } from "../ui/log.ts";
 
 interface MaintenanceTabDeps {
     getSettings: () => CouchSyncSettings;
@@ -140,7 +141,7 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
             }
         } catch (e) {
             migrationSetting.setDesc("Could not check for legacy configs (see console).");
-            console.error("CouchSync: legacy probe failed:", e);
+            logError(`CouchSync: legacy probe failed: ${e?.message ?? e}`);
         }
     })();
 

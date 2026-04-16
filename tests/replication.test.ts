@@ -47,15 +47,10 @@ describe("ConflictResolver — resolveOnPull", () => {
         const localDoc = makeFile("note.md", "A's edit", 2000, { A: 2, B: 0 });
         const remoteDoc = makeFile("note.md", "B's edit", 2000, { A: 0, B: 1 });
 
-        const concurrentCalls: string[] = [];
         const resolver = new ConflictResolver();
-        resolver.setOnConcurrent((path) => {
-            concurrentCalls.push(path);
-        });
 
         const verdict = await resolver.resolveOnPull(localDoc, remoteDoc);
         expect(verdict).toBe("concurrent");
-        expect(concurrentCalls).toContain("note.md");
     });
 });
 

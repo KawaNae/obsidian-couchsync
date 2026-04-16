@@ -1,9 +1,10 @@
 /**
  * Tests for DexieStore — Dexie-based IDocStore implementation.
  *
- * Post-Step C refactor: the only write path is `runWrite`. These tests
- * cover the full surface: builder + fixed-tx forms, atomic batch of
- * docs/chunks/deletes/vclocks/meta, CAS semantics, lifecycle.
+ * Post-Step C refactor: the write paths are `runWriteBuilder` and
+ * `runWriteTx`. These tests cover the full surface: builder + fixed-tx
+ * forms, atomic batch of docs/chunks/deletes/vclocks/meta, CAS semantics,
+ * lifecycle.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
@@ -46,9 +47,9 @@ function makeConfig(path: string, vc: Record<string, number> = { test: 1 }): Con
     };
 }
 
-/** Shorthand: single-doc put via fixed-tx runWrite. */
+/** Shorthand: single-doc put via fixed-tx runWriteTx. */
 async function put(store: DexieStore<CouchSyncDoc>, doc: CouchSyncDoc): Promise<void> {
-    await store.runWrite({ docs: [{ doc }] });
+    await store.runWriteTx({ docs: [{ doc }] });
 }
 
 // ── Suite ────────────────────────────────────────────────
@@ -109,7 +110,7 @@ describe("DexieStore", () => {
         it("vclock CAS rejects stale writes", async () => {
             await put(store, makeFile("a.md", { A: 1 }));
             await expect(
-                store.runWrite({
+                store.runWriteTx({
                     docs: [{
                         doc: makeFile("a.md", { A: 2 }),
                         expectedVclock: { A: 99 }, // wrong
@@ -126,16 +127,16 @@ describe("DexieStore", () => {
     describe("chunks", () => {
         it("writes fresh chunks via runWrite.chunks", async () => {
             const chunks = [makeChunk("aaa", "AAAA"), makeChunk("bbb", "BBBB")];
-            await store.runWrite({ chunks });
+            await store.runWriteTx({ chunks });
             expect(await store.get(chunks[0]._id)).not.toBeNull();
             expect(await store.get(chunks[1]._id)).not.toBeNull();
         });
 
         it("skips duplicate content-addressed chunks silently", async () => {
             const chunk = makeChunk("ccc", "CCCC");
-            await store.runWrite({ chunks: [chunk] });
+            await store.runWriteTx({ chunks: [chunk] });
             // Same chunk id again — no throw, no version bump.
-            await store.runWrite({ chunks: [chunk] });
+            await store.runWriteTx({ chunks: [chunk] });
             const got = await store.get(chunk._id);
             expect(got!._rev).toBe("1-dexie"); // still version 1
         });
@@ -144,7 +145,7 @@ describe("DexieStore", () => {
             // A no-op runWrite still opens a tx and bumps seq — documented
             // behaviour so callers can't rely on seq as a "real write" counter.
             const before = await store.info();
-            await store.runWrite({});
+            await store.runWriteTx({});
             const after = await store.info();
             expect((after.updateSeq as number) - (before.updateSeq as number)).toBe(1);
         });
@@ -155,13 +156,13 @@ describe("DexieStore", () => {
     describe("deletes", () => {
         it("removes an existing doc", async () => {
             await put(store, makeFile("a.md"));
-            await store.runWrite({ deletes: [makeFileId("a.md")] });
+            await store.runWriteTx({ deletes: [makeFileId("a.md")] });
             expect(await store.get(makeFileId("a.md"))).toBeNull();
         });
 
         it("is a no-op for nonexistent id", async () => {
             await expect(
-                store.runWrite({ deletes: ["nonexistent"] }),
+                store.runWriteTx({ deletes: ["nonexistent"] }),
             ).resolves.toBeUndefined();
         });
 
@@ -170,7 +171,7 @@ describe("DexieStore", () => {
             await put(store, makeFile("b.md"));
             await put(store, makeFile("c.md"));
             const before = await store.info();
-            await store.runWrite({
+            await store.runWriteTx({
                 deletes: [makeFileId("a.md"), makeFileId("b.md"), makeFileId("c.md")],
             });
             const after = await store.info();
@@ -186,7 +187,7 @@ describe("DexieStore", () => {
     describe("runWrite (builder)", () => {
         it("builder sees snapshot and commits", async () => {
             const fileId = makeFileId("b.md");
-            const committed = await store.runWrite(async (snap) => {
+            const committed = await store.runWriteBuilder(async (snap) => {
                 expect(await snap.get(fileId)).toBeNull();
                 return { docs: [{ doc: makeFile("b.md", { A: 1 }) }] };
             });
@@ -196,7 +197,7 @@ describe("DexieStore", () => {
 
         it("null return is a side-effect-free no-op", async () => {
             const before = await store.info();
-            const committed = await store.runWrite(async () => null);
+            const committed = await store.runWriteBuilder(async () => null);
             expect(committed).toBe(false);
             const after = await store.info();
             expect(after.updateSeq).toBe(before.updateSeq);
@@ -206,7 +207,7 @@ describe("DexieStore", () => {
             const fileId = makeFileId("race.md");
             await put(store, makeFile("race.md", { A: 1 }));
             let calls = 0;
-            const committed = await store.runWrite(async (snap) => {
+            const committed = await store.runWriteBuilder(async (snap) => {
                 calls++;
                 const cur = (await snap.get(fileId)) as FileDoc;
                 const stale = calls === 1 ? { A: 0 } : cur.vclock;
@@ -226,7 +227,7 @@ describe("DexieStore", () => {
         it("throws DbError(conflict) after exhausting maxAttempts", async () => {
             await put(store, makeFile("exh.md", { A: 1 }));
             await expect(
-                store.runWrite(
+                store.runWriteBuilder(
                     async () => ({
                         docs: [{
                             doc: makeFile("exh.md", { A: 2 }),
@@ -240,7 +241,7 @@ describe("DexieStore", () => {
 
         it("onCommit fires once after a successful commit", async () => {
             let fired = 0;
-            await store.runWrite(async () => ({
+            await store.runWriteBuilder(async () => ({
                 meta: [{ op: "put", key: "k", value: 1 }],
                 onCommit: () => { fired++; },
             }));
@@ -250,7 +251,7 @@ describe("DexieStore", () => {
         it("onCommit does NOT fire when the builder aborts", async () => {
             let fired = 0;
             await expect(
-                store.runWrite(
+                store.runWriteBuilder(
                     async () => ({
                         docs: [{
                             doc: makeFile("z.md"),
@@ -271,7 +272,7 @@ describe("DexieStore", () => {
         it("writes docs + chunks + vclocks + meta in one tx", async () => {
             const fileId = makeFileId("compound.md");
             const chunk = makeChunk("ch1", "Y2g=");
-            await store.runWrite({
+            await store.runWriteTx({
                 chunks: [chunk],
                 docs: [{ doc: { ...makeFile("compound.md", { A: 1 }), chunks: [chunk._id] } }],
                 vclocks: [{ path: "compound.md", op: "set", clock: { A: 1 } }],
@@ -288,7 +289,7 @@ describe("DexieStore", () => {
 
         it("bumps _update_seq exactly once per compound tx", async () => {
             const before = await store.info();
-            await store.runWrite({
+            await store.runWriteTx({
                 chunks: [makeChunk("a", "QQ=="), makeChunk("b", "Qg==")],
                 docs: [{ doc: { ...makeFile("seq.md"), chunks: ["chunk:a", "chunk:b"] } }],
                 vclocks: [{ path: "seq.md", op: "set", clock: { A: 1 } }],
@@ -298,11 +299,11 @@ describe("DexieStore", () => {
         });
 
         it("vclock op delete removes the meta entry", async () => {
-            await store.runWrite({
+            await store.runWriteTx({
                 vclocks: [{ path: "p", op: "set", clock: { A: 5 } }],
             });
             expect(await store.getDexie().meta.get("_local/vclock/p")).toBeDefined();
-            await store.runWrite({
+            await store.runWriteTx({
                 vclocks: [{ path: "p", op: "delete" }],
             });
             expect(await store.getDexie().meta.get("_local/vclock/p")).toBeUndefined();
@@ -310,7 +311,7 @@ describe("DexieStore", () => {
 
         it("classifies thrown errors as DbError with recovery", async () => {
             try {
-                await store.runWrite({
+                await store.runWriteTx({
                     docs: [{
                         doc: makeFile("err.md"),
                         expectedVclock: { ghost: 42 },
@@ -333,7 +334,7 @@ describe("DexieStore", () => {
             const chunk2 = makeChunk("h2", "Y2h1bmsy");
             const fileId = makeFileId("atomic.md");
 
-            const committed = await store.runWrite(async () => ({
+            const committed = await store.runWriteBuilder(async () => ({
                 chunks: [chunk1, chunk2],
                 docs: [{
                     doc: {
@@ -358,7 +359,7 @@ describe("DexieStore", () => {
         it("aborting via null return writes nothing — no orphan chunks", async () => {
             const chunk = makeChunk("unused", "dW51c2Vk");
             const fileId = makeFileId("abort.md");
-            const committed = await store.runWrite(async () => null);
+            const committed = await store.runWriteBuilder(async () => null);
             expect(committed).toBe(false);
             expect(await store.get(fileId)).toBeNull();
             expect(await store.get(chunk._id)).toBeNull();
@@ -366,7 +367,7 @@ describe("DexieStore", () => {
 
         it("increments version on subsequent write", async () => {
             const fileId = makeFileId("version.md");
-            await store.runWrite({
+            await store.runWriteTx({
                 docs: [{
                     doc: {
                         _id: fileId, type: "file", chunks: [],
@@ -377,7 +378,7 @@ describe("DexieStore", () => {
             const first = await store.get(fileId);
             expect(first!._rev).toBe("1-dexie");
 
-            await store.runWrite(async (snap) => {
+            await store.runWriteBuilder(async (snap) => {
                 const existing = (await snap.get(fileId)) as FileDoc;
                 return {
                     docs: [{
@@ -491,7 +492,7 @@ describe("DexieStore", () => {
 
     describe("meta read surface", () => {
         it("round-trips a meta value via runWrite + getMeta", async () => {
-            await store.runWrite({
+            await store.runWriteTx({
                 meta: [{ op: "put", key: "scan-cursor", value: { lastScanStartedAt: 1000 } }],
             });
             expect(await store.getMeta("scan-cursor"))
@@ -503,19 +504,19 @@ describe("DexieStore", () => {
         });
 
         it("runWrite overwrites existing meta", async () => {
-            await store.runWrite({ meta: [{ op: "put", key: "k", value: "v1" }] });
-            await store.runWrite({ meta: [{ op: "put", key: "k", value: "v2" }] });
+            await store.runWriteTx({ meta: [{ op: "put", key: "k", value: "v1" }] });
+            await store.runWriteTx({ meta: [{ op: "put", key: "k", value: "v2" }] });
             expect(await store.getMeta("k")).toBe("v2");
         });
 
         it("runWrite can delete meta", async () => {
-            await store.runWrite({ meta: [{ op: "put", key: "k", value: "value" }] });
-            await store.runWrite({ meta: [{ op: "delete", key: "k" }] });
+            await store.runWriteTx({ meta: [{ op: "put", key: "k", value: "value" }] });
+            await store.runWriteTx({ meta: [{ op: "delete", key: "k" }] });
             expect(await store.getMeta("k")).toBeNull();
         });
 
         it("getMetaByPrefix returns all matching entries", async () => {
-            await store.runWrite({
+            await store.runWriteTx({
                 vclocks: [
                     { path: "a.md", op: "set", clock: { A: 1 } },
                     { path: "sub/b.md", op: "set", clock: { B: 2 } },

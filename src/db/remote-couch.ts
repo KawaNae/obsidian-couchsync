@@ -94,7 +94,7 @@ export async function pullByPrefix(
     // Strip remote _rev before writing to local.
     const localDocs = docs.map((d) => stripRev(d) as CouchSyncDoc);
 
-    await local.runWrite({
+    await local.runWriteTx({
         docs: localDocs.map((doc) => ({ doc })),
     });
     return localDocs.length;
@@ -199,7 +199,7 @@ export async function pullAll(
     // Strip remote _rev before writing to local.
     const localDocs = docs.map((d) => stripRev(d) as CouchSyncDoc);
 
-    await local.runWrite({
+    await local.runWriteTx({
         docs: localDocs.map((doc) => ({ doc })),
     });
     let total = 0;

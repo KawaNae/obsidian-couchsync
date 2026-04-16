@@ -58,10 +58,11 @@ function makeMockLocalDb(overrides?: any): any {
     const docsMeta: Record<string, any> = {};
     const legacyMeta: Record<string, any> = {};
 
-    // Simulate the docs store: runWrite accepts either a fixed tx or a
-    // builder. Mimics the real DexieStore: meta puts land in docsMeta,
-    // `docs` flow into the `bulkPut` mock so existing assertions still
-    // observe pulled writes. Fires onCommit synchronously after.
+    // Simulate the docs store: runWriteTx accepts a fixed tx,
+    // runWriteBuilder accepts a builder function. Mimics the real DexieStore:
+    // meta puts land in docsMeta, `docs` flow into the `bulkPut` mock so
+    // existing assertions still observe pulled writes. Fires onCommit
+    // synchronously after.
     const bulkPut = vi.fn().mockResolvedValue([]);
     const applyTx = async (tx: any) => {
         if (!tx) return;
@@ -78,30 +79,31 @@ function makeMockLocalDb(overrides?: any): any {
         }
         if (tx.onCommit) await tx.onCommit();
     };
-    const runWrite = vi.fn(async (arg: any, _opts?: any) => {
-        if (typeof arg === "function") {
-            // Builder form: invoke once with a minimal snapshot.
-            const built = await arg({
-                get: async () => null,
-                getMeta: async (k: string) => docsMeta[k] ?? null,
-                getMetaByPrefix: async () => [],
-            });
-            if (!built) return false;
-            await applyTx(built);
-            return true;
-        }
-        await applyTx(arg);
+    const runWriteTx = vi.fn(async (tx: any) => {
+        await applyTx(tx);
+    });
+    const runWriteBuilder = vi.fn(async (builder: any, _opts?: any) => {
+        const built = await builder({
+            get: async () => null,
+            getMeta: async (k: string) => docsMeta[k] ?? null,
+            getMetaByPrefix: async () => [],
+        });
+        if (!built) return false;
+        await applyTx(built);
+        return true;
     });
     const docsStore = {
         getMeta: vi.fn(async (key: string) => docsMeta[key] ?? null),
-        runWrite,
+        runWriteTx,
+        runWriteBuilder,
     };
     return {
         bulkPut,
         changes: vi.fn().mockResolvedValue({ results: [], last_seq: 0 }),
         info: vi.fn().mockResolvedValue({ updateSeq: 0 }),
         getChunks: vi.fn().mockResolvedValue([]),
-        runWrite,
+        runWriteTx,
+        runWriteBuilder,
         getStore: () => docsStore,
         getMetaStore: () => ({
             getMeta: vi.fn(async (key: string) => legacyMeta[key] ?? null),
@@ -303,17 +305,11 @@ describe("SyncEngine catchup pull", () => {
         const localDb = makeMockLocalDb();
         const engine = makeSyncEngine(localDb, mockClient);
 
-        const changedDocs: string[] = [];
-        engine.onChange((doc) => changedDocs.push((doc as any)._id));
-
         await engine.start();
         await new Promise((r) => setTimeout(r, 50));
 
         expect(mockClient.changes).toHaveBeenCalledTimes(3);
         expect(localDb.bulkPut).toHaveBeenCalledTimes(2);
-        expect(changedDocs).toContain("file:a.md");
-        expect(changedDocs).toContain("file:b.md");
-        expect(changedDocs).toContain("file:c.md");
 
         engine.stop();
     });
@@ -350,16 +346,12 @@ describe("SyncEngine live sync", () => {
         const localDb = makeMockLocalDb();
         const engine = makeSyncEngine(localDb, mockClient);
 
-        const changedDocs: string[] = [];
-        engine.onChange((doc) => changedDocs.push((doc as any)._id));
-
         const pausedCalls: boolean[] = [];
         engine.onPaused(() => pausedCalls.push(true));
 
         await engine.start();
         await new Promise((r) => setTimeout(r, 100));
 
-        expect(changedDocs).toContain("file:live-a.md");
         expect(pausedCalls.length).toBeGreaterThanOrEqual(1);
 
         engine.stop();
@@ -668,7 +660,6 @@ describe("SyncEngine vclock guard in writePulledDocs", () => {
 
         const mockResolver = {
             resolveOnPull: vi.fn().mockResolvedValue("take-remote"),
-            setOnConcurrent: vi.fn(),
         };
         engine.setConflictResolver(mockResolver as any);
 
@@ -701,7 +692,6 @@ describe("SyncEngine vclock guard in writePulledDocs", () => {
 
         const mockResolver = {
             resolveOnPull: vi.fn().mockResolvedValue("keep-local"),
-            setOnConcurrent: vi.fn(),
         };
         engine.setConflictResolver(mockResolver as any);
 
@@ -731,7 +721,6 @@ describe("SyncEngine vclock guard in writePulledDocs", () => {
 
         const mockResolver = {
             resolveOnPull: vi.fn().mockResolvedValue("concurrent"),
-            setOnConcurrent: vi.fn(),
         };
         engine.setConflictResolver(mockResolver as any);
 
@@ -784,7 +773,6 @@ describe("SyncEngine vclock guard in writePulledDocs", () => {
 
         const mockResolver = {
             resolveOnPull: vi.fn(),
-            setOnConcurrent: vi.fn(),
         };
         engine.setConflictResolver(mockResolver as any);
 
