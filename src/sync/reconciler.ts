@@ -1,10 +1,11 @@
-import type { App } from "obsidian";
+import type { App, TFile } from "obsidian";
 import type { LocalDB, VaultManifest } from "../db/local-db.ts";
 import type { VaultSync, CompareResult } from "./vault-sync.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { FileDoc } from "../types.ts";
 import { latestDevice } from "./vector-clock.ts";
 import { filePathFromId } from "../types/doc-id.ts";
+import { toPathKey, type PathKey } from "../utils/path.ts";
 import { logDebug, logInfo, logWarn, logError } from "../ui/log.ts";
 
 /**
@@ -166,10 +167,17 @@ export class Reconciler {
 
         // Fast path: cheap inputs only (no allFileDocs). If everything looks
         // unchanged we return without ever scanning the DB.
+        //
+        // All in-memory comparison structures key by `PathKey` (NFC + lowercase)
+        // so case-insensitive filesystems and Unicode-equivalent forms collapse
+        // to one entry. The original-case path is preserved inside the value
+        // (TFile.path / FileDoc._id) for filesystem I/O and user-facing strings.
         const vaultFiles = this.app.vault.getFiles();
-        const vaultPathSet = new Set(vaultFiles.map((f) => f.path));
+        const vaultPathSet = new Set<PathKey>(vaultFiles.map((f) => toPathKey(f.path)));
         const manifest = await this.localDb.getVaultManifest();
-        const manifestPaths = manifest ? new Set(manifest.paths) : null;
+        const manifestPaths = manifest
+            ? new Set<PathKey>(manifest.paths.map(toPathKey))
+            : null;
 
         if (mode === "apply") {
             const cursor = await this.localDb.getScanCursor();
@@ -193,32 +201,44 @@ export class Reconciler {
         }
 
         // Slow path: scan the union of vault and DB and process every path.
-        // Both maps MUST be keyed by bare vault path. `FileDoc._id` carries
-        // a "file:" prefix after the ID redesign, so we strip it here via
-        // filePathFromId — keying dbByPath raw would put the two maps in
-        // disjoint key spaces and cause every file to be mis-classified
-        // as both "push" and "delete" (the 227-file regression bug).
-        const vaultByPath = new Map(vaultFiles.map((f) => [f.path, f]));
+        // Both maps key by `PathKey` (normalized) so a vault path differing
+        // only in case from the DB doc — common on case-insensitive FS —
+        // collapses to one entry instead of being mis-classified as both
+        // "push" (vault side) and "delete" (DB side).
+        // The original-case path lives inside each value (TFile.path or
+        // FileDoc._id) and is what we use for FS I/O and reporting.
+        const vaultByPath = new Map<PathKey, TFile>(
+            vaultFiles.map((f) => [toPathKey(f.path), f]),
+        );
         const dbDocs = await this.localDb.allFileDocs();
-        const dbByPath = new Map(dbDocs.map((d) => [filePathFromId(d._id), d]));
-        const allPaths = new Set<string>([...vaultByPath.keys(), ...dbByPath.keys()]);
+        const dbByPath = new Map<PathKey, FileDoc>(
+            dbDocs.map((d) => [toPathKey(filePathFromId(d._id)), d]),
+        );
+        const allPaths = new Set<PathKey>([
+            ...vaultByPath.keys(),
+            ...dbByPath.keys(),
+        ]);
         const deviceId = this.getSettings().deviceId;
 
         logDebug(
             `reconcile (${reason}, ${mode}) — ${vaultByPath.size} vault, ${dbByPath.size} db, manifest=${manifestPaths?.size ?? "null"}`,
         );
 
-        for (const path of allPaths) {
-            const file = vaultByPath.get(path);
-            const doc = dbByPath.get(path);
+        for (const pathKey of allPaths) {
+            const file = vaultByPath.get(pathKey);
+            const doc = dbByPath.get(pathKey);
 
             // Case E: vault and DB both empty (or DB tombstone) → no-op
             if (!file && (!doc || doc.deleted)) continue;
 
+            // Display path: prefer the vault's case (current truth) when both
+            // exist; fall back to the DB doc's stored path otherwise.
+            const displayPath = file?.path ?? filePathFromId(doc!._id);
+
             // Case C: vault has it, DB doesn't (or DB tombstone)
             if (file && (!doc || doc.deleted)) {
-                if (await this.tryStep(path, "push", () => this.vaultSync.fileToDb(file), mode)) {
-                    report.pushed.push(path);
+                if (await this.tryStep(displayPath, "push", () => this.vaultSync.fileToDb(file), mode)) {
+                    report.pushed.push(displayPath);
                 }
                 continue;
             }
@@ -227,12 +247,12 @@ export class Reconciler {
             if (!file && doc && !doc.deleted) {
                 const decision = this.classifyMissingFromVault(doc, deviceId, manifestPaths);
                 if (decision === "delete") {
-                    if (await this.tryStep(path, "delete", () => this.vaultSync.markDeleted(path), mode)) {
-                        report.deleted.push(path);
+                    if (await this.tryStep(displayPath, "delete", () => this.vaultSync.markDeleted(displayPath), mode)) {
+                        report.deleted.push(displayPath);
                     }
                 } else {
-                    if (await this.tryStep(path, "restore", async () => { await this.ensureChunks(doc); await this.vaultSync.dbToFile(doc); }, mode)) {
-                        report.restored.push(path);
+                    if (await this.tryStep(displayPath, "restore", async () => { await this.ensureChunks(doc); await this.vaultSync.dbToFile(doc); }, mode)) {
+                        report.restored.push(displayPath);
                     }
                 }
                 continue;
@@ -244,18 +264,18 @@ export class Reconciler {
                 try {
                     cmp = await this.vaultSync.compareFileToDoc(doc, file);
                 } catch (e) {
-                    logError(`CouchSync: reconcile compare failed for ${path}: ${e?.message ?? e}`);
+                    logError(`CouchSync: reconcile compare failed for ${displayPath}: ${e?.message ?? e}`);
                     continue;
                 }
                 if (cmp === "identical") {
                     report.inSync++;
                 } else if (cmp === "local-unpushed") {
-                    if (await this.tryStep(path, "push", () => this.vaultSync.fileToDb(file), mode)) {
-                        report.localWins.push(path);
+                    if (await this.tryStep(displayPath, "push", () => this.vaultSync.fileToDb(file), mode)) {
+                        report.localWins.push(displayPath);
                     }
                 } else {
-                    if (await this.tryStep(path, "pull", async () => { await this.ensureChunks(doc); await this.vaultSync.dbToFile(doc); }, mode)) {
-                        report.remoteWins.push(path);
+                    if (await this.tryStep(displayPath, "pull", async () => { await this.ensureChunks(doc); await this.vaultSync.dbToFile(doc); }, mode)) {
+                        report.remoteWins.push(displayPath);
                     }
                 }
             }
@@ -358,13 +378,14 @@ export class Reconciler {
     private classifyMissingFromVault(
         doc: FileDoc,
         deviceId: string,
-        manifestPaths: Set<string> | null,
+        manifestPaths: Set<PathKey> | null,
     ): "delete" | "restore" {
         if (manifestPaths === null) return "restore";
         const lastWriter = latestDevice(doc.vclock ?? {});
         if (this.isLocalDevice(lastWriter)) return "delete";
-        // Manifest stores bare vault paths; doc._id is "file:<path>".
-        if (manifestPaths.has(filePathFromId(doc._id))) return "delete";
+        // Manifest paths are case-folded for comparison; do the same for
+        // the doc's stored path before lookup.
+        if (manifestPaths.has(toPathKey(filePathFromId(doc._id)))) return "delete";
         return "restore";
     }
 

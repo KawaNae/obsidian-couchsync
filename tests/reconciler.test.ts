@@ -424,4 +424,42 @@ describe("Reconciler", () => {
             expect(h.notifyCalls.some((m) => m.includes("Large deletion"))).toBe(false);
         });
     });
+
+    describe("case-insensitive path collapse", () => {
+        it("treats vault 'AGENTS.md' and DB 'agents.md' as the same path (no spurious push/delete)", async () => {
+            // Reproduces the case-insensitive FS bug: vault preserves
+            // 'AGENTS.md' but DB doc was stored as 'agents.md'. Pre-fix
+            // the reconciler classified them as two distinct paths and
+            // emitted both a "push AGENTS.md" and a "delete agents.md".
+            const h = setup([makeFile("AGENTS.md", 1000)]);
+            h.db.fileDocs.set("agents.md", makeDoc("agents.md", { lastWriter: SELF }));
+            h.db.manifest = { paths: ["AGENTS.md"], updatedAt: 0 };
+            // Fake compareFileToDoc keys by the DB doc's stored path.
+            h.vaultSync.compareResults.set("agents.md", "identical");
+
+            const r = await h.reconciler.reconcile("manual");
+
+            expect(r.inSync).toBe(1);
+            expect(r.pushed).toEqual([]);
+            expect(r.deleted).toEqual([]);
+            expect(h.vaultSync.fileToDbCalls).toEqual([]);
+            expect(h.vaultSync.markDeletedCalls).toEqual([]);
+        });
+
+        it("uses the vault's case for display when reporting reconciled paths", async () => {
+            // When vault has 'README.md' and DB has 'readme.md' with a
+            // local-unpushed compare result, the reconcile report should
+            // surface the current vault casing — not the stale DB casing.
+            const h = setup([makeFile("README.md", 5000)]);
+            h.db.fileDocs.set("readme.md", makeDoc("readme.md", { mtime: 1000 }));
+            h.db.manifest = { paths: ["README.md"], updatedAt: 0 };
+            // Fake compareFileToDoc keys by the DB doc's stored path.
+            h.vaultSync.compareResults.set("readme.md", "local-unpushed");
+
+            const r = await h.reconciler.reconcile("manual");
+
+            expect(r.localWins).toEqual(["README.md"]);
+            expect(h.vaultSync.fileToDbCalls).toEqual(["README.md"]);
+        });
+    });
 });
