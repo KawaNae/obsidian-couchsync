@@ -27,6 +27,7 @@ import type {
     LocalChangesResult,
 } from "./interfaces.ts";
 import { stripRev } from "../utils/doc.ts";
+import { toPathKey } from "../utils/path.ts";
 import {
     DbError,
     classifyDexieError,
@@ -65,7 +66,7 @@ export interface LocalMeta {
 /** Prefix for `_local/vclock/<path>` entries written by `runWrite`. */
 export const VCLOCK_KEY_PREFIX = "_local/vclock/";
 export function vclockMetaKey(path: string): string {
-    return VCLOCK_KEY_PREFIX + path;
+    return VCLOCK_KEY_PREFIX + toPathKey(path);
 }
 
 // ── Retry policy for transient AbortError ───────────────
