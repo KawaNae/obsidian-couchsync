@@ -8,7 +8,8 @@ let xxhash: { h64ToString: (input: string) => string } | null = null;
 async function getXXHash() {
     if (xxhash) return xxhash;
     const mod = await import("xxhash-wasm-102");
-    xxhash = await (mod.default ?? mod)();
+    const init = (mod.default ?? mod) as () => Promise<typeof xxhash>;
+    xxhash = await init();
     return xxhash;
 }
 
