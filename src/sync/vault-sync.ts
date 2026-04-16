@@ -8,6 +8,7 @@ import { notify } from "../ui/log.ts";
 import { compareVC, incrementVC } from "./vector-clock.ts";
 import type { VectorClock } from "./vector-clock.ts";
 import { makeFileId, filePathFromId } from "../types/doc-id.ts";
+import { toPathKey, type PathKey } from "../utils/path.ts";
 import { logWarn } from "../ui/log.ts";
 import { DbError } from "../db/write-transaction.ts";
 
@@ -47,13 +48,13 @@ export class VaultSync {
      * Loaded once via `loadLastSyncedVclocks()` at plugin init; the on-disk
      * representation is per-path meta entries (`_local/vclock/<path>`).
      */
-    private lastSyncedVclock = new Map<string, VectorClock>();
+    private lastSyncedVclock = new Map<PathKey, VectorClock>();
 
     /**
      * In-memory mirror of `_local/skipped-files` paths. Lets the hot path
      * skip a DB read on every successful file sync.
      */
-    private skippedPaths: Set<string> | null = null;
+    private skippedPaths: Set<PathKey> | null = null;
 
     constructor(
         private app: App,
@@ -135,7 +136,7 @@ export class VaultSync {
                         }],
                         vclocks: [{ path, op: "set", clock: newVclock }],
                         onCommit: () => {
-                            this.lastSyncedVclock.set(path, newVclock);
+                            this.lastSyncedVclock.set(toPathKey(path), newVclock);
                         },
                     };
                 },
@@ -210,7 +211,7 @@ export class VaultSync {
             await this.db.runWrite({
                 vclocks: [{ path: vaultPath, op: "set", clock }],
             });
-            this.lastSyncedVclock.set(vaultPath, clock);
+            this.lastSyncedVclock.set(toPathKey(vaultPath), clock);
         }
 
         if (writtenFile && this.historyCapture) {
@@ -230,7 +231,7 @@ export class VaultSync {
                 return "identical";
             }
         }
-        const lastSynced = this.lastSyncedVclock.get(filePathFromId(fileDoc._id));
+        const lastSynced = this.lastSyncedVclock.get(toPathKey(filePathFromId(fileDoc._id)));
         if (lastSynced) {
             const rel = compareVC(fileDoc.vclock ?? {}, lastSynced);
             return rel === "equal" ? "local-unpushed" : "remote-pending";
@@ -248,7 +249,7 @@ export class VaultSync {
                     if (!existing || existing.deleted) {
                         return {
                             vclocks: [{ path, op: "delete" }],
-                            onCommit: () => { this.lastSyncedVclock.delete(path); },
+                            onCommit: () => { this.lastSyncedVclock.delete(toPathKey(path)); },
                         };
                     }
                     const newVclock = incrementVC(existing.vclock, deviceId);
@@ -263,7 +264,7 @@ export class VaultSync {
                             expectedVclock: existing.vclock,
                         }],
                         vclocks: [{ path, op: "delete" }],
-                        onCommit: () => { this.lastSyncedVclock.delete(path); },
+                        onCommit: () => { this.lastSyncedVclock.delete(toPathKey(path)); },
                     };
                 },
                 { maxAttempts: CAS_MAX_ATTEMPTS },
@@ -303,7 +304,7 @@ export class VaultSync {
      * no record exists (plugin just loaded — assume nothing pending).
      */
     hasUnpushedChanges(path: string, localVclock: VectorClock): boolean {
-        const lastSynced = this.lastSyncedVclock.get(path);
+        const lastSynced = this.lastSyncedVclock.get(toPathKey(path));
         if (!lastSynced) return false;
         return compareVC(localVclock, lastSynced) !== "equal";
     }
@@ -313,26 +314,27 @@ export class VaultSync {
         await this.markDeleted(oldPath);
     }
 
-    private async loadSkippedCache(): Promise<Set<string>> {
+    private async loadSkippedCache(): Promise<Set<PathKey>> {
         if (this.skippedPaths) return this.skippedPaths;
         const doc = await this.db.getSkippedFiles();
-        this.skippedPaths = new Set(Object.keys(doc.files));
+        this.skippedPaths = new Set(Object.keys(doc.files).map(toPathKey));
         return this.skippedPaths;
     }
 
     private async wasSkipped(path: string): Promise<boolean> {
         const cache = await this.loadSkippedCache();
-        return cache.has(path);
+        return cache.has(toPathKey(path));
     }
 
     private async recordSkipped(path: string, sizeMB: number, limitMB: number): Promise<void> {
         const doc = await this.db.getSkippedFiles();
-        const existing = doc.files[path];
+        const key = toPathKey(path);
+        const existing = doc.files[key];
         const roundedSize = Math.round(sizeMB * 10) / 10;
         const isNew = !existing || Math.round(existing.sizeMB * 10) / 10 !== roundedSize;
-        doc.files[path] = { sizeMB: roundedSize, skippedAt: Date.now() };
+        doc.files[key] = { sizeMB: roundedSize, skippedAt: Date.now() };
         await this.db.putSkippedFiles(doc);
-        (await this.loadSkippedCache()).add(path);
+        (await this.loadSkippedCache()).add(key);
         if (isNew) {
             notify(
                 `Skipped "${path}" — ${roundedSize} MB exceeds ${limitMB} MB limit. ` +
@@ -344,10 +346,11 @@ export class VaultSync {
 
     private async forgetSkipped(path: string): Promise<void> {
         const doc = await this.db.getSkippedFiles();
-        if (!(path in doc.files)) return;
-        delete doc.files[path];
+        const key = toPathKey(path);
+        if (!(key in doc.files)) return;
+        delete doc.files[key];
         await this.db.putSkippedFiles(doc);
-        this.skippedPaths?.delete(path);
+        this.skippedPaths?.delete(key);
     }
 
     private async localChunkIds(file: TFile): Promise<string[]> {

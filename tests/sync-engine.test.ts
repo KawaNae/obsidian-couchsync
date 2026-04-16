@@ -474,11 +474,11 @@ describe("SyncEngine live sync", () => {
             }),
         });
 
+        // Capture `before` BEFORE engine creation so any healthyAt write
+        // (catchup or push) is guaranteed to land in [before, after].
+        const before = Date.now();
         const engine = makeSyncEngine(localDb, mockClient);
         await engine.start();
-
-        // Wait for push loop to complete its first iteration.
-        const before = Date.now();
         // Poll until bulkDocs has been called (push loop ran).
         for (let i = 0; i < 20 && !bulkDocsMock.mock.calls.length; i++) {
             await new Promise((r) => setTimeout(r, 50));
