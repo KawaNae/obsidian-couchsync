@@ -3,6 +3,7 @@ import type { IDocStore, AllDocsOpts, AllDocsResult, LocalChangesResult } from "
 import { DexieStore, SyncDB, VCLOCK_KEY_PREFIX, vclockMetaKey } from "./dexie-store.ts";
 import type { WriteTransaction, WriteBuilder } from "./write-transaction.ts";
 import type { VectorClock } from "../sync/vector-clock.ts";
+import { toPathKey, type PathKey } from "../utils/path.ts";
 import {
     ID_RANGE,
     makeFileId,
@@ -261,15 +262,20 @@ export class LocalDB implements IDocStore<CouchSyncDoc> {
      * (`_local/last-synced-vclocks`, formerly stored on the *separate*
      * meta store) when detected, so existing vaults upgrade transparently.
      */
-    async loadAllSyncedVclocks(): Promise<Map<string, VectorClock>> {
-        const out = new Map<string, VectorClock>();
+    async loadAllSyncedVclocks(): Promise<Map<PathKey, VectorClock>> {
+        const out = new Map<PathKey, VectorClock>();
+        const staleKeys: string[] = [];
 
         const rows = await this.getStore().getMetaByPrefix<VectorClock>(
             VCLOCK_KEY_PREFIX,
         );
         for (const { key, value } of rows) {
-            const path = key.slice(VCLOCK_KEY_PREFIX.length);
-            out.set(path, value);
+            const rawPath = key.slice(VCLOCK_KEY_PREFIX.length);
+            const normalized = toPathKey(rawPath);
+            out.set(normalized, value);
+            if (rawPath !== (normalized as string)) {
+                staleKeys.push(key);
+            }
         }
 
         // One-shot migration: legacy single-doc lived on the *meta* store.
@@ -280,8 +286,9 @@ export class LocalDB implements IDocStore<CouchSyncDoc> {
         if (legacy?.clocks) {
             const newVclocks: Array<{ path: string; op: "set"; clock: VectorClock }> = [];
             for (const [path, vc] of Object.entries(legacy.clocks)) {
-                if (!out.has(path)) {
-                    out.set(path, vc);
+                const normalized = toPathKey(path);
+                if (!out.has(normalized)) {
+                    out.set(normalized, vc);
                     newVclocks.push({ path, op: "set", clock: vc });
                 }
             }
@@ -291,6 +298,19 @@ export class LocalDB implements IDocStore<CouchSyncDoc> {
             await legacyMeta.runWrite({
                 meta: [{ op: "delete", key: LAST_SYNCED_VCLOCKS_ID }],
             });
+        }
+
+        // Stale-key cleanup: delete non-normalized keys, re-write with normalized keys.
+        if (staleKeys.length > 0) {
+            await this.getStore().runWrite({
+                meta: staleKeys.map((key) => ({ op: "delete" as const, key })),
+            });
+            const rewriteOps = [...out.entries()].map(([pathKey, clock]) => ({
+                path: pathKey as string,
+                op: "set" as const,
+                clock,
+            }));
+            await this.getStore().runWrite({ vclocks: rewriteOps });
         }
 
         return out;
