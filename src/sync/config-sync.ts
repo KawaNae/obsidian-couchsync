@@ -9,11 +9,18 @@ import {
 } from "../types/doc-id.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import { ProgressNotice } from "../ui/notices.ts";
+import { ConfirmModal } from "../ui/confirm-modal.ts";
 import { arrayBufferToBase64, base64ToArrayBuffer } from "../db/chunker.ts";
 import { incrementVC } from "./vector-clock.ts";
 import { CouchClient, makeCouchClient } from "../db/couch-client.ts";
-import { logError } from "../ui/log.ts";
+import { logError, logWarn } from "../ui/log.ts";
 import * as remoteCouch from "../db/remote-couch.ts";
+import {
+    detectDivergence,
+    dangerousForPush,
+    dangerousForPull,
+    type Divergence,
+} from "./config-divergence.ts";
 
 /**
  * ConfigSync — scan-based replication of `.obsidian/` configuration files
@@ -148,7 +155,7 @@ export class ConfigSync {
         });
     }
 
-    /** Push: scan .obsidian/ → push config docs to remote */
+    /** Push: scan .obsidian/ → divergence check → push config docs to remote */
     async push(): Promise<number> {
         const db = this.requireConfigDb();
         return this.withProgress("Config Push", async (progress) => {
@@ -156,29 +163,59 @@ export class ConfigSync {
                 progress.update(`Scanning: ${path} (${i}/${total})`);
             });
 
-            const docIds = await this.allDocIds();
-            if (docIds.length > 0) {
-                await this.withConfigRemote((client) =>
-                    remoteCouch.pushDocs(
-                        db,
-                        client,
-                        docIds,
-                        (docId, n) => {
-                            progress.update(`Pushing: ${configPathFromId(docId)} (${n}/${docIds.length})`);
-                        },
-                    ),
-                );
+            const localDocs = await db.allConfigDocs();
+            if (localDocs.length === 0) {
+                progress.done(`Pushed 0 config file(s).`);
+                return scanned;
             }
+
+            // Divergence check: fetch remote counterparts and compare vclocks.
+            // Surfacing here is the "concurrent edits are detected and
+            // surfaced" guarantee the class docstring promises.
+            progress.update("Checking remote for concurrent edits...");
+            const localIds = localDocs.map((d) => d._id);
+            const remoteDocs = await this.withConfigRemote((client) =>
+                this.fetchRemoteConfigDocs(client, localIds),
+            );
+            const dangerous = dangerousForPush(detectDivergence(localDocs, remoteDocs));
+            if (dangerous.length > 0) {
+                const ok = await this.confirmDivergence(dangerous, "push");
+                if (!ok) throw new Error("Cancelled by user (concurrent edits detected)");
+            }
+
+            await this.withConfigRemote((client) =>
+                remoteCouch.pushDocs(
+                    db,
+                    client,
+                    localIds,
+                    (docId, n) => {
+                        progress.update(`Pushing: ${configPathFromId(docId)} (${n}/${localIds.length})`);
+                    },
+                ),
+            );
 
             progress.done(`Pushed ${scanned} config file(s).`);
             return scanned;
         });
     }
 
-    /** Pull: pull config docs from remote → write configSyncPaths to filesystem */
+    /** Pull: divergence check → pull config docs from remote → write configSyncPaths to filesystem */
     async pull(): Promise<number> {
         const db = this.requireConfigDb();
         return this.withProgress("Config Pull", async (progress) => {
+            // Divergence check: fetch what we'd be overwriting and compare
+            // vclocks before pullByPrefix unconditionally clobbers local.
+            progress.update("Checking local for concurrent edits...");
+            const localDocs = await db.allConfigDocs();
+            const remoteDocs = await this.withConfigRemote((client) =>
+                this.fetchRemoteConfigDocs(client),
+            );
+            const dangerous = dangerousForPull(detectDivergence(localDocs, remoteDocs));
+            if (dangerous.length > 0) {
+                const ok = await this.confirmDivergence(dangerous, "pull");
+                if (!ok) throw new Error("Cancelled by user (concurrent edits detected)");
+            }
+
             progress.update("Pulling config from remote...");
             await this.withConfigRemote((client) =>
                 remoteCouch.pullByPrefix(db, client, DOC_ID.CONFIG),
@@ -191,6 +228,64 @@ export class ConfigSync {
             progress.done(`Pulled ${written} config file(s). Reload Obsidian to apply.`);
             return written;
         });
+    }
+
+    /**
+     * Fetch ConfigDocs from remote: by `keys` if given, otherwise by the
+     * full `config:` prefix range. Filters out tombstones and any non-config
+     * stragglers defensively.
+     */
+    private async fetchRemoteConfigDocs(
+        client: CouchClient,
+        ids?: string[],
+    ): Promise<ConfigDoc[]> {
+        const opts = ids
+            ? { keys: ids, include_docs: true }
+            : { startkey: DOC_ID.CONFIG, endkey: DOC_ID.CONFIG + "\ufff0", include_docs: true };
+        const result = await client.allDocs<ConfigDoc>(opts);
+        const docs: ConfigDoc[] = [];
+        for (const row of result.rows) {
+            if (row.doc && !row.value?.deleted && row.doc.type === "config") {
+                docs.push(row.doc);
+            }
+        }
+        return docs;
+    }
+
+    /**
+     * Show a confirm modal listing the divergent paths, returning true if
+     * the user chose to proceed (overwrite the other side) and false on
+     * cancel. The full path list is also written to the log so the user
+     * can review it after the modal closes.
+     */
+    private async confirmDivergence(
+        divs: Divergence[],
+        direction: "push" | "pull",
+    ): Promise<boolean> {
+        const verb = direction === "push" ? "Pushing" : "Pulling";
+        const target = direction === "push" ? "remote" : "local";
+        const paths = divs.map((d) => `  • ${d.path} (${d.relation})`).join("\n");
+        logWarn(
+            `CouchSync: Config ${direction} would overwrite concurrent edits on ${divs.length} doc(s):\n${paths}`,
+        );
+        const previewLimit = 5;
+        const preview = divs
+            .slice(0, previewLimit)
+            .map((d) => d.path)
+            .join(", ");
+        const more = divs.length > previewLimit ? ` (+${divs.length - previewLimit} more)` : "";
+        const message =
+            `${verb} would overwrite ${target} for ${divs.length} doc(s) ` +
+            `with concurrent edits: ${preview}${more}. ` +
+            `See the Log View for the full list. Continue anyway?`;
+        const modal = new ConfirmModal(
+            this.app,
+            `Config ${direction}: concurrent edits detected`,
+            message,
+            direction === "push" ? "Push anyway" : "Pull anyway",
+            true,
+        );
+        return await modal.waitForResult();
     }
 
     // ── Low-level operations ───────────────────────────
