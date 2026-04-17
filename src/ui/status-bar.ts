@@ -1,5 +1,5 @@
 import { Platform, type Plugin } from "obsidian";
-import type { SyncState, SyncErrorDetail } from "../db/sync-engine.ts";
+import type { SyncState, SyncErrorDetail } from "../db/reconnect-policy.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 
 const STATE_LABELS: Record<SyncState, string> = {

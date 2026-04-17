@@ -18,12 +18,11 @@ import type { ICouchClient } from "./interfaces.ts";
 import type { ConflictResolver } from "../conflict/conflict-resolver.ts";
 import { filePathFromId } from "../types/doc-id.ts";
 import { CouchClient, makeCouchClient } from "./couch-client.ts";
-import {
-    decideReconnect,
-    type ReconnectReason,
-    type SyncState,
-    type SyncErrorDetail,
-    type SyncErrorKind,
+import { decideReconnect } from "./reconnect-policy.ts";
+import type {
+    ReconnectReason,
+    SyncState,
+    SyncErrorDetail,
 } from "./reconnect-policy.ts";
 import { logDebug, logInfo, logWarn, logError, notify } from "../ui/log.ts";
 import { ErrorRecovery } from "./error-recovery.ts";
@@ -33,15 +32,6 @@ import { AuthGate } from "./sync/auth-gate.ts";
 import { SyncEvents } from "./sync/sync-events.ts";
 import { Checkpoints } from "./sync/checkpoints.ts";
 import { SyncSession } from "./sync/sync-session.ts";
-
-// ── Re-exports ──────────────────────────────────────────
-
-export type {
-    SyncState,
-    ReconnectReason,
-    SyncErrorDetail,
-    SyncErrorKind,
-} from "./reconnect-policy.ts";
 
 // ── Constants ────────────────────────────────────────────
 
