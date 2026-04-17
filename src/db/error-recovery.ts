@@ -7,6 +7,7 @@
  */
 
 import type { SyncState, SyncErrorDetail } from "./reconnect-policy.ts";
+import type { AuthGate } from "./sync/auth-gate.ts";
 import { logDebug, logError } from "../ui/log.ts";
 
 // ── Constants ────────────────────────────────────────────
@@ -25,7 +26,6 @@ export interface ErrorRecoveryHost {
     getState(): SyncState;
     setState(state: SyncState, detail?: SyncErrorDetail): void;
     emitError(message: string): void;
-    setAuthError(): void;
     teardown(): void;
     requestReconnect(reason: "retry-backoff"): Promise<void>;
 }
@@ -37,7 +37,10 @@ export class ErrorRecovery {
     private errorRetryTimer: ReturnType<typeof setTimeout> | null = null;
     private errorRetryStep = 0;
 
-    constructor(private host: ErrorRecoveryHost) {}
+    constructor(
+        private host: ErrorRecoveryHost,
+        private auth: AuthGate,
+    ) {}
 
     // ── Public API (called by SyncEngine) ────────────────
 
@@ -111,7 +114,8 @@ export class ErrorRecovery {
         this.host.emitError(detail.message);
 
         if (detail.kind === "auth") {
-            this.host.setAuthError();
+            // AuthGate owns the latch; ErrorRecovery raises it directly.
+            this.auth.raise(detail.code ?? 401, detail.message);
             this.host.teardown();
             this.stopErrorRetryTimer();
             return;

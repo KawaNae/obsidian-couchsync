@@ -1,5 +1,6 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { ErrorRecovery, type ErrorRecoveryHost } from "../src/db/error-recovery.ts";
+import { AuthGate } from "../src/db/sync/auth-gate.ts";
 
 function makeHost(overrides?: Partial<ErrorRecoveryHost>): ErrorRecoveryHost & {
     states: { state: string; detail?: any }[];
@@ -13,16 +14,19 @@ function makeHost(overrides?: Partial<ErrorRecoveryHost>): ErrorRecoveryHost & {
         getState: vi.fn(() => states.at(-1)?.state ?? "connected"),
         setState: vi.fn((s, d) => { states.push({ state: s, detail: d }); }),
         emitError: vi.fn((m) => { errors.push(m); }),
-        setAuthError: vi.fn(),
         teardown: vi.fn(),
         requestReconnect: vi.fn().mockResolvedValue(undefined),
         ...overrides,
     };
 }
 
+function makeRecovery(host: ErrorRecoveryHost, auth: AuthGate = new AuthGate()) {
+    return { recovery: new ErrorRecovery(host, auth), auth };
+}
+
 describe("ErrorRecovery.classifyError", () => {
     const host = makeHost();
-    const recovery = new ErrorRecovery(host);
+    const { recovery } = makeRecovery(host);
 
     it("401/403 → auth", () => {
         expect(recovery.classifyError({ status: 401, message: "nope" }).kind).toBe("auth");
@@ -63,7 +67,7 @@ describe("ErrorRecovery.handleTransientError", () => {
 
     it("sets state to reconnecting on first transient error", () => {
         const host = makeHost();
-        const recovery = new ErrorRecovery(host);
+        const { recovery } = makeRecovery(host);
         recovery.handleTransientError({ message: "ECONNREFUSED" });
         expect(host.setState).toHaveBeenCalledWith("reconnecting");
         recovery.reset();
@@ -79,7 +83,7 @@ describe("ErrorRecovery.handleTransientError", () => {
                 getState: vi.fn(() => currentState as any),
                 setState: vi.fn((s: any) => { currentState = s; }),
             });
-            const recovery = new ErrorRecovery(host);
+            const { recovery } = makeRecovery(host);
 
             recovery.handleTransientError({ message: "ECONNREFUSED" });
             expect(currentState).toBe("reconnecting");
@@ -94,9 +98,9 @@ describe("ErrorRecovery.handleTransientError", () => {
 
     it("auth errors escalate immediately (no 10s grace)", () => {
         const host = makeHost();
-        const recovery = new ErrorRecovery(host);
+        const { recovery, auth } = makeRecovery(host);
         recovery.handleTransientError({ status: 401, message: "bad creds" });
-        expect(host.setAuthError).toHaveBeenCalled();
+        expect(auth.isBlocked()).toBe(true);
         expect(host.states.some((s) => s.state === "error")).toBe(true);
         recovery.reset();
     });
@@ -105,14 +109,14 @@ describe("ErrorRecovery.handleTransientError", () => {
 describe("ErrorRecovery.enterHardError", () => {
     afterEach(() => { vi.useRealTimers(); });
 
-    it("auth error → pins error state, sets auth flag, no retries", async () => {
+    it("auth error → pins error state, raises auth gate, no retries", async () => {
         vi.useFakeTimers();
         try {
             const host = makeHost();
-            const recovery = new ErrorRecovery(host);
+            const { recovery, auth } = makeRecovery(host);
             recovery.enterHardError({ kind: "auth", code: 401, message: "fail" });
 
-            expect(host.setAuthError).toHaveBeenCalled();
+            expect(auth.isBlocked()).toBe(true);
             expect(host.teardown).toHaveBeenCalled();
 
             await vi.advanceTimersByTimeAsync(60_000);
@@ -125,7 +129,7 @@ describe("ErrorRecovery.enterHardError", () => {
         vi.useFakeTimers();
         try {
             const host = makeHost({ getState: vi.fn(() => "error") });
-            const recovery = new ErrorRecovery(host);
+            const { recovery } = makeRecovery(host);
             recovery.enterHardError({ kind: "network", message: "fake down" });
 
             expect(host.requestReconnect).not.toHaveBeenCalled();
@@ -148,7 +152,7 @@ describe("ErrorRecovery.enterHardError", () => {
         vi.useFakeTimers();
         try {
             const host = makeHost({ getState: vi.fn(() => "error") });
-            const recovery = new ErrorRecovery(host);
+            const { recovery } = makeRecovery(host);
             recovery.enterHardError({ kind: "network", message: "fake" });
 
             await vi.advanceTimersByTimeAsync(2_000); // step 0 fires

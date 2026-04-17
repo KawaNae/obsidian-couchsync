@@ -97,28 +97,7 @@ export class SyncEngine {
 
     // ── Error handling ────────────────────────────────────
 
-    private readonly errorRecovery = new ErrorRecovery({
-        getState: () => this.state,
-        setState: (s, d) => this.setState(s, d),
-        emitError: (m) => this.events.emit("error", { message: m }),
-        setAuthError: () => {
-            // ErrorRecovery sets this as part of classifying a 401/403 as a
-            // hard error. enterHardError has already issued emitError and
-            // pinned state="error"; we just need to latch the gate.
-            //
-            // Only raise if not already blocked — the outer driver (pull
-            // loop, verify) typically calls enterHardError via a path
-            // that has already stored the detail in lastErrorDetail.
-            if (!this.auth.isBlocked() && this.lastErrorDetail?.kind === "auth") {
-                this.auth.raise(
-                    this.lastErrorDetail.code ?? 401,
-                    this.lastErrorDetail.message,
-                );
-            }
-        },
-        teardown: () => this.teardown(),
-        requestReconnect: (r) => this.requestReconnect(r),
-    });
+    private readonly errorRecovery: ErrorRecovery;
 
     // ── Timers & env listeners ────────────────────────────
 
@@ -150,19 +129,32 @@ export class SyncEngine {
     ) {
         this.auth = auth ?? new AuthGate();
 
+        this.errorRecovery = new ErrorRecovery(
+            {
+                getState: () => this.state,
+                setState: (s, d) => this.setState(s, d),
+                emitError: (m) => this.events.emit("error", { message: m }),
+                teardown: () => this.teardown(),
+                requestReconnect: (r) => this.requestReconnect(r),
+            },
+            this.auth,
+        );
+
         // External raise (Settings tab probe, config-sync) → pin state=error
-        // with the auth detail so the status bar and onError listeners see
-        // the same signal the internal path produces.
+        // so the status bar and onError listeners see the auth latch.
+        // ErrorRecovery's internal path raises auth then sets state=error,
+        // so the early-return guard prevents re-entry.
         this.auth.onChange((detail) => {
             if (!detail) return;
-            if (this.state === "error" && this.lastErrorDetail?.kind === "auth") return;
-            this.errorRecovery.enterHardError({
+            if (this.state === "error") return;
+            this.setState("error", {
                 kind: "auth",
                 code: detail.status,
                 message:
                     `Authentication failed (${detail.status})${detail.reason ? ": " + detail.reason : ""}. ` +
                     `Update credentials in the Connection tab.`,
             });
+            this.teardown();
         });
 
         this.pullWriter = new PullWriter({

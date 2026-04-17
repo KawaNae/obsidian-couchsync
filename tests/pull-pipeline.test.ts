@@ -3,6 +3,7 @@ import { PullPipeline } from "../src/db/sync/pull-pipeline.ts";
 import { PullWriter } from "../src/db/sync/pull-writer.ts";
 import { EchoTracker } from "../src/db/sync/echo-tracker.ts";
 import { SyncEvents } from "../src/db/sync/sync-events.ts";
+import { AuthGate } from "../src/db/sync/auth-gate.ts";
 import { ErrorRecovery } from "../src/db/error-recovery.ts";
 import { DbError } from "../src/db/write-transaction.ts";
 import type { ICouchClient } from "../src/db/interfaces.ts";
@@ -63,10 +64,9 @@ function makeHarness(client: ICouchClient): Harness {
         getState: () => state,
         setState: (s) => { state = s; },
         emitError: () => {},
-        setAuthError: () => {},
         teardown: () => {},
         requestReconnect: async () => {},
-    });
+    }, new AuthGate());
 
     const pipeline = new PullPipeline({
         localDb, client, pullWriter, errorRecovery, events,
