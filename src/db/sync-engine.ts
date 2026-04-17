@@ -30,12 +30,9 @@ import { ErrorRecovery } from "./error-recovery.ts";
 import { EnvListeners } from "./env-listeners.ts";
 import { DbError } from "./write-transaction.ts";
 import { AuthGate } from "./sync/auth-gate.ts";
-import { EchoTracker } from "./sync/echo-tracker.ts";
 import { SyncEvents } from "./sync/sync-events.ts";
-import { PullWriter } from "./sync/pull-writer.ts";
-import { PullPipeline } from "./sync/pull-pipeline.ts";
-import { PushPipeline } from "./sync/push-pipeline.ts";
 import { Checkpoints } from "./sync/checkpoints.ts";
+import { SyncSession } from "./sync/sync-session.ts";
 
 // ── Re-exports ──────────────────────────────────────────
 
@@ -59,8 +56,6 @@ export class SyncEngine {
     /** Auth latch. External callers read `auth.isBlocked()` and call `auth.raise/clear`. */
     readonly auth: AuthGate;
 
-    private readonly pullWriter: PullWriter;
-
     // ── State ─────────────────────────────────────────────
 
     private state: SyncState = "disconnected";
@@ -68,28 +63,15 @@ export class SyncEngine {
     private lastErrorDetail: SyncErrorDetail | null = null;
     private lastRestartTime = 0;
 
-    // ── Echo suppression ─────────────────────────────────
-
-    private readonly echoes = new EchoTracker();
-
     /** Last remote update_seq seen by stall detection. Compared against
      *  our consumed remoteSeq to detect a stalled pull loop. */
     private lastObservedRemoteSeq: number | string = 0;
 
     // ── Session management ────────────────────────────────
 
-    /** Incremented on every teardown so async loops can detect mid-flight
-     *  session replacement. */
-    private syncEpoch = 0;
-
-    /** Dedup for concurrent bringUpSession() calls. */
-    private bringUpPromise: Promise<void> | null = null;
-
-    /** The CouchClient for the current session. */
-    private client: ICouchClient | null = null;
-
-    /** Whether any session is actively running (pull/push loops alive). */
-    private running = false;
+    /** Current live session. null when disconnected, in error, or
+     *  between restart() teardown and the next openSession(). */
+    private session: SyncSession | null = null;
 
     // ── Error handling ────────────────────────────────────
 
@@ -153,14 +135,6 @@ export class SyncEngine {
             this.teardown();
         });
 
-        this.pullWriter = new PullWriter({
-            localDb: this.localDb,
-            events: this.events,
-            echoes: this.echoes,
-            getConflictResolver: () => this.conflictResolver,
-            ensureChunks: (doc) => this.ensureChunks(doc),
-        });
-
         // Pipelines emit "paused" after applying a batch (live loop only —
         // catchup paused is fired by firePausedCallbacks below). SyncEngine
         // owns lastHealthyAt and updates it here.
@@ -179,16 +153,19 @@ export class SyncEngine {
 
     /**
      * Ensure every chunk referenced by FileDoc exists in localDB. Any missing
-     * chunks are fetched from the remote and persisted locally. When `client`
+     * chunks are fetched via `client` and persisted locally. When `client`
      * is null, this is a no-op (offline callers rely on existing error paths).
      */
-    private async ensureChunks(fileDoc: FileDoc): Promise<void> {
+    private async ensureChunksInternal(
+        client: ICouchClient | null,
+        fileDoc: FileDoc,
+    ): Promise<void> {
         const existing = await this.localDb.getChunks(fileDoc.chunks);
         const existingIds = new Set(existing.map((c) => c._id));
         const missing = fileDoc.chunks.filter((id) => !existingIds.has(id));
         if (missing.length === 0) return;
 
-        if (!this.client) {
+        if (!client) {
             logWarn(
                 `missing ${missing.length} chunk(s) for ${filePathFromId(fileDoc._id)} but no remote client`,
             );
@@ -198,7 +175,7 @@ export class SyncEngine {
         logDebug(
             `  fetching ${missing.length} missing chunk(s) from remote for ${filePathFromId(fileDoc._id)}`,
         );
-        const fetched = await this.client.bulkGet<ChunkDoc>(missing);
+        const fetched = await client.bulkGet<ChunkDoc>(missing);
         if (fetched.length > 0) {
             // Chunks are content-addressed: put-if-absent handled inside
             // runWrite when passed via the `chunks` field.
@@ -206,8 +183,10 @@ export class SyncEngine {
         }
     }
 
+    /** Public API for Reconciler / ConflictOrchestrator. Uses the live
+     *  session's client when available, no-op otherwise. */
     async ensureFileChunks(fileDoc: FileDoc): Promise<void> {
-        return this.ensureChunks(fileDoc);
+        return this.ensureChunksInternal(this.session?.client ?? null, fileDoc);
     }
 
     // ── Public API: State ─────────────────────────────────
@@ -235,20 +214,23 @@ export class SyncEngine {
      * once per user-driven lifecycle, then kicks off a session.
      */
     async start(): Promise<void> {
-        if (this.running) return;
+        if (this.session) return;
         // An explicit start() call means the user is trying again — assume
         // they've fixed their credentials.
         this.auth.clear();
         this.envListeners.attach();
         this.startHealthTimer();
-        await this.bringUpSession();
+        await this.openSession();
     }
 
     stop(): void {
         this.envListeners.detach();
         this.stopHealthTimer();
         this.errorRecovery.reset();
-        this.teardown();
+        // Fire-and-forget teardown — public stop() shouldn't block on
+        // session loops winding down. The disconnect state is set
+        // synchronously so the UI updates immediately.
+        void this.teardown();
         this.setState("disconnected");
     }
 
@@ -310,130 +292,79 @@ export class SyncEngine {
     // ── Internal: Session lifecycle ───────────────────────
 
     /**
-     * Session-internal cleanup: cancel running loops, drop session-scoped
-     * state. Does NOT touch env listeners or health timer — those survive
-     * restart() and are owned by start/stop.
+     * Session-internal cleanup: dispose the current session and await its
+     * loops to settle. Does NOT touch env listeners or health timer —
+     * those survive restart() and are owned by start/stop.
      */
-    private teardown(): void {
-        this.syncEpoch++;
-        this.bringUpPromise = null;
-        this.running = false;
-        this.client = null;
+    private async teardown(): Promise<void> {
+        const old = this.session;
+        this.session = null;
         this.events.resetIdle();
         this.lastObservedRemoteSeq = 0;
-        this.echoes.clear();
+        if (!old) return;
+        old.dispose();
+        await old.settled;
         // lastHealthyAt and lastErrorDetail intentionally NOT reset.
     }
 
     private async restart(): Promise<void> {
         this.lastRestartTime = Date.now();
-        this.teardown();
-        await this.bringUpSession();
+        await this.teardown();
+        await this.openSession();
     }
 
-    /** Dedup wrapper for concurrent bringUpSession calls. */
-    private bringUpSession(): Promise<void> {
-        if (this.bringUpPromise) return this.bringUpPromise;
-        if (this.running) return Promise.resolve();
-        if (this.auth.isBlocked()) return Promise.resolve();
-        const p = this.doBringUpSession().finally(() => {
-            if (this.bringUpPromise === p) this.bringUpPromise = null;
-        });
-        this.bringUpPromise = p;
-        return p;
-    }
+    /**
+     * Build a new SyncSession, run catchup, transition to connected, and
+     * start live loops. Concurrent calls dedup via the `this.session != null`
+     * check at the top.
+     */
+    private async openSession(): Promise<void> {
+        if (this.session) return;
+        if (this.auth.isBlocked()) return;
 
-    private async doBringUpSession(): Promise<void> {
-        const myEpoch = this.syncEpoch;
         const client = this.makeVaultClient();
+        const session = new SyncSession({
+            client,
+            localDb: this.localDb,
+            events: this.events,
+            errorRecovery: this.errorRecovery,
+            checkpoints: this.checkpoints,
+            getConflictResolver: () => this.conflictResolver,
+            ensureChunks: (doc) => this.ensureChunksInternal(client, doc),
+            handleLocalDbError: (e, ctx) => this.handleLocalDbError(e, ctx),
+        });
+        this.session = session;
+
         this.setState("reconnecting");
 
-        // Load checkpoints from meta store.
         try {
             await this.checkpoints.load();
         } catch (e) {
             logDebug(`checkpoint load error: ${e}`);
             // Start from 0 if meta is unavailable.
         }
-
-        if (this.syncEpoch !== myEpoch) return;
-
-        const pullPipeline = this.makePullPipeline(client, myEpoch);
-        const pushPipeline = this.makePushPipeline(client, myEpoch);
+        if (session.disposed) return;
 
         // Catchup = actual data transfer → syncing.
         this.setState("syncing");
-
         try {
-            await pullPipeline.runCatchup();
+            await session.runCatchup();
         } catch (e: any) {
-            if (this.syncEpoch !== myEpoch) return;
+            if (session.disposed) return;
             this.errorRecovery.enterHardError(this.errorRecovery.classifyError(e));
             this.events.emit("catchup-failed");
+            this.session = null;
             return;
         }
-
-        if (this.syncEpoch !== myEpoch) return;
+        if (session.disposed) return;
 
         // Catchup complete = caught up → connected immediately.
         this.lastHealthyAt = Date.now();
-        this.client = client;
-        this.running = true;
         this.setState("connected");
         this.firePausedCallbacks();
         this.events.emit("catchup-complete");
 
-        // Live loops run for the rest of the session; their `isCancelled`
-        // closures fire when syncEpoch advances (teardown).
-        pullPipeline.runLongpoll().catch((e) =>
-            logError(`CouchSync: pullLoop unexpected exit: ${e?.message ?? e}`),
-        );
-        pushPipeline.run().catch((e) =>
-            logError(`CouchSync: pushLoop unexpected exit: ${e?.message ?? e}`),
-        );
-    }
-
-    private makePullPipeline(client: ICouchClient, epoch: number): PullPipeline {
-        return new PullPipeline({
-            localDb: this.localDb,
-            client,
-            pullWriter: this.pullWriter,
-            errorRecovery: this.errorRecovery,
-            events: this.events,
-            isCancelled: () => this.syncEpoch !== epoch,
-            getRemoteSeq: () => this.checkpoints.getRemoteSeq(),
-            setRemoteSeq: (s) => this.checkpoints.setRemoteSeq(s),
-            saveCheckpoints: () => this.saveCheckpointsSafe(),
-            handleLocalDbError: (e, ctx) => this.handleLocalDbError(e, ctx),
-            delay: (ms) => this.delay(ms, epoch),
-        });
-    }
-
-    private makePushPipeline(client: ICouchClient, epoch: number): PushPipeline {
-        return new PushPipeline({
-            localDb: this.localDb,
-            client,
-            echoes: this.echoes,
-            events: this.events,
-            isCancelled: () => this.syncEpoch !== epoch,
-            getLastPushedSeq: () => this.checkpoints.getLastPushedSeq(),
-            setLastPushedSeq: (s) => this.checkpoints.setLastPushedSeq(s),
-            saveCheckpoints: () => this.saveCheckpointsSafe(),
-            handleLocalDbError: (e, ctx) => this.handleLocalDbError(e, ctx),
-            delay: (ms) => this.delay(ms, epoch),
-        });
-    }
-
-    // ── Internal: Checkpoints ─────────────────────────────
-
-    /** Wrap Checkpoints.save() with the local DB error handler — quota
-     *  errors halt the sync loops, transient errors log at warn. */
-    private async saveCheckpointsSafe(): Promise<void> {
-        try {
-            await this.checkpoints.save();
-        } catch (e) {
-            this.handleLocalDbError(e, "checkpoint save");
-        }
+        session.startLive();
     }
 
     /**
@@ -447,7 +378,7 @@ export class SyncEngine {
             if (this.state !== "error") {
                 if (e.userMessage) notify(e.userMessage, 15000);
                 logError(`local DB halt during ${context}: ${e.kind} — ${e.message}`);
-                this.teardown();
+                void this.teardown();
             }
             return;
         }
@@ -485,11 +416,11 @@ export class SyncEngine {
         // CouchDB 3.x cluster returns opaque seq strings (e.g. "1771-g1AAAA…")
         // where the opaque suffix can differ between info() and _changes even
         // for the same logical position. Compare only the numeric prefix.
-        if (!this.client) return;
-        const sessionEpoch = this.syncEpoch;
+        const session = this.session;
+        if (!session) return;
         try {
-            const info = await this.client.info();
-            if (this.syncEpoch !== sessionEpoch) return;
+            const info = await session.client.info();
+            if (session.disposed) return;
 
             const currentRemoteSeq = info.update_seq;
             const remoteNum = SyncEngine.seqNumericPrefix(currentRemoteSeq);
@@ -507,7 +438,7 @@ export class SyncEngine {
             this.lastObservedRemoteSeq = currentRemoteSeq;
             this.lastHealthyAt = Date.now();
         } catch (e: any) {
-            if (this.syncEpoch !== sessionEpoch) return;
+            if (session.disposed) return;
             logDebug(`health: info() failed ${e?.message ?? e}`);
             this.errorRecovery.enterHardError(this.errorRecovery.classifyError(e));
         }
@@ -538,9 +469,10 @@ export class SyncEngine {
      *  falling back to a fresh one from saved settings. */
     private async verifyReachable(): Promise<boolean> {
         let err: string | null = null;
-        if (this.client) {
+        const session = this.session;
+        if (session) {
             try {
-                await this.client.info();
+                await session.client.info();
             } catch (e: any) {
                 err = e?.message || "Connection failed";
             }
@@ -575,17 +507,6 @@ export class SyncEngine {
         return makeCouchClient(
             s.couchdbUri, s.couchdbDbName, s.couchdbUser, s.couchdbPassword,
         );
-    }
-
-    /** Epoch-aware delay. Resolves immediately if epoch has changed. */
-    private delay(ms: number, epoch: number): Promise<void> {
-        return new Promise((resolve) => {
-            if (this.syncEpoch !== epoch) {
-                resolve();
-                return;
-            }
-            setTimeout(resolve, ms);
-        });
     }
 
     /**

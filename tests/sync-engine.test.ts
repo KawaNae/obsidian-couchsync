@@ -233,6 +233,39 @@ describe("SyncEngine state machine", () => {
         engine.stop();
     });
 
+    it("restart() awaits old session settled before opening new", async () => {
+        // First catchup parks; the second one resolves only after the first
+        // finishes. We check the second catchup hasn't started until we
+        // unblock the first (= old session has fully settled).
+        let resolveFirstCatchup: (v: any) => void = () => {};
+        let firstCatchupCalled = false;
+        let secondCatchupCalled = false;
+        const mockClient = makeMockClient({
+            changes: vi.fn().mockImplementation(async () => {
+                if (!firstCatchupCalled) {
+                    firstCatchupCalled = true;
+                    return new Promise((resolve) => { resolveFirstCatchup = resolve; });
+                }
+                secondCatchupCalled = true;
+                return { results: [], last_seq: "0" };
+            }),
+        });
+        const engine = makeSyncEngine(makeMockLocalDb(), mockClient);
+        const startP = engine.start();
+        await vi.waitFor(() => expect(firstCatchupCalled).toBe(true));
+
+        const restartP = (engine as any).restart();
+        await new Promise((r) => setTimeout(r, 20));
+        expect(secondCatchupCalled).toBe(false);
+
+        resolveFirstCatchup({ results: [], last_seq: "0" });
+        await restartP;
+        expect(secondCatchupCalled).toBe(true);
+
+        await startP.catch(() => {});
+        engine.stop();
+    });
+
     it("empty longpoll result does not change state", async () => {
         // changesLongpoll returns empty results (max-wait timeout).
         const mockClient = makeMockClient({
@@ -492,8 +525,7 @@ describe("SyncEngine stall detection (checkHealth)", () => {
         });
         const engine = makeSyncEngine(makeMockLocalDb(), mockClient);
 
-        (engine as any).client = mockClient;
-        (engine as any).running = true;
+        (engine as any).session = { client: mockClient, disposed: false, dispose() { this.disposed = true; }, get settled() { return Promise.resolve(); } };
         (engine as any).checkpoints.setRemoteSeq("42");
         (engine as any).setState("connected");
 
@@ -513,8 +545,7 @@ describe("SyncEngine stall detection (checkHealth)", () => {
         });
         const engine = makeSyncEngine(makeMockLocalDb(), mockClient);
 
-        (engine as any).client = mockClient;
-        (engine as any).running = true;
+        (engine as any).session = { client: mockClient, disposed: false, dispose() { this.disposed = true; }, get settled() { return Promise.resolve(); } };
         (engine as any).checkpoints.setRemoteSeq("40");
         (engine as any).setState("syncing");
 
@@ -532,8 +563,7 @@ describe("SyncEngine stall detection (checkHealth)", () => {
         });
         const engine = makeSyncEngine(makeMockLocalDb(), mockClient);
 
-        (engine as any).client = mockClient;
-        (engine as any).running = true;
+        (engine as any).session = { client: mockClient, disposed: false, dispose() { this.disposed = true; }, get settled() { return Promise.resolve(); } };
         (engine as any).checkpoints.setRemoteSeq("40");
         (engine as any).setState("connected");
 
@@ -564,8 +594,7 @@ describe("SyncEngine stall detection (checkHealth)", () => {
         });
         const engine = makeSyncEngine(makeMockLocalDb(), mockClient);
 
-        (engine as any).client = mockClient;
-        (engine as any).running = true;
+        (engine as any).session = { client: mockClient, disposed: false, dispose() { this.disposed = true; }, get settled() { return Promise.resolve(); } };
         // checkpoints.remoteSeq from _changes has different opaque suffix but same numeric prefix
         (engine as any).checkpoints.setRemoteSeq("1771-g1AAAACReJz_OPAQUE_FROM_CHANGES");
         (engine as any).setState("connected");
@@ -590,8 +619,7 @@ describe("SyncEngine stall detection (checkHealth)", () => {
         });
         const engine = makeSyncEngine(makeMockLocalDb(), mockClient);
 
-        (engine as any).client = mockClient;
-        (engine as any).running = true;
+        (engine as any).session = { client: mockClient, disposed: false, dispose() { this.disposed = true; }, get settled() { return Promise.resolve(); } };
         (engine as any).setState("connected");
 
         await (engine as any).checkHealth();
@@ -605,8 +633,7 @@ describe("SyncEngine stall detection (checkHealth)", () => {
         const mockClient = makeMockClient();
         const engine = makeSyncEngine(makeMockLocalDb(), mockClient);
 
-        (engine as any).client = mockClient;
-        (engine as any).running = true;
+        (engine as any).session = { client: mockClient, disposed: false, dispose() { this.disposed = true; }, get settled() { return Promise.resolve(); } };
         engine.auth.raise(401, "blocked");
         (engine as any).setState("connected");
 
@@ -619,8 +646,7 @@ describe("SyncEngine stall detection (checkHealth)", () => {
         const mockClient = makeMockClient();
         const engine = makeSyncEngine(makeMockLocalDb(), mockClient);
 
-        (engine as any).client = mockClient;
-        (engine as any).running = true;
+        (engine as any).session = { client: mockClient, disposed: false, dispose() { this.disposed = true; }, get settled() { return Promise.resolve(); } };
 
         (engine as any).setState("reconnecting");
         await (engine as any).checkHealth();
