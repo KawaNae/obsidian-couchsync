@@ -1,4 +1,4 @@
-import type { Vault, TFile } from "obsidian";
+import type { IVaultIO } from "../types/vault-io.ts";
 import { DiffEngine } from "./diff-engine.ts";
 import type { HistoryStorage } from "./storage.ts";
 import type { HistoryCapture } from "./history-capture.ts";
@@ -11,7 +11,7 @@ export class HistoryManager {
     private diffEngine = new DiffEngine();
 
     constructor(
-        private vault: Vault,
+        private vault: IVaultIO,
         private storage: HistoryStorage,
         private historyCapture: HistoryCapture,
         private getSettings: () => CouchSyncSettings,
@@ -55,12 +55,13 @@ export class HistoryManager {
         const reconstructed = await this.reconstructAtPoint(filePath, timestamp);
         if (reconstructed === null) return false;
 
-        const file = this.vault.getAbstractFileByPath(filePath);
-        if (!file || !("extension" in file)) return false;
+        const stat = await this.vault.stat(filePath);
+        if (!stat) return false;
 
         this.historyCapture.pause();
         try {
-            await this.vault.modify(file as TFile, reconstructed);
+            const bytes = new TextEncoder().encode(reconstructed);
+            await this.vault.writeBinary(filePath, bytes.buffer as ArrayBuffer);
             await this.storage.saveSnapshot(filePath, reconstructed);
         } finally {
             setTimeout(() => this.historyCapture.resume(), 500);

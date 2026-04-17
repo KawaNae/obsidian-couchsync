@@ -1,4 +1,5 @@
-import type { App, TAbstractFile, TFile, EventRef } from "obsidian";
+import type { IVaultIO } from "../types/vault-io.ts";
+import type { IVaultEvents, VaultEventRef } from "../types/vault-events.ts";
 import type { HistoryStorage } from "./storage.ts";
 import { DiffEngine, computeHash } from "./diff-engine.ts";
 import type { CouchSyncSettings } from "../settings.ts";
@@ -11,45 +12,45 @@ export class HistoryCapture {
     private debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
     private lastCaptureTime = new Map<string, number>();
     private pendingCapture = new Map<string, ReturnType<typeof setTimeout>>();
-    private pendingQueue: TFile[] = [];
-    private eventRefs: EventRef[] = [];
+    private pendingQueue: string[] = [];
+    private eventRefs: VaultEventRef[] = [];
     private paused = false;
     private diffEngine = new DiffEngine();
 
     constructor(
-        private app: App,
+        private vault: IVaultIO,
+        private events: IVaultEvents,
         private storage: HistoryStorage,
         private getSettings: () => CouchSyncSettings,
     ) {}
 
     start(): void {
         this.eventRefs.push(
-            this.app.vault.on("modify", (file: TAbstractFile) => {
-                if (!this.isTargetFile(file)) return;
-                this.scheduleCapture(file as TFile);
+            this.events.on("modify", (path) => {
+                if (!this.isTargetPath(path)) return;
+                this.scheduleCapture(path);
             }),
         );
 
         this.eventRefs.push(
-            this.app.vault.on("rename", (file: TAbstractFile, oldPath: string) => {
-                if (!("extension" in file)) return;
+            this.events.on("rename", (path, oldPath) => {
                 this.lastCaptureTime.delete(oldPath);
-                this.storage.renamePath(oldPath, file.path);
+                this.storage.renamePath(oldPath, path);
             }),
         );
 
         this.eventRefs.push(
-            this.app.vault.on("delete", (file: TAbstractFile) => {
-                this.lastCaptureTime.delete(file.path);
-                const timer = this.debounceTimers.get(file.path);
+            this.events.on("delete", (path) => {
+                this.lastCaptureTime.delete(path);
+                const timer = this.debounceTimers.get(path);
                 if (timer) {
                     clearTimeout(timer);
-                    this.debounceTimers.delete(file.path);
+                    this.debounceTimers.delete(path);
                 }
-                const pending = this.pendingCapture.get(file.path);
+                const pending = this.pendingCapture.get(path);
                 if (pending) {
                     clearTimeout(pending);
-                    this.pendingCapture.delete(file.path);
+                    this.pendingCapture.delete(path);
                 }
             }),
         );
@@ -57,7 +58,7 @@ export class HistoryCapture {
 
     stop(): void {
         for (const ref of this.eventRefs) {
-            this.app.vault.offref(ref);
+            this.events.offref(ref);
         }
         this.eventRefs = [];
         for (const timer of this.debounceTimers.values()) clearTimeout(timer);
@@ -101,66 +102,64 @@ export class HistoryCapture {
      * Bypasses debounce/rate-limit (sync events are discrete, not continuous input)
      * and tags the entry with source="sync".
      */
-    async captureSyncWrite(file: TFile): Promise<void> {
-        if (!this.isTargetFile(file)) return;
-        await this.captureChange(file, "sync");
+    async captureSyncWrite(path: string): Promise<void> {
+        if (!this.isTargetPath(path)) return;
+        await this.captureChange(path, "sync");
     }
 
-    private isTargetFile(file: TAbstractFile): boolean {
-        if (!("extension" in file)) return false;
-        const tfile = file as TFile;
+    private isTargetPath(path: string): boolean {
         // Binary detection happens in captureChange() to avoid sync I/O in
         // the modify event handler.
-        if (tfile.path.startsWith(".")) return false;
+        if (path.startsWith(".")) return false;
         const settings = this.getSettings();
         if (settings.historyExcludePatterns) {
             for (const pattern of settings.historyExcludePatterns) {
-                if (minimatch(tfile.path, pattern)) return false;
+                if (minimatch(path, pattern)) return false;
             }
         }
         return true;
     }
 
-    private scheduleCapture(file: TFile): void {
+    private scheduleCapture(path: string): void {
         if (this.paused) {
-            if (!this.pendingQueue.some((f) => f.path === file.path)) {
-                this.pendingQueue.push(file);
+            if (!this.pendingQueue.includes(path)) {
+                this.pendingQueue.push(path);
             }
             return;
         }
 
-        const existing = this.debounceTimers.get(file.path);
+        const existing = this.debounceTimers.get(path);
         if (existing) clearTimeout(existing);
 
         const timer = setTimeout(() => {
-            this.debounceTimers.delete(file.path);
-            this.tryCapture(file);
+            this.debounceTimers.delete(path);
+            this.tryCapture(path);
         }, this.getSettings().historyDebounceMs);
 
-        this.debounceTimers.set(file.path, timer);
+        this.debounceTimers.set(path, timer);
     }
 
-    private tryCapture(file: TFile): void {
+    private tryCapture(path: string): void {
         const settings = this.getSettings();
-        const lastCapture = this.lastCaptureTime.get(file.path) ?? 0;
+        const lastCapture = this.lastCaptureTime.get(path) ?? 0;
         const elapsed = Date.now() - lastCapture;
 
         if (elapsed >= settings.historyMinIntervalMs) {
-            this.captureChange(file);
+            this.captureChange(path);
         } else {
-            const existingPending = this.pendingCapture.get(file.path);
+            const existingPending = this.pendingCapture.get(path);
             if (existingPending) clearTimeout(existingPending);
 
             const delay = settings.historyMinIntervalMs - elapsed;
             const pendingTimer = setTimeout(() => {
-                this.pendingCapture.delete(file.path);
-                this.captureChange(file);
+                this.pendingCapture.delete(path);
+                this.captureChange(path);
             }, delay);
-            this.pendingCapture.set(file.path, pendingTimer);
+            this.pendingCapture.set(path, pendingTimer);
         }
     }
 
-    private async captureChange(file: TFile, source: HistorySource = "local"): Promise<void> {
+    private async captureChange(path: string, source: HistorySource = "local"): Promise<void> {
         try {
             // Local edits use cachedRead (memory-cached parsed text) for the
             // typing hot path. Sync writes go through the byte-sniff path so
@@ -168,14 +167,14 @@ export class HistoryCapture {
             // string to validate it's diffable UTF-8 either way.
             let currentContent: string;
             if (source === "sync") {
-                const buffer = await this.app.vault.readBinary(file);
+                const buffer = await this.vault.readBinary(path);
                 if (!isDiffableText(buffer)) return;
                 currentContent = new TextDecoder("utf-8").decode(buffer);
             } else {
-                currentContent = await this.app.vault.cachedRead(file);
+                currentContent = await this.vault.cachedRead(path);
                 if (!isDiffableText(new TextEncoder().encode(currentContent))) return;
             }
-            const snapshot = await this.storage.getSnapshot(file.path);
+            const snapshot = await this.storage.getSnapshot(path);
 
             const prevContent = snapshot?.content ?? "";
             if (prevContent === currentContent) return;
@@ -183,12 +182,11 @@ export class HistoryCapture {
             const patches = this.diffEngine.computePatch(prevContent, currentContent);
             const baseHash = await computeHash(prevContent);
             const { added, removed } = this.diffEngine.computeLineDiff(prevContent, currentContent);
-            await this.storage.saveDiff(file.path, patches, baseHash, added, removed, false, source);
+            await this.storage.saveDiff(path, patches, baseHash, added, removed, false, source);
 
-            await this.storage.saveSnapshot(file.path, currentContent);
-            this.lastCaptureTime.set(file.path, Date.now());
-            logDebug(`History captured for ${file.path} (${source})`);
-            (this.app.workspace as any).trigger("couchsync:diff-saved", file.path);
+            await this.storage.saveSnapshot(path, currentContent);
+            this.lastCaptureTime.set(path, Date.now());
+            logDebug(`History captured for ${path} (${source})`);
         } catch (e) {
             logError(`CouchSync: Failed to capture history: ${e?.message ?? e}`);
         }

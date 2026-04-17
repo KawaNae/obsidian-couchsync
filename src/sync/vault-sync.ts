@@ -1,4 +1,4 @@
-import type { App, TFile } from "obsidian";
+import type { IVaultIO } from "../types/vault-io.ts";
 import type { LocalDB } from "../db/local-db.ts";
 import type { FileDoc, ChunkDoc, CouchSyncDoc } from "../types.ts";
 import type { CouchSyncSettings } from "../settings.ts";
@@ -57,7 +57,7 @@ export class VaultSync {
     private skippedPaths: Set<PathKey> | null = null;
 
     constructor(
-        private app: App,
+        private vault: IVaultIO,
         private db: LocalDB,
         private getSettings: () => CouchSyncSettings,
         private historyCapture: HistoryCapture | null = null,
@@ -87,26 +87,28 @@ export class VaultSync {
         // intentionally empty: state is never buffered
     }
 
-    async fileToDb(file: TFile): Promise<void> {
+    async fileToDb(path: string): Promise<void> {
         const settings = this.getSettings();
-        const sizeMB = file.stat.size / (1024 * 1024);
+        const fileStat = await this.vault.stat(path);
+        if (!fileStat) return; // file disappeared before we could read it
+
+        const sizeMB = fileStat.size / (1024 * 1024);
         if (sizeMB > settings.maxFileSizeMB) {
-            await this.recordSkipped(file.path, sizeMB, settings.maxFileSizeMB);
+            await this.recordSkipped(path, sizeMB, settings.maxFileSizeMB);
             return;
         }
-        if (!this.shouldSync(file.path)) return;
+        if (!this.shouldSync(path)) return;
 
-        if (await this.wasSkipped(file.path)) {
-            await this.forgetSkipped(file.path);
+        if (await this.wasSkipped(path)) {
+            await this.forgetSkipped(path);
         }
 
-        const content = await this.app.vault.readBinary(file);
+        const content = await this.vault.readBinary(path);
         const chunks = await splitIntoChunks(content);
         const chunkIds = chunks.map((c) => c._id);
 
         const deviceId = settings.deviceId;
-        const fileId = makeFileId(file.path);
-        const path = file.path;
+        const fileId = makeFileId(path);
 
         // Builder-form runWrite: the snapshot read + CAS retry is handled
         // inside the store. This function only decides WHAT to write based
@@ -123,9 +125,9 @@ export class VaultSync {
                         _id: fileId,
                         type: "file",
                         chunks: chunkIds,
-                        mtime: file.stat.mtime,
-                        ctime: file.stat.ctime,
-                        size: file.stat.size,
+                        mtime: fileStat.mtime,
+                        ctime: fileStat.ctime,
+                        size: fileStat.size,
                         vclock: newVclock,
                     };
                     return {
@@ -158,23 +160,19 @@ export class VaultSync {
         }
 
         if (fileDoc.deleted) {
-            const existing = this.app.vault.getAbstractFileByPath(vaultPath);
-            if (existing) {
+            if (await this.vault.exists(vaultPath)) {
                 this.writeIgnore?.ignoreDelete(vaultPath);
-                await this.app.vault.delete(existing);
+                await this.vault.delete(vaultPath);
             }
             return;
         }
 
-        const existing = this.app.vault.getAbstractFileByPath(vaultPath);
+        const existingStat = await this.vault.stat(vaultPath);
 
-        if (existing && "stat" in existing) {
-            const localFile = existing as TFile;
-            if (localFile.stat.size === fileDoc.size) {
-                const ids = await this.localChunkIds(localFile);
-                if (VaultSync.chunksEqual(ids, fileDoc.chunks)) {
-                    return; // identical content
-                }
+        if (existingStat && existingStat.size === fileDoc.size) {
+            const ids = await this.localChunkIds(vaultPath);
+            if (VaultSync.chunksEqual(ids, fileDoc.chunks)) {
+                return; // identical content
             }
         }
 
@@ -194,22 +192,20 @@ export class VaultSync {
         const content = joinChunks(orderedChunks);
         this.writeIgnore?.ignoreWrite(vaultPath);
 
-        let writtenFile: TFile | null = null;
+        let written = false;
         try {
-            if (existing) {
-                await this.app.vault.modifyBinary(existing as TFile, content);
-                writtenFile = existing as TFile;
+            if (existingStat) {
+                await this.vault.writeBinary(vaultPath, content);
             } else {
                 await this.ensureParentDir(vaultPath);
-                await this.app.vault.createBinary(vaultPath, content);
-                const created = this.app.vault.getAbstractFileByPath(vaultPath);
-                if (created && "extension" in created) writtenFile = created as TFile;
+                await this.vault.createBinary(vaultPath, content);
             }
+            written = true;
         } finally {
             this.writeIgnore?.clearIgnore(vaultPath);
         }
 
-        if (writtenFile) {
+        if (written) {
             const clock = { ...(fileDoc.vclock ?? {}) };
             // Persist the vclock in the docs store's meta so it lives in
             // the same IDB as the FileDoc itself. Pure meta write — no CAS
@@ -220,8 +216,8 @@ export class VaultSync {
             this.lastSyncedVclock.set(toPathKey(vaultPath), clock);
         }
 
-        if (writtenFile && this.historyCapture) {
-            await this.historyCapture.captureSyncWrite(writtenFile);
+        if (written && this.historyCapture) {
+            await this.historyCapture.captureSyncWrite(vaultPath);
         }
     }
 
@@ -230,9 +226,9 @@ export class VaultSync {
      * Step 1 — chunk equality.
      * Step 2 — vclock comparison against `lastSyncedVclock[path]`.
      */
-    async compareFileToDoc(fileDoc: FileDoc, localFile: TFile): Promise<CompareResult> {
-        if (localFile.stat.size === fileDoc.size) {
-            const ids = await this.localChunkIds(localFile);
+    async compareFileToDoc(fileDoc: FileDoc, filePath: string, fileSize: number): Promise<CompareResult> {
+        if (fileSize === fileDoc.size) {
+            const ids = await this.localChunkIds(filePath);
             if (VaultSync.chunksEqual(ids, fileDoc.chunks)) {
                 return "identical";
             }
@@ -296,10 +292,9 @@ export class VaultSync {
     }
 
     async applyRemoteDeletion(path: string): Promise<void> {
-        const existing = this.app.vault.getAbstractFileByPath(path);
-        if (existing) {
+        if (await this.vault.exists(path)) {
             this.writeIgnore?.ignoreDelete(path);
-            await this.app.vault.delete(existing);
+            await this.vault.delete(path);
         }
         await this.markDeleted(path);
     }
@@ -315,8 +310,8 @@ export class VaultSync {
         return compareVC(localVclock, lastSynced) !== "equal";
     }
 
-    async handleRename(file: TFile, oldPath: string): Promise<void> {
-        await this.fileToDb(file);
+    async handleRename(newPath: string, oldPath: string): Promise<void> {
+        await this.fileToDb(newPath);
         await this.markDeleted(oldPath);
     }
 
@@ -359,8 +354,8 @@ export class VaultSync {
         this.skippedPaths?.delete(key);
     }
 
-    private async localChunkIds(file: TFile): Promise<string[]> {
-        const content = await this.app.vault.readBinary(file);
+    private async localChunkIds(path: string): Promise<string[]> {
+        const content = await this.vault.readBinary(path);
         const chunks = await splitIntoChunks(content);
         return chunks.map((c) => c._id);
     }
@@ -392,8 +387,8 @@ export class VaultSync {
         const parts = filePath.split("/");
         if (parts.length <= 1) return;
         const dir = parts.slice(0, -1).join("/");
-        if (!this.app.vault.getAbstractFileByPath(dir)) {
-            await this.app.vault.createFolder(dir);
+        if (!(await this.vault.exists(dir))) {
+            await this.vault.createFolder(dir);
         }
     }
 }

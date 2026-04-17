@@ -1,11 +1,10 @@
-import type { App } from "obsidian";
 import type { LocalDB } from "../db/local-db.ts";
 import type { SyncEngine } from "../db/sync-engine.ts";
 import { ConflictResolver } from "./conflict-resolver.ts";
 import type { HistoryCapture } from "../history/history-capture.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { FileDoc, CouchSyncDoc } from "../types.ts";
-import { ConflictModal, type ConflictChoice } from "../ui/conflict-modal.ts";
+import type { IModalPresenter, ConflictChoice } from "../types/modal-presenter.ts";
 import { isFileDoc } from "../types.ts";
 import { joinChunks } from "../db/chunker.ts";
 import { isDiffableText } from "../utils/binary.ts";
@@ -14,7 +13,7 @@ import { stripRev } from "../utils/doc.ts";
 import { logDebug, logInfo, logError, notify } from "../ui/log.ts";
 
 export interface ConflictOrchestratorDeps {
-    app: App;
+    modal: IModalPresenter;
     localDb: LocalDB;
     replicator: SyncEngine;
     historyCapture: HistoryCapture;
@@ -30,7 +29,7 @@ export interface ConflictOrchestratorDeps {
  * callbacks that were registered in onload() now live here.
  */
 export class ConflictOrchestrator {
-    private openConflictModals = new Map<string, ConflictModal>();
+    private openConflictDismiss = new Map<string, () => void>();
 
     constructor(private deps: ConflictOrchestratorDeps) {}
 
@@ -55,11 +54,11 @@ export class ConflictOrchestrator {
         // Auto-dismiss conflict modals when a resolved version arrives
         // from another device (take-remote auto-resolve).
         replicator.onAutoResolve((filePath) => {
-            const modal = this.openConflictModals.get(filePath);
-            if (modal) {
+            const dismiss = this.openConflictDismiss.get(filePath);
+            if (dismiss) {
                 logInfo(`Auto-dismissing conflict modal for ${filePath.split("/").pop()}`);
-                modal.dismiss();
-                this.openConflictModals.delete(filePath);
+                dismiss();
+                this.openConflictDismiss.delete(filePath);
             }
         });
     }
@@ -69,7 +68,7 @@ export class ConflictOrchestrator {
         localDoc: CouchSyncDoc,
         remoteDoc: CouchSyncDoc,
     ): Promise<void> {
-        const { app, localDb, historyCapture } = this.deps;
+        const { modal: modalPresenter, localDb, historyCapture } = this.deps;
         const fileName = filePath.split("/").pop();
 
         if (isFileDoc(localDoc) && isFileDoc(remoteDoc)) {
@@ -81,15 +80,15 @@ export class ConflictOrchestrator {
                 const remoteBuf = joinChunks(remoteChunks);
 
                 if (isDiffableText(localBuf) && isDiffableText(remoteBuf)) {
-                    const modal = new ConflictModal(
-                        app, filePath,
+                    const { result, dismiss } = modalPresenter.showConflictModal(
+                        filePath,
                         dec.decode(localBuf), dec.decode(remoteBuf),
                     );
-                    this.openConflictModals.set(filePath, modal);
-                    const choice = await modal.waitForResult();
-                    this.openConflictModals.delete(filePath);
+                    this.openConflictDismiss.set(filePath, dismiss);
+                    const { choice, dismissed } = await result;
+                    this.openConflictDismiss.delete(filePath);
 
-                    if (modal.wasDismissed) {
+                    if (dismissed) {
                         logInfo(`Conflict auto-resolved for ${fileName} (other device resolved)`);
                     } else {
                         await this.applyConflictChoice(
@@ -125,7 +124,7 @@ export class ConflictOrchestrator {
                     );
                 }
             } catch (e: any) {
-                this.openConflictModals.delete(filePath);
+                this.openConflictDismiss.delete(filePath);
                 logError(`Conflict resolution error for ${fileName}: ${e?.message ?? e}`);
                 notify(
                     `CouchSync: conflict on ${fileName} — keeping local version due to error.`,

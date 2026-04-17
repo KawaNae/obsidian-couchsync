@@ -1,4 +1,4 @@
-import type { App, TFile } from "obsidian";
+import type { IVaultIO, VaultFile } from "../types/vault-io.ts";
 import type { LocalDB, VaultManifest } from "../db/local-db.ts";
 import type { VaultSync, CompareResult } from "./vault-sync.ts";
 import type { CouchSyncSettings } from "../settings.ts";
@@ -113,7 +113,7 @@ export class Reconciler {
     private autoPendingTimer: ReturnType<typeof setTimeout> | null = null;
 
     constructor(
-        private app: App,
+        private vault: IVaultIO,
         private localDb: LocalDB,
         private vaultSync: VaultSync,
         private getSettings: () => CouchSyncSettings,
@@ -172,7 +172,7 @@ export class Reconciler {
         // so case-insensitive filesystems and Unicode-equivalent forms collapse
         // to one entry. The original-case path is preserved inside the value
         // (TFile.path / FileDoc._id) for filesystem I/O and user-facing strings.
-        const vaultFiles = this.app.vault.getFiles();
+        const vaultFiles = this.vault.getFiles();
         const vaultPathSet = new Set<PathKey>(vaultFiles.map((f) => toPathKey(f.path)));
         const manifest = await this.localDb.getVaultManifest();
         const manifestPaths = manifest
@@ -207,7 +207,7 @@ export class Reconciler {
         // "push" (vault side) and "delete" (DB side).
         // The original-case path lives inside each value (TFile.path or
         // FileDoc._id) and is what we use for FS I/O and reporting.
-        const vaultByPath = new Map<PathKey, TFile>(
+        const vaultByPath = new Map<PathKey, VaultFile>(
             vaultFiles.map((f) => [toPathKey(f.path), f]),
         );
         const seqBeforeScan = (await this.localDb.info()).updateSeq;
@@ -238,7 +238,7 @@ export class Reconciler {
 
             // Case C: vault has it, DB doesn't (or DB tombstone)
             if (file && (!doc || doc.deleted)) {
-                if (await this.tryStep(displayPath, "push", () => this.vaultSync.fileToDb(file), mode)) {
+                if (await this.tryStep(displayPath, "push", () => this.vaultSync.fileToDb(file.path), mode)) {
                     report.pushed.push(displayPath);
                 }
                 continue;
@@ -263,7 +263,7 @@ export class Reconciler {
             if (file && doc && !doc.deleted) {
                 let cmp: CompareResult;
                 try {
-                    cmp = await this.vaultSync.compareFileToDoc(doc, file);
+                    cmp = await this.vaultSync.compareFileToDoc(doc, file.path, file.stat.size);
                 } catch (e) {
                     logError(`CouchSync: reconcile compare failed for ${displayPath}: ${e?.message ?? e}`);
                     continue;
@@ -271,7 +271,7 @@ export class Reconciler {
                 if (cmp === "identical") {
                     report.inSync++;
                 } else if (cmp === "local-unpushed") {
-                    if (await this.tryStep(displayPath, "push", () => this.vaultSync.fileToDb(file), mode)) {
+                    if (await this.tryStep(displayPath, "push", () => this.vaultSync.fileToDb(file.path), mode)) {
                         report.localWins.push(displayPath);
                     }
                 } else {

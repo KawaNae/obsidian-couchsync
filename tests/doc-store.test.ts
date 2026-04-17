@@ -150,7 +150,7 @@ describe("DbError recovery inference", () => {
     it("quota defaults to halt with a userMessage", () => {
         const e = new DbError("quota", null);
         expect(e.recovery).toBe("halt");
-        expect(e.userMessage).toMatch(/容量/);
+        expect(e.userMessage).toMatch(/storage is full/);
     });
 
     it("conflict defaults to fail with no userMessage", () => {

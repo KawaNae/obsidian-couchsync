@@ -71,10 +71,10 @@ interface FakeVaultSync {
     markDeletedCalls: string[];
     /** Per-path comparison override. Tests must set this explicitly. */
     compareResults: Map<string, CompareResult>;
-    fileToDb(file: { path: string }): Promise<void>;
+    fileToDb(path: string): Promise<void>;
     dbToFile(doc: FileDoc): Promise<void>;
     markDeleted(path: string): Promise<void>;
-    compareFileToDoc(doc: FileDoc, file: any): Promise<CompareResult>;
+    compareFileToDoc(doc: FileDoc, path: string, size: number): Promise<CompareResult>;
 }
 
 function makeVaultSync(): FakeVaultSync {
@@ -83,12 +83,12 @@ function makeVaultSync(): FakeVaultSync {
         dbToFileCalls: [],
         markDeletedCalls: [],
         compareResults: new Map(),
-        async fileToDb(file) { this.fileToDbCalls.push(file.path); },
+        async fileToDb(path) { this.fileToDbCalls.push(path); },
         // Record the bare vault path (not the prefixed _id) so tests can
         // keep asserting `expect(dbToFileCalls).toEqual(["a.md"])`.
         async dbToFile(doc) { this.dbToFileCalls.push(filePathFromId(doc._id)); },
         async markDeleted(path) { this.markDeletedCalls.push(path); },
-        async compareFileToDoc(doc, _file) {
+        async compareFileToDoc(doc, _path, _size) {
             // Fake honours compareResults keyed by vault path — extract
             // from the prefixed _id to match how tests register overrides.
             const key = filePathFromId(doc._id);
@@ -105,9 +105,9 @@ function setup(files: FakeFile[]) {
     const db = new FakeLocalDb();
     const vaultSync = makeVaultSync();
     const notifyCalls: string[] = [];
-    const app = { vault: { getFiles: () => files } };
+    const vault = { getFiles: () => files };
     const reconciler = new Reconciler(
-        app as any,
+        vault as any,
         db as any,
         vaultSync as any,
         () => ({ deviceId: SELF } as any),

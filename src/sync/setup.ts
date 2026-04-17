@@ -1,4 +1,4 @@
-import type { App } from "obsidian";
+import type { IVaultIO } from "../types/vault-io.ts";
 import type { LocalDB } from "../db/local-db.ts";
 import type { SyncEngine } from "../db/sync-engine.ts";
 import type { VaultSync } from "./vault-sync.ts";
@@ -29,7 +29,7 @@ export interface SetupResult {
 
 export class SetupService {
     constructor(
-        private app: App,
+        private vault: IVaultIO,
         private localDb: LocalDB,
         private replicator: SyncEngine,
         private vaultSync: VaultSync,
@@ -117,13 +117,13 @@ export class SetupService {
 
     /** Scan all vault files to local DB (no mtime check — clean start) */
     private async scanVaultToDb(onProgress: (msg: string) => void): Promise<number> {
-        const files = this.app.vault.getFiles();
+        const files = this.vault.getFiles();
         let synced = 0;
         for (let i = 0; i < files.length; i++) {
             const file = files[i];
             try {
                 onProgress(`Scanning: ${file.path} (${i + 1}/${files.length})`);
-                await this.vaultSync.fileToDb(file);
+                await this.vaultSync.fileToDb(file.path);
                 synced++;
             } catch (e) {
                 logError(`CouchSync: Failed to scan ${file.path}: ${e?.message ?? e}`);

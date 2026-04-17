@@ -23,6 +23,10 @@ import { LogView, VIEW_TYPE_LOG } from "./ui/log-view.ts";
 import { migrateSettings } from "./settings-migration.ts";
 import { registerCommands } from "./commands.ts";
 import { gcOrphanChunks } from "./db/chunk-gc.ts";
+import { ObsidianVaultIO } from "./adapters/obsidian-vault-io.ts";
+import { ObsidianAdapterIO } from "./adapters/obsidian-adapter-io.ts";
+import { ObsidianVaultEvents } from "./adapters/obsidian-vault-events.ts";
+import { ObsidianModalPresenter } from "./adapters/obsidian-modal-presenter.ts";
 
 export default class CouchSyncPlugin extends Plugin {
     settings!: CouchSyncSettings;
@@ -86,13 +90,18 @@ export default class CouchSyncPlugin extends Plugin {
             () => this.settings,
             (msg, dur) => new Notice(`CouchSync: ${msg}`, dur),
         );
+        const vaultIO = new ObsidianVaultIO(this.app);
+        const adapterIO = new ObsidianAdapterIO(this.app);
+        const vaultEvents = new ObsidianVaultEvents(this.app);
+        const modalPresenter = new ObsidianModalPresenter(this.app);
+
         this.replicator = new SyncEngine(this.localDb, () => this.settings, Platform.isMobile);
         this.historyStorage = new HistoryStorage(this.app.vault.getName());
-        this.historyCapture = new HistoryCapture(this.app, this.historyStorage, () => this.settings);
-        this.vaultSync = new VaultSync(this.app, this.localDb, () => this.settings, this.historyCapture);
-        this.changeTracker = new ChangeTracker(this.app, this.vaultSync, () => this.settings);
+        this.historyCapture = new HistoryCapture(vaultIO, vaultEvents, this.historyStorage, () => this.settings);
+        this.vaultSync = new VaultSync(vaultIO, this.localDb, () => this.settings, this.historyCapture);
+        this.changeTracker = new ChangeTracker(vaultEvents, this.vaultSync, () => this.settings);
         this.vaultSync.setWriteIgnore(this.changeTracker);
-        this.configSync = new ConfigSync(this.app, this.configLocalDb, this.replicator, () => this.settings);
+        this.configSync = new ConfigSync(adapterIO, modalPresenter, this.configLocalDb, this.replicator, () => this.settings);
         this.statusBar = new StatusBar(
             this,
             () => this.settings,
@@ -102,7 +111,7 @@ export default class CouchSyncPlugin extends Plugin {
         this.replicator.onStateChange((state) => this.statusBar.update(state));
         this.replicator.onError((msg) => notify(msg, 8000));
         this.reconciler = new Reconciler(
-            this.app,
+            vaultIO,
             this.localDb,
             this.vaultSync,
             () => this.settings,
@@ -110,13 +119,13 @@ export default class CouchSyncPlugin extends Plugin {
             (doc) => this.replicator.ensureFileChunks(doc),
         );
         this.setupService = new SetupService(
-            this.app, this.localDb, this.replicator, this.vaultSync, this.reconciler,
+            vaultIO, this.localDb, this.replicator, this.vaultSync, this.reconciler,
         );
         this.historyManager = new HistoryManager(
-            this.app.vault, this.historyStorage, this.historyCapture, () => this.settings,
+            vaultIO, this.historyStorage, this.historyCapture, () => this.settings,
         );
         this.conflictOrchestrator = new ConflictOrchestrator({
-            app: this.app,
+            modal: modalPresenter,
             localDb: this.localDb,
             replicator: this.replicator,
             historyCapture: this.historyCapture,
@@ -222,14 +231,14 @@ export default class CouchSyncPlugin extends Plugin {
 
             if (!this.settings.deviceId) {
                 notify(
-                    "CouchSync: デバイス名を設定してください（Settings → Vault Sync）。" +
-                        "設定するまで同期は開始されません。",
+                    "CouchSync: Please set a device name (Settings → Vault Sync). " +
+                        "Sync will not start until a device name is configured.",
                     15000,
                 );
             } else if (this.isLegacyDeviceId(this.settings.deviceId)) {
                 notify(
-                    "CouchSync: デバイス名を設定してください（Settings → Vault Sync）。" +
-                        "現在は自動生成 ID を使用中です。",
+                    "CouchSync: Please set a device name (Settings → Vault Sync). " +
+                        "Currently using an auto-generated ID.",
                     10000,
                 );
             }
@@ -319,7 +328,7 @@ export default class CouchSyncPlugin extends Plugin {
     async startSync(): Promise<void> {
         if (this.settings.connectionState !== "syncing") return;
         if (!this.settings.deviceId) {
-            notify("CouchSync: デバイス名を設定してから同期を開始してください。");
+            notify("CouchSync: Set a device name before starting sync.");
             return;
         }
         await this.vaultSync.loadLastSyncedVclocks();

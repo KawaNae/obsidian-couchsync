@@ -1,4 +1,5 @@
-import type { App } from "obsidian";
+import type { IVaultIO } from "../types/vault-io.ts";
+import type { IModalPresenter } from "../types/modal-presenter.ts";
 import type { ConfigLocalDB } from "../db/config-local-db.ts";
 import type { SyncEngine } from "../db/sync-engine.ts";
 import type { ConfigDoc, CouchSyncDoc } from "../types.ts";
@@ -9,7 +10,6 @@ import {
 } from "../types/doc-id.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import { ProgressNotice } from "../ui/notices.ts";
-import { ConfirmModal } from "../ui/confirm-modal.ts";
 import { arrayBufferToBase64, base64ToArrayBuffer } from "../db/chunker.ts";
 import { incrementVC } from "./vector-clock.ts";
 import { CouchClient, makeCouchClient } from "../db/couch-client.ts";
@@ -52,7 +52,8 @@ export class ConfigSync {
     private static readonly MAX_CONFIG_SIZE = 5 * 1024 * 1024; // 5MB
 
     constructor(
-        private app: App,
+        private vault: IVaultIO,
+        private modal: IModalPresenter,
         private configDb: ConfigLocalDB | null,
         private replicator: SyncEngine,
         private getSettings: () => CouchSyncSettings,
@@ -278,14 +279,12 @@ export class ConfigSync {
             `${verb} would overwrite ${target} for ${divs.length} doc(s) ` +
             `with concurrent edits: ${preview}${more}. ` +
             `See the Log View for the full list. Continue anyway?`;
-        const modal = new ConfirmModal(
-            this.app,
+        return await this.modal.showConfirmModal(
             `Config ${direction}: concurrent edits detected`,
             message,
             direction === "push" ? "Push anyway" : "Pull anyway",
             true,
         );
-        return await modal.waitForResult();
     }
 
     // ── Low-level operations ───────────────────────────
@@ -298,7 +297,6 @@ export class ConfigSync {
 
         const deviceId = this.getSettings().deviceId;
         let count = 0;
-        const adapter = this.app.vault.adapter;
         for (let i = 0; i < files.length; i++) {
             const file = files[i];
             const fileName = file.split("/").pop() ?? "";
@@ -307,10 +305,10 @@ export class ConfigSync {
 
             try {
                 onProgress?.(file, i + 1, files.length);
-                const stat = await adapter.stat(file);
+                const stat = await this.vault.stat(file);
                 if (!stat || stat.size > ConfigSync.MAX_CONFIG_SIZE) continue;
 
-                const buf = await adapter.readBinary(file);
+                const buf = await this.vault.readBinary(file);
                 const data = arrayBufferToBase64(buf);
 
                 const configId = makeConfigId(file);
@@ -374,7 +372,11 @@ export class ConfigSync {
                 await this.ensureDir(path);
                 // ConfigDoc is always base64-encoded binary; decode verbatim.
                 const buf = base64ToArrayBuffer(data);
-                await this.app.vault.adapter.writeBinary(path, buf);
+                if (await this.vault.exists(path)) {
+                    await this.vault.writeBinary(path, buf);
+                } else {
+                    await this.vault.createBinary(path, buf);
+                }
                 count++;
             } catch (e) {
                 logError(`CouchSync: Failed to write config ${path}: ${e?.message ?? e}`);
@@ -408,10 +410,9 @@ export class ConfigSync {
 
     /** List installed plugin folder paths (fallback when remote unavailable) */
     async listPluginFolders(): Promise<string[]> {
-        const adapter = this.app.vault.adapter;
         const folders: string[] = [];
         try {
-            const listing = await adapter.list(".obsidian/plugins");
+            const listing = await this.vault.list(".obsidian/plugins");
             for (const folder of listing.folders) {
                 folders.push(folder + "/");
             }
@@ -462,14 +463,14 @@ export class ConfigSync {
 
     private async ensureDir(filePath: string): Promise<void> {
         const dir = filePath.split("/").slice(0, -1).join("/");
-        if (dir && !(await this.app.vault.adapter.exists(dir))) {
-            await this.app.vault.adapter.mkdir(dir);
+        if (dir && !(await this.vault.exists(dir))) {
+            await this.vault.createFolder(dir);
         }
     }
 
     private async listFilesRecursive(dir: string, result: string[]): Promise<void> {
         try {
-            const listing = await this.app.vault.adapter.list(dir);
+            const listing = await this.vault.list(dir);
             for (const file of listing.files) {
                 result.push(file);
             }

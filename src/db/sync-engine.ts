@@ -188,9 +188,9 @@ export class SyncEngine {
     private conflictResolver?: ConflictResolver;
 
     /**
-     * FileDoc が参照する chunk が全て localDB に存在することを保証する。
-     * 不足分はリモートから fetch して localDB に保存する。
-     * client が null の場合は何もしない（オフライン時は既存エラーに委ねる）。
+     * Ensure every chunk referenced by FileDoc exists in localDB. Any missing
+     * chunks are fetched from the remote and persisted locally. When `client`
+     * is null, this is a no-op (offline callers rely on existing error paths).
      */
     private async ensureChunks(fileDoc: FileDoc): Promise<void> {
         const existing = await this.localDb.getChunks(fileDoc.chunks);

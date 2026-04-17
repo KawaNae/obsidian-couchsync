@@ -47,7 +47,7 @@ export class DbError extends Error {
         this.recovery = opts?.recovery ?? (kind === "quota" ? "halt" : "fail");
         this.userMessage = opts?.userMessage ?? (
             kind === "quota"
-                ? "CouchSync: ローカルDB容量不足 — 設定 → メンテナンスから chunk GC を実行してください。"
+                ? "CouchSync: Local DB storage is full — run chunk GC from Settings → Maintenance."
                 : undefined
         );
     }

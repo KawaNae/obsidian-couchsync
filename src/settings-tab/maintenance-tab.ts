@@ -70,7 +70,7 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
 
     new Setting(el)
         .setName("Verbose notice")
-        .setDesc("ONにすると、debug/infoレベルのログもコンソールとNoticeに表示します。OFFでもLog Viewには全て記録されます。")
+        .setDesc("When ON, debug/info-level logs are also shown in the console and as Notices. When OFF, everything is still recorded in the Log View.")
         .addToggle((toggle) =>
             toggle.setValue(settings.verboseNotice).onChange(async (value) => {
                 await deps.updateSettings({ verboseNotice: value });
