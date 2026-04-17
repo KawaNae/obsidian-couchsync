@@ -46,14 +46,15 @@ export class ConflictOrchestrator {
         // Wire ConflictResolver into SyncEngine for pull-time vclock guard.
         replicator.setConflictResolver(conflictResolver);
 
-        // Interactive conflict resolution via modal (SyncEngine's onConcurrent)
-        replicator.onConcurrent(
-            (filePath, localDoc, remoteDoc) => this.handleConcurrent(filePath, localDoc, remoteDoc),
+        // Interactive conflict resolution via modal (SyncEngine's concurrent event).
+        // Return the promise so subscribers that want to await (e.g. tests) can.
+        replicator.events.on("concurrent", ({ filePath, localDoc, remoteDoc }) =>
+            this.handleConcurrent(filePath, localDoc, remoteDoc),
         );
 
         // Auto-dismiss conflict modals when a resolved version arrives
         // from another device (take-remote auto-resolve).
-        replicator.onAutoResolve((filePath) => {
+        replicator.events.on("auto-resolve", ({ filePath }) => {
             const dismiss = this.openConflictDismiss.get(filePath);
             if (dismiss) {
                 logInfo(`Auto-dismissing conflict modal for ${filePath.split("/").pop()}`);

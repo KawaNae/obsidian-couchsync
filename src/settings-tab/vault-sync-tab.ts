@@ -15,6 +15,7 @@
 import { type App, Notice, Setting, type ButtonComponent } from "obsidian";
 import { MAX_PREVIOUS_DEVICE_IDS, type ConnectionState, type CouchSyncSettings } from "../settings.ts";
 import type { SyncEngine } from "../db/sync-engine.ts";
+import type { AuthGate } from "../db/sync/auth-gate.ts";
 import type { LocalDB } from "../db/local-db.ts";
 import { validateDeviceName } from "../utils/device-name.ts";
 
@@ -23,6 +24,7 @@ export interface VaultSyncTabDeps {
     getSettings: () => CouchSyncSettings;
     updateSettings: (patch: Partial<CouchSyncSettings>) => Promise<void>;
     replicator: SyncEngine;
+    auth: AuthGate;
     localDb: LocalDB;
     initVault: () => Promise<void>;
     cloneFromRemote: () => Promise<void>;
@@ -328,7 +330,7 @@ export class VaultSyncTab {
             new Notice(`Connection failed: ${error}`, 8000);
         } else {
             this.testPassed = true;
-            this.deps.replicator.clearAuthError();
+            this.deps.auth.clear();
             new Notice("Connection successful!", 3000);
         }
         this.deps.refresh();

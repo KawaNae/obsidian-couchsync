@@ -4,6 +4,7 @@ import { LocalDB } from "./db/local-db.ts";
 import { ConfigLocalDB } from "./db/config-local-db.ts";
 import { DexieStore } from "./db/dexie-store.ts";
 import { SyncEngine } from "./db/sync-engine.ts";
+import { AuthGate } from "./db/sync/auth-gate.ts";
 import { VaultSync } from "./sync/vault-sync.ts";
 import { ConfigSync } from "./sync/config-sync.ts";
 import { SetupService } from "./sync/setup.ts";
@@ -34,6 +35,7 @@ export default class CouchSyncPlugin extends Plugin {
     /** Null when `couchdbConfigDbName === ""` (config sync disabled) */
     configLocalDb: ConfigLocalDB | null = null;
     replicator!: SyncEngine;
+    auth!: AuthGate;
     configSync!: ConfigSync;
     private vaultSync!: VaultSync;
     private setupService!: SetupService;
@@ -95,21 +97,22 @@ export default class CouchSyncPlugin extends Plugin {
         const vaultEvents = new ObsidianVaultEvents(this.app);
         const modalPresenter = new ObsidianModalPresenter(this.app);
 
-        this.replicator = new SyncEngine(this.localDb, () => this.settings, Platform.isMobile);
+        this.auth = new AuthGate();
+        this.replicator = new SyncEngine(this.localDb, () => this.settings, Platform.isMobile, this.auth);
         this.historyStorage = new HistoryStorage(this.app.vault.getName());
         this.historyCapture = new HistoryCapture(vaultIO, vaultEvents, this.historyStorage, () => this.settings);
         this.vaultSync = new VaultSync(vaultIO, this.localDb, () => this.settings, this.historyCapture);
         this.changeTracker = new ChangeTracker(vaultEvents, this.vaultSync, () => this.settings);
         this.vaultSync.setWriteIgnore(this.changeTracker);
-        this.configSync = new ConfigSync(adapterIO, modalPresenter, this.configLocalDb, this.replicator, () => this.settings);
+        this.configSync = new ConfigSync(adapterIO, modalPresenter, this.configLocalDb, this.auth, () => this.settings);
         this.statusBar = new StatusBar(
             this,
             () => this.settings,
             () => this.replicator.getLastHealthyAt(),
             () => this.replicator.getLastErrorDetail(),
         );
-        this.replicator.onStateChange((state) => this.statusBar.update(state));
-        this.replicator.onError((msg) => notify(msg, 8000));
+        this.replicator.events.on("state-change", ({ state }) => this.statusBar.update(state));
+        this.replicator.events.on("error", ({ message }) => notify(message, 8000));
         this.reconciler = new Reconciler(
             vaultIO,
             this.localDb,
@@ -136,13 +139,13 @@ export default class CouchSyncPlugin extends Plugin {
 
         // Pull-driven vault writes: accepted FileDocs are written directly
         // to vault in the pull path. Reconciler handles only drift detection.
-        this.replicator.onPullWrite(async (doc) => {
+        this.replicator.events.onAsync("pull-write", async ({ doc }) => {
             await this.vaultSync.dbToFile(doc);
         });
 
         // Pull-driven deletions: if the remote deleted a file, apply
         // locally unless there are unpushed local edits (→ concurrent).
-        this.replicator.onPullDelete(async (path, localDoc) => {
+        this.replicator.events.onQuery("pull-delete", async ({ path, localDoc }) => {
             if (this.vaultSync.hasUnpushedChanges(path, localDoc.vclock)) {
                 return true; // → concurrent conflict
             }
@@ -152,13 +155,13 @@ export default class CouchSyncPlugin extends Plugin {
 
         // Reconcile AFTER catchup completes — never concurrent with pull.
         // This ordering guarantees reconcile sees the latest DB state.
-        this.replicator.onCatchupComplete(() => this.fireReconcile("onload"));
-        this.replicator.onCatchupFailed(() => this.fireReconcile("onload"));
+        this.replicator.events.on("catchup-complete", () => this.fireReconcile("onload"));
+        this.replicator.events.on("catchup-failed", () => this.fireReconcile("onload"));
 
         // Run orphan-chunk GC once after the first idle (catchup done,
         // no pending pull/push). Cleans up chunks left by pre-v0.15
         // non-atomic writes and stale content changes.
-        this.replicator.onceIdle(() => {
+        this.replicator.events.onceIdle(() => {
             gcOrphanChunks(this.localDb).catch((e) =>
                 logError(`Chunk GC failed: ${e?.message ?? e}`),
             );

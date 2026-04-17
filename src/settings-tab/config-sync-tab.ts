@@ -25,6 +25,7 @@ import { type App, Notice, Setting, type ButtonComponent } from "obsidian";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { ConfigSync } from "../sync/config-sync.ts";
 import type { SyncEngine } from "../db/sync-engine.ts";
+import type { AuthGate } from "../db/sync/auth-gate.ts";
 import { logWarn } from "../ui/log.ts";
 
 export interface ConfigSyncTabDeps {
@@ -33,6 +34,7 @@ export interface ConfigSyncTabDeps {
     updateSettings: (patch: Partial<CouchSyncSettings>) => Promise<void>;
     configSync: ConfigSync;
     replicator: SyncEngine;
+    auth: AuthGate;
     refresh: () => void;
 }
 
@@ -371,7 +373,7 @@ export class ConfigSyncTab {
             new Notice(`Connection failed: ${error}`, 8000);
         } else {
             this.testPassed = true;
-            this.deps.replicator.clearAuthError();
+            this.deps.auth.clear();
             new Notice("Connection successful!", 3000);
         }
         this.deps.refresh();
@@ -414,13 +416,13 @@ async function loadSuggestions(suggestionsEl: HTMLElement, deps: ConfigSyncTabDe
     const cacheExpired = cachedRemotePaths && Date.now() - cachedRemotePaths.fetchedAt > CACHE_TTL_MS;
     if (cacheExpired) cachedRemotePaths = null;
 
-    if (!cachedRemotePaths && !deps.replicator.isAuthBlocked()) {
+    if (!cachedRemotePaths && !deps.auth.isBlocked()) {
         try {
             const rawPaths = await deps.configSync.listRemotePaths();
             cachedRemotePaths = { ...groupPaths(rawPaths), fetchedAt: Date.now() };
         } catch (e: any) {
             if (e?.status === 401 || e?.status === 403) {
-                deps.replicator.markAuthError(e.status, e.message ?? "Auth failed");
+                deps.auth.raise(e.status, e.message ?? "Auth failed");
             }
             cachedRemotePaths = null;
         }

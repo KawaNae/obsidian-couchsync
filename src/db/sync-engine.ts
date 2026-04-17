@@ -5,6 +5,10 @@
  *   - CouchClient.changesLongpoll() loop for live pull
  *   - localDb.changes() poll + CouchClient.bulkDocs() for push
  *   - CouchClient.info() for stall detection
+ *
+ * Event wiring, auth-latch management, and echo suppression are
+ * factored into `SyncEvents`, `AuthGate`, and `EchoTracker` — this
+ * class focuses on the sync loops themselves.
  */
 
 import type { CouchSyncDoc, FileDoc, ChunkDoc } from "../types.ts";
@@ -13,7 +17,7 @@ import { isReplicatedDocId, isFileDocId } from "../types/doc-id.ts";
 import type { LocalDB } from "./local-db.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { ICouchClient, ChangesResult } from "./interfaces.ts";
-import type { ConflictResolver, PullVerdict } from "../conflict/conflict-resolver.ts";
+import type { ConflictResolver } from "../conflict/conflict-resolver.ts";
 import { isFileDoc, isConfigDoc } from "../types.ts";
 import { filePathFromId, configPathFromId } from "../types/doc-id.ts";
 import * as remoteCouch from "./remote-couch.ts";
@@ -29,6 +33,9 @@ import { logDebug, logInfo, logWarn, logError, notify } from "../ui/log.ts";
 import { ErrorRecovery } from "./error-recovery.ts";
 import { EnvListeners } from "./env-listeners.ts";
 import { DbError } from "./write-transaction.ts";
+import { AuthGate } from "./sync/auth-gate.ts";
+import { EchoTracker } from "./sync/echo-tracker.ts";
+import { SyncEvents } from "./sync/sync-events.ts";
 
 // ── Re-exports ──────────────────────────────────────────
 
@@ -39,24 +46,6 @@ export type {
     SyncErrorKind,
 } from "./reconnect-policy.ts";
 
-export type OnStateChangeHandler = (state: SyncState) => void;
-export type OnErrorHandler = (message: string) => void;
-export type OnConcurrentHandler = (
-    filePath: string,
-    localDoc: CouchSyncDoc,
-    remoteDoc: CouchSyncDoc,
-) => void | Promise<void>;
-
-/** Tracks a doc ID written by pull so the push loop can distinguish
- *  the pull echo from a genuine post-pull user edit. */
-interface PullWriteRecord {
-    /** localDb updateSeq immediately after bulkPut. Any local change
-     *  with seq <= this value is the pull echo; seq > this is a new edit. */
-    seq: number;
-    /** Date.now() at insertion — used for TTL-based cleanup. */
-    addedAt: number;
-}
-
 // ── Constants ────────────────────────────────────────────
 
 const HEALTH_CHECK_INTERVAL = 30000; // 30s
@@ -64,7 +53,7 @@ const CATCHUP_IDLE_TIMEOUT_MS = 60000; // abort catchup after 60s of no progress
 
 /** Build identifier, logged at start(). Lets us verify on mobile that a
  *  deployed plugin update actually reached the device. */
-const BUILD_TAG = "sync-engine-v0.17.0";
+const BUILD_TAG = "sync-engine-v0.18.0";
 
 /** How often to check for local changes to push. */
 const PUSH_POLL_INTERVAL_MS = 2000;
@@ -80,6 +69,12 @@ const META_PUSH_SEQ = "_sync/push-seq";
 // ── SyncEngine ───────────────────────────────────────────
 
 export class SyncEngine {
+    /** Typed event bus. External subscribers use `events.on(...)` / `events.onAsync(...)`. */
+    readonly events = new SyncEvents();
+
+    /** Auth latch. External callers read `auth.isBlocked()` and call `auth.raise/clear`. */
+    readonly auth: AuthGate;
+
     // ── State ─────────────────────────────────────────────
 
     private state: SyncState = "disconnected";
@@ -87,29 +82,10 @@ export class SyncEngine {
     private lastErrorDetail: SyncErrorDetail | null = null;
     private lastRestartTime = 0;
 
-    // ── Event handlers ────────────────────────────────────
+    // ── Echo suppression ─────────────────────────────────
 
-    private onStateChangeHandlers: OnStateChangeHandler[] = [];
-    private onErrorHandlers: OnErrorHandler[] = [];
-    private onPausedHandlers: (() => void)[] = [];
-    private onReconnectHandlers: (() => void)[] = [];
-    private onConcurrentHandlers: OnConcurrentHandler[] = [];
-    private onPullWriteHandler: ((doc: FileDoc) => Promise<void>) | null = null;
-    /** Returns true if local has unpushed changes (→ concurrent conflict). */
-    private onPullDeleteHandler:
-        ((path: string, localDoc: FileDoc) => Promise<boolean>) | null = null;
-    private onAutoResolveHandler: ((filePath: string) => void) | null = null;
-    private onCatchupCompleteHandler: (() => void) | null = null;
-    private onCatchupFailedHandler: (() => void) | null = null;
-    private idleCallbacks: (() => void)[] = [];
-    private hasBeenIdle = false;
+    private readonly echoes = new EchoTracker();
 
-    /** Doc IDs written by pull (bulkPut). Push loop uses seq comparison
-     *  to distinguish pull echoes from genuine post-pull edits. */
-    private pullWrittenIds = new Map<string, PullWriteRecord>();
-    private static readonly PULL_WRITTEN_TTL_MS = 60_000;
-    /** Doc IDs recently pushed. Pull skips logging for these (echo suppression). */
-    private recentlyPushedIds = new Set<string>();
     /** Last remote update_seq seen by stall detection. Compared against
      *  our consumed remoteSeq to detect a stalled pull loop. */
     private lastObservedRemoteSeq: number | string = 0;
@@ -137,15 +113,25 @@ export class SyncEngine {
 
     // ── Error handling ────────────────────────────────────
 
-    /** Latched on 401/403 to stop retry storms. Cleared only on explicit
-     *  start() call (user has presumably fixed credentials). */
-    private authError = false;
-
     private readonly errorRecovery = new ErrorRecovery({
         getState: () => this.state,
         setState: (s, d) => this.setState(s, d),
-        emitError: (m) => this.emitError(m),
-        setAuthError: () => { this.authError = true; },
+        emitError: (m) => this.events.emit("error", { message: m }),
+        setAuthError: () => {
+            // ErrorRecovery sets this as part of classifying a 401/403 as a
+            // hard error. enterHardError has already issued emitError and
+            // pinned state="error"; we just need to latch the gate.
+            //
+            // Only raise if not already blocked — the outer driver (pull
+            // loop, verify) typically calls enterHardError via a path
+            // that has already stored the detail in lastErrorDetail.
+            if (!this.auth.isBlocked() && this.lastErrorDetail?.kind === "auth") {
+                this.auth.raise(
+                    this.lastErrorDetail.code ?? 401,
+                    this.lastErrorDetail.message,
+                );
+            }
+        },
         teardown: () => this.teardown(),
         requestReconnect: (r) => this.requestReconnect(r),
     });
@@ -157,9 +143,9 @@ export class SyncEngine {
     private readonly envListeners = new EnvListeners({
         getState: () => this.state,
         setState: (s) => this.setState(s),
-        emitError: (m) => this.emitError(m),
+        emitError: (m) => this.events.emit("error", { message: m }),
         requestReconnect: (r) => this.requestReconnect(r),
-        fireReconnectHandlers: () => this.fireReconnectHandlers(),
+        fireReconnectHandlers: () => this.events.emit("reconnect"),
         isMobile: this.isMobile,
     });
 
@@ -179,7 +165,25 @@ export class SyncEngine {
         private localDb: LocalDB,
         private getSettings: () => CouchSyncSettings,
         private isMobile: boolean = false,
-    ) {}
+        auth?: AuthGate,
+    ) {
+        this.auth = auth ?? new AuthGate();
+
+        // External raise (Settings tab probe, config-sync) → pin state=error
+        // with the auth detail so the status bar and onError listeners see
+        // the same signal the internal path produces.
+        this.auth.onChange((detail) => {
+            if (!detail) return;
+            if (this.state === "error" && this.lastErrorDetail?.kind === "auth") return;
+            this.errorRecovery.enterHardError({
+                kind: "auth",
+                code: detail.status,
+                message:
+                    `Authentication failed (${detail.status})${detail.reason ? ": " + detail.reason : ""}. ` +
+                    `Update credentials in the Connection tab.`,
+            });
+        });
+    }
 
     setConflictResolver(resolver: ConflictResolver): void {
         this.conflictResolver = resolver;
@@ -238,104 +242,6 @@ export class SyncEngine {
         return this.lastErrorDetail;
     }
 
-    /**
-     * True while credentials are known to be rejected by the server. All
-     * network-facing code paths should check this before issuing requests
-     * to avoid tripping CouchDB's brute-force lockout.
-     */
-    isAuthBlocked(): boolean {
-        return this.authError;
-    }
-
-    /**
-     * Latch the auth-blocked flag from outside (e.g. from Settings tab
-     * fetches that get 401/403). Emits the error so existing onError
-     * consumers see it, and pins state to "error".
-     */
-    markAuthError(status: number, reason?: string): void {
-        if (this.authError) return;
-        this.errorRecovery.enterHardError({
-            kind: "auth",
-            code: status,
-            message:
-                `Authentication failed (${status})${reason ? ": " + reason : ""}. ` +
-                `Update credentials in the Connection tab.`,
-        });
-    }
-
-    /** Clear the auth-blocked flag. Call after a successful Test button. */
-    clearAuthError(): void {
-        this.authError = false;
-    }
-
-    // ── Public API: Event handlers ────────────────────────
-
-    onStateChange(handler: OnStateChangeHandler): void {
-        this.onStateChangeHandlers.push(handler);
-    }
-
-    onError(handler: OnErrorHandler): void {
-        this.onErrorHandlers.push(handler);
-    }
-
-    onPaused(handler: () => void): void {
-        this.onPausedHandlers.push(handler);
-    }
-
-    onReconnect(handler: () => void): void {
-        this.onReconnectHandlers.push(handler);
-    }
-
-    onConcurrent(handler: OnConcurrentHandler): void {
-        this.onConcurrentHandlers.push(handler);
-    }
-
-    /**
-     * Register a handler for pull-driven vault writes. Called for each
-     * accepted FileDoc after bulkPut (chunks already in localDB).
-     * This is the primary vault write path for pulled documents —
-     * Reconciler handles only drift detection.
-     */
-    onPullWrite(handler: (doc: FileDoc) => Promise<void>): void {
-        this.onPullWriteHandler = handler;
-    }
-
-    /**
-     * Called when a remote deletion is detected in the changes feed.
-     * The handler returns true if local has unpushed edits (→ concurrent
-     * conflict), false if the deletion was applied successfully.
-     */
-    onPullDelete(handler: (path: string, localDoc: FileDoc) => Promise<boolean>): void {
-        this.onPullDeleteHandler = handler;
-    }
-
-    /**
-     * Called when a pulled doc is auto-resolved as take-remote (vclock
-     * dominance). main.ts uses this to auto-dismiss open conflict modals.
-     */
-    onAutoResolve(handler: (filePath: string) => void): void {
-        this.onAutoResolveHandler = handler;
-    }
-
-    /** Called after catchup completes and pull-writes are done. */
-    onCatchupComplete(handler: () => void): void {
-        this.onCatchupCompleteHandler = handler;
-    }
-
-    /** Called when catchup fails (hard error). */
-    onCatchupFailed(handler: () => void): void {
-        this.onCatchupFailedHandler = handler;
-    }
-
-    /** Register callback to fire once initial sync reaches idle state. */
-    onceIdle(callback: () => void): void {
-        if (this.hasBeenIdle) {
-            callback();
-            return;
-        }
-        this.idleCallbacks.push(callback);
-    }
-
     // ── Public API: Lifecycle ─────────────────────────────
 
     /**
@@ -347,7 +253,7 @@ export class SyncEngine {
         logDebug(`sync-engine start (build=${BUILD_TAG})`);
         // An explicit start() call means the user is trying again — assume
         // they've fixed their credentials.
-        this.authError = false;
+        this.auth.clear();
         this.envListeners.attach();
         this.startHealthTimer();
         await this.bringUpSession();
@@ -370,7 +276,7 @@ export class SyncEngine {
         const decision = decideReconnect({
             state: this.state,
             reason,
-            authError: this.authError,
+            authError: this.auth.isBlocked(),
             coolDownActive: Date.now() - this.lastRestartTime < 5000,
         });
 
@@ -471,15 +377,7 @@ export class SyncEngine {
             }
         }
 
-        for (const handler of this.onStateChangeHandlers) {
-            handler(state);
-        }
-    }
-
-    private emitError(message: string): void {
-        for (const handler of this.onErrorHandlers) {
-            handler(message);
-        }
+        this.events.emit("state-change", { state });
     }
 
     // ── Internal: Session lifecycle ───────────────────────
@@ -494,11 +392,10 @@ export class SyncEngine {
         this.bringUpPromise = null;
         this.running = false;
         this.client = null;
-        this.hasBeenIdle = false;
-        this.idleCallbacks = [];
+        this.events.resetIdle();
         this.deniedWarningEmitted = false;
         this.lastObservedRemoteSeq = 0;
-        this.pullWrittenIds.clear();
+        this.echoes.clear();
         this.pullRetryMs = SyncEngine.PULL_RETRY_MIN_MS;
         this.lastPullErrorMsg = null;
         // lastHealthyAt and lastErrorDetail intentionally NOT reset.
@@ -514,7 +411,7 @@ export class SyncEngine {
     private bringUpSession(): Promise<void> {
         if (this.bringUpPromise) return this.bringUpPromise;
         if (this.running) return Promise.resolve();
-        if (this.authError) return Promise.resolve();
+        if (this.auth.isBlocked()) return Promise.resolve();
         const p = this.doBringUpSession().finally(() => {
             if (this.bringUpPromise === p) this.bringUpPromise = null;
         });
@@ -545,7 +442,7 @@ export class SyncEngine {
         } catch (e: any) {
             if (this.syncEpoch !== myEpoch) return;
             this.errorRecovery.enterHardError(this.errorRecovery.classifyError(e));
-            this.onCatchupFailedHandler?.();
+            this.events.emit("catchup-failed");
             return;
         }
 
@@ -557,7 +454,7 @@ export class SyncEngine {
         this.running = true;
         this.setState("connected");
         this.firePausedCallbacks();
-        this.onCatchupCompleteHandler?.();
+        this.events.emit("catchup-complete");
         this.startLiveSync(myEpoch);
     }
 
@@ -708,22 +605,12 @@ export class SyncEngine {
                 // user edit and must be pushed.
                 const toPush = localChanges.results.filter((r) => {
                     if (!r.doc || !isReplicatedDocId(r.id) || r.deleted) return false;
-                    const record = this.pullWrittenIds.get(r.id);
-                    if (!record) return true;
                     const rSeq = typeof r.seq === "number" ? r.seq : parseInt(String(r.seq), 10);
-                    return rSeq > record.seq;
+                    return !this.echoes.isPullEcho(r.id, rSeq);
                 });
 
-                // Clean up pullWrittenIds: remove seen IDs + TTL expiry.
-                const now = Date.now();
-                for (const r of localChanges.results) {
-                    this.pullWrittenIds.delete(r.id);
-                }
-                for (const [id, rec] of this.pullWrittenIds) {
-                    if (now - rec.addedAt > SyncEngine.PULL_WRITTEN_TTL_MS) {
-                        this.pullWrittenIds.delete(id);
-                    }
-                }
+                // Clean up EchoTracker: remove seen IDs + TTL expiry.
+                this.echoes.sweepPullWritten(localChanges.results.map((r) => r.id));
 
                 if (toPush.length > 0 && this.client) {
                     const docs = toPush.map((r) => r.doc!);
@@ -784,8 +671,7 @@ export class SyncEngine {
             const remoteDoc = stripRev(row.doc) as CouchSyncDoc;
 
             // Skip echo: docs we just pushed come back via changes feed.
-            if (this.recentlyPushedIds.has(remoteDoc._id)) {
-                this.recentlyPushedIds.delete(remoteDoc._id);
+            if (this.echoes.consumePushEcho(remoteDoc._id)) {
                 continue;
             }
 
@@ -831,7 +717,7 @@ export class SyncEngine {
 
         // Atomic commit: accepted docs + META_REMOTE_SEQ in one rw tx.
         // Crash between the two is impossible — remote changes and the
-        // checkpoint advance together or neither. pullWrittenIds / vault
+        // checkpoint advance together or neither. EchoTracker / vault
         // writes are in-memory / filesystem side effects, so they happen
         // *after* the tx via onCommit.
         const nextRemoteSeq = result.last_seq;
@@ -847,29 +733,23 @@ export class SyncEngine {
                     const seq = typeof updateSeq === "number"
                         ? updateSeq
                         : parseInt(String(updateSeq), 10);
-                    const now = Date.now();
-                    for (const doc of accepted) {
-                        this.pullWrittenIds.set(doc._id, { seq, addedAt: now });
-                    }
+                    this.echoes.recordPullWrites(accepted.map((d) => d._id), seq);
 
-                    if (this.onPullWriteHandler) {
-                        for (const doc of accepted) {
-                            if (isFileDoc(doc)) {
-                                const path = filePathFromId(doc._id);
-                                try {
-                                    await this.ensureChunks(doc);
-                                    await this.onPullWriteHandler(doc);
-                                    logDebug(`  ← ${path} (take-remote)`);
-                                    writtenCount++;
-                                    this.onAutoResolveHandler?.(path);
-                                } catch (e: any) {
-                                    logError(`pull vault write failed: ${path}: ${e?.message ?? e}`);
-                                    writeFailCount++;
-                                }
+                    for (const doc of accepted) {
+                        if (isFileDoc(doc)) {
+                            const path = filePathFromId(doc._id);
+                            try {
+                                await this.ensureChunks(doc);
+                                await this.events.emitAsync("pull-write", { doc });
+                                logDebug(`  ← ${path} (take-remote)`);
+                                writtenCount++;
+                                this.events.emit("auto-resolve", { filePath: path });
+                            } catch (e: any) {
+                                logError(`pull vault write failed: ${path}: ${e?.message ?? e}`);
+                                writeFailCount++;
                             }
                         }
                     }
-
                 },
             });
             this.remoteSeq = nextRemoteSeq;
@@ -898,19 +778,15 @@ export class SyncEngine {
         // pull loop continues receiving. Any bulkPut inside a handler
         // (e.g. vclock merge on keep-local) is NOT in pullWrittenIds,
         // so the push loop will naturally pick it up.
-        for (const { filePath, localDoc, remoteDoc } of concurrent) {
-            for (const h of this.onConcurrentHandlers) {
-                Promise.resolve(h(filePath, localDoc, remoteDoc)).catch((e: any) =>
-                    logError(`onConcurrent handler error: ${e?.message ?? e}`),
-                );
-            }
+        for (const c of concurrent) {
+            this.events.emit("concurrent", c);
         }
     }
 
     /**
      * Handle a remote deletion detected in the changes feed.
-     * Delegates to onPullDeleteHandler which checks for unpushed local
-     * edits and either applies the deletion or signals a concurrent conflict.
+     * Delegates to a pull-delete query subscriber which checks for unpushed
+     * local edits and either applies the deletion or signals a concurrent conflict.
      */
     private async handlePulledDeletion(
         docId: string,
@@ -922,18 +798,18 @@ export class SyncEngine {
         // No local doc or already deleted — nothing to do.
         if (!localDoc || !isFileDoc(localDoc) || localDoc.deleted) return;
 
-        if (this.onPullDeleteHandler) {
-            const hasUnpushed = await this.onPullDeleteHandler(path, localDoc);
-            if (hasUnpushed) {
-                // Remote deletion vs local edit → concurrent conflict.
-                const tombstone: FileDoc = {
-                    _id: docId, type: "file", chunks: [],
-                    mtime: localDoc.mtime, ctime: localDoc.ctime,
-                    size: 0, deleted: true, vclock: {},
-                };
-                concurrent.push({ filePath: path, localDoc, remoteDoc: tombstone });
-                logDebug(`  ⚡ ${path} (concurrent: remote-deleted vs local-edit)`);
-            }
+        const hasUnpushed = await this.events.emitAsyncAny("pull-delete", {
+            path, localDoc,
+        });
+        if (hasUnpushed) {
+            // Remote deletion vs local edit → concurrent conflict.
+            const tombstone: FileDoc = {
+                _id: docId, type: "file", chunks: [],
+                mtime: localDoc.mtime, ctime: localDoc.ctime,
+                size: 0, deleted: true, vclock: {},
+            };
+            concurrent.push({ filePath: path, localDoc, remoteDoc: tombstone });
+            logDebug(`  ⚡ ${path} (concurrent: remote-deleted vs local-edit)`);
         }
     }
 
@@ -985,9 +861,10 @@ export class SyncEngine {
                 deniedCount++;
                 if (!this.deniedWarningEmitted) {
                     this.deniedWarningEmitted = true;
-                    this.emitError(
-                        "Some documents were denied — check CouchDB _security permissions.",
-                    );
+                    this.events.emit("error", {
+                        message:
+                            "Some documents were denied — check CouchDB _security permissions.",
+                    });
                 }
             } else if (res.error === "conflict") {
                 const path = isFile ? filePathFromId(doc._id) : doc._id;
@@ -995,7 +872,7 @@ export class SyncEngine {
                 conflictCount++;
             } else {
                 // Success — track for echo suppression in pull.
-                this.recentlyPushedIds.add(doc._id);
+                this.echoes.recordPushEcho(doc._id);
                 if (isFile) {
                     logDebug(`  → ${filePathFromId(doc._id)}`);
                     fileCount++;
@@ -1099,7 +976,7 @@ export class SyncEngine {
      * and we trigger a reconnect.
      */
     private async checkHealth(): Promise<void> {
-        if (this.authError) return;
+        if (this.auth.isBlocked()) return;
 
         if (this.state === "reconnecting" || this.state === "error") return;
 
@@ -1147,16 +1024,8 @@ export class SyncEngine {
     // ── Internal: Paused callbacks ──────────────────────────
 
     private firePausedCallbacks(): void {
-        if (!this.hasBeenIdle) {
-            this.hasBeenIdle = true;
-            for (const cb of this.idleCallbacks) cb();
-            this.idleCallbacks = [];
-        }
-        for (const handler of this.onPausedHandlers) {
-            try { handler(); } catch (e) {
-                logError(`CouchSync: onPaused handler error: ${e?.message ?? e}`);
-            }
-        }
+        this.events.fireIdle();
+        this.events.emit("paused");
     }
 
     private startHealthTimer(): void {
@@ -1168,16 +1037,6 @@ export class SyncEngine {
         if (!this.healthTimer) return;
         clearInterval(this.healthTimer);
         this.healthTimer = null;
-    }
-
-    private fireReconnectHandlers(): void {
-        for (const handler of this.onReconnectHandlers) {
-            try {
-                handler();
-            } catch (e) {
-                logError(`CouchSync: onReconnect handler error: ${e?.message ?? e}`);
-            }
-        }
     }
 
     // ── Internal: Verify reachability ─────────────────────

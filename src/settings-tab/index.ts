@@ -83,6 +83,7 @@ export class CouchSyncSettingTab extends PluginSettingTab {
             ...settingsDeps,
             app: this.app,
             replicator: this.plugin.replicator,
+            auth: this.plugin.auth,
             localDb: this.plugin.localDb,
             initVault: () => this.plugin.initVault(),
             cloneFromRemote: () => this.plugin.cloneFromRemote(),
@@ -104,6 +105,7 @@ export class CouchSyncSettingTab extends PluginSettingTab {
             app: this.app,
             configSync: this.plugin.configSync,
             replicator: this.plugin.replicator,
+            auth: this.plugin.auth,
             refresh: () => this.display(),
         };
         if (!this.configSyncTab) {
@@ -143,6 +145,7 @@ export class CouchSyncSettingTab extends PluginSettingTab {
             renderStatusTab(statusPanel, {
                 ...settingsDeps,
                 replicator: this.plugin.replicator,
+                auth: this.plugin.auth,
                 app: this.app,
                 refresh: () => this.display(),
             });

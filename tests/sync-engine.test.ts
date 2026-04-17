@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeAll, afterEach, vi } from "vitest";
 import type { ICouchClient, ChangesResult, DbInfo } from "../src/db/interfaces.ts";
 import type { CouchSyncSettings } from "../src/settings.ts";
-import type { CouchSyncDoc } from "../src/types.ts";
+import type { CouchSyncDoc, FileDoc } from "../src/types.ts";
+import type { SyncState } from "../src/db/reconnect-policy.ts";
 
 // ── Stub browser globals ─────────────────────────────────
 const noop = () => {};
@@ -142,8 +143,8 @@ describe("SyncEngine state machine", () => {
         const localDb = makeMockLocalDb();
         const engine = makeSyncEngine(localDb, mockClient);
 
-        const states: string[] = [];
-        engine.onStateChange((s) => states.push(s));
+        const states: SyncState[] = [];
+        engine.events.on("state-change", ({ state }) => states.push(state));
 
         expect(engine.getState()).toBe("disconnected");
         await engine.start();
@@ -176,15 +177,15 @@ describe("SyncEngine state machine", () => {
         engine.stop();
     });
 
-    it("onPaused fires immediately after catchup completes", async () => {
+    it("paused event fires immediately after catchup completes", async () => {
         const engine = makeSyncEngine(makeMockLocalDb(), makeMockClient());
 
         const pausedCalls: boolean[] = [];
-        engine.onPaused(() => pausedCalls.push(true));
+        engine.events.on("paused", () => pausedCalls.push(true));
 
         await engine.start();
 
-        // onPaused fires during start(), no longpoll wait needed.
+        // paused event fires during start(), no longpoll wait needed.
         expect(pausedCalls).toEqual([true]);
         expect(engine.getState()).toBe("connected");
         engine.stop();
@@ -194,7 +195,7 @@ describe("SyncEngine state machine", () => {
         const engine = makeSyncEngine(makeMockLocalDb(), makeMockClient());
 
         const idleCalls: boolean[] = [];
-        engine.onceIdle(() => idleCalls.push(true));
+        engine.events.onceIdle(() => idleCalls.push(true));
 
         await engine.start();
 
@@ -212,11 +213,11 @@ describe("SyncEngine state machine", () => {
         });
         const engine = makeSyncEngine(makeMockLocalDb(), mockClient);
 
-        const states: string[] = [];
-        engine.onStateChange((s) => states.push(s));
+        const states: SyncState[] = [];
+        engine.events.on("state-change", ({ state }) => states.push(state));
 
         const pausedCalls: boolean[] = [];
-        engine.onPaused(() => pausedCalls.push(true));
+        engine.events.on("paused", () => pausedCalls.push(true));
 
         await engine.start();
         // Wait for pullLoop to process the longpoll result.
@@ -226,7 +227,7 @@ describe("SyncEngine state machine", () => {
         // Then pullLoop: syncing → connected (live change received)
         expect(states).toContain("syncing");
         expect(states).toContain("connected");
-        // onPaused: once for catchup, once for pullLoop change
+        // paused: once for catchup, once for pullLoop change
         expect(pausedCalls.length).toBeGreaterThanOrEqual(2);
 
         engine.stop();
@@ -239,8 +240,8 @@ describe("SyncEngine state machine", () => {
         });
         const engine = makeSyncEngine(makeMockLocalDb(), mockClient);
 
-        const states: string[] = [];
-        engine.onStateChange((s) => states.push(s));
+        const states: SyncState[] = [];
+        engine.events.on("state-change", ({ state }) => states.push(state));
 
         await engine.start();
         // Wait for two longpoll cycles.
@@ -259,14 +260,14 @@ describe("SyncEngine error integration", () => {
     // These tests verify the SyncEngine ↔ ErrorRecovery integration
     // through public SyncEngine methods only.
 
-    it("start() clears authError flag", async () => {
+    it("start() clears the auth latch", async () => {
         const engine = makeSyncEngine(makeMockLocalDb(), makeMockClient());
 
-        engine.markAuthError(401, "test");
-        expect(engine.isAuthBlocked()).toBe(true);
+        engine.auth.raise(401, "test");
+        expect(engine.auth.isBlocked()).toBe(true);
 
         await engine.start();
-        expect(engine.isAuthBlocked()).toBe(false);
+        expect(engine.auth.isBlocked()).toBe(false);
         engine.stop();
     });
 
@@ -287,7 +288,7 @@ describe("SyncEngine error integration", () => {
 describe("SyncEngine catchup pull", () => {
     afterEach(() => { vi.useRealTimers(); });
 
-    it("drains remote changes in batches and fires onChange", async () => {
+    it("drains remote changes in batches and applies them to localDb", async () => {
         const doc1 = fakeDoc("file:a.md");
         const doc2 = fakeDoc("file:b.md");
         const doc3 = fakeDoc("file:c.md");
@@ -334,7 +335,7 @@ describe("SyncEngine catchup pull", () => {
 describe("SyncEngine live sync", () => {
     afterEach(() => { vi.useRealTimers(); });
 
-    it("pull loop fires onChange for pulled docs and transitions syncing->connected", async () => {
+    it("pull loop fires paused event for pulled docs and transitions syncing->connected", async () => {
         const doc1 = fakeDoc("file:live-a.md");
 
         const mockClient = makeMockClient({
@@ -347,7 +348,7 @@ describe("SyncEngine live sync", () => {
         const engine = makeSyncEngine(localDb, mockClient);
 
         const pausedCalls: boolean[] = [];
-        engine.onPaused(() => pausedCalls.push(true));
+        engine.events.on("paused", () => pausedCalls.push(true));
 
         await engine.start();
         await new Promise((r) => setTimeout(r, 100));
@@ -600,13 +601,13 @@ describe("SyncEngine stall detection (checkHealth)", () => {
         engine.stop();
     });
 
-    it("auth error → checkHealth skipped entirely", async () => {
+    it("auth latch → checkHealth skipped entirely", async () => {
         const mockClient = makeMockClient();
         const engine = makeSyncEngine(makeMockLocalDb(), mockClient);
 
         (engine as any).client = mockClient;
         (engine as any).running = true;
-        (engine as any).authError = true;
+        engine.auth.raise(401, "blocked");
         (engine as any).setState("connected");
 
         await (engine as any).checkHealth();
@@ -710,7 +711,7 @@ describe("SyncEngine vclock guard in writePulledDocs", () => {
         engine.stop();
     });
 
-    it("concurrent: skips doc and fires onConcurrent handler", async () => {
+    it("concurrent: skips doc and fires concurrent event", async () => {
         const localDb = makeMockLocalDb({
             get: vi.fn().mockResolvedValue({
                 _id: "file:test.md", type: "file", chunks: [], vclock: { A: 2 },
@@ -725,7 +726,7 @@ describe("SyncEngine vclock guard in writePulledDocs", () => {
         engine.setConflictResolver(mockResolver as any);
 
         const concurrentCalls: string[] = [];
-        engine.onConcurrent(async (filePath) => {
+        engine.events.on("concurrent", ({ filePath }) => {
             concurrentCalls.push(filePath);
         });
 
@@ -806,9 +807,11 @@ describe("SyncEngine one-shot operations", () => {
     });
 });
 
-// ── pullWrittenIds seq-based echo detection ─────────────
+// ── EchoTracker integration via push loop ─────────────────
+// Unit behavior of EchoTracker is covered in echo-tracker.test.ts;
+// here we only verify the wiring at the SyncEngine boundary.
 
-describe("pullWrittenIds seq-based filtering", () => {
+describe("SyncEngine echo suppression integration", () => {
     it("filters pull echoes but allows post-pull edits through", async () => {
         // localDb.info() returns seq=10 after bulkPut
         const localDb = makeMockLocalDb({
@@ -854,63 +857,12 @@ describe("pullWrittenIds seq-based filtering", () => {
 
         engine.stop();
     });
-
-    it("push loop clears pullWrittenIds entries on encounter", async () => {
-        const localDb = makeMockLocalDb({
-            info: vi.fn().mockResolvedValue({ updateSeq: 5 }),
-            get: vi.fn().mockResolvedValue(null),
-        });
-        const engine = makeSyncEngine(localDb, makeMockClient());
-        await engine.start();
-
-        // Insert an entry manually
-        const map = (engine as any).pullWrittenIds as Map<string, any>;
-        map.set("file:cleanup.md", { seq: 3, addedAt: Date.now() });
-        expect(map.size).toBe(1);
-
-        // Simulate push loop seeing the doc
-        localDb.changes.mockResolvedValueOnce({
-            results: [{ id: "file:cleanup.md", seq: 5, doc: { _id: "file:cleanup.md", type: "file" } }],
-            last_seq: 5,
-        });
-
-        const pushPromise = (engine as any).pushLoop((engine as any).syncEpoch);
-        await vi.waitFor(() => expect(localDb.changes).toHaveBeenCalled());
-        engine.stop();
-        await pushPromise.catch(() => {});
-
-        // Entry should be cleaned up.
-        expect(map.has("file:cleanup.md")).toBe(false);
-    });
-
-    it("TTL expires stale pullWrittenIds entries", async () => {
-        const localDb = makeMockLocalDb({
-            info: vi.fn().mockResolvedValue({ updateSeq: 5 }),
-        });
-        const engine = makeSyncEngine(localDb, makeMockClient());
-        await engine.start();
-
-        const map = (engine as any).pullWrittenIds as Map<string, any>;
-        // Insert entry with addedAt far in the past
-        map.set("file:stale.md", { seq: 1, addedAt: Date.now() - 120_000 });
-
-        // Simulate empty push loop iteration (no matching results)
-        localDb.changes.mockResolvedValueOnce({ results: [], last_seq: 5 });
-
-        const pushPromise = (engine as any).pushLoop((engine as any).syncEpoch);
-        await vi.waitFor(() => expect(localDb.changes).toHaveBeenCalled());
-        engine.stop();
-        await pushPromise.catch(() => {});
-
-        // Stale entry should be cleaned up by TTL.
-        expect(map.has("file:stale.md")).toBe(false);
-    });
 });
 
 // ── Remote deletion propagation ─────────────────────────
 
 describe("handlePulledDeletion", () => {
-    it("calls onPullDeleteHandler for file doc tombstones", async () => {
+    it("calls pull-delete subscribers for file doc tombstones", async () => {
         const localDb = makeMockLocalDb({
             info: vi.fn().mockResolvedValue({ updateSeq: 5 }),
             get: vi.fn().mockResolvedValue({
@@ -922,7 +874,7 @@ describe("handlePulledDeletion", () => {
         await engine.start();
 
         const deleteHandler = vi.fn().mockResolvedValue(false); // deletion applied
-        engine.onPullDelete(deleteHandler);
+        engine.events.onQuery("pull-delete", deleteHandler);
 
         const result: ChangesResult<any> = {
             results: [
@@ -932,7 +884,10 @@ describe("handlePulledDeletion", () => {
         };
         await (engine as any).writePulledDocs(result);
 
-        expect(deleteHandler).toHaveBeenCalledWith("deleted.md", expect.objectContaining({ _id: "file:deleted.md" }));
+        expect(deleteHandler).toHaveBeenCalledWith(expect.objectContaining({
+            path: "deleted.md",
+            localDoc: expect.objectContaining({ _id: "file:deleted.md" }),
+        }));
         engine.stop();
     });
 
@@ -944,7 +899,7 @@ describe("handlePulledDeletion", () => {
         await engine.start();
 
         const deleteHandler = vi.fn().mockResolvedValue(false);
-        engine.onPullDelete(deleteHandler);
+        engine.events.onQuery("pull-delete", deleteHandler);
 
         const result: ChangesResult<any> = {
             results: [
@@ -970,7 +925,7 @@ describe("handlePulledDeletion", () => {
         await engine.start();
 
         const deleteHandler = vi.fn().mockResolvedValue(false);
-        engine.onPullDelete(deleteHandler);
+        engine.events.onQuery("pull-delete", deleteHandler);
 
         const result: ChangesResult<any> = {
             results: [
@@ -985,7 +940,7 @@ describe("handlePulledDeletion", () => {
         engine.stop();
     });
 
-    it("produces concurrent conflict when handler returns true", async () => {
+    it("produces concurrent conflict when pull-delete subscriber returns true", async () => {
         const localDb = makeMockLocalDb({
             info: vi.fn().mockResolvedValue({ updateSeq: 5 }),
             get: vi.fn().mockResolvedValue({
@@ -997,10 +952,10 @@ describe("handlePulledDeletion", () => {
         await engine.start();
 
         const deleteHandler = vi.fn().mockResolvedValue(true); // unpushed changes
-        engine.onPullDelete(deleteHandler);
+        engine.events.onQuery("pull-delete", deleteHandler);
 
         const concurrentHandler = vi.fn();
-        engine.onConcurrent(concurrentHandler);
+        engine.events.on("concurrent", concurrentHandler);
 
         const result: ChangesResult<any> = {
             results: [
@@ -1010,13 +965,13 @@ describe("handlePulledDeletion", () => {
         };
         await (engine as any).writePulledDocs(result);
 
-        // Should fire concurrent handler (async, fire-and-forget).
+        // Should fire concurrent event.
         await vi.waitFor(() => expect(concurrentHandler).toHaveBeenCalled());
-        expect(concurrentHandler).toHaveBeenCalledWith(
-            "edited.md",
-            expect.objectContaining({ _id: "file:edited.md" }),
-            expect.objectContaining({ deleted: true }),
-        );
+        expect(concurrentHandler).toHaveBeenCalledWith(expect.objectContaining({
+            filePath: "edited.md",
+            localDoc: expect.objectContaining({ _id: "file:edited.md" }),
+            remoteDoc: expect.objectContaining({ deleted: true }),
+        }));
         engine.stop();
     });
 });

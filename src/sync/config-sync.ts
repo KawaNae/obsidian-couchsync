@@ -1,7 +1,7 @@
 import type { IVaultIO } from "../types/vault-io.ts";
 import type { IModalPresenter } from "../types/modal-presenter.ts";
 import type { ConfigLocalDB } from "../db/config-local-db.ts";
-import type { SyncEngine } from "../db/sync-engine.ts";
+import type { AuthGate } from "../db/sync/auth-gate.ts";
 import type { ConfigDoc, CouchSyncDoc } from "../types.ts";
 import {
     DOC_ID,
@@ -35,7 +35,7 @@ import {
  * Architecturally:
  *   - Local storage: `ConfigLocalDB` (Dexie-backed IndexedDB store)
  *   - Remote storage: `settings.couchdbConfigDbName` on the same CouchDB
- *     server as the vault DB (auth shared via `SyncEngine.isAuthBlocked`)
+ *     server as the vault DB (auth shared via a common `AuthGate`)
  *   - Replication: one-shot push/pull/list via `remote-couch` helpers,
  *     never live-sync (manual init/push/pull from the settings UI)
  *   - Ordering: every write increments the device's `vclock` counter,
@@ -55,7 +55,7 @@ export class ConfigSync {
         private vault: IVaultIO,
         private modal: IModalPresenter,
         private configDb: ConfigLocalDB | null,
-        private replicator: SyncEngine,
+        private auth: AuthGate,
         private getSettings: () => CouchSyncSettings,
     ) {}
 
@@ -92,14 +92,14 @@ export class ConfigSync {
         if (client === null) {
             throw new Error("Config sync not configured (couchdbConfigDbName is empty)");
         }
-        if (this.replicator.isAuthBlocked()) {
+        if (this.auth.isBlocked()) {
             throw new Error("Auth blocked — fix credentials in Vault Sync first");
         }
         try {
             return await op(client);
         } catch (e: any) {
             if (e?.status === 401 || e?.status === 403) {
-                this.replicator.markAuthError(e.status, e?.message);
+                this.auth.raise(e.status, e?.message);
             }
             throw e;
         }
@@ -448,7 +448,7 @@ export class ConfigSync {
         } catch (e: any) {
             if (e?.status === 404) return null; // DB will be created on first push
             if (e?.status === 401 || e?.status === 403) {
-                this.replicator.markAuthError(e.status, e?.message);
+                this.auth.raise(e.status, e?.message);
             }
             return e?.message || "Connection failed";
         }

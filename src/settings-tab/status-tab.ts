@@ -1,6 +1,7 @@
 import { type App, Modal, Notice, Setting } from "obsidian";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { SyncEngine } from "../db/sync-engine.ts";
+import type { AuthGate } from "../db/sync/auth-gate.ts";
 import { ConfirmModal } from "../ui/confirm-modal.ts";
 
 /** Thrown internally when a fetch gets 401/403, so callers can abort. */
@@ -73,6 +74,7 @@ class TypeToConfirmModal extends Modal {
 interface StatusTabDeps {
     getSettings: () => CouchSyncSettings;
     replicator: SyncEngine;
+    auth: AuthGate;
     app: App;
     refresh: () => void;
 }
@@ -179,7 +181,7 @@ export function renderStatusTab(el: HTMLElement, deps: StatusTabDeps): void {
     // Bail out early if a prior 401/403 latched the auth-blocked flag.
     // Otherwise opening this tab fires a dozen parallel fetches that each
     // add a failed-login strike and trip CouchDB's brute-force lockout.
-    if (deps.replicator.isAuthBlocked()) {
+    if (deps.auth.isBlocked()) {
         renderAuthBlocked(el, deps);
         return;
     }
@@ -223,7 +225,7 @@ function renderAuthBlocked(el: HTMLElement, deps: StatusTabDeps): void {
         .setDesc("Clear the auth-blocked flag and try loading server info again.")
         .addButton((btn) =>
             btn.setButtonText("Retry").onClick(() => {
-                deps.replicator.clearAuthError();
+                deps.auth.clear();
                 deps.refresh();
             }),
         );
@@ -247,7 +249,7 @@ async function loadServerInfo(
     } catch (e: any) {
         el.empty();
         if (e instanceof AuthError) {
-            deps.replicator.markAuthError(e.status, e.message);
+            deps.auth.raise(e.status, e.message);
             el.createEl("p", {
                 text: `Authentication failed (${e.status}): ${e.message}`,
                 cls: "setting-item-description mod-warning",
@@ -280,7 +282,7 @@ async function loadDatabases(
                 infos.push(await fetchJson(`${baseUri}/${encodeURIComponent(name)}`, user, pass));
             } catch (e) {
                 if (e instanceof AuthError) {
-                    deps.replicator.markAuthError(e.status, e.message);
+                    deps.auth.raise(e.status, e.message);
                     el.empty();
                     el.createEl("p", {
                         text: `Authentication failed (${e.status}): ${e.message}`,
@@ -294,7 +296,7 @@ async function loadDatabases(
                 lastUpdates.push(await getLastUpdateTime(baseUri, user, pass, name));
             } catch (e) {
                 if (e instanceof AuthError) {
-                    deps.replicator.markAuthError(e.status, e.message);
+                    deps.auth.raise(e.status, e.message);
                     el.empty();
                     el.createEl("p", {
                         text: `Authentication failed (${e.status}): ${e.message}`,
@@ -352,7 +354,7 @@ async function loadDatabases(
     } catch (e: any) {
         el.empty();
         if (e instanceof AuthError) {
-            deps.replicator.markAuthError(e.status, e.message);
+            deps.auth.raise(e.status, e.message);
             el.createEl("p", {
                 text: `Authentication failed (${e.status}): ${e.message}`,
                 cls: "setting-item-description mod-warning",

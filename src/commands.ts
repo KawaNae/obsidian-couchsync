@@ -112,7 +112,7 @@ export function registerCommands(plugin: CouchSyncPlugin): void {
         id: "couchsync-reconnect",
         name: "Reconnect sync",
         callback: async () => {
-            if (plugin.replicator.isAuthBlocked()) {
+            if (plugin.auth.isBlocked()) {
                 notify(
                     "CouchSync: auth is blocked. Update credentials in " +
                         "Vault Sync (Step 1) before reconnecting.",

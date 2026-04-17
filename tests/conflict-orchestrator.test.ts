@@ -45,15 +45,37 @@ describe("ConflictOrchestrator", () => {
 
     /** Minimal SyncEngine stub */
     function makeReplicator() {
-        const cbs: Record<string, Function> = {};
+        const cbs: Record<string, Array<(p: any) => void | Promise<void>>> = {};
+        const on = (type: string, cb: (p: any) => void | Promise<void>) => {
+            (cbs[type] ??= []).push(cb);
+        };
+        const emit = (type: string, payload: any) => {
+            for (const cb of cbs[type] ?? []) cb(payload);
+        };
+        // Test helper: fire and await any handler promise so assertions
+        // see the post-handler DB state. ConflictOrchestrator returns the
+        // handleConcurrent promise from its `on` subscriber so this works.
+        const emitAndSettle = async (type: string, payload: any) => {
+            await Promise.all(
+                (cbs[type] ?? []).map(async (cb) => {
+                    try {
+                        const r = cb(payload);
+                        if (r && typeof (r as any).then === "function") await r;
+                    } catch { /* match production: log & swallow */ }
+                }),
+            );
+        };
         return {
             setConflictResolver: vi.fn(),
-            onConcurrent: (cb: Function) => { cbs.concurrent = cb; },
-            onAutoResolve: (cb: Function) => { cbs.autoResolve = cb; },
+            events: {
+                on,
+                emit,
+            },
             ensureFileChunks: vi.fn().mockResolvedValue(undefined),
             fireConcurrent: (path: string, local: CouchSyncDoc, remote: CouchSyncDoc) =>
-                cbs.concurrent?.(path, local, remote),
-            fireAutoResolve: (path: string) => cbs.autoResolve?.(path),
+                emitAndSettle("concurrent", { filePath: path, localDoc: local, remoteDoc: remote }),
+            fireAutoResolve: (path: string) =>
+                emitAndSettle("auto-resolve", { filePath: path }),
         };
     }
 
