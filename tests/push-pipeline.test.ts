@@ -44,8 +44,9 @@ function makePipeline(
 
     let lastPushedSeq: number | string = 0;
     const saveCheckpoints = vi.fn().mockResolvedValue(undefined);
-    const markHealthy = vi.fn();
     const handleLocalDbError = vi.fn();
+    let pausedCount = 0;
+    events.on("paused", () => { pausedCount++; });
 
     const pipeline = new PushPipeline({
         localDb,
@@ -56,7 +57,6 @@ function makePipeline(
         getLastPushedSeq: () => lastPushedSeq,
         setLastPushedSeq: (s) => { lastPushedSeq = s; },
         saveCheckpoints,
-        markHealthy,
         handleLocalDbError,
         delay: async () => {
             callCount++;
@@ -67,7 +67,8 @@ function makePipeline(
         pipeline, echoes, events, localDb,
         cancel: () => { cancelled = true; },
         getLastPushedSeq: () => lastPushedSeq,
-        saveCheckpoints, markHealthy, handleLocalDbError,
+        saveCheckpoints, handleLocalDbError,
+        pausedCount: () => pausedCount,
     };
 }
 
@@ -87,12 +88,13 @@ describe("PushPipeline.run", () => {
         };
         const bulkDocs = vi.fn().mockResolvedValue([{ ok: true, id: "file:a.md", rev: "1-x" }]);
         const client = makeMockClient({ bulkDocs });
-        const { pipeline, markHealthy } = makePipeline(client, { localDb, cancelAfter: 1 });
+        const { pipeline, pausedCount } = makePipeline(client, { localDb, cancelAfter: 1 });
 
         await pipeline.run();
 
         expect(bulkDocs).toHaveBeenCalled();
-        expect(markHealthy).toHaveBeenCalled();
+        // SyncEngine subscribes to paused to update lastHealthyAt.
+        expect(pausedCount()).toBeGreaterThanOrEqual(1);
     });
 
     it("skips non-replicated doc IDs (_local/*)", async () => {

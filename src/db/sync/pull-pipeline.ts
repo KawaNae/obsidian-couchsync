@@ -19,7 +19,6 @@
 import type { CouchSyncDoc } from "../../types.ts";
 import type { LocalDB } from "../local-db.ts";
 import type { ICouchClient, ChangesResult } from "../interfaces.ts";
-import type { SyncState } from "../reconnect-policy.ts";
 import { DbError } from "../write-transaction.ts";
 import type { ErrorRecovery } from "../error-recovery.ts";
 import { logDebug, logInfo } from "../../ui/log.ts";
@@ -42,15 +41,6 @@ export interface PullPipelineDeps {
     getRemoteSeq: () => number | string;
     setRemoteSeq: (s: number | string) => void;
     saveCheckpoints: () => Promise<void>;
-
-    /** Stamp `lastHealthyAt` after a successful pull batch. */
-    markHealthy: () => void;
-    /** Transition "syncing" (caller owns state machine). */
-    setSyncing: () => void;
-    /** Transition back to "connected" + fire paused callbacks. */
-    setConnectedAndPause: () => void;
-    /** Query current state so the pipeline can suppress duplicate logs. */
-    getState: () => SyncState;
     handleLocalDbError: (e: unknown, context: string) => void;
     delay: (ms: number) => Promise<void>;
 }
@@ -116,11 +106,12 @@ export class PullPipeline {
                 if (result.results.length > 0) {
                     this.retryMs = PULL_RETRY_MIN_MS;
                     this.lastErrorMsg = null;
-                    this.deps.setSyncing();
                     await this.applyBatch(result);
                     if (this.deps.isCancelled()) return;
-                    this.deps.markHealthy();
-                    this.deps.setConnectedAndPause();
+                    // State machine is SyncEngine's concern; pipeline just
+                    // signals that a batch was applied. SyncEngine subscribes
+                    // to "paused" to update lastHealthyAt.
+                    this.deps.events.emit("paused");
                 }
                 // Empty result (longpoll max-wait): stay connected.
             } catch (e: any) {
@@ -138,15 +129,12 @@ export class PullPipeline {
                 if (detail.kind === "auth" || detail.kind === "server") {
                     this.deps.errorRecovery.handleTransientError(e);
                 } else {
-                    const state = this.deps.getState();
-                    if (state !== "reconnecting" && state !== "error") {
-                        // Deduplicate consecutive identical messages.
-                        if (detail.message !== this.lastErrorMsg) {
-                            this.lastErrorMsg = detail.message;
-                            logDebug(
-                                `pullLoop: ${detail.kind} error, retrying — ${detail.message}`,
-                            );
-                        }
+                    // Deduplicate consecutive identical messages.
+                    if (detail.message !== this.lastErrorMsg) {
+                        this.lastErrorMsg = detail.message;
+                        logDebug(
+                            `pullLoop: ${detail.kind} error, retrying — ${detail.message}`,
+                        );
                     }
                 }
 

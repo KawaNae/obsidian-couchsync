@@ -35,8 +35,6 @@ export interface PushPipelineDeps {
     getLastPushedSeq: () => number | string;
     setLastPushedSeq: (s: number | string) => void;
     saveCheckpoints: () => Promise<void>;
-    /** Called after a successful push to advance the health watermark. */
-    markHealthy: () => void;
     handleLocalDbError: (e: unknown, context: string) => void;
     delay: (ms: number) => Promise<void>;
 }
@@ -73,7 +71,8 @@ export class PushPipeline {
                 if (toPush.length > 0) {
                     const docs = toPush.map((r) => r.doc!);
                     await this.pushDocs(docs);
-                    this.deps.markHealthy();
+                    // SyncEngine subscribes to "paused" to update lastHealthyAt.
+                    this.deps.events.emit("paused");
                 }
 
                 this.deps.setLastPushedSeq(localChanges.last_seq);

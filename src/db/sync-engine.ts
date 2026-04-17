@@ -172,6 +172,15 @@ export class SyncEngine {
             getConflictResolver: () => this.conflictResolver,
             ensureChunks: (doc) => this.ensureChunks(doc),
         });
+
+        // Pipelines emit "paused" after applying a batch (live loop only —
+        // catchup paused is fired by firePausedCallbacks below). SyncEngine
+        // owns lastHealthyAt and updates it here.
+        this.events.on("paused", () => {
+            if (this.state === "connected" || this.state === "syncing") {
+                this.lastHealthyAt = Date.now();
+            }
+        });
     }
 
     setConflictResolver(resolver: ConflictResolver): void {
@@ -407,13 +416,6 @@ export class SyncEngine {
             getRemoteSeq: () => this.remoteSeq,
             setRemoteSeq: (s) => { this.remoteSeq = s; },
             saveCheckpoints: () => this.saveCheckpoints(),
-            markHealthy: () => { this.lastHealthyAt = Date.now(); },
-            setSyncing: () => this.setState("syncing"),
-            setConnectedAndPause: () => {
-                this.setState("connected");
-                this.firePausedCallbacks();
-            },
-            getState: () => this.state,
             handleLocalDbError: (e, ctx) => this.handleLocalDbError(e, ctx),
             delay: (ms) => this.delay(ms, epoch),
         });
@@ -429,7 +431,6 @@ export class SyncEngine {
             getLastPushedSeq: () => this.lastPushedSeq,
             setLastPushedSeq: (s) => { this.lastPushedSeq = s; },
             saveCheckpoints: () => this.saveCheckpoints(),
-            markHealthy: () => { this.lastHealthyAt = Date.now(); },
             handleLocalDbError: (e, ctx) => this.handleLocalDbError(e, ctx),
             delay: (ms) => this.delay(ms, epoch),
         });

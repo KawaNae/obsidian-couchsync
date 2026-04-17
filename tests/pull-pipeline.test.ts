@@ -34,8 +34,7 @@ function makeLocalDb(): any {
 interface Harness {
     pipeline: PullPipeline;
     events: SyncEvents;
-    setState: ReturnType<typeof vi.fn>;
-    markHealthy: ReturnType<typeof vi.fn>;
+    pausedCount: () => number;
     handleLocalDbError: ReturnType<typeof vi.fn>;
     saveCheckpoints: ReturnType<typeof vi.fn>;
     cancel: () => void;
@@ -53,16 +52,16 @@ function makeHarness(client: ICouchClient): Harness {
     });
 
     let state: SyncState = "connected";
-    const setState = vi.fn((s: SyncState) => { state = s; });
     let remoteSeq: number | string = 0;
     let cancelled = false;
+    let paused = 0;
+    events.on("paused", () => { paused++; });
 
     const saveCheckpoints = vi.fn().mockResolvedValue(undefined);
-    const markHealthy = vi.fn();
     const handleLocalDbError = vi.fn();
     const errorRecovery = new ErrorRecovery({
         getState: () => state,
-        setState: (s) => setState(s),
+        setState: (s) => { state = s; },
         emitError: () => {},
         setAuthError: () => {},
         teardown: () => {},
@@ -74,16 +73,14 @@ function makeHarness(client: ICouchClient): Harness {
         isCancelled: () => cancelled,
         getRemoteSeq: () => remoteSeq,
         setRemoteSeq: (s) => { remoteSeq = s; },
-        saveCheckpoints, markHealthy,
-        setSyncing: () => setState("syncing"),
-        setConnectedAndPause: () => setState("connected"),
-        getState: () => state,
+        saveCheckpoints,
         handleLocalDbError,
         delay: async () => {},
     });
 
     return {
-        pipeline, events, setState, markHealthy, handleLocalDbError, saveCheckpoints,
+        pipeline, events, pausedCount: () => paused,
+        handleLocalDbError, saveCheckpoints,
         cancel: () => { cancelled = true; },
         getRemoteSeq: () => remoteSeq,
     };
@@ -133,9 +130,7 @@ describe("PullPipeline.runCatchup", () => {
 // ── Longpoll ────────────────────────────────────────────
 
 describe("PullPipeline.runLongpoll", () => {
-    it("applies received changes and transitions syncing → connected", async () => {
-        // Build the client first — harness.cancel() is captured by closure
-        // only after harness construction, so we set the mock here.
+    it("applies received changes and emits paused after batch", async () => {
         let h!: Harness;
         let callCount = 0;
         const client = makeClient({
@@ -157,13 +152,12 @@ describe("PullPipeline.runLongpoll", () => {
 
         await h.pipeline.runLongpoll();
 
-        const states = h.setState.mock.calls.map((c) => c[0]);
-        expect(states).toContain("syncing");
-        expect(states).toContain("connected");
-        expect(h.markHealthy).toHaveBeenCalled();
+        // Pipeline does not drive the state machine — SyncEngine owns it.
+        // Pipeline only signals "batch was applied" via paused.
+        expect(h.pausedCount()).toBeGreaterThanOrEqual(1);
     });
 
-    it("empty longpoll result stays in current state (no transition)", async () => {
+    it("empty longpoll result emits no paused (no batch applied)", async () => {
         let h!: Harness;
         let callCount = 0;
         const client = makeClient({
@@ -177,7 +171,7 @@ describe("PullPipeline.runLongpoll", () => {
 
         await h.pipeline.runLongpoll();
 
-        expect(h.setState).not.toHaveBeenCalled();
+        expect(h.pausedCount()).toBe(0);
     });
 
     it("DbError with recovery=halt exits the loop immediately", async () => {
