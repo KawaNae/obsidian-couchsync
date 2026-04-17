@@ -12,14 +12,11 @@
  */
 
 import type { CouchSyncDoc, FileDoc, ChunkDoc } from "../types.ts";
-import { stripRev } from "../utils/doc.ts";
-import { isReplicatedDocId, isFileDocId } from "../types/doc-id.ts";
 import type { LocalDB } from "./local-db.ts";
 import type { CouchSyncSettings } from "../settings.ts";
-import type { ICouchClient, ChangesResult } from "./interfaces.ts";
+import type { ICouchClient } from "./interfaces.ts";
 import type { ConflictResolver } from "../conflict/conflict-resolver.ts";
-import { isFileDoc, isConfigDoc } from "../types.ts";
-import { filePathFromId, configPathFromId } from "../types/doc-id.ts";
+import { filePathFromId } from "../types/doc-id.ts";
 import * as remoteCouch from "./remote-couch.ts";
 import { CouchClient, makeCouchClient } from "./couch-client.ts";
 import {
@@ -36,6 +33,9 @@ import { DbError } from "./write-transaction.ts";
 import { AuthGate } from "./sync/auth-gate.ts";
 import { EchoTracker } from "./sync/echo-tracker.ts";
 import { SyncEvents } from "./sync/sync-events.ts";
+import { PullWriter } from "./sync/pull-writer.ts";
+import { PullPipeline } from "./sync/pull-pipeline.ts";
+import { PushPipeline } from "./sync/push-pipeline.ts";
 
 // ── Re-exports ──────────────────────────────────────────
 
@@ -49,17 +49,10 @@ export type {
 // ── Constants ────────────────────────────────────────────
 
 const HEALTH_CHECK_INTERVAL = 30000; // 30s
-const CATCHUP_IDLE_TIMEOUT_MS = 60000; // abort catchup after 60s of no progress
 
 /** Build identifier, logged at start(). Lets us verify on mobile that a
  *  deployed plugin update actually reached the device. */
 const BUILD_TAG = "sync-engine-v0.18.0";
-
-/** How often to check for local changes to push. */
-const PUSH_POLL_INTERVAL_MS = 2000;
-
-/** Batch size for catchup pull changes requests. */
-const CATCHUP_BATCH_SIZE = 200;
 
 // ── Checkpoint keys ──────────────────────────────────────
 
@@ -75,6 +68,8 @@ export class SyncEngine {
     /** Auth latch. External callers read `auth.isBlocked()` and call `auth.raise/clear`. */
     readonly auth: AuthGate;
 
+    private readonly pullWriter: PullWriter;
+
     // ── State ─────────────────────────────────────────────
 
     private state: SyncState = "disconnected";
@@ -89,12 +84,6 @@ export class SyncEngine {
     /** Last remote update_seq seen by stall detection. Compared against
      *  our consumed remoteSeq to detect a stalled pull loop. */
     private lastObservedRemoteSeq: number | string = 0;
-
-    // ── Pull loop retry state ────────────────────────────
-    private pullRetryMs = 2_000;
-    private lastPullErrorMsg: string | null = null;
-    private static readonly PULL_RETRY_MIN_MS = 2_000;
-    private static readonly PULL_RETRY_MAX_MS = 30_000;
 
     // ── Session management ────────────────────────────────
 
@@ -149,9 +138,6 @@ export class SyncEngine {
         isMobile: this.isMobile,
     });
 
-    /** Latch so we emit at most one warning Notice per `denied` storm. */
-    private deniedWarningEmitted = false;
-
     // ── Checkpoints ───────────────────────────────────────
 
     /** Last remote _changes seq consumed. */
@@ -182,6 +168,14 @@ export class SyncEngine {
                     `Authentication failed (${detail.status})${detail.reason ? ": " + detail.reason : ""}. ` +
                     `Update credentials in the Connection tab.`,
             });
+        });
+
+        this.pullWriter = new PullWriter({
+            localDb: this.localDb,
+            events: this.events,
+            echoes: this.echoes,
+            getConflictResolver: () => this.conflictResolver,
+            ensureChunks: (doc) => this.ensureChunks(doc),
         });
     }
 
@@ -393,11 +387,8 @@ export class SyncEngine {
         this.running = false;
         this.client = null;
         this.events.resetIdle();
-        this.deniedWarningEmitted = false;
         this.lastObservedRemoteSeq = 0;
         this.echoes.clear();
-        this.pullRetryMs = SyncEngine.PULL_RETRY_MIN_MS;
-        this.lastPullErrorMsg = null;
         // lastHealthyAt and lastErrorDetail intentionally NOT reset.
     }
 
@@ -434,11 +425,14 @@ export class SyncEngine {
 
         if (this.syncEpoch !== myEpoch) return;
 
+        const pullPipeline = this.makePullPipeline(client, myEpoch);
+        const pushPipeline = this.makePushPipeline(client, myEpoch);
+
         // Catchup = actual data transfer → syncing.
         this.setState("syncing");
 
         try {
-            await this.catchupPull(client, myEpoch);
+            await pullPipeline.runCatchup();
         } catch (e: any) {
             if (this.syncEpoch !== myEpoch) return;
             this.errorRecovery.enterHardError(this.errorRecovery.classifyError(e));
@@ -455,442 +449,54 @@ export class SyncEngine {
         this.setState("connected");
         this.firePausedCallbacks();
         this.events.emit("catchup-complete");
-        this.startLiveSync(myEpoch);
-    }
 
-    // ── Internal: Catchup pull ────────────────────────────
-
-    /**
-     * One-shot pull using CouchClient.changes() in batches until all
-     * pending remote changes are consumed. Uses an idle-based timeout:
-     * if 60s pass with no progress, the catchup is aborted.
-     */
-    private async catchupPull(
-        client: ICouchClient,
-        epoch: number,
-    ): Promise<void> {
-        logDebug("catchup: starting HTTP changes pull");
-
-        let lastProgressAt = Date.now();
-
-        while (true) {
-            if (this.syncEpoch !== epoch) return;
-
-            // Check idle timeout.
-            if (Date.now() - lastProgressAt > CATCHUP_IDLE_TIMEOUT_MS) {
-                logInfo("Catchup timed out (no progress for 60s)");
-                throw new Error("Catchup timed out");
-            }
-
-            const result = await client.changes<CouchSyncDoc>({
-                since: this.remoteSeq,
-                include_docs: true,
-                limit: CATCHUP_BATCH_SIZE,
-            });
-
-            if (this.syncEpoch !== epoch) return;
-
-            if (result.results.length > 0) {
-                lastProgressAt = Date.now();
-                await this.writePulledDocs(result);
-                logDebug(
-                    `catchup: batch ${result.results.length} docs, seq=${result.last_seq}`,
-                );
-            } else {
-                // No more changes — catchup complete.
-                const seq = String(result.last_seq);
-                logInfo(
-                    `Catchup complete (seq=${seq.length > 20 ? seq.slice(0, 20) + "…" : seq})`,
-                );
-                // Update seq even on empty result (last_seq may advance).
-                this.remoteSeq = result.last_seq;
-                await this.saveCheckpoints();
-                break;
-            }
-        }
-    }
-
-    // ── Internal: Live sync loops ─────────────────────────
-
-    /**
-     * Start the pull and push loops running concurrently in the background.
-     * Both loops check syncEpoch to self-terminate on teardown.
-     */
-    private startLiveSync(epoch: number): void {
-        // State is already "connected" — just start the loops.
-        this.pullLoop(epoch).catch((e) =>
+        // Live loops run for the rest of the session; their `isCancelled`
+        // closures fire when syncEpoch advances (teardown).
+        pullPipeline.runLongpoll().catch((e) =>
             logError(`CouchSync: pullLoop unexpected exit: ${e?.message ?? e}`),
         );
-        this.pushLoop(epoch).catch((e) =>
+        pushPipeline.run().catch((e) =>
             logError(`CouchSync: pushLoop unexpected exit: ${e?.message ?? e}`),
         );
     }
 
-    /**
-     * Long-poll pull loop. Each iteration issues a longpoll _changes
-     * request. On received changes: syncing → apply → connected.
-     * On empty result (max-wait timeout): no state change.
-     */
-    private async pullLoop(epoch: number): Promise<void> {
-        while (this.syncEpoch === epoch) {
-            try {
-                const result = await this.client!.changesLongpoll<CouchSyncDoc>({
-                    since: this.remoteSeq,
-                    include_docs: true,
-                });
-
-                if (this.syncEpoch !== epoch) return;
-
-                if (result.results.length > 0) {
-                    this.pullRetryMs = SyncEngine.PULL_RETRY_MIN_MS;
-                    this.lastPullErrorMsg = null;
-                    this.setState("syncing");
-                    await this.writePulledDocs(result);
-                    if (this.syncEpoch !== epoch) return;
-                    this.lastHealthyAt = Date.now();
-                    this.setState("connected");
-                    this.firePausedCallbacks();
-                }
-                // Empty result (longpoll max-wait): stay connected.
-            } catch (e: any) {
-                if (this.syncEpoch !== epoch) return;
-
-                if (e instanceof DbError) {
-                    this.handleLocalDbError(e, "pull write");
-                    if (e.recovery === "halt") return; // teardown already invoked
-                    await this.delay(this.pullRetryMs, epoch);
-                    continue;
-                }
-
-                const detail = this.errorRecovery.classifyError(e);
-
-                if (detail.kind === "auth" || detail.kind === "server") {
-                    this.errorRecovery.handleTransientError(e);
-                } else if (this.state !== "reconnecting" && this.state !== "error") {
-                    // Deduplicate consecutive identical error messages.
-                    if (detail.message !== this.lastPullErrorMsg) {
-                        this.lastPullErrorMsg = detail.message;
-                        logDebug(
-                            `pullLoop: ${detail.kind} error, retrying — ${detail.message}`,
-                        );
-                    }
-                }
-
-                await this.delay(this.pullRetryMs, epoch);
-                this.pullRetryMs = Math.min(
-                    this.pullRetryMs * 2,
-                    SyncEngine.PULL_RETRY_MAX_MS,
-                );
-            }
-        }
-    }
-
-    /**
-     * Poll-based push loop. Checks for local changes since lastPushedSeq
-     * and pushes them to the remote via bulkDocs.
-     */
-    private async pushLoop(epoch: number): Promise<void> {
-        while (this.syncEpoch === epoch) {
-            try {
-                const localChanges = await this.localDb.changes(
-                    this.lastPushedSeq,
-                    { include_docs: true },
-                );
-
-                if (this.syncEpoch !== epoch) return;
-
-                // Filter to replicated docs. For pull-written docs, use
-                // seq comparison: if the local change's seq is greater than
-                // the seq recorded at pull time, it's a genuine post-pull
-                // user edit and must be pushed.
-                const toPush = localChanges.results.filter((r) => {
-                    if (!r.doc || !isReplicatedDocId(r.id) || r.deleted) return false;
-                    const rSeq = typeof r.seq === "number" ? r.seq : parseInt(String(r.seq), 10);
-                    return !this.echoes.isPullEcho(r.id, rSeq);
-                });
-
-                // Clean up EchoTracker: remove seen IDs + TTL expiry.
-                this.echoes.sweepPullWritten(localChanges.results.map((r) => r.id));
-
-                if (toPush.length > 0 && this.client) {
-                    const docs = toPush.map((r) => r.doc!);
-                    await this.pushDocs(docs);
-                    this.lastHealthyAt = Date.now();
-                }
-
-                this.lastPushedSeq = localChanges.last_seq;
-                await this.saveCheckpoints();
-            } catch (e: any) {
-                if (this.syncEpoch !== epoch) return;
-                if (e instanceof DbError) {
-                    this.handleLocalDbError(e, "push loop");
-                    if (e.recovery === "halt") return;
-                } else {
-                    // Push errors are logged but don't escalate — the next
-                    // cycle will retry.
-                    logDebug(`push error: ${e?.message ?? e}`);
-                }
-            }
-
-            await this.delay(PUSH_POLL_INTERVAL_MS, epoch);
-        }
-    }
-
-    // ── Internal: Doc I/O ─────────────────────────────────
-
-    /**
-     * Write pulled docs to local store with vclock guard.
-     * For FileDoc/ConfigDoc: compare vclock before writing.
-     * ChunkDoc: always accept (no vclock, keyed by content hash).
-     */
-    private async writePulledDocs(
-        result: ChangesResult<CouchSyncDoc>,
-    ): Promise<void> {
-        const accepted: CouchSyncDoc[] = [];
-        const concurrent: Array<{
-            filePath: string;
-            localDoc: CouchSyncDoc;
-            remoteDoc: CouchSyncDoc;
-        }> = [];
-        let keepLocalCount = 0;
-        let chunkCount = 0;
-        let writtenCount = 0;
-        let writeFailCount = 0;
-        let deletedCount = 0;
-
-        for (const row of result.results) {
-            // Handle remote deletions (CouchDB tombstones).
-            if (row.deleted) {
-                if (isFileDocId(row.id)) {
-                    await this.handlePulledDeletion(row.id, concurrent);
-                    deletedCount++;
-                }
-                continue;
-            }
-            if (!row.doc) continue;
-            const remoteDoc = stripRev(row.doc) as CouchSyncDoc;
-
-            // Skip echo: docs we just pushed come back via changes feed.
-            if (this.echoes.consumePushEcho(remoteDoc._id)) {
-                continue;
-            }
-
-            // ChunkDocs have no vclock — always accept.
-            if (!isFileDoc(remoteDoc) && !isConfigDoc(remoteDoc)) {
-                accepted.push(remoteDoc);
-                chunkCount++;
-                continue;
-            }
-
-            // vclock guard: compare with local version.
-            if (this.conflictResolver) {
-                const localDoc = await this.localDb.get(remoteDoc._id);
-                if (localDoc && (isFileDoc(localDoc) || isConfigDoc(localDoc))) {
-                    const verdict = await this.conflictResolver.resolveOnPull(
-                        localDoc, remoteDoc,
-                    );
-                    if (verdict === "keep-local") {
-                        const path = isFileDoc(remoteDoc) ? filePathFromId(remoteDoc._id) : configPathFromId(remoteDoc._id);
-                        logDebug(`  × ${path} (keep-local)`);
-                        keepLocalCount++;
-                        continue;
-                    }
-                    if (verdict === "concurrent") {
-                        const filePath = isFileDoc(remoteDoc)
-                            ? filePathFromId(remoteDoc._id)
-                            : configPathFromId(remoteDoc._id);
-                        // Ensure remote chunks are available locally so the
-                        // conflict modal can display the remote content.
-                        if (isFileDoc(remoteDoc)) {
-                            await this.ensureChunks(remoteDoc);
-                        }
-                        logDebug(`  ⚡ ${filePath} (concurrent)`);
-                        concurrent.push({ filePath, localDoc, remoteDoc });
-                        continue; // keep local, don't write remote
-                    }
-                    // "take-remote": fall through to accept
-                }
-            }
-
-            accepted.push(remoteDoc);
-        }
-
-        // Atomic commit: accepted docs + META_REMOTE_SEQ in one rw tx.
-        // Crash between the two is impossible — remote changes and the
-        // checkpoint advance together or neither. EchoTracker / vault
-        // writes are in-memory / filesystem side effects, so they happen
-        // *after* the tx via onCommit.
-        const nextRemoteSeq = result.last_seq;
-        if (accepted.length > 0) {
-            await this.localDb.runWriteTx({
-                // bulkPut semantics: docs here are accepted from the remote
-                // and must overwrite local rows (the CAS decision was made
-                // upstream in resolveOnPull). No expectedVclock → unconditional.
-                docs: accepted.map((d) => ({ doc: d })),
-                meta: [{ op: "put", key: META_REMOTE_SEQ, value: nextRemoteSeq }],
-                onCommit: async () => {
-                    const { updateSeq } = await this.localDb.info();
-                    const seq = typeof updateSeq === "number"
-                        ? updateSeq
-                        : parseInt(String(updateSeq), 10);
-                    this.echoes.recordPullWrites(accepted.map((d) => d._id), seq);
-
-                    for (const doc of accepted) {
-                        if (isFileDoc(doc)) {
-                            const path = filePathFromId(doc._id);
-                            try {
-                                await this.ensureChunks(doc);
-                                await this.events.emitAsync("pull-write", { doc });
-                                logDebug(`  ← ${path} (take-remote)`);
-                                writtenCount++;
-                                this.events.emit("auto-resolve", { filePath: path });
-                            } catch (e: any) {
-                                logError(`pull vault write failed: ${path}: ${e?.message ?? e}`);
-                                writeFailCount++;
-                            }
-                        }
-                    }
-                },
-            });
-            this.remoteSeq = nextRemoteSeq;
-        } else {
-            // No docs to apply — just advance the checkpoint (1 small meta write).
-            this.remoteSeq = nextRemoteSeq;
-            await this.saveCheckpoints();
-        }
-
-        // Summary log — only when there's something to report.
-        const hasActivity = writtenCount > 0 || keepLocalCount > 0
-            || concurrent.length > 0 || writeFailCount > 0 || deletedCount > 0;
-        if (hasActivity) {
-            const parts: string[] = [];
-            if (writtenCount > 0) parts.push(`${writtenCount} written`);
-            if (deletedCount > 0) parts.push(`${deletedCount} deleted`);
-            if (keepLocalCount > 0) parts.push(`${keepLocalCount} keep-local`);
-            if (concurrent.length > 0) parts.push(`${concurrent.length} concurrent`);
-            if (writeFailCount > 0) parts.push(`${writeFailCount} failed`);
-            if (chunkCount > 0) parts.push(`${chunkCount} chunks`);
-            logInfo(`Pull: ${parts.join(", ")}`);
-        }
-
-        // Fire concurrent handlers (non-blocking). The handlers run
-        // asynchronously — writePulledDocs returns immediately so the
-        // pull loop continues receiving. Any bulkPut inside a handler
-        // (e.g. vclock merge on keep-local) is NOT in pullWrittenIds,
-        // so the push loop will naturally pick it up.
-        for (const c of concurrent) {
-            this.events.emit("concurrent", c);
-        }
-    }
-
-    /**
-     * Handle a remote deletion detected in the changes feed.
-     * Delegates to a pull-delete query subscriber which checks for unpushed
-     * local edits and either applies the deletion or signals a concurrent conflict.
-     */
-    private async handlePulledDeletion(
-        docId: string,
-        concurrent: Array<{ filePath: string; localDoc: CouchSyncDoc; remoteDoc: CouchSyncDoc }>,
-    ): Promise<void> {
-        const path = filePathFromId(docId);
-        const localDoc = await this.localDb.get<FileDoc>(docId);
-
-        // No local doc or already deleted — nothing to do.
-        if (!localDoc || !isFileDoc(localDoc) || localDoc.deleted) return;
-
-        const hasUnpushed = await this.events.emitAsyncAny("pull-delete", {
-            path, localDoc,
+    private makePullPipeline(client: ICouchClient, epoch: number): PullPipeline {
+        return new PullPipeline({
+            localDb: this.localDb,
+            client,
+            pullWriter: this.pullWriter,
+            errorRecovery: this.errorRecovery,
+            events: this.events,
+            isCancelled: () => this.syncEpoch !== epoch,
+            getRemoteSeq: () => this.remoteSeq,
+            setRemoteSeq: (s) => { this.remoteSeq = s; },
+            saveCheckpoints: () => this.saveCheckpoints(),
+            markHealthy: () => { this.lastHealthyAt = Date.now(); },
+            setSyncing: () => this.setState("syncing"),
+            setConnectedAndPause: () => {
+                this.setState("connected");
+                this.firePausedCallbacks();
+            },
+            getState: () => this.state,
+            handleLocalDbError: (e, ctx) => this.handleLocalDbError(e, ctx),
+            delay: (ms) => this.delay(ms, epoch),
         });
-        if (hasUnpushed) {
-            // Remote deletion vs local edit → concurrent conflict.
-            const tombstone: FileDoc = {
-                _id: docId, type: "file", chunks: [],
-                mtime: localDoc.mtime, ctime: localDoc.ctime,
-                size: 0, deleted: true, vclock: {},
-            };
-            concurrent.push({ filePath: path, localDoc, remoteDoc: tombstone });
-            logDebug(`  ⚡ ${path} (concurrent: remote-deleted vs local-edit)`);
-        }
     }
 
-    /**
-     * Push docs to remote. Fetches current remote revs and threads them
-     * onto the docs before bulkDocs, same approach as remote-couch.ts
-     * pushDocs().
-     */
-    private async pushDocs(docs: CouchSyncDoc[]): Promise<void> {
-        if (!this.client || docs.length === 0) return;
-
-        // Strip local _rev, prepare docs for remote.
-        const prepared: Array<CouchSyncDoc & { _rev?: string }> = docs.map(
-            (d) => stripRev(d) as CouchSyncDoc,
-        );
-
-        // Fetch current remote revisions for threading.
-        const remoteResult = await this.client.allDocs<CouchSyncDoc>({
-            keys: prepared.map((d) => d._id),
+    private makePushPipeline(client: ICouchClient, epoch: number): PushPipeline {
+        return new PushPipeline({
+            localDb: this.localDb,
+            client,
+            echoes: this.echoes,
+            events: this.events,
+            isCancelled: () => this.syncEpoch !== epoch,
+            getLastPushedSeq: () => this.lastPushedSeq,
+            setLastPushedSeq: (s) => { this.lastPushedSeq = s; },
+            saveCheckpoints: () => this.saveCheckpoints(),
+            markHealthy: () => { this.lastHealthyAt = Date.now(); },
+            handleLocalDbError: (e, ctx) => this.handleLocalDbError(e, ctx),
+            delay: (ms) => this.delay(ms, epoch),
         });
-        const remoteRevMap = new Map<string, string>();
-        for (const row of remoteResult.rows) {
-            if (row.value?.rev && !row.value?.deleted) {
-                remoteRevMap.set(row.id, row.value.rev);
-            }
-        }
-        for (const doc of prepared) {
-            const remoteRev = remoteRevMap.get(doc._id);
-            if (remoteRev) doc._rev = remoteRev;
-        }
-
-        const results = await this.client.bulkDocs(prepared);
-
-        // Count results and log per-file details.
-        let fileCount = 0;
-        let chunkCount = 0;
-        let deniedCount = 0;
-        let conflictCount = 0;
-
-        for (let i = 0; i < results.length; i++) {
-            const res = results[i];
-            const doc = prepared[i];
-            const isFile = doc._id?.startsWith("file:");
-            const isChunk = doc._id?.startsWith("chunk:");
-
-            if (res.error === "forbidden") {
-                const path = isFile ? filePathFromId(doc._id) : doc._id;
-                logDebug(`  → ${path} (denied: ${res.reason})`);
-                deniedCount++;
-                if (!this.deniedWarningEmitted) {
-                    this.deniedWarningEmitted = true;
-                    this.events.emit("error", {
-                        message:
-                            "Some documents were denied — check CouchDB _security permissions.",
-                    });
-                }
-            } else if (res.error === "conflict") {
-                const path = isFile ? filePathFromId(doc._id) : doc._id;
-                logDebug(`  → ${path} (conflict, will resolve on next pull)`);
-                conflictCount++;
-            } else {
-                // Success — track for echo suppression in pull.
-                this.echoes.recordPushEcho(doc._id);
-                if (isFile) {
-                    logDebug(`  → ${filePathFromId(doc._id)}`);
-                    fileCount++;
-                } else if (isChunk) {
-                    chunkCount++;
-                }
-            }
-        }
-
-        // Summary — only when files were pushed.
-        if (fileCount > 0 || deniedCount > 0 || conflictCount > 0) {
-            const parts: string[] = [];
-            if (fileCount > 0) parts.push(`${fileCount} files`);
-            if (chunkCount > 0) parts.push(`${chunkCount} chunks`);
-            if (deniedCount > 0) parts.push(`${deniedCount} denied`);
-            if (conflictCount > 0) parts.push(`${conflictCount} conflicts`);
-            logInfo(`Push: ${parts.join(", ")}`);
-        }
     }
 
     // ── Internal: Checkpoints ─────────────────────────────

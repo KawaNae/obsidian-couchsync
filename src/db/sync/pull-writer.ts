@@ -1,0 +1,255 @@
+/**
+ * PullWriter — applies a batch of pulled docs to localDB.
+ *
+ * The responsibility that used to be a 150-line `writePulledDocs` method
+ * on SyncEngine is split into three phases:
+ *
+ *   1. `classify()` — walk the changes result, produce the accepted /
+ *      concurrent / deletion sets via the ConflictResolver vclock guard.
+ *      Read-only against localDB; no writes yet.
+ *
+ *   2. `commit()` — one atomic `runWriteTx` that lands accepted docs and
+ *      the META_REMOTE_SEQ checkpoint together. Crash between the two
+ *      is impossible — the remote seq advance and the data commit are
+ *      inseparable. EchoTracker recording and vault writes are side
+ *      effects in `onCommit`, so they happen *after* the durable write.
+ *
+ *   3. `dispatch()` — emit concurrent events + format the log summary.
+ *      Pure post-commit bookkeeping.
+ *
+ * Atomicity is the load-bearing guarantee here: if the pull loop crashes
+ * mid-batch, the next session must either see every doc in `accepted`
+ * applied with the new seq, or none with the old seq. Never half.
+ */
+
+import type { CouchSyncDoc, FileDoc } from "../../types.ts";
+import { isFileDoc, isConfigDoc } from "../../types.ts";
+import {
+    filePathFromId, configPathFromId, isFileDocId,
+} from "../../types/doc-id.ts";
+import { stripRev } from "../../utils/doc.ts";
+import type { LocalDB } from "../local-db.ts";
+import type { ChangesResult } from "../interfaces.ts";
+import type { ConflictResolver } from "../../conflict/conflict-resolver.ts";
+import { logDebug, logError, logInfo } from "../../ui/log.ts";
+import type { EchoTracker } from "./echo-tracker.ts";
+import type { SyncEvents } from "./sync-events.ts";
+
+export const META_REMOTE_SEQ = "_sync/remote-seq";
+
+export interface PullApplyResult {
+    nextRemoteSeq: number | string;
+    /** True when the batch had no accepted docs (caller may still want
+     *  to advance its checkpoint outside the tx). */
+    empty: boolean;
+}
+
+export interface PullWriterDeps {
+    localDb: LocalDB;
+    events: SyncEvents;
+    echoes: EchoTracker;
+    getConflictResolver: () => ConflictResolver | undefined;
+    ensureChunks: (doc: FileDoc) => Promise<void>;
+}
+
+interface BatchStats {
+    writtenCount: number;
+    writeFailCount: number;
+    keepLocalCount: number;
+    chunkCount: number;
+    deletedCount: number;
+}
+
+interface ConcurrentEntry {
+    filePath: string;
+    localDoc: CouchSyncDoc;
+    remoteDoc: CouchSyncDoc;
+}
+
+export class PullWriter {
+    constructor(private deps: PullWriterDeps) {}
+
+    async apply(result: ChangesResult<CouchSyncDoc>): Promise<PullApplyResult> {
+        const { accepted, concurrent, stats } = await this.classify(result);
+
+        if (accepted.length > 0) {
+            await this.commit(accepted, concurrent, result.last_seq, stats);
+        }
+
+        this.logSummary(stats, concurrent.length);
+        this.emitConcurrent(concurrent);
+
+        return {
+            nextRemoteSeq: result.last_seq,
+            empty: accepted.length === 0,
+        };
+    }
+
+    // ── Phase 1: classify ───────────────────────────────
+
+    private async classify(
+        result: ChangesResult<CouchSyncDoc>,
+    ): Promise<{
+        accepted: CouchSyncDoc[];
+        concurrent: ConcurrentEntry[];
+        stats: BatchStats;
+    }> {
+        const accepted: CouchSyncDoc[] = [];
+        const concurrent: ConcurrentEntry[] = [];
+        const stats: BatchStats = {
+            writtenCount: 0,
+            writeFailCount: 0,
+            keepLocalCount: 0,
+            chunkCount: 0,
+            deletedCount: 0,
+        };
+        const resolver = this.deps.getConflictResolver();
+
+        for (const row of result.results) {
+            if (row.deleted) {
+                if (isFileDocId(row.id)) {
+                    await this.handlePulledDeletion(row.id, concurrent);
+                    stats.deletedCount++;
+                }
+                continue;
+            }
+            if (!row.doc) continue;
+            const remoteDoc = stripRev(row.doc) as CouchSyncDoc;
+
+            if (this.deps.echoes.consumePushEcho(remoteDoc._id)) continue;
+
+            // ChunkDocs have no vclock — always accept.
+            if (!isFileDoc(remoteDoc) && !isConfigDoc(remoteDoc)) {
+                accepted.push(remoteDoc);
+                stats.chunkCount++;
+                continue;
+            }
+
+            // vclock guard: compare with local.
+            if (resolver) {
+                const localDoc = await this.deps.localDb.get(remoteDoc._id);
+                if (localDoc && (isFileDoc(localDoc) || isConfigDoc(localDoc))) {
+                    const verdict = await resolver.resolveOnPull(localDoc, remoteDoc);
+                    if (verdict === "keep-local") {
+                        const path = isFileDoc(remoteDoc)
+                            ? filePathFromId(remoteDoc._id)
+                            : configPathFromId(remoteDoc._id);
+                        logDebug(`  × ${path} (keep-local)`);
+                        stats.keepLocalCount++;
+                        continue;
+                    }
+                    if (verdict === "concurrent") {
+                        const filePath = isFileDoc(remoteDoc)
+                            ? filePathFromId(remoteDoc._id)
+                            : configPathFromId(remoteDoc._id);
+                        // Ensure remote chunks are available locally so the
+                        // conflict modal can display remote content.
+                        if (isFileDoc(remoteDoc)) {
+                            await this.deps.ensureChunks(remoteDoc);
+                        }
+                        logDebug(`  ⚡ ${filePath} (concurrent)`);
+                        concurrent.push({ filePath, localDoc, remoteDoc });
+                        continue;
+                    }
+                    // "take-remote" falls through.
+                }
+            }
+
+            accepted.push(remoteDoc);
+        }
+
+        return { accepted, concurrent, stats };
+    }
+
+    private async handlePulledDeletion(
+        docId: string,
+        concurrent: ConcurrentEntry[],
+    ): Promise<void> {
+        const path = filePathFromId(docId);
+        const localDoc = await this.deps.localDb.get<FileDoc>(docId);
+
+        if (!localDoc || !isFileDoc(localDoc) || localDoc.deleted) return;
+
+        const hasUnpushed = await this.deps.events.emitAsyncAny("pull-delete", {
+            path, localDoc,
+        });
+        if (hasUnpushed) {
+            const tombstone: FileDoc = {
+                _id: docId, type: "file", chunks: [],
+                mtime: localDoc.mtime, ctime: localDoc.ctime,
+                size: 0, deleted: true, vclock: {},
+            };
+            concurrent.push({ filePath: path, localDoc, remoteDoc: tombstone });
+            logDebug(`  ⚡ ${path} (concurrent: remote-deleted vs local-edit)`);
+        }
+    }
+
+    // ── Phase 2: commit ─────────────────────────────────
+
+    /**
+     * Single atomic tx. bulkPut semantics: accepted docs overwrite local
+     * rows (CAS was already decided upstream). `onCommit` records echoes,
+     * fires pull-write, emits auto-resolve — all after the durable write.
+     */
+    private async commit(
+        accepted: CouchSyncDoc[],
+        concurrent: ConcurrentEntry[],
+        nextRemoteSeq: number | string,
+        stats: BatchStats,
+    ): Promise<void> {
+        await this.deps.localDb.runWriteTx({
+            docs: accepted.map((d) => ({ doc: d })),
+            meta: [{ op: "put", key: META_REMOTE_SEQ, value: nextRemoteSeq }],
+            onCommit: async () => {
+                const { updateSeq } = await this.deps.localDb.info();
+                const seq = typeof updateSeq === "number"
+                    ? updateSeq
+                    : parseInt(String(updateSeq), 10);
+                this.deps.echoes.recordPullWrites(
+                    accepted.map((d) => d._id), seq,
+                );
+
+                for (const doc of accepted) {
+                    if (!isFileDoc(doc)) continue;
+                    const path = filePathFromId(doc._id);
+                    try {
+                        await this.deps.ensureChunks(doc);
+                        await this.deps.events.emitAsync("pull-write", { doc });
+                        logDebug(`  ← ${path} (take-remote)`);
+                        stats.writtenCount++;
+                        this.deps.events.emit("auto-resolve", { filePath: path });
+                    } catch (e: any) {
+                        logError(`pull vault write failed: ${path}: ${e?.message ?? e}`);
+                        stats.writeFailCount++;
+                    }
+                }
+            },
+        });
+    }
+
+    // ── Phase 3: dispatch ───────────────────────────────
+
+    private logSummary(stats: BatchStats, concurrentCount: number): void {
+        const active = stats.writtenCount > 0
+            || stats.keepLocalCount > 0
+            || concurrentCount > 0
+            || stats.writeFailCount > 0
+            || stats.deletedCount > 0;
+        if (!active) return;
+
+        const parts: string[] = [];
+        if (stats.writtenCount > 0) parts.push(`${stats.writtenCount} written`);
+        if (stats.deletedCount > 0) parts.push(`${stats.deletedCount} deleted`);
+        if (stats.keepLocalCount > 0) parts.push(`${stats.keepLocalCount} keep-local`);
+        if (concurrentCount > 0) parts.push(`${concurrentCount} concurrent`);
+        if (stats.writeFailCount > 0) parts.push(`${stats.writeFailCount} failed`);
+        if (stats.chunkCount > 0) parts.push(`${stats.chunkCount} chunks`);
+        logInfo(`Pull: ${parts.join(", ")}`);
+    }
+
+    private emitConcurrent(concurrent: ConcurrentEntry[]): void {
+        for (const c of concurrent) {
+            this.deps.events.emit("concurrent", c);
+        }
+    }
+}
