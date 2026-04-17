@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import { PushPipeline } from "../src/db/sync/push-pipeline.ts";
 import { EchoTracker } from "../src/db/sync/echo-tracker.ts";
 import { SyncEvents } from "../src/db/sync/sync-events.ts";
+import { Checkpoints } from "../src/db/sync/checkpoints.ts";
 import { DbError } from "../src/db/write-transaction.ts";
 import type { ICouchClient } from "../src/db/interfaces.ts";
 
@@ -27,9 +28,24 @@ function makePipeline(
 ) {
     const echoes = new EchoTracker();
     const events = new SyncEvents();
-    const localDb = opts.localDb ?? {
+    const baseLocalDb = opts.localDb ?? {
         changes: vi.fn().mockResolvedValue({ results: [], last_seq: 0 }),
     };
+    // Checkpoints expects getStore()/getMetaStore(); stub them for tests
+    // that don't provide a real LocalDB.
+    const localDb: any = baseLocalDb;
+    if (!localDb.getStore) {
+        localDb.getStore = () => ({
+            runWriteTx: vi.fn().mockResolvedValue(undefined),
+            getMeta: vi.fn().mockResolvedValue(null),
+        });
+    }
+    if (!localDb.getMetaStore) {
+        localDb.getMetaStore = () => ({
+            runWriteTx: vi.fn().mockResolvedValue(undefined),
+            getMeta: vi.fn().mockResolvedValue(null),
+        });
+    }
 
     let cancelled = false;
     let callCount = 0;
@@ -42,8 +58,9 @@ function makePipeline(
         return false;
     };
 
-    let lastPushedSeq: number | string = 0;
+    const checkpoints = new Checkpoints(localDb);
     const saveCheckpoints = vi.fn().mockResolvedValue(undefined);
+    checkpoints.save = saveCheckpoints as any;
     const handleLocalDbError = vi.fn();
     let pausedCount = 0;
     events.on("paused", () => { pausedCount++; });
@@ -53,10 +70,8 @@ function makePipeline(
         client,
         echoes,
         events,
+        checkpoints,
         isCancelled,
-        getLastPushedSeq: () => lastPushedSeq,
-        setLastPushedSeq: (s) => { lastPushedSeq = s; },
-        saveCheckpoints,
         handleLocalDbError,
         delay: async () => {
             callCount++;
@@ -66,7 +81,7 @@ function makePipeline(
     return {
         pipeline, echoes, events, localDb,
         cancel: () => { cancelled = true; },
-        getLastPushedSeq: () => lastPushedSeq,
+        getLastPushedSeq: () => checkpoints.getLastPushedSeq(),
         saveCheckpoints, handleLocalDbError,
         pausedCount: () => pausedCount,
     };

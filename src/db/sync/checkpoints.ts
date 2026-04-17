@@ -1,15 +1,18 @@
 /**
- * Checkpoints — persistent sync progress markers.
+ * Checkpoints — persistent sync progress markers and pull-batch atomic commit owner.
  *
  * Survives across sessions: session N consumes/advances, session N+1
  * reads the final state. SyncEngine owns the instance; it loads once
  * at startup and passes the ref to each SyncSession.
  *
- * The atomic storage boundary is maintained: meta lives in the docs
- * store (same `runWriteTx` boundary as pulled docs), so a pull batch
- * commits both accepted docs and the new remoteSeq together.
+ * The atomic storage boundary lives here: a pull batch lands accepted
+ * docs + the new META_REMOTE_SEQ in a single `runWriteTx`, and the
+ * in-memory `remoteSeq` is advanced inside the same `onCommit` so the
+ * durable write, the cached cursor, and the caller's side effects are
+ * observable together or not at all.
  */
 
+import type { CouchSyncDoc } from "../../types.ts";
 import type { LocalDB } from "../local-db.ts";
 import { logDebug } from "../../ui/log.ts";
 
@@ -66,5 +69,36 @@ export class Checkpoints {
                 { op: "put", key: META_PUSH_SEQ, value: this.lastPushedSeq },
             ],
         });
+    }
+
+    /**
+     * Commit a pull batch: docs + new remoteSeq in a single atomic tx.
+     * The in-memory `remoteSeq` is advanced at the start of `onCommit`
+     * (inside the tx boundary) before the caller's `onCommit` fires, so
+     * downstream side effects always observe a consistent cursor.
+     */
+    async commitPullBatch(params: {
+        docs: CouchSyncDoc[];
+        nextRemoteSeq: number | string;
+        onCommit: () => Promise<void>;
+    }): Promise<void> {
+        await this.localDb.runWriteTx({
+            docs: params.docs.map((d) => ({ doc: d })),
+            meta: [{ op: "put", key: META_REMOTE_SEQ, value: params.nextRemoteSeq }],
+            onCommit: async () => {
+                this.remoteSeq = params.nextRemoteSeq;
+                await params.onCommit();
+            },
+        });
+    }
+
+    /**
+     * Advance the remote checkpoint for a batch that produced no accepted
+     * docs (empty fetch, or every row skipped by echo/keep-local). Persists
+     * both seqs so the on-disk cursor matches in-memory state.
+     */
+    async saveEmptyPullBatch(nextRemoteSeq: number | string): Promise<void> {
+        this.remoteSeq = nextRemoteSeq;
+        await this.save();
     }
 }

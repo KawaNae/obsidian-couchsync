@@ -60,25 +60,19 @@ export class SyncSession {
             localDb: deps.localDb,
             events: deps.events,
             echoes: this.echoes,
+            checkpoints: deps.checkpoints,
             getConflictResolver: deps.getConflictResolver,
             ensureChunks: deps.ensureChunks,
         });
         const isCancelled = () => this._disposed;
         const delay = (ms: number) => this.delay(ms);
-        const saveCheckpoints = async () => {
-            try { await deps.checkpoints.save(); }
-            catch (e) { deps.handleLocalDbError(e, "checkpoint save"); }
-        };
         this.pullPipeline = new PullPipeline({
-            localDb: deps.localDb,
             client: deps.client,
             pullWriter: this.pullWriter,
+            checkpoints: deps.checkpoints,
             errorRecovery: deps.errorRecovery,
             events: deps.events,
             isCancelled,
-            getRemoteSeq: () => deps.checkpoints.getRemoteSeq(),
-            setRemoteSeq: (s) => deps.checkpoints.setRemoteSeq(s),
-            saveCheckpoints,
             handleLocalDbError: deps.handleLocalDbError,
             delay,
         });
@@ -87,10 +81,8 @@ export class SyncSession {
             client: deps.client,
             echoes: this.echoes,
             events: deps.events,
+            checkpoints: deps.checkpoints,
             isCancelled,
-            getLastPushedSeq: () => deps.checkpoints.getLastPushedSeq(),
-            setLastPushedSeq: (s) => deps.checkpoints.setLastPushedSeq(s),
-            saveCheckpoints,
             handleLocalDbError: deps.handleLocalDbError,
             delay,
         });

@@ -21,6 +21,7 @@ import { DbError } from "../write-transaction.ts";
 import { logDebug, logInfo } from "../../ui/log.ts";
 import type { EchoTracker } from "./echo-tracker.ts";
 import type { SyncEvents } from "./sync-events.ts";
+import type { Checkpoints } from "./checkpoints.ts";
 
 const PUSH_POLL_INTERVAL_MS = 2000;
 
@@ -29,12 +30,10 @@ export interface PushPipelineDeps {
     client: ICouchClient;
     echoes: EchoTracker;
     events: SyncEvents;
+    checkpoints: Checkpoints;
 
     /** Session cancellation signal — pipeline exits its loop when true. */
     isCancelled: () => boolean;
-    getLastPushedSeq: () => number | string;
-    setLastPushedSeq: (s: number | string) => void;
-    saveCheckpoints: () => Promise<void>;
     handleLocalDbError: (e: unknown, context: string) => void;
     delay: (ms: number) => Promise<void>;
 }
@@ -49,7 +48,7 @@ export class PushPipeline {
         while (!this.deps.isCancelled()) {
             try {
                 const localChanges = await this.deps.localDb.changes(
-                    this.deps.getLastPushedSeq(),
+                    this.deps.checkpoints.getLastPushedSeq(),
                     { include_docs: true },
                 );
 
@@ -75,8 +74,8 @@ export class PushPipeline {
                     this.deps.events.emit("paused");
                 }
 
-                this.deps.setLastPushedSeq(localChanges.last_seq);
-                await this.deps.saveCheckpoints();
+                this.deps.checkpoints.setLastPushedSeq(localChanges.last_seq);
+                await this.deps.checkpoints.save();
             } catch (e: any) {
                 if (this.deps.isCancelled()) return;
                 if (e instanceof DbError) {

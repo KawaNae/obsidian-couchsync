@@ -63,12 +63,40 @@ type SyncHandler<T> = T extends void
 type SyncAsyncHandler<T> = (payload: T) => Promise<void>;
 type SyncQueryHandler<T> = (payload: T) => Promise<boolean>;
 
+// Fire-and-forget uses a normalized `(p: T) => void` storage signature:
+// void-payload handlers (`() => void`) are structurally assignable via
+// parameter-bivariance, so emit() can invoke `h(payload)` uniformly.
+type InternalHandler<T> = (payload: T) => void;
+
+type FireAndForgetHandlers = {
+    [K in keyof SyncEventMap]: Set<InternalHandler<SyncEventMap[K]>>;
+};
+type AwaitedHandlers = {
+    [K in keyof SyncAsyncEventMap]: Set<SyncAsyncHandler<SyncAsyncEventMap[K]>>;
+};
+type QueryHandlers = {
+    [K in keyof SyncQueryEventMap]: Set<SyncQueryHandler<SyncQueryEventMap[K]>>;
+};
+
 // ── SyncEvents ───────────────────────────────────────────
 
 export class SyncEvents {
-    private fireAndForget = new Map<keyof SyncEventMap, Set<(p: any) => void>>();
-    private awaited = new Map<keyof SyncAsyncEventMap, Set<(p: any) => Promise<void>>>();
-    private queries = new Map<keyof SyncQueryEventMap, Set<(p: any) => Promise<boolean>>>();
+    private fireAndForget: FireAndForgetHandlers = {
+        "state-change": new Set(),
+        error: new Set(),
+        paused: new Set(),
+        reconnect: new Set(),
+        concurrent: new Set(),
+        "auto-resolve": new Set(),
+        "catchup-complete": new Set(),
+        "catchup-failed": new Set(),
+    };
+    private awaited: AwaitedHandlers = {
+        "pull-write": new Set(),
+    };
+    private queries: QueryHandlers = {
+        "pull-delete": new Set(),
+    };
 
     private idleCallbacks: Array<() => void> = [];
     private idleFired = false;
@@ -79,25 +107,25 @@ export class SyncEvents {
         type: K,
         handler: SyncHandler<SyncEventMap[K]>,
     ): () => void {
-        let set = this.fireAndForget.get(type);
-        if (!set) {
-            set = new Set();
-            this.fireAndForget.set(type, set);
-        }
-        set.add(handler as (p: any) => void);
-        return () => { set!.delete(handler as (p: any) => void); };
+        const set = this.fireAndForget[type];
+        // SyncHandler<void> is `() => void`; storage uses the uniform
+        // `(p: void) => void`. The shapes are compatible at runtime (a
+        // 0-arg fn tolerates an extra arg) but TS can't simplify the
+        // conditional type through a generic K, so we assert structurally.
+        const h = handler as InternalHandler<SyncEventMap[K]>;
+        set.add(h);
+        return () => { set.delete(h); };
     }
 
     emit<K extends keyof SyncEventMap>(
         type: K,
         ...args: SyncEventMap[K] extends void ? [] : [SyncEventMap[K]]
     ): void {
-        const payload = (args[0] ?? undefined) as SyncEventMap[K];
-        const set = this.fireAndForget.get(type);
-        if (!set) return;
+        const payload = args[0] as SyncEventMap[K];
+        const set = this.fireAndForget[type];
         for (const h of set) {
             try {
-                (h as any)(payload);
+                h(payload);
             } catch (e: any) {
                 logError(`SyncEvents[${String(type)}] handler error: ${e?.message ?? e}`);
             }
@@ -110,21 +138,16 @@ export class SyncEvents {
         type: K,
         handler: SyncAsyncHandler<SyncAsyncEventMap[K]>,
     ): () => void {
-        let set = this.awaited.get(type);
-        if (!set) {
-            set = new Set();
-            this.awaited.set(type, set);
-        }
-        set.add(handler as (p: any) => Promise<void>);
-        return () => { set!.delete(handler as (p: any) => Promise<void>); };
+        const set = this.awaited[type];
+        set.add(handler);
+        return () => { set.delete(handler); };
     }
 
     async emitAsync<K extends keyof SyncAsyncEventMap>(
         type: K,
         payload: SyncAsyncEventMap[K],
     ): Promise<void> {
-        const set = this.awaited.get(type);
-        if (!set) return;
+        const set = this.awaited[type];
         for (const h of set) {
             try {
                 await h(payload);
@@ -140,13 +163,9 @@ export class SyncEvents {
         type: K,
         handler: SyncQueryHandler<SyncQueryEventMap[K]>,
     ): () => void {
-        let set = this.queries.get(type);
-        if (!set) {
-            set = new Set();
-            this.queries.set(type, set);
-        }
-        set.add(handler as (p: any) => Promise<boolean>);
-        return () => { set!.delete(handler as (p: any) => Promise<boolean>); };
+        const set = this.queries[type];
+        set.add(handler);
+        return () => { set.delete(handler); };
     }
 
     /** True if any subscriber returned true (or false when none registered). */
@@ -154,8 +173,7 @@ export class SyncEvents {
         type: K,
         payload: SyncQueryEventMap[K],
     ): Promise<boolean> {
-        const set = this.queries.get(type);
-        if (!set) return false;
+        const set = this.queries[type];
         let any = false;
         for (const h of set) {
             try {

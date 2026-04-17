@@ -1,18 +1,17 @@
 /**
- * PullWriter — applies a batch of pulled docs to localDB.
+ * PullWriter — classifies + dispatches a batch of pulled docs.
  *
- * The responsibility that used to be a 150-line `writePulledDocs` method
- * on SyncEngine is split into three phases:
+ * Three phases, sharp responsibilities:
  *
- *   1. `classify()` — walk the changes result, produce the accepted /
- *      concurrent / deletion sets via the ConflictResolver vclock guard.
- *      Read-only against localDB; no writes yet.
+ *   1. `classify()` — read-only walk of the changes result. Runs the
+ *      ConflictResolver vclock guard, produces the accepted / concurrent /
+ *      deletion sets. No writes.
  *
- *   2. `commit()` — one atomic `runWriteTx` that lands accepted docs and
- *      the META_REMOTE_SEQ checkpoint together. Crash between the two
- *      is impossible — the remote seq advance and the data commit are
- *      inseparable. EchoTracker recording and vault writes are side
- *      effects in `onCommit`, so they happen *after* the durable write.
+ *   2. `commit()` — delegates to `Checkpoints.commitPullBatch`, which
+ *      owns the atomic `runWriteTx` that lands accepted docs and the
+ *      new remoteSeq together. The onCommit closure passed in here
+ *      runs post-durable-write: echo recording, pull-write emission,
+ *      vault writes, auto-resolve events.
  *
  *   3. `dispatch()` — emit concurrent events + format the log summary.
  *      Pure post-commit bookkeeping.
@@ -34,8 +33,7 @@ import type { ConflictResolver } from "../../conflict/conflict-resolver.ts";
 import { logDebug, logError, logInfo } from "../../ui/log.ts";
 import type { EchoTracker } from "./echo-tracker.ts";
 import type { SyncEvents } from "./sync-events.ts";
-
-export const META_REMOTE_SEQ = "_sync/remote-seq";
+import type { Checkpoints } from "./checkpoints.ts";
 
 export interface PullApplyResult {
     nextRemoteSeq: number | string;
@@ -48,6 +46,7 @@ export interface PullWriterDeps {
     localDb: LocalDB;
     events: SyncEvents;
     echoes: EchoTracker;
+    checkpoints: Checkpoints;
     getConflictResolver: () => ConflictResolver | undefined;
     ensureChunks: (doc: FileDoc) => Promise<void>;
 }
@@ -73,7 +72,7 @@ export class PullWriter {
         const { accepted, concurrent, stats } = await this.classify(result);
 
         if (accepted.length > 0) {
-            await this.commit(accepted, concurrent, result.last_seq, stats);
+            await this.commit(accepted, result.last_seq, stats);
         }
 
         this.logSummary(stats, concurrent.length);
@@ -187,19 +186,19 @@ export class PullWriter {
     // ── Phase 2: commit ─────────────────────────────────
 
     /**
-     * Single atomic tx. bulkPut semantics: accepted docs overwrite local
-     * rows (CAS was already decided upstream). `onCommit` records echoes,
-     * fires pull-write, emits auto-resolve — all after the durable write.
+     * Hand the batch to Checkpoints, which owns the atomic tx. The
+     * onCommit closure here records echoes, fires pull-write, and emits
+     * auto-resolve — all after the durable write and after `remoteSeq`
+     * has advanced in memory.
      */
     private async commit(
         accepted: CouchSyncDoc[],
-        concurrent: ConcurrentEntry[],
         nextRemoteSeq: number | string,
         stats: BatchStats,
     ): Promise<void> {
-        await this.deps.localDb.runWriteTx({
-            docs: accepted.map((d) => ({ doc: d })),
-            meta: [{ op: "put", key: META_REMOTE_SEQ, value: nextRemoteSeq }],
+        await this.deps.checkpoints.commitPullBatch({
+            docs: accepted,
+            nextRemoteSeq,
             onCommit: async () => {
                 const { updateSeq } = await this.deps.localDb.info();
                 const seq = typeof updateSeq === "number"

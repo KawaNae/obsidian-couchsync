@@ -10,20 +10,20 @@
  *     shared ErrorRecovery, and exits cleanly on `isCancelled()`.
  *
  * The pipeline is stateless w.r.t. durable data: it delegates all doc
- * writes to `PullWriter` (which owns the atomic runWriteTx boundary)
- * and consults the caller's `getRemoteSeq()` for the feed cursor. The
+ * writes to `PullWriter` / `Checkpoints` (which together own the atomic
+ * runWriteTx boundary) and reads the feed cursor from Checkpoints. The
  * only state it owns is its own backoff and error-dedup registers,
  * both session-scoped and reset on construction.
  */
 
 import type { CouchSyncDoc } from "../../types.ts";
-import type { LocalDB } from "../local-db.ts";
 import type { ICouchClient, ChangesResult } from "../interfaces.ts";
 import { DbError } from "../write-transaction.ts";
 import type { ErrorRecovery } from "../error-recovery.ts";
 import { logDebug, logInfo } from "../../ui/log.ts";
 import type { PullWriter } from "./pull-writer.ts";
 import type { SyncEvents } from "./sync-events.ts";
+import type { Checkpoints } from "./checkpoints.ts";
 
 const CATCHUP_BATCH_SIZE = 200;
 const CATCHUP_IDLE_TIMEOUT_MS = 60_000;
@@ -31,16 +31,13 @@ const PULL_RETRY_MIN_MS = 2_000;
 const PULL_RETRY_MAX_MS = 30_000;
 
 export interface PullPipelineDeps {
-    localDb: LocalDB;
     client: ICouchClient;
     pullWriter: PullWriter;
+    checkpoints: Checkpoints;
     errorRecovery: ErrorRecovery;
     events: SyncEvents;
 
     isCancelled: () => boolean;
-    getRemoteSeq: () => number | string;
-    setRemoteSeq: (s: number | string) => void;
-    saveCheckpoints: () => Promise<void>;
     handleLocalDbError: (e: unknown, context: string) => void;
     delay: (ms: number) => Promise<void>;
 }
@@ -66,7 +63,7 @@ export class PullPipeline {
             }
 
             const result = await this.deps.client.changes<CouchSyncDoc>({
-                since: this.deps.getRemoteSeq(),
+                since: this.deps.checkpoints.getRemoteSeq(),
                 include_docs: true,
                 limit: CATCHUP_BATCH_SIZE,
             });
@@ -84,8 +81,11 @@ export class PullPipeline {
                 logInfo(
                     `Catchup complete (seq=${seq.length > 20 ? seq.slice(0, 20) + "…" : seq})`,
                 );
-                this.deps.setRemoteSeq(result.last_seq);
-                await this.deps.saveCheckpoints();
+                try {
+                    await this.deps.checkpoints.saveEmptyPullBatch(result.last_seq);
+                } catch (e) {
+                    this.deps.handleLocalDbError(e, "checkpoint save");
+                }
                 return;
             }
         }
@@ -97,7 +97,7 @@ export class PullPipeline {
         while (!this.deps.isCancelled()) {
             try {
                 const result = await this.deps.client.changesLongpoll<CouchSyncDoc>({
-                    since: this.deps.getRemoteSeq(),
+                    since: this.deps.checkpoints.getRemoteSeq(),
                     include_docs: true,
                 });
 
@@ -148,10 +148,16 @@ export class PullPipeline {
 
     private async applyBatch(result: ChangesResult<CouchSyncDoc>): Promise<void> {
         const applied = await this.deps.pullWriter.apply(result);
-        this.deps.setRemoteSeq(applied.nextRemoteSeq);
         // When the batch had no accepted docs, PullWriter didn't run a
-        // tx — advance the checkpoint explicitly here.
-        if (applied.empty) await this.deps.saveCheckpoints();
+        // tx — advance the checkpoint explicitly here. Otherwise
+        // commitPullBatch already advanced remoteSeq inside its onCommit.
+        if (applied.empty) {
+            try {
+                await this.deps.checkpoints.saveEmptyPullBatch(applied.nextRemoteSeq);
+            } catch (e) {
+                this.deps.handleLocalDbError(e, "checkpoint save");
+            }
+        }
     }
 
     // ── Introspection (tests) ───────────────────────────

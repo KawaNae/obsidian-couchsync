@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import { PullWriter } from "../src/db/sync/pull-writer.ts";
 import { EchoTracker } from "../src/db/sync/echo-tracker.ts";
 import { SyncEvents } from "../src/db/sync/sync-events.ts";
+import { Checkpoints } from "../src/db/sync/checkpoints.ts";
 import type { ChangesResult } from "../src/db/interfaces.ts";
 import type { FileDoc } from "../src/types.ts";
 
@@ -24,7 +25,7 @@ function makeMockLocalDb(overrides?: any): any {
         if (tx.onCommit) await tx.onCommit();
     };
     const runWriteTx = vi.fn(async (tx: any) => { await applyTx(tx); });
-    return {
+    const mock: any = {
         bulkPut,
         info: vi.fn().mockResolvedValue({ updateSeq: 5 }),
         get: vi.fn().mockResolvedValue(null),
@@ -33,12 +34,31 @@ function makeMockLocalDb(overrides?: any): any {
         getMeta: vi.fn(async (k: string) => docsMeta[k] ?? null),
         ...overrides,
     };
+    // Checkpoints uses localDb.getStore().runWriteTx for its saves, but
+    // commitPullBatch routes through localDb.runWriteTx — provide a
+    // getStore() that delegates back to the same runWriteTx so tests
+    // can observe all tx calls via `runWriteTx.mock`.
+    mock.getStore = () => ({
+        runWriteTx: mock.runWriteTx,
+        getMeta: mock.getMeta,
+    });
+    mock.getMetaStore = () => ({
+        runWriteTx: vi.fn().mockResolvedValue(undefined),
+        getMeta: vi.fn().mockResolvedValue(null),
+    });
+    return mock;
 }
 
 function makeWriter(
     localDb: any,
     opts: { resolver?: any; ensureChunks?: (doc: FileDoc) => Promise<void> } = {},
-): { writer: PullWriter; echoes: EchoTracker; events: SyncEvents; metaWrites: any[] } {
+): {
+    writer: PullWriter;
+    echoes: EchoTracker;
+    events: SyncEvents;
+    checkpoints: Checkpoints;
+    metaWrites: any[];
+} {
     const echoes = new EchoTracker();
     const events = new SyncEvents();
     const metaWrites: any[] = [];
@@ -47,14 +67,16 @@ function makeWriter(
         if (tx?.meta) metaWrites.push(...tx.meta);
         return origTx(tx);
     });
+    const checkpoints = new Checkpoints(localDb);
     const writer = new PullWriter({
         localDb,
         events,
         echoes,
+        checkpoints,
         getConflictResolver: () => opts.resolver,
         ensureChunks: opts.ensureChunks ?? (async () => {}),
     });
-    return { writer, echoes, events, metaWrites };
+    return { writer, echoes, events, checkpoints, metaWrites };
 }
 
 // ── Tests ─────────────────────────────────────────────────

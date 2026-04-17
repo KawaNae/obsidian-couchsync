@@ -5,7 +5,7 @@ import type { HistoryCapture } from "../history/history-capture.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { FileDoc, CouchSyncDoc } from "../types.ts";
 import type { IModalPresenter, ConflictChoice } from "../types/modal-presenter.ts";
-import { isFileDoc } from "../types.ts";
+import { isFileDoc, isConfigDoc } from "../types.ts";
 import { joinChunks } from "../db/chunker.ts";
 import { isDiffableText } from "../utils/binary.ts";
 import { incrementVC, mergeVC } from "../sync/vector-clock.ts";
@@ -133,13 +133,15 @@ export class ConflictOrchestrator {
                 );
             }
         } else {
-            // ConfigDoc or unknown — keep local, merge vclocks for push.
-            if ("vclock" in localDoc && "vclock" in remoteDoc) {
+            // ConfigDoc (or unknown) — keep local, merge vclocks for push.
+            // Narrow to the vclock-bearing union (FileDoc | ConfigDoc);
+            // ChunkDocs have no vclock, so we skip those paths silently.
+            if (
+                (isFileDoc(localDoc) || isConfigDoc(localDoc))
+                && (isFileDoc(remoteDoc) || isConfigDoc(remoteDoc))
+            ) {
                 const deviceId = this.deps.getSettings().deviceId;
-                const merged = mergeVC(
-                    (localDoc as any).vclock ?? {},
-                    (remoteDoc as any).vclock ?? {},
-                );
+                const merged = mergeVC(localDoc.vclock, remoteDoc.vclock);
                 const updated = { ...localDoc, vclock: incrementVC(merged, deviceId) };
                 await localDb.runWriteTx({
                     docs: [{ doc: stripRev(updated) as CouchSyncDoc }],

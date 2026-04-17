@@ -280,7 +280,7 @@ export class DexieStore<T extends { _id: string; _rev?: string } = any>
                     const id = doc._id;
                     const stored = existingMap.get(id);
                     if (expectedVclock !== undefined) {
-                        const currentVc = (stored as any)?.vclock as
+                        const currentVc = stored?.vclock as
                             | VectorClock
                             | undefined;
                         if (!vclocksEqual(currentVc, expectedVclock)) {

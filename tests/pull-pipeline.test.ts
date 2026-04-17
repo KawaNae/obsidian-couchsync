@@ -4,6 +4,7 @@ import { PullWriter } from "../src/db/sync/pull-writer.ts";
 import { EchoTracker } from "../src/db/sync/echo-tracker.ts";
 import { SyncEvents } from "../src/db/sync/sync-events.ts";
 import { AuthGate } from "../src/db/sync/auth-gate.ts";
+import { Checkpoints } from "../src/db/sync/checkpoints.ts";
 import { ErrorRecovery } from "../src/db/error-recovery.ts";
 import { DbError } from "../src/db/write-transaction.ts";
 import type { ICouchClient } from "../src/db/interfaces.ts";
@@ -24,12 +25,22 @@ function makeClient(overrides?: Partial<ICouchClient>): ICouchClient {
 }
 
 function makeLocalDb(): any {
-    return {
-        runWriteTx: vi.fn(async (tx: any) => { if (tx?.onCommit) await tx.onCommit(); }),
+    const runWriteTx = vi.fn(async (tx: any) => { if (tx?.onCommit) await tx.onCommit(); });
+    const mock: any = {
+        runWriteTx,
         info: vi.fn().mockResolvedValue({ updateSeq: 5 }),
         get: vi.fn().mockResolvedValue(null),
         getChunks: vi.fn().mockResolvedValue([]),
     };
+    mock.getStore = () => ({
+        runWriteTx: mock.runWriteTx,
+        getMeta: vi.fn().mockResolvedValue(null),
+    });
+    mock.getMetaStore = () => ({
+        runWriteTx: vi.fn().mockResolvedValue(undefined),
+        getMeta: vi.fn().mockResolvedValue(null),
+    });
+    return mock;
 }
 
 interface Harness {
@@ -37,6 +48,7 @@ interface Harness {
     events: SyncEvents;
     pausedCount: () => number;
     handleLocalDbError: ReturnType<typeof vi.fn>;
+    checkpoints: Checkpoints;
     saveCheckpoints: ReturnType<typeof vi.fn>;
     cancel: () => void;
     getRemoteSeq: () => number | string;
@@ -46,19 +58,21 @@ function makeHarness(client: ICouchClient): Harness {
     const localDb = makeLocalDb();
     const echoes = new EchoTracker();
     const events = new SyncEvents();
+    const checkpoints = new Checkpoints(localDb);
+    // Spy save() to observe persistence attempts without hitting the mock store.
+    const saveCheckpoints = vi.fn().mockResolvedValue(undefined);
+    checkpoints.save = saveCheckpoints as any;
     const pullWriter = new PullWriter({
-        localDb, events, echoes,
+        localDb, events, echoes, checkpoints,
         getConflictResolver: () => undefined,
         ensureChunks: async () => {},
     });
 
     let state: SyncState = "connected";
-    let remoteSeq: number | string = 0;
     let cancelled = false;
     let paused = 0;
     events.on("paused", () => { paused++; });
 
-    const saveCheckpoints = vi.fn().mockResolvedValue(undefined);
     const handleLocalDbError = vi.fn();
     const errorRecovery = new ErrorRecovery({
         getState: () => state,
@@ -69,20 +83,17 @@ function makeHarness(client: ICouchClient): Harness {
     }, new AuthGate());
 
     const pipeline = new PullPipeline({
-        localDb, client, pullWriter, errorRecovery, events,
+        client, pullWriter, checkpoints, errorRecovery, events,
         isCancelled: () => cancelled,
-        getRemoteSeq: () => remoteSeq,
-        setRemoteSeq: (s) => { remoteSeq = s; },
-        saveCheckpoints,
         handleLocalDbError,
         delay: async () => {},
     });
 
     return {
         pipeline, events, pausedCount: () => paused,
-        handleLocalDbError, saveCheckpoints,
+        handleLocalDbError, checkpoints, saveCheckpoints,
         cancel: () => { cancelled = true; },
-        getRemoteSeq: () => remoteSeq,
+        getRemoteSeq: () => checkpoints.getRemoteSeq(),
     };
 }
 
