@@ -35,6 +35,7 @@ import { SyncEvents } from "./sync/sync-events.ts";
 import { PullWriter } from "./sync/pull-writer.ts";
 import { PullPipeline } from "./sync/pull-pipeline.ts";
 import { PushPipeline } from "./sync/push-pipeline.ts";
+import { Checkpoints } from "./sync/checkpoints.ts";
 
 // ── Re-exports ──────────────────────────────────────────
 
@@ -48,11 +49,6 @@ export type {
 // ── Constants ────────────────────────────────────────────
 
 const HEALTH_CHECK_INTERVAL = 30000; // 30s
-
-// ── Checkpoint keys ──────────────────────────────────────
-
-const META_REMOTE_SEQ = "_sync/remote-seq";
-const META_PUSH_SEQ = "_sync/push-seq";
 
 // ── SyncEngine ───────────────────────────────────────────
 
@@ -114,10 +110,9 @@ export class SyncEngine {
 
     // ── Checkpoints ───────────────────────────────────────
 
-    /** Last remote _changes seq consumed. */
-    private remoteSeq: number | string = 0;
-    /** Last local seq that was pushed to remote. */
-    private lastPushedSeq: number | string = 0;
+    /** Persistent sync progress markers (remoteSeq, lastPushedSeq).
+     *  Owned by SyncEngine because they survive across sessions. */
+    private readonly checkpoints: Checkpoints;
 
     // ── Constructor ───────────────────────────────────────
 
@@ -128,6 +123,7 @@ export class SyncEngine {
         auth?: AuthGate,
     ) {
         this.auth = auth ?? new AuthGate();
+        this.checkpoints = new Checkpoints(localDb);
 
         this.errorRecovery = new ErrorRecovery(
             {
@@ -354,7 +350,7 @@ export class SyncEngine {
 
         // Load checkpoints from meta store.
         try {
-            await this.loadCheckpoints();
+            await this.checkpoints.load();
         } catch (e) {
             logDebug(`checkpoint load error: ${e}`);
             // Start from 0 if meta is unavailable.
@@ -405,9 +401,9 @@ export class SyncEngine {
             errorRecovery: this.errorRecovery,
             events: this.events,
             isCancelled: () => this.syncEpoch !== epoch,
-            getRemoteSeq: () => this.remoteSeq,
-            setRemoteSeq: (s) => { this.remoteSeq = s; },
-            saveCheckpoints: () => this.saveCheckpoints(),
+            getRemoteSeq: () => this.checkpoints.getRemoteSeq(),
+            setRemoteSeq: (s) => this.checkpoints.setRemoteSeq(s),
+            saveCheckpoints: () => this.saveCheckpointsSafe(),
             handleLocalDbError: (e, ctx) => this.handleLocalDbError(e, ctx),
             delay: (ms) => this.delay(ms, epoch),
         });
@@ -420,9 +416,9 @@ export class SyncEngine {
             echoes: this.echoes,
             events: this.events,
             isCancelled: () => this.syncEpoch !== epoch,
-            getLastPushedSeq: () => this.lastPushedSeq,
-            setLastPushedSeq: (s) => { this.lastPushedSeq = s; },
-            saveCheckpoints: () => this.saveCheckpoints(),
+            getLastPushedSeq: () => this.checkpoints.getLastPushedSeq(),
+            setLastPushedSeq: (s) => this.checkpoints.setLastPushedSeq(s),
+            saveCheckpoints: () => this.saveCheckpointsSafe(),
             handleLocalDbError: (e, ctx) => this.handleLocalDbError(e, ctx),
             delay: (ms) => this.delay(ms, epoch),
         });
@@ -430,50 +426,11 @@ export class SyncEngine {
 
     // ── Internal: Checkpoints ─────────────────────────────
 
-    private async loadCheckpoints(): Promise<void> {
-        // Checkpoints live in the docs-store meta so they can sit in the
-        // same rw tx as pull-written docs. Migrate from the legacy metaStore
-        // location transparently on first load.
-        const docsStore = this.localDb.getStore();
-        let remoteSeq = await docsStore.getMeta<number | string>(META_REMOTE_SEQ);
-        let pushSeq = await docsStore.getMeta<number | string>(META_PUSH_SEQ);
-
-        if (remoteSeq === null && pushSeq === null) {
-            const legacy = this.localDb.getMetaStore();
-            const legacyRemote = await legacy.getMeta<number | string>(META_REMOTE_SEQ);
-            const legacyPush = await legacy.getMeta<number | string>(META_PUSH_SEQ);
-            if (legacyRemote !== null || legacyPush !== null) {
-                const meta: Array<{ op: "put"; key: string; value: unknown }> = [];
-                if (legacyRemote !== null) meta.push({ op: "put", key: META_REMOTE_SEQ, value: legacyRemote });
-                if (legacyPush !== null) meta.push({ op: "put", key: META_PUSH_SEQ, value: legacyPush });
-                await docsStore.runWriteTx({ meta });
-                await legacy.runWriteTx({
-                    meta: [
-                        { op: "delete", key: META_REMOTE_SEQ },
-                        { op: "delete", key: META_PUSH_SEQ },
-                    ],
-                });
-                remoteSeq = legacyRemote;
-                pushSeq = legacyPush;
-                logDebug("checkpoints migrated from legacy metaStore");
-            }
-        }
-
-        if (remoteSeq !== null) this.remoteSeq = remoteSeq;
-        if (pushSeq !== null) this.lastPushedSeq = pushSeq;
-        logDebug(`checkpoints loaded: remoteSeq=${this.remoteSeq} pushSeq=${this.lastPushedSeq}`);
-    }
-
-    private async saveCheckpoints(): Promise<void> {
+    /** Wrap Checkpoints.save() with the local DB error handler — quota
+     *  errors halt the sync loops, transient errors log at warn. */
+    private async saveCheckpointsSafe(): Promise<void> {
         try {
-            // Both sequence checkpoints land in the docs store so a later
-            // pull-commit refactor can inline them into the same tx.
-            await this.localDb.getStore().runWriteTx({
-                meta: [
-                    { op: "put", key: META_REMOTE_SEQ, value: this.remoteSeq },
-                    { op: "put", key: META_PUSH_SEQ, value: this.lastPushedSeq },
-                ],
-            });
+            await this.checkpoints.save();
         } catch (e) {
             this.handleLocalDbError(e, "checkpoint save");
         }
@@ -536,7 +493,7 @@ export class SyncEngine {
 
             const currentRemoteSeq = info.update_seq;
             const remoteNum = SyncEngine.seqNumericPrefix(currentRemoteSeq);
-            const consumedNum = SyncEngine.seqNumericPrefix(this.remoteSeq);
+            const consumedNum = SyncEngine.seqNumericPrefix(this.checkpoints.getRemoteSeq());
 
             if (remoteNum !== consumedNum
                 && remoteNum === SyncEngine.seqNumericPrefix(this.lastObservedRemoteSeq)) {

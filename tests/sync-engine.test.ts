@@ -494,7 +494,7 @@ describe("SyncEngine stall detection (checkHealth)", () => {
 
         (engine as any).client = mockClient;
         (engine as any).running = true;
-        (engine as any).remoteSeq = "42";
+        (engine as any).checkpoints.setRemoteSeq("42");
         (engine as any).setState("connected");
 
         const before = Date.now();
@@ -515,7 +515,7 @@ describe("SyncEngine stall detection (checkHealth)", () => {
 
         (engine as any).client = mockClient;
         (engine as any).running = true;
-        (engine as any).remoteSeq = "40";
+        (engine as any).checkpoints.setRemoteSeq("40");
         (engine as any).setState("syncing");
 
         await (engine as any).checkHealth();
@@ -534,7 +534,7 @@ describe("SyncEngine stall detection (checkHealth)", () => {
 
         (engine as any).client = mockClient;
         (engine as any).running = true;
-        (engine as any).remoteSeq = "40";
+        (engine as any).checkpoints.setRemoteSeq("40");
         (engine as any).setState("connected");
 
         const reconnectSpy = vi
@@ -566,8 +566,8 @@ describe("SyncEngine stall detection (checkHealth)", () => {
 
         (engine as any).client = mockClient;
         (engine as any).running = true;
-        // remoteSeq from _changes has different opaque suffix but same numeric prefix
-        (engine as any).remoteSeq = "1771-g1AAAACReJz_OPAQUE_FROM_CHANGES";
+        // checkpoints.remoteSeq from _changes has different opaque suffix but same numeric prefix
+        (engine as any).checkpoints.setRemoteSeq("1771-g1AAAACReJz_OPAQUE_FROM_CHANGES");
         (engine as any).setState("connected");
 
         const reconnectSpy = vi
