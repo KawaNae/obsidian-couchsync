@@ -16,6 +16,7 @@ import { type App, Notice, Setting, type ButtonComponent } from "obsidian";
 import { MAX_PREVIOUS_DEVICE_IDS, type ConnectionState, type CouchSyncSettings } from "../settings.ts";
 import type { SyncEngine } from "../db/sync-engine.ts";
 import type { AuthGate } from "../db/sync/auth-gate.ts";
+import type { VaultRemoteOps } from "../db/sync/vault-remote-ops.ts";
 import type { LocalDB } from "../db/local-db.ts";
 import { validateDeviceName } from "../utils/device-name.ts";
 
@@ -25,6 +26,7 @@ export interface VaultSyncTabDeps {
     updateSettings: (patch: Partial<CouchSyncSettings>) => Promise<void>;
     replicator: SyncEngine;
     auth: AuthGate;
+    remoteOps: VaultRemoteOps;
     localDb: LocalDB;
     initVault: () => Promise<void>;
     cloneFromRemote: () => Promise<void>;
@@ -319,7 +321,7 @@ export class VaultSyncTab {
     private async handleTest(btn: ButtonComponent): Promise<void> {
         btn.setButtonText("Testing...");
         btn.setDisabled(true);
-        const error = await this.deps.replicator.testConnectionWith(
+        const error = await this.deps.remoteOps.testConnectionWith(
             this.draft.uri,
             this.draft.user,
             this.draft.pass,

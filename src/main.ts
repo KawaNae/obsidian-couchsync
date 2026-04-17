@@ -5,6 +5,7 @@ import { ConfigLocalDB } from "./db/config-local-db.ts";
 import { DexieStore } from "./db/dexie-store.ts";
 import { SyncEngine } from "./db/sync-engine.ts";
 import { AuthGate } from "./db/sync/auth-gate.ts";
+import { VaultRemoteOps } from "./db/sync/vault-remote-ops.ts";
 import { VaultSync } from "./sync/vault-sync.ts";
 import { ConfigSync } from "./sync/config-sync.ts";
 import { SetupService } from "./sync/setup.ts";
@@ -36,6 +37,7 @@ export default class CouchSyncPlugin extends Plugin {
     configLocalDb: ConfigLocalDB | null = null;
     replicator!: SyncEngine;
     auth!: AuthGate;
+    remoteOps!: VaultRemoteOps;
     configSync!: ConfigSync;
     private vaultSync!: VaultSync;
     private setupService!: SetupService;
@@ -98,6 +100,7 @@ export default class CouchSyncPlugin extends Plugin {
         const modalPresenter = new ObsidianModalPresenter(this.app);
 
         this.auth = new AuthGate();
+        this.remoteOps = new VaultRemoteOps(this.localDb, () => this.settings, this.auth);
         this.replicator = new SyncEngine(this.localDb, () => this.settings, Platform.isMobile, this.auth);
         this.historyStorage = new HistoryStorage(this.app.vault.getName());
         this.historyCapture = new HistoryCapture(vaultIO, vaultEvents, this.historyStorage, () => this.settings);
@@ -122,7 +125,7 @@ export default class CouchSyncPlugin extends Plugin {
             (doc) => this.replicator.ensureFileChunks(doc),
         );
         this.setupService = new SetupService(
-            vaultIO, this.localDb, this.replicator, this.vaultSync, this.reconciler,
+            vaultIO, this.localDb, this.remoteOps, this.vaultSync, this.reconciler,
         );
         this.historyManager = new HistoryManager(
             vaultIO, this.historyStorage, this.historyCapture, () => this.settings,

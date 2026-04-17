@@ -53,7 +53,7 @@ export function registerCommands(plugin: CouchSyncPlugin): void {
                 if (plugin.settings.connectionState === "syncing") {
                     progress.update("Pulling latest from remote...");
                     try {
-                        await plugin.replicator.pullFromRemote();
+                        await plugin.remoteOps.pullAll();
                     } catch (e: any) {
                         logWarn(`CouchSync: verify pull failed, continuing with local view: ${e?.message ?? e}`);
                     }

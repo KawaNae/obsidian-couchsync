@@ -26,6 +26,7 @@ import type { CouchSyncSettings } from "../settings.ts";
 import type { ConfigSync } from "../sync/config-sync.ts";
 import type { SyncEngine } from "../db/sync-engine.ts";
 import type { AuthGate } from "../db/sync/auth-gate.ts";
+import type { VaultRemoteOps } from "../db/sync/vault-remote-ops.ts";
 import { logWarn } from "../ui/log.ts";
 
 export interface ConfigSyncTabDeps {
@@ -35,6 +36,7 @@ export interface ConfigSyncTabDeps {
     configSync: ConfigSync;
     replicator: SyncEngine;
     auth: AuthGate;
+    remoteOps: VaultRemoteOps;
     refresh: () => void;
 }
 
@@ -360,9 +362,9 @@ export class ConfigSyncTab {
         }
 
         // Construct a temporary URL using the inherited credentials and
-        // the draft config DB name. Re-use Replicator's testConnectionWith
-        // helper which already handles HEAD checks and surfaces errors.
-        const error = await this.deps.replicator.testConnectionWith(
+        // the draft config DB name. VaultRemoteOps.testConnectionWith
+        // handles the HEAD check and auth-latch bookkeeping.
+        const error = await this.deps.remoteOps.testConnectionWith(
             settings.couchdbUri,
             settings.couchdbUser,
             settings.couchdbPassword,

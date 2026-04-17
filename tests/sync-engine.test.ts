@@ -652,17 +652,8 @@ describe("SyncEngine stall detection (checkHealth)", () => {
 // vclock guard + atomic commit are tested directly against PullWriter
 // in tests/pull-writer.test.ts. SyncEngine just wires the call site.
 
-describe("SyncEngine one-shot operations", () => {
-    it("testConnectionWith returns error string on unreachable server", async () => {
-        const engine = makeSyncEngine(makeMockLocalDb(), makeMockClient());
-
-        const result = await engine.testConnectionWith(
-            "http://test.invalid", "user", "pass", "db",
-        );
-        expect(typeof result).toBe("string");
-        engine.stop();
-    });
-});
+// One-shot operations (pushToRemote/pullFromRemote/destroyRemote/testConnection)
+// moved to VaultRemoteOps. See tests/vault-remote-ops.test.ts.
 
 // Echo suppression unit behavior: tests/echo-tracker.test.ts
 // Deletion propagation (handlePulledDeletion): tests/pull-writer.test.ts

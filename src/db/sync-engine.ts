@@ -11,13 +11,12 @@
  * class focuses on the sync loops themselves.
  */
 
-import type { CouchSyncDoc, FileDoc, ChunkDoc } from "../types.ts";
+import type { FileDoc, ChunkDoc } from "../types.ts";
 import type { LocalDB } from "./local-db.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { ICouchClient } from "./interfaces.ts";
 import type { ConflictResolver } from "../conflict/conflict-resolver.ts";
 import { filePathFromId } from "../types/doc-id.ts";
-import * as remoteCouch from "./remote-couch.ts";
 import { CouchClient, makeCouchClient } from "./couch-client.ts";
 import {
     decideReconnect,
@@ -49,10 +48,6 @@ export type {
 // ── Constants ────────────────────────────────────────────
 
 const HEALTH_CHECK_INTERVAL = 30000; // 30s
-
-/** Build identifier, logged at start(). Lets us verify on mobile that a
- *  deployed plugin update actually reached the device. */
-const BUILD_TAG = "sync-engine-v0.18.0";
 
 // ── Checkpoint keys ──────────────────────────────────────
 
@@ -244,7 +239,6 @@ export class SyncEngine {
      */
     async start(): Promise<void> {
         if (this.running) return;
-        logDebug(`sync-engine start (build=${BUILD_TAG})`);
         // An explicit start() call means the user is trying again — assume
         // they've fixed their credentials.
         this.auth.clear();
@@ -289,66 +283,8 @@ export class SyncEngine {
         await this.restart();
     }
 
-    // ── Public API: One-shot operations ───────────────────
-
-    /**
-     * One-shot push of the entire vault local DB to the vault remote.
-     * Used by SetupService.init() and similar bootstrap flows.
-     */
-    async pushToRemote(onProgress?: (docId: string, count: number) => void): Promise<number> {
-        const client = this.makeVaultClient();
-        return remoteCouch.pushAll(this.localDb, client, onProgress);
-    }
-
-    /** One-shot pull of the entire vault remote → local. */
-    async pullFromRemote(
-        onProgress?: (docId: string, count: number) => void,
-    ): Promise<{ written: number; docs: CouchSyncDoc[] }> {
-        const client = this.makeVaultClient();
-        return remoteCouch.pullAll(this.localDb, client, onProgress);
-    }
-
-    /** Destroy the vault remote database (auto-recreated on next push). */
-    async destroyRemote(): Promise<void> {
-        const client = this.makeVaultClient();
-        await remoteCouch.destroyRemote(client);
-    }
-
-    /** Create the vault remote database if it doesn't exist. */
-    async ensureRemoteDb(): Promise<void> {
-        const client = this.makeVaultClient();
-        await client.ensureDb();
-    }
-
-    /** Test connection with explicit credentials (for unsaved draft values). */
-    async testConnectionWith(
-        uri: string, user: string, pass: string, db: string,
-    ): Promise<string | null> {
-        try {
-            const client = makeCouchClient(uri, db, user, pass);
-            await client.info();
-            return null;
-        } catch (e: any) {
-            return e.message || "Connection failed";
-        }
-    }
-
-    /** Test connection using saved settings. Reuses the live client when
-     *  available so we don't allocate a fresh one on every health probe. */
-    async testConnection(): Promise<string | null> {
-        if (this.client) {
-            try {
-                await this.client.info();
-                return null;
-            } catch (e: any) {
-                return e.message || "Connection failed";
-            }
-        }
-        const s = this.getSettings();
-        return this.testConnectionWith(
-            s.couchdbUri, s.couchdbUser, s.couchdbPassword, s.couchdbDbName,
-        );
-    }
+    // One-shot operations live on VaultRemoteOps (plugin.remoteOps).
+    // SyncEngine is exclusively live-loop from v0.18.0 onward.
 
     // ── Internal: State management ────────────────────────
 
@@ -648,9 +584,25 @@ export class SyncEngine {
     // ── Internal: Verify reachability ─────────────────────
 
     /** Verify the server can be reached. On failure, transitions to hard
-     *  error and returns false. */
+     *  error and returns false. Uses the live client when available,
+     *  falling back to a fresh one from saved settings. */
     private async verifyReachable(): Promise<boolean> {
-        const err = await this.testConnection();
+        let err: string | null = null;
+        if (this.client) {
+            try {
+                await this.client.info();
+            } catch (e: any) {
+                err = e?.message || "Connection failed";
+            }
+        } else {
+            const s = this.getSettings();
+            try {
+                const probe = makeCouchClient(s.couchdbUri, s.couchdbDbName, s.couchdbUser, s.couchdbPassword);
+                await probe.info();
+            } catch (e: any) {
+                err = e?.message || "Connection failed";
+            }
+        }
         if (err) {
             const detail = this.errorRecovery.classifyError({ message: err });
             if (detail.kind === "unknown") {

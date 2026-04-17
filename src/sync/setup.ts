@@ -1,6 +1,6 @@
 import type { IVaultIO } from "../types/vault-io.ts";
 import type { LocalDB } from "../db/local-db.ts";
-import type { SyncEngine } from "../db/sync-engine.ts";
+import type { VaultRemoteOps } from "../db/sync/vault-remote-ops.ts";
 import type { VaultSync } from "./vault-sync.ts";
 import type { Reconciler } from "./reconciler.ts";
 import { filePathFromId, parseDocId } from "../types/doc-id.ts";
@@ -31,7 +31,7 @@ export class SetupService {
     constructor(
         private vault: IVaultIO,
         private localDb: LocalDB,
-        private replicator: SyncEngine,
+        private remoteOps: VaultRemoteOps,
         private vaultSync: VaultSync,
         private reconciler: Reconciler,
     ) {}
@@ -44,14 +44,14 @@ export class SetupService {
             this.localDb.open();
 
             onProgress("Initializing remote database...");
-            await this.replicator.destroyRemote();
-            await this.replicator.ensureRemoteDb();
+            await this.remoteOps.destroyRemote();
+            await this.remoteOps.ensureRemoteDb();
 
             onProgress("Scanning vault files...");
             const vaultFiles = await this.scanVaultToDb(onProgress);
 
             onProgress("Pushing to remote...");
-            const totalDocs = await this.replicator.pushToRemote((docId, n) => {
+            const totalDocs = await this.remoteOps.pushAll((docId, n) => {
                 onProgress(`Pushing: ${formatDocIdForProgress(docId)} (${n})`);
             });
 
@@ -71,7 +71,7 @@ export class SetupService {
             this.localDb.open();
 
             onProgress("Pulling from remote...");
-            const { written: totalDocs } = await this.replicator.pullFromRemote((docId, n) => {
+            const { written: totalDocs } = await this.remoteOps.pullAll((docId, n) => {
                 onProgress(`Pulling: ${formatDocIdForProgress(docId)} (${n})`);
             });
 
