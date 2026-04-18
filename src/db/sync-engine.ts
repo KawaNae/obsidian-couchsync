@@ -17,7 +17,7 @@ import type { CouchSyncSettings } from "../settings.ts";
 import type { ICouchClient } from "./interfaces.ts";
 import type { ConflictResolver } from "../conflict/conflict-resolver.ts";
 import { filePathFromId } from "../types/doc-id.ts";
-import { CouchClient, makeCouchClient } from "./couch-client.ts";
+import { makeCouchClient } from "./couch-client.ts";
 import { decideReconnect } from "./reconnect-policy.ts";
 import type {
     ReconnectReason,
@@ -88,13 +88,23 @@ export class SyncEngine {
 
     // ── Constructor ───────────────────────────────────────
 
+    /** Client factory for the vault DB session. Tests inject a fake
+     *  here so multiple engines can share one in-memory remote; E2E
+     *  specs inject a real CouchClient pre-configured against a docker
+     *  instance. Production callers omit it and get the default. */
+    private readonly clientFactory: (s: CouchSyncSettings) => ICouchClient;
+
     constructor(
         private localDb: LocalDB,
         private getSettings: () => CouchSyncSettings,
         private isMobile: boolean = false,
         auth?: AuthGate,
+        clientFactory?: (s: CouchSyncSettings) => ICouchClient,
     ) {
         this.auth = auth ?? new AuthGate();
+        this.clientFactory = clientFactory ?? ((s) =>
+            makeCouchClient(s.couchdbUri, s.couchdbDbName, s.couchdbUser, s.couchdbPassword)
+        );
         this.checkpoints = new Checkpoints(localDb);
 
         this.errorRecovery = new ErrorRecovery(
@@ -467,9 +477,8 @@ export class SyncEngine {
                 err = e?.message || "Connection failed";
             }
         } else {
-            const s = this.getSettings();
             try {
-                const probe = makeCouchClient(s.couchdbUri, s.couchdbDbName, s.couchdbUser, s.couchdbPassword);
+                const probe = this.clientFactory(this.getSettings());
                 await probe.info();
             } catch (e: any) {
                 err = e?.message || "Connection failed";
@@ -491,12 +500,10 @@ export class SyncEngine {
 
     // ── Internal: Helpers ─────────────────────────────────
 
-    /** Build a CouchClient for the vault database. */
-    private makeVaultClient(): CouchClient {
-        const s = this.getSettings();
-        return makeCouchClient(
-            s.couchdbUri, s.couchdbDbName, s.couchdbUser, s.couchdbPassword,
-        );
+    /** Build a client for the vault database session. Uses the injected
+     *  factory (tests / E2E) or the default CouchClient factory (prod). */
+    private makeVaultClient(): ICouchClient {
+        return this.clientFactory(this.getSettings());
     }
 
     /**
