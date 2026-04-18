@@ -1,8 +1,8 @@
-import { describe, it, expect, beforeEach } from "vitest";
-import { Reconciler, totalDiscrepancies } from "../src/sync/reconciler.ts";
-import type { ScanCursor, VaultManifest } from "../src/db/local-db.ts";
-import type { FileDoc } from "../src/types.ts";
-import { makeFileId, filePathFromId } from "../src/types/doc-id.ts";
+import { describe, it, expect } from "vitest";
+import { Reconciler, totalDiscrepancies } from "../../src/sync/reconciler.ts";
+import type { ScanCursor, VaultManifest } from "../../src/db/local-db.ts";
+import type { FileDoc } from "../../src/types.ts";
+import { makeFileId, filePathFromId } from "../../src/types/doc-id.ts";
 
 const SELF = "device-self";
 const OTHER = "device-other";

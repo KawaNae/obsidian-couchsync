@@ -1,6 +1,11 @@
 /**
  * In-memory ICouchClient for integration tests. Simulates CouchDB
  * semantics: bulkDocs stores documents, changes() returns them in order.
+ *
+ * `changesLongpoll()` honours the longpoll contract: it parks the caller
+ * until either (a) new docs land via `bulkDocs`, or (b) the client is
+ * destroyed. Without this, the SyncEngine pull loop would busy-spin
+ * against an instantly-resolving longpoll and starve the test runner.
  */
 
 import type {
@@ -21,10 +26,23 @@ interface StoredDoc {
     deleted?: boolean;
 }
 
+interface Tick {
+    promise: Promise<void>;
+    resolve: () => void;
+}
+function makeTick(): Tick {
+    let resolve!: () => void;
+    const promise = new Promise<void>((r) => { resolve = r; });
+    return { promise, resolve };
+}
+
 export class FakeCouchClient implements ICouchClient {
     private docs = new Map<string, StoredDoc>();
     private revCounter = 0;
     private seqCounter = 0;
+    /** Bumped on every bulkDocs (+ destroy) to wake parked longpoll callers. */
+    private tick: Tick = makeTick();
+    private destroyed = false;
 
     async info(): Promise<DbInfo> {
         return {
@@ -66,7 +84,15 @@ export class FakeCouchClient implements ICouchClient {
             });
             results.push({ ok: true, id, rev });
         }
+        // Wake any longpoll caller waiting for docs.
+        if (docs.length > 0) this.bumpTick();
         return results;
+    }
+
+    private bumpTick(): void {
+        const old = this.tick;
+        this.tick = makeTick();
+        old.resolve();
     }
 
     async allDocs<T>(opts: AllDocsOpts): Promise<AllDocsResult<T>> {
@@ -117,8 +143,23 @@ export class FakeCouchClient implements ICouchClient {
         return { results, last_seq: this.seqCounter };
     }
 
+    /**
+     * Longpoll: drains immediately if changes exist past `since`; otherwise
+     * parks the caller until `bulkDocs` produces something or the client is
+     * destroyed. Avoids calling `changes()` on the empty-and-quiet path so
+     * tests that spy on `changes` see only intentional polls.
+     */
     async changesLongpoll<T>(opts: ChangesOpts): Promise<ChangesResult<T>> {
-        return this.changes(opts);
+        while (!this.destroyed) {
+            const sinceNum = typeof opts.since === "number"
+                ? opts.since
+                : parseInt(String(opts.since ?? 0), 10) || 0;
+            if (this.seqCounter > sinceNum) {
+                return this.changes<T>(opts);
+            }
+            await this.tick.promise;
+        }
+        return { results: [], last_seq: this.seqCounter };
     }
 
     async ensureDb(): Promise<void> {
@@ -126,6 +167,9 @@ export class FakeCouchClient implements ICouchClient {
     }
 
     async destroy(): Promise<void> {
+        this.destroyed = true;
+        // Wake every parked longpoll caller so their loops can exit.
+        this.bumpTick();
         this.docs.clear();
         this.seqCounter = 0;
         this.revCounter = 0;

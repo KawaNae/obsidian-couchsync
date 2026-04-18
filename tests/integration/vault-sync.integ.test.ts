@@ -1,11 +1,11 @@
 import "fake-indexeddb/auto";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { VaultSync, type IWriteIgnore } from "../src/sync/vault-sync.ts";
-import { LocalDB } from "../src/db/local-db.ts";
-import { FakeVaultIO } from "./helpers/fake-vault-io.ts";
-import { makeSettings } from "./helpers/settings-factory.ts";
-import { filePathFromId, makeFileId } from "../src/types/doc-id.ts";
-import type { FileDoc, ChunkDoc } from "../src/types.ts";
+import { VaultSync, type IWriteIgnore } from "../../src/sync/vault-sync.ts";
+import { LocalDB } from "../../src/db/local-db.ts";
+import { FakeVaultIO } from "../helpers/fake-vault-io.ts";
+import { makeSettings } from "../helpers/settings-factory.ts";
+import { makeFileId } from "../../src/types/doc-id.ts";
+import type { FileDoc } from "../../src/types.ts";
 
 let counter = 0;
 function uniqueDbName() { return `vault-sync-test-${Date.now()}-${counter++}`; }
