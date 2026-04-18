@@ -18,6 +18,9 @@ export default defineConfig({
     test: {
         include: ["tests/e2e/**/*.test.ts"],
         testTimeout: 30000,
+        // beforeEach has to DELETE+PUT the shared CouchDB instance which
+        // can take several seconds when CouchDB hasn't released file shards.
+        hookTimeout: 30000,
         // 1 CouchDB instance shared across tests — avoid parallel clashes.
         pool: "forks",
         poolOptions: {

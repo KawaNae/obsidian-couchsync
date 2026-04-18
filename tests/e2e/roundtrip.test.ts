@@ -5,8 +5,8 @@
  * 実行: npm run test:e2e
  */
 import "fake-indexeddb/auto";
-import { describe, it, expect, beforeAll, beforeEach, afterAll } from "vitest";
-import { createE2EHarness, type E2EHarness } from "./couch-harness.ts";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { createE2EHarness, stripLocalRevs, type E2EHarness } from "./couch-harness.ts";
 import { expectVault, expectCouch } from "../harness/assertions.ts";
 import { makeFileId } from "../../src/types/doc-id.ts";
 import type { FileDoc, CouchSyncDoc } from "../../src/types.ts";
@@ -14,16 +14,11 @@ import type { FileDoc, CouchSyncDoc } from "../../src/types.ts";
 describe("E2E: roundtrip (real CouchDB)", () => {
     let h: E2EHarness;
 
-    beforeAll(async () => {
-        h = await createE2EHarness();
-    });
-
     beforeEach(async () => {
-        await h.destroyAll();
-        await h.resetCouch();
+        h = await createE2EHarness({ uniqueDb: true });
     });
 
-    afterAll(async () => {
+    afterEach(async () => {
         if (h) await h.destroyAll();
     });
 
@@ -36,10 +31,7 @@ describe("E2E: roundtrip (real CouchDB)", () => {
         const docA = (await a.db.get(fileId)) as FileDoc;
         const chunksA = await a.db.getChunks(docA.chunks);
 
-        await a.client.bulkDocs([
-            docA as unknown as CouchSyncDoc,
-            ...(chunksA as unknown as CouchSyncDoc[]),
-        ]);
+        await a.client.bulkDocs(stripLocalRevs([docA, ...chunksA]));
 
         const info = await a.client.info();
         expect(info.doc_count).toBeGreaterThanOrEqual(1 + chunksA.length);
@@ -58,10 +50,7 @@ describe("E2E: roundtrip (real CouchDB)", () => {
         const fileId = makeFileId("notes/shared.md");
         const docA = (await a.db.get(fileId)) as FileDoc;
         const chunksA = await a.db.getChunks(docA.chunks);
-        await a.client.bulkDocs([
-            docA as unknown as CouchSyncDoc,
-            ...(chunksA as unknown as CouchSyncDoc[]),
-        ]);
+        await a.client.bulkDocs(stripLocalRevs([docA, ...chunksA]));
 
         // B pulls via bulkGet.
         const ids = [fileId, ...docA.chunks];

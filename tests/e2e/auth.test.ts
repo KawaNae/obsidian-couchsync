@@ -7,22 +7,17 @@
  * use wrong credentials here to provoke 401.
  */
 import "fake-indexeddb/auto";
-import { describe, it, expect, beforeAll, beforeEach, afterAll } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { createE2EHarness, type E2EHarness } from "./couch-harness.ts";
 
 describe("E2E: auth failure (real CouchDB)", () => {
     let h: E2EHarness;
 
-    beforeAll(async () => {
-        h = await createE2EHarness();
-    });
-
     beforeEach(async () => {
-        await h.destroyAll();
-        await h.resetCouch();
+        h = await createE2EHarness({ uniqueDb: true });
     });
 
-    afterAll(async () => {
+    afterEach(async () => {
         if (h) await h.destroyAll();
     });
 
@@ -43,11 +38,16 @@ describe("E2E: auth failure (real CouchDB)", () => {
         // Allow a few event-loop turns for session open → catchup → 401.
         await new Promise((r) => setTimeout(r, 1500));
 
+        // Capture the error detail BEFORE stop(): setState("disconnected")
+        // resets lastErrorDetail to null by design. The transient detail is
+        // what the status bar reads while the engine is still in the error
+        // state.
+        const detail = dev.engine.getLastErrorDetail();
+
         dev.engine.stop();
 
-        expect(dev.auth.isBlocked()).toBe(true);
+        expect(dev.engine.auth.isBlocked()).toBe(true);
         expect(states).toContain("error");
-        const detail = dev.engine.getLastErrorDetail();
         expect(detail?.kind).toBe("auth");
     });
 });

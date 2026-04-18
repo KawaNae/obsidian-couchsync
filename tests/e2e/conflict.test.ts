@@ -9,24 +9,19 @@
  * against a real HTTP response.
  */
 import "fake-indexeddb/auto";
-import { describe, it, expect, beforeAll, beforeEach, afterAll } from "vitest";
-import { createE2EHarness, type E2EHarness } from "./couch-harness.ts";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { createE2EHarness, stripLocalRevs, type E2EHarness } from "./couch-harness.ts";
 import { makeFileId } from "../../src/types/doc-id.ts";
 import type { FileDoc, CouchSyncDoc } from "../../src/types.ts";
 
 describe("E2E: concurrent edit conflict (real CouchDB)", () => {
     let h: E2EHarness;
 
-    beforeAll(async () => {
-        h = await createE2EHarness();
-    });
-
     beforeEach(async () => {
-        await h.destroyAll();
-        await h.resetCouch();
+        h = await createE2EHarness({ uniqueDb: true });
     });
 
-    afterAll(async () => {
+    afterEach(async () => {
         if (h) await h.destroyAll();
     });
 
@@ -40,10 +35,7 @@ describe("E2E: concurrent edit conflict (real CouchDB)", () => {
         const fileId = makeFileId("shared.md");
         const base = (await a.db.get(fileId)) as FileDoc;
         const baseChunks = await a.db.getChunks(base.chunks);
-        await a.client.bulkDocs([
-            base as unknown as CouchSyncDoc,
-            ...(baseChunks as unknown as CouchSyncDoc[]),
-        ]);
+        await a.client.bulkDocs(stripLocalRevs([base, ...baseChunks]));
         await b.db.runWriteTx({
             docs: [{ doc: base as unknown as CouchSyncDoc }],
             chunks: baseChunks as unknown as CouchSyncDoc[],
