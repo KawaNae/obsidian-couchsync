@@ -11,7 +11,10 @@ export default defineConfig({
         },
     },
     test: {
+        // E2E tests (real CouchDB) live under tests/e2e and require the
+        // docker-compose stack — run them via `vitest.e2e.config.ts`.
         include: ["tests/**/*.test.ts"],
+        exclude: ["tests/e2e/**", "node_modules/**"],
         testTimeout: 10000,
     },
 });

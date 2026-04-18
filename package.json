@@ -5,7 +5,13 @@
     "main": "main.js",
     "scripts": {
         "dev": "node esbuild.config.mjs",
-        "build": "node esbuild.config.mjs production"
+        "build": "node esbuild.config.mjs production",
+        "test": "vitest run",
+        "test:e2e": "vitest run --config vitest.e2e.config.ts",
+        "test:all": "vitest run && vitest run --config vitest.e2e.config.ts",
+        "integ:start": "bash scripts/integ-start.sh",
+        "integ:stop": "bash scripts/integ-stop.sh",
+        "integ:reset": "bash scripts/integ-reset.sh"
     },
     "keywords": [],
     "author": "KawaNae",

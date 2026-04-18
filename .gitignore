@@ -25,6 +25,8 @@
 !/tsconfig.json
 !/esbuild.config.mjs
 !/vitest.config.ts
+!/vitest.e2e.config.ts
+!/docker-compose.yml
 !/manifest.json
 !/styles.css
 

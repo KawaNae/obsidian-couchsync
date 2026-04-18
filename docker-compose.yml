@@ -1,0 +1,18 @@
+version: "3.8"
+
+services:
+  couchdb:
+    image: couchdb:3.3
+    container_name: couchsync-integ-couchdb
+    environment:
+      COUCHDB_USER: admin
+      COUCHDB_PASSWORD: admin
+    ports:
+      - "5984:5984"
+    # No volume mount — data is intentionally ephemeral so `integ-stop.sh`
+    # leaves behind a clean slate.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:5984/_up | grep -q ok"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
