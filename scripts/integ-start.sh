@@ -35,6 +35,14 @@ echo "integ-start: waiting for /_up to return 200..."
 for i in $(seq 1 60); do
     if curl -fsS http://localhost:5984/_up >/dev/null 2>&1; then
         echo "integ-start: CouchDB is healthy."
+        # Create the three system databases CouchDB expects in "single-node"
+        # mode. Without them the logs spam `database_does_not_exist` every
+        # few seconds from the auth cache / replicator / global-changes
+        # feed. Idempotent — PUT returns 412 if a DB already exists.
+        for sysdb in _users _replicator _global_changes; do
+            curl -fsS -u admin:admin -X PUT "http://localhost:5984/$sysdb" \
+                >/dev/null 2>&1 || true
+        done
         exit 0
     fi
     sleep 1
