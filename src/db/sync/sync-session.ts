@@ -20,7 +20,6 @@ import type { FileDoc } from "../../types.ts";
 import type { LocalDB } from "../local-db.ts";
 import type { ICouchClient } from "../interfaces.ts";
 import type { ConflictResolver } from "../../conflict/conflict-resolver.ts";
-import type { ErrorRecovery } from "../error-recovery.ts";
 import { EchoTracker } from "./echo-tracker.ts";
 import type { SyncEvents } from "./sync-events.ts";
 import type { Checkpoints } from "./checkpoints.ts";
@@ -33,11 +32,13 @@ export interface SyncSessionDeps {
     client: ICouchClient;
     localDb: LocalDB;
     events: SyncEvents;
-    errorRecovery: ErrorRecovery;
     checkpoints: Checkpoints;
     getConflictResolver: () => ConflictResolver | undefined;
     ensureChunks: (doc: FileDoc) => Promise<void>;
     handleLocalDbError: (e: unknown, ctx: string) => void;
+    /** Invoked from pipelines when a transient upstream error (auth /
+     *  5xx) occurs. The supervisor (SyncEngine) decides escalation. */
+    onTransientError: (err: unknown) => void;
 }
 
 export class SyncSession {
@@ -70,10 +71,10 @@ export class SyncSession {
             client: deps.client,
             pullWriter: this.pullWriter,
             checkpoints: deps.checkpoints,
-            errorRecovery: deps.errorRecovery,
             events: deps.events,
             isCancelled,
             handleLocalDbError: deps.handleLocalDbError,
+            onTransientError: deps.onTransientError,
             delay,
         });
         this.pushPipeline = new PushPipeline({

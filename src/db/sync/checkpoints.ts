@@ -31,21 +31,19 @@ export class Checkpoints {
     setLastPushedSeq(s: number | string): void { this.lastPushedSeq = s; }
 
     async load(): Promise<void> {
-        const docsStore = this.localDb.getStore();
-        let remote = await docsStore.getMeta<number | string>(META_REMOTE_SEQ);
-        let push = await docsStore.getMeta<number | string>(META_PUSH_SEQ);
+        let remote = await this.localDb.getMeta<number | string>(META_REMOTE_SEQ);
+        let push = await this.localDb.getMeta<number | string>(META_PUSH_SEQ);
 
         if (remote === null && push === null) {
             // Legacy: migrate from metaStore (pre-v0.13 location).
-            const legacy = this.localDb.getMetaStore();
-            const legacyRemote = await legacy.getMeta<number | string>(META_REMOTE_SEQ);
-            const legacyPush = await legacy.getMeta<number | string>(META_PUSH_SEQ);
+            const legacyRemote = await this.localDb.getMetaStoreValue<number | string>(META_REMOTE_SEQ);
+            const legacyPush = await this.localDb.getMetaStoreValue<number | string>(META_PUSH_SEQ);
             if (legacyRemote !== null || legacyPush !== null) {
                 const meta: Array<{ op: "put"; key: string; value: unknown }> = [];
                 if (legacyRemote !== null) meta.push({ op: "put", key: META_REMOTE_SEQ, value: legacyRemote });
                 if (legacyPush !== null) meta.push({ op: "put", key: META_PUSH_SEQ, value: legacyPush });
-                await docsStore.runWriteTx({ meta });
-                await legacy.runWriteTx({
+                await this.localDb.runWriteTx({ meta });
+                await this.localDb.runMetaWriteTx({
                     meta: [
                         { op: "delete", key: META_REMOTE_SEQ },
                         { op: "delete", key: META_PUSH_SEQ },
@@ -63,7 +61,7 @@ export class Checkpoints {
     }
 
     async save(): Promise<void> {
-        await this.localDb.getStore().runWriteTx({
+        await this.localDb.runWriteTx({
             meta: [
                 { op: "put", key: META_REMOTE_SEQ, value: this.remoteSeq },
                 { op: "put", key: META_PUSH_SEQ, value: this.lastPushedSeq },

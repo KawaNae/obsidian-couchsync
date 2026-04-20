@@ -21,8 +21,6 @@ import { PullWriter } from "../../src/db/sync/pull-writer.ts";
 import { EchoTracker } from "../../src/db/sync/echo-tracker.ts";
 import { SyncEvents } from "../../src/db/sync/sync-events.ts";
 import { Checkpoints } from "../../src/db/sync/checkpoints.ts";
-import { ErrorRecovery } from "../../src/db/error-recovery.ts";
-import { AuthGate } from "../../src/db/sync/auth-gate.ts";
 import { DbError } from "../../src/db/write-transaction.ts";
 import { makeFileId } from "../../src/types/doc-id.ts";
 import type { FileDoc, CouchSyncDoc } from "../../src/types.ts";
@@ -57,27 +55,16 @@ function attachPullPipeline(opts: {
     });
 
     let cancelled = false;
-    const errorRecovery = new ErrorRecovery(
-        {
-            getState: () => "connected",
-            setState: () => {},
-            emitError: () => {},
-            teardown: () => {},
-            requestReconnect: async () => {},
-        },
-        new AuthGate(),
-    );
-
     const dbErrorCalls: Array<{ err: unknown; ctx: string }> = [];
 
     const pipeline = new PullPipeline({
         client: opts.couch,
         pullWriter,
         checkpoints,
-        errorRecovery,
         events,
         isCancelled: () => cancelled,
         handleLocalDbError: (err, ctx) => { dbErrorCalls.push({ err, ctx }); },
+        onTransientError: () => {},
         delay: async () => {},
     });
 
@@ -174,7 +161,7 @@ describe("PullPipeline integration", () => {
 
             // Couch has seq=0 → remoteSeq is set to 0 (still falsy but
             // no exception thrown). The persisted META row reflects this.
-            const persisted = await b.db.getStore().getMeta<number | string>("_sync/remote-seq");
+            const persisted = await b.db.getMeta<number | string>("_sync/remote-seq");
             expect(persisted).toBe(0);
         });
     });

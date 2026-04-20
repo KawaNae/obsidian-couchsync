@@ -16,6 +16,7 @@ export type DbErrorKind =
     | "quota"          // QuotaExceededError — IndexedDB out of space
     | "abort"          // AbortError — transient (concurrent tx, lock)
     | "invalid-state"  // InvalidStateError — DB closed mid-op
+    | "degraded"       // HandleGuard exhausted reopen attempts — unrecoverable
     | "conflict"       // CAS version mismatch (expectedVclock failed)
     | "constraint"     // ConstraintError — schema/PK violation
     | "unknown";
@@ -44,11 +45,13 @@ export class DbError extends Error {
     ) {
         super(message ?? `DbError(${kind}): ${(cause as any)?.message ?? cause}`);
         this.name = "DbError";
-        this.recovery = opts?.recovery ?? (kind === "quota" ? "halt" : "fail");
+        this.recovery = opts?.recovery ?? ((kind === "quota" || kind === "degraded") ? "halt" : "fail");
         this.userMessage = opts?.userMessage ?? (
             kind === "quota"
                 ? "CouchSync: Local DB storage is full — run chunk GC from Settings → Maintenance."
-                : undefined
+                : kind === "degraded"
+                    ? "CouchSync: Please restart Obsidian — the local DB handle is no longer usable."
+                    : undefined
         );
     }
 

@@ -1,32 +1,32 @@
 import { describe, it, expect, vi } from "vitest";
 import { Checkpoints } from "../src/db/sync/checkpoints.ts";
 
+/**
+ * Test-double for LocalDB matching only the surface Checkpoints touches:
+ *   - getMeta / getMetaStoreValue (for legacy migration path)
+ *   - runWriteTx / runMetaWriteTx
+ */
 function makeLocalDb(initialMeta: Record<string, any> = {}): any {
-    const meta = { ...initialMeta };
-    const legacyMeta: Record<string, any> = {};
-    const docsStore = {
-        getMeta: vi.fn(async (k: string) => meta[k] ?? null),
-        runWriteTx: vi.fn(async (tx: any) => {
-            if (tx?.meta) for (const m of tx.meta) {
-                if (m.op === "put") meta[m.key] = m.value;
-                else delete meta[m.key];
-            }
-        }),
-    };
-    const metaStore = {
-        getMeta: vi.fn(async (k: string) => legacyMeta[k] ?? null),
-        runWriteTx: vi.fn(async (tx: any) => {
-            if (tx?.meta) for (const m of tx.meta) {
-                if (m.op === "put") legacyMeta[m.key] = m.value;
-                else delete legacyMeta[m.key];
-            }
-        }),
-    };
+    const docsMeta = { ...initialMeta };
+    const metaStoreMeta: Record<string, any> = {};
     return {
-        getStore: () => docsStore,
-        getMetaStore: () => metaStore,
-        _meta: meta,
-        _legacyMeta: legacyMeta,
+        getMeta: vi.fn(async (k: string) => docsMeta[k] ?? null),
+        getMetaStoreValue: vi.fn(async (k: string) => metaStoreMeta[k] ?? null),
+        runWriteTx: vi.fn(async (tx: any) => {
+            if (tx?.meta) for (const m of tx.meta) {
+                if (m.op === "put") docsMeta[m.key] = m.value;
+                else delete docsMeta[m.key];
+            }
+            if (tx?.onCommit) await tx.onCommit();
+        }),
+        runMetaWriteTx: vi.fn(async (tx: any) => {
+            if (tx?.meta) for (const m of tx.meta) {
+                if (m.op === "put") metaStoreMeta[m.key] = m.value;
+                else delete metaStoreMeta[m.key];
+            }
+        }),
+        _meta: docsMeta,
+        _legacyMeta: metaStoreMeta,
     };
 }
 
@@ -79,8 +79,9 @@ describe("Checkpoints", () => {
             });
             return {
                 runWriteTx,
-                getStore: () => ({ getMeta: vi.fn().mockResolvedValue(null), runWriteTx: vi.fn() }),
-                getMetaStore: () => ({ getMeta: vi.fn().mockResolvedValue(null), runWriteTx: vi.fn() }),
+                getMeta: vi.fn().mockResolvedValue(null),
+                getMetaStoreValue: vi.fn().mockResolvedValue(null),
+                runMetaWriteTx: vi.fn(),
                 _calls: calls,
             } as any;
         }
@@ -113,9 +114,6 @@ describe("Checkpoints", () => {
                 onCommit: async () => { observedSeq = cp.getRemoteSeq(); },
             });
 
-            // User onCommit ran after the cached seq was already advanced,
-            // keeping durable write, in-memory cursor, and side effects
-            // observable together.
             expect(observedSeq).toBe("100");
             expect(cp.getRemoteSeq()).toBe("100");
         });

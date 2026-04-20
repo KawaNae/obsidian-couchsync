@@ -214,7 +214,7 @@ describe("PullWriter integration", () => {
             expect(tx.meta).toEqual([{ op: "put", key: "_sync/remote-seq", value: "7" }]);
 
             // Persisted: the meta row matches.
-            const persisted = await b.db.getStore().getMeta<string>("_sync/remote-seq");
+            const persisted = await b.db.getMeta<string>("_sync/remote-seq");
             expect(persisted).toBe("7");
             spy.mockRestore();
         });

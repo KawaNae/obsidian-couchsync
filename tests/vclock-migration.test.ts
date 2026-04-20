@@ -21,9 +21,8 @@ describe("vclock per-path migration", () => {
     it("migrates legacy single-doc into per-path entries on first load", async () => {
         db = new LocalDB(`mig-${Date.now()}`);
         db.open();
-        // Seed the legacy doc directly via metaStore.
-        const meta = db.getMetaStore();
-        await meta.runWriteTx({
+        // Seed the legacy doc directly via the meta store.
+        await db.runMetaWriteTx({
             meta: [{
                 op: "put",
                 key: "_local/last-synced-vclocks",
@@ -42,17 +41,14 @@ describe("vclock per-path migration", () => {
         expect(loaded.get("sub/beta.md")).toEqual({ A: 3 });
 
         // Per-path entries now live in the docs store's meta table.
-        const docsDexie = db.getStore().getDexie();
-        const alpha = await docsDexie.meta.get("_local/vclock/alpha.md");
-        expect(alpha?.value).toEqual({ A: 1, B: 2 });
-        const beta = await docsDexie.meta.get("_local/vclock/sub/beta.md");
-        expect(beta?.value).toEqual({ A: 3 });
+        const alpha = await db.getMeta<{ A: number; B: number }>("_local/vclock/alpha.md");
+        expect(alpha).toEqual({ A: 1, B: 2 });
+        const beta = await db.getMeta<{ A: number }>("_local/vclock/sub/beta.md");
+        expect(beta).toEqual({ A: 3 });
 
         // Legacy doc is gone from the (separate) meta store.
-        const legacy = await meta.getDexie().meta.get(
-            "_local/last-synced-vclocks",
-        );
-        expect(legacy).toBeUndefined();
+        const legacy = await db.getMetaStoreValue("_local/last-synced-vclocks");
+        expect(legacy).toBeNull();
     });
 
     it("second load returns same map without re-migrating", async () => {
@@ -76,7 +72,7 @@ describe("vclock per-path migration", () => {
             vclocks: [{ path: "shared.md", op: "set", clock: { A: 9 } }],
         });
         // Now seed legacy with a stale value for the same path.
-        await db.getMetaStore().runWriteTx({
+        await db.runMetaWriteTx({
             meta: [{
                 op: "put",
                 key: "_local/last-synced-vclocks",

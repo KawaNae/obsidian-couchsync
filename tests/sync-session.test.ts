@@ -1,8 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { SyncSession } from "../src/db/sync/sync-session.ts";
 import { SyncEvents } from "../src/db/sync/sync-events.ts";
-import { AuthGate } from "../src/db/sync/auth-gate.ts";
-import { ErrorRecovery } from "../src/db/error-recovery.ts";
 import { Checkpoints } from "../src/db/sync/checkpoints.ts";
 import type { ICouchClient } from "../src/db/interfaces.ts";
 
@@ -27,34 +25,22 @@ function makeLocalDb(): any {
         get: vi.fn().mockResolvedValue(null),
         getChunks: vi.fn().mockResolvedValue([]),
         changes: vi.fn().mockResolvedValue({ results: [], last_seq: 0 }),
-        getStore: () => ({
-            getMeta: vi.fn().mockResolvedValue(null),
-            runWriteTx: vi.fn().mockResolvedValue(undefined),
-        }),
-        getMetaStore: () => ({
-            getMeta: vi.fn().mockResolvedValue(null),
-            runWriteTx: vi.fn().mockResolvedValue(undefined),
-        }),
+        getMeta: vi.fn().mockResolvedValue(null),
+        getMetaStoreValue: vi.fn().mockResolvedValue(null),
+        runMetaWriteTx: vi.fn().mockResolvedValue(undefined),
     };
 }
 
 function makeSession(client = makeClient()) {
     const localDb = makeLocalDb();
     const events = new SyncEvents();
-    const auth = new AuthGate();
-    const errorRecovery = new ErrorRecovery({
-        getState: () => "connected" as const,
-        setState: () => {},
-        emitError: () => {},
-        teardown: () => {},
-        requestReconnect: async () => {},
-    }, auth);
     const checkpoints = new Checkpoints(localDb);
     return new SyncSession({
-        client, localDb, events, errorRecovery, checkpoints,
+        client, localDb, events, checkpoints,
         getConflictResolver: () => undefined,
         ensureChunks: async () => {},
         handleLocalDbError: () => {},
+        onTransientError: () => {},
     });
 }
 
@@ -88,9 +74,6 @@ describe("SyncSession", () => {
 
     it("dispose mid-longpoll stops further iterations", async () => {
         let callCount = 0;
-        // changesLongpoll resolves only when the disposed flag is set, so the
-        // loop is parked on the await until dispose; after dispose it returns
-        // empty, the loop reads isCancelled, and exits. callCount must be 1.
         let resolveLongpoll: (v: any) => void = () => {};
         const client = makeClient({
             changesLongpoll: vi.fn().mockImplementation(() => {
@@ -103,11 +86,9 @@ describe("SyncSession", () => {
         await new Promise((r) => setTimeout(r, 20));
         expect(callCount).toBe(1);
         s.dispose();
-        // Unblock the parked longpoll so the loop can read isCancelled.
         resolveLongpoll({ results: [], last_seq: "0" });
         await s.settled;
         await new Promise((r) => setTimeout(r, 30));
-        // Loop saw cancellation and never re-issued changesLongpoll.
         expect(callCount).toBe(1);
     });
 
@@ -115,7 +96,6 @@ describe("SyncSession", () => {
         const s = makeSession();
         s.echoes.recordPushEcho("file:a.md");
         expect(s.echoes.consumePushEcho("file:a.md")).toBe(true);
-        // Fresh session starts with empty echoes
         const s2 = makeSession();
         expect(s2.echoes.consumePushEcho("file:a.md")).toBe(false);
     });

@@ -1,6 +1,6 @@
 import type { CouchSyncDoc, FileDoc, ChunkDoc } from "../types.ts";
 import type { IDocStore, AllDocsOpts, AllDocsResult, LocalChangesResult } from "./interfaces.ts";
-import { DexieStore, SyncDB, VCLOCK_KEY_PREFIX, vclockMetaKey } from "./dexie-store.ts";
+import { DexieStore, VCLOCK_KEY_PREFIX, vclockMetaKey } from "./dexie-store.ts";
 import type { WriteTransaction, WriteBuilder } from "./write-transaction.ts";
 import type { VectorClock } from "../sync/vector-clock.ts";
 import { toPathKey, type PathKey } from "../utils/path.ts";
@@ -12,6 +12,7 @@ import {
     isConfigDocId,
     isReplicatedDocId,
 } from "../types/doc-id.ts";
+import { HandleGuard } from "./handle-guard.ts";
 
 /** Local-only catch-up scan cursor (not replicated). */
 export interface ScanCursor {
@@ -46,45 +47,113 @@ export interface SkippedFilesDoc {
     files: Record<string, { sizeMB: number; skippedAt: number }>;
 }
 
+/**
+ * LocalDB — self-healing wrapper over two DexieStores (docs + meta).
+ *
+ * Every access routes through a `HandleGuard` so a silently-killed
+ * IndexedDB connection (OS suspend, tab reclaim) can be reopened
+ * transparently. Callers see one logical database that is always
+ * available; after `HandleGuard.maxReopen` consecutive failures the
+ * guard gives up and throws `DbError("degraded")` for the sync
+ * supervisor to halt + notify the user.
+ */
 export class LocalDB implements IDocStore<CouchSyncDoc> {
-    private store: DexieStore<CouchSyncDoc> | null = null;
-    private dbName: string;
-    /** Dexie store for local metadata (scan cursor, vault manifest, etc.). */
-    private metaStore: DexieStore<CouchSyncDoc> | null = null;
+    private readonly dbName: string;
+    private docsGuard: HandleGuard<DexieStore<CouchSyncDoc>> | null = null;
+    private metaGuard: HandleGuard<DexieStore<CouchSyncDoc>> | null = null;
 
     constructor(dbName: string) {
         this.dbName = dbName;
     }
 
     open(): void {
-        if (this.store) return;
-        this.store = new DexieStore<CouchSyncDoc>(this.dbName);
-        this.metaStore = new DexieStore<CouchSyncDoc>(`${this.dbName}-meta`);
+        if (this.docsGuard) return;
+        this.docsGuard = new HandleGuard({
+            factory: () => new DexieStore<CouchSyncDoc>(this.dbName),
+            cleanup: async (s) => { await s.close(); },
+            probe: async (s) => { await s.info(); },
+        });
+        this.metaGuard = new HandleGuard({
+            factory: () => new DexieStore<CouchSyncDoc>(`${this.dbName}-meta`),
+            cleanup: async (s) => { await s.close(); },
+            probe: async (s) => { await s.info(); },
+        });
     }
 
     async close(): Promise<void> {
-        if (this.store) {
-            await this.store.close();
-            this.store = null;
-        }
-        if (this.metaStore) {
-            await this.metaStore.close();
-            this.metaStore = null;
-        }
+        if (this.docsGuard) await this.docsGuard.close();
+        if (this.metaGuard) await this.metaGuard.close();
+        this.docsGuard = null;
+        this.metaGuard = null;
     }
 
-    /** Exposed for sync-engine's checkpoint migration. Other callers should
-     *  prefer `runWriteBuilder` / `runWriteTx` / `get` / etc. on `LocalDB` itself. */
-    getStore(): DexieStore<CouchSyncDoc> {
-        if (!this.store) throw new Error("Database not opened");
-        return this.store;
+    async destroy(): Promise<void> {
+        await this.runDocsOp((s) => s.destroy(), "destroy-docs");
+        await this.runMetaOp((s) => s.destroy(), "destroy-meta");
+        this.docsGuard = null;
+        this.metaGuard = null;
     }
 
-    /** Expose the Dexie meta store for migration and testing. */
-    getMetaStore(): DexieStore<CouchSyncDoc> {
-        if (!this.metaStore) throw new Error("Database not opened");
-        return this.metaStore;
+    // ── Guarded access (canonical) ───────────────────────
+
+    /** Run an op against the docs store. Handle failures are retried
+     *  internally; other exceptions bubble up. */
+    async runDocsOp<R>(op: (s: DexieStore<CouchSyncDoc>) => Promise<R>, context: string): Promise<R> {
+        const g = this.docsGuard;
+        if (!g) throw new Error("Database not opened");
+        return g.runOp(op, context);
     }
+
+    /** Run an op against the meta store. */
+    async runMetaOp<R>(op: (s: DexieStore<CouchSyncDoc>) => Promise<R>, context: string): Promise<R> {
+        const g = this.metaGuard;
+        if (!g) throw new Error("Database not opened");
+        return g.runOp(op, context);
+    }
+
+    /** Probe both handles and reopen if either has expired. Called by
+     *  SyncEngine.openSession() before it trusts the local DB. */
+    async ensureHealthy(): Promise<void> {
+        if (!this.docsGuard || !this.metaGuard) throw new Error("Database not opened");
+        await this.docsGuard.ensureHealthy();
+        await this.metaGuard.ensureHealthy();
+    }
+
+    // ── IDocStore: reads ─────────────────────────────────
+
+    async get<T extends CouchSyncDoc>(id: string): Promise<T | null> {
+        return this.runDocsOp((s) => s.get(id), "get") as Promise<T | null>;
+    }
+
+    async allDocs(opts?: AllDocsOpts): Promise<AllDocsResult<CouchSyncDoc>> {
+        return this.runDocsOp((s) => s.allDocs(opts), "allDocs");
+    }
+
+    async info(): Promise<{ updateSeq: number | string }> {
+        return this.runDocsOp((s) => s.info(), "info");
+    }
+
+    async changes(
+        since?: number | string,
+        opts?: { include_docs?: boolean },
+    ): Promise<LocalChangesResult<CouchSyncDoc>> {
+        return this.runDocsOp((s) => s.changes(since, opts), "changes");
+    }
+
+    // ── IDocStore: writes ────────────────────────────────
+
+    async runWriteBuilder(
+        builder: WriteBuilder<CouchSyncDoc>,
+        opts?: { maxAttempts?: number },
+    ): Promise<boolean> {
+        return this.runDocsOp((s) => s.runWriteBuilder(builder, opts), "runWriteBuilder");
+    }
+
+    async runWriteTx(tx: WriteTransaction<CouchSyncDoc>): Promise<void> {
+        return this.runDocsOp((s) => s.runWriteTx(tx), "runWriteTx");
+    }
+
+    // ── Higher-level reads ───────────────────────────────
 
     /**
      * Probe the **vault** database for non-conforming documents. Returns
@@ -93,13 +162,13 @@ export class LocalDB implements IDocStore<CouchSyncDoc> {
      * the user rebuilds via Maintenance.
      */
     async findLegacyVaultDoc(): Promise<string | null> {
-        const idResult = await this.getStore().allDocs({ limit: 200 });
+        const idResult = await this.allDocs({ limit: 200 });
         for (const row of idResult.rows) {
             if (row.id.startsWith("_")) continue;
             if (!isReplicatedDocId(row.id)) return row.id;
             if (isConfigDocId(row.id)) return row.id;
             if (isFileDocId(row.id)) {
-                const doc = await this.getStore().get(row.id) as FileDoc | null;
+                const doc = await this.get<FileDoc>(row.id);
                 if (!doc || doc.type !== "file") continue;
                 if (!doc.vclock || Object.keys(doc.vclock).length === 0) {
                     return row.id;
@@ -116,33 +185,14 @@ export class LocalDB implements IDocStore<CouchSyncDoc> {
      * in a single atomic tx. Returns the IDs of the deleted documents.
      */
     async deleteAllByPrefix(prefix: string): Promise<string[]> {
-        const result = await this.getStore().allDocs({
+        const result = await this.allDocs({
             startkey: prefix,
             endkey: prefix + "\ufff0",
         });
         if (result.rows.length === 0) return [];
         const ids = result.rows.map((row) => row.id);
-        await this.getStore().runWriteTx({ deletes: ids });
+        await this.runWriteTx({ deletes: ids });
         return ids;
-    }
-
-    async get<T extends CouchSyncDoc>(id: string): Promise<T | null> {
-        return this.getStore().get(id) as Promise<T | null>;
-    }
-
-    async allDocs(opts?: AllDocsOpts): Promise<AllDocsResult<CouchSyncDoc>> {
-        return this.getStore().allDocs(opts);
-    }
-
-    async info(): Promise<{ updateSeq: number | string }> {
-        return this.getStore().info();
-    }
-
-    async changes(
-        since?: number | string,
-        opts?: { include_docs?: boolean },
-    ): Promise<LocalChangesResult<CouchSyncDoc>> {
-        return this.getStore().changes(since, opts);
     }
 
     async getFileDoc(path: string): Promise<FileDoc | null> {
@@ -153,10 +203,7 @@ export class LocalDB implements IDocStore<CouchSyncDoc> {
         const result = new Map<string, FileDoc>();
         if (paths.length === 0) return result;
         const ids = paths.map((p) => makeFileId(p));
-        const rows = await this.getStore().allDocs({
-            keys: ids,
-            include_docs: true,
-        });
+        const rows = await this.allDocs({ keys: ids, include_docs: true });
         for (let i = 0; i < rows.rows.length; i++) {
             const row = rows.rows[i];
             if (row.doc) {
@@ -168,10 +215,7 @@ export class LocalDB implements IDocStore<CouchSyncDoc> {
     }
 
     async getChunks(chunkIds: string[]): Promise<ChunkDoc[]> {
-        const result = await this.getStore().allDocs({
-            keys: chunkIds,
-            include_docs: true,
-        });
+        const result = await this.allDocs({ keys: chunkIds, include_docs: true });
         const chunks: ChunkDoc[] = [];
         for (const row of result.rows) {
             if (row.doc) {
@@ -182,7 +226,7 @@ export class LocalDB implements IDocStore<CouchSyncDoc> {
     }
 
     async allFileDocs(): Promise<FileDoc[]> {
-        const result = await this.getStore().allDocs({
+        const result = await this.allDocs({
             startkey: ID_RANGE.file.startkey,
             endkey: ID_RANGE.file.endkey,
             include_docs: true,
@@ -202,11 +246,26 @@ export class LocalDB implements IDocStore<CouchSyncDoc> {
         return this.deleteAllByPrefix(prefix);
     }
 
-    // ── Metadata (Dexie meta table) ────────────────────
+    // ── Metadata (Dexie meta store) ──────────────────────
+
+    async getMeta<V = any>(key: string): Promise<V | null> {
+        return this.runDocsOp((s) => s.getMeta<V>(key), "getMeta");
+    }
+
+    async getMetaByPrefix<V = any>(prefix: string): Promise<Array<{ key: string; value: V }>> {
+        return this.runDocsOp((s) => s.getMetaByPrefix<V>(prefix), "getMetaByPrefix");
+    }
+
+    async getMetaStoreValue<V = any>(key: string): Promise<V | null> {
+        return this.runMetaOp((s) => s.getMeta<V>(key), "getMetaStoreValue");
+    }
+
+    async runMetaWriteTx(tx: WriteTransaction<CouchSyncDoc>): Promise<void> {
+        return this.runMetaOp((s) => s.runWriteTx(tx), "runMetaWriteTx");
+    }
 
     async getScanCursor(): Promise<ScanCursor | null> {
-        const meta = this.getMetaStore();
-        const doc = await meta.getMeta<ScanCursor>(SCAN_CURSOR_ID);
+        const doc = await this.getMetaStoreValue<ScanCursor>(SCAN_CURSOR_ID);
         if (!doc) return null;
         return {
             lastScanStartedAt: doc.lastScanStartedAt ?? 0,
@@ -216,13 +275,13 @@ export class LocalDB implements IDocStore<CouchSyncDoc> {
     }
 
     async putScanCursor(cursor: ScanCursor): Promise<void> {
-        await this.getMetaStore().runWriteTx({
+        await this.runMetaWriteTx({
             meta: [{ op: "put", key: SCAN_CURSOR_ID, value: cursor }],
         });
     }
 
     async getVaultManifest(): Promise<VaultManifest | null> {
-        const doc = await this.getMetaStore().getMeta<VaultManifest>(VAULT_MANIFEST_ID);
+        const doc = await this.getMetaStoreValue<VaultManifest>(VAULT_MANIFEST_ID);
         if (!doc) return null;
         return {
             paths: doc.paths ?? [],
@@ -231,18 +290,18 @@ export class LocalDB implements IDocStore<CouchSyncDoc> {
     }
 
     async putVaultManifest(manifest: VaultManifest): Promise<void> {
-        await this.getMetaStore().runWriteTx({
+        await this.runMetaWriteTx({
             meta: [{ op: "put", key: VAULT_MANIFEST_ID, value: manifest }],
         });
     }
 
     async getSkippedFiles(): Promise<SkippedFilesDoc> {
-        const doc = await this.getMetaStore().getMeta<SkippedFilesDoc>(SKIPPED_FILES_ID);
+        const doc = await this.getMetaStoreValue<SkippedFilesDoc>(SKIPPED_FILES_ID);
         return { files: doc?.files ?? {} };
     }
 
     async putSkippedFiles(doc: SkippedFilesDoc): Promise<void> {
-        await this.getMetaStore().runWriteTx({
+        await this.runMetaWriteTx({
             meta: [{ op: "put", key: SKIPPED_FILES_ID, value: doc }],
         });
     }
@@ -261,9 +320,7 @@ export class LocalDB implements IDocStore<CouchSyncDoc> {
         const out = new Map<PathKey, VectorClock>();
         const staleKeys: string[] = [];
 
-        const rows = await this.getStore().getMetaByPrefix<VectorClock>(
-            VCLOCK_KEY_PREFIX,
-        );
+        const rows = await this.getMetaByPrefix<VectorClock>(VCLOCK_KEY_PREFIX);
         for (const { key, value } of rows) {
             const rawPath = key.slice(VCLOCK_KEY_PREFIX.length);
             const normalized = toPathKey(rawPath);
@@ -274,8 +331,7 @@ export class LocalDB implements IDocStore<CouchSyncDoc> {
         }
 
         // One-shot migration: legacy single-doc lived on the *meta* store.
-        const legacyMeta = this.getMetaStore();
-        const legacy = await legacyMeta.getMeta<{ clocks: Record<string, VectorClock> }>(
+        const legacy = await this.getMetaStoreValue<{ clocks: Record<string, VectorClock> }>(
             LAST_SYNCED_VCLOCKS_ID,
         );
         if (legacy?.clocks) {
@@ -288,16 +344,16 @@ export class LocalDB implements IDocStore<CouchSyncDoc> {
                 }
             }
             if (newVclocks.length > 0) {
-                await this.getStore().runWriteTx({ vclocks: newVclocks });
+                await this.runWriteTx({ vclocks: newVclocks });
             }
-            await legacyMeta.runWriteTx({
+            await this.runMetaWriteTx({
                 meta: [{ op: "delete", key: LAST_SYNCED_VCLOCKS_ID }],
             });
         }
 
         // Stale-key cleanup: delete non-normalized keys, re-write with normalized keys.
         if (staleKeys.length > 0) {
-            await this.getStore().runWriteTx({
+            await this.runWriteTx({
                 meta: staleKeys.map((key) => ({ op: "delete" as const, key })),
             });
             const rewriteOps = [...out.entries()].map(([pathKey, clock]) => ({
@@ -305,23 +361,10 @@ export class LocalDB implements IDocStore<CouchSyncDoc> {
                 op: "set" as const,
                 clock,
             }));
-            await this.getStore().runWriteTx({ vclocks: rewriteOps });
+            await this.runWriteTx({ vclocks: rewriteOps });
         }
 
         return out;
-    }
-
-    /** Builder-style atomic write with CAS retry. */
-    async runWriteBuilder(
-        builder: WriteBuilder<CouchSyncDoc>,
-        opts?: { maxAttempts?: number },
-    ): Promise<boolean> {
-        return this.getStore().runWriteBuilder(builder, opts);
-    }
-
-    /** Simple atomic batch write (no CAS retry needed). */
-    async runWriteTx(tx: WriteTransaction<CouchSyncDoc>): Promise<void> {
-        return this.getStore().runWriteTx(tx);
     }
 
     /** Compose a vclock meta key (`_local/vclock/<path>`). Exposed for tests. */
@@ -329,14 +372,15 @@ export class LocalDB implements IDocStore<CouchSyncDoc> {
         return vclockMetaKey(path);
     }
 
-    async destroy(): Promise<void> {
-        if (this.store) {
-            await this.store.destroy();
-            this.store = null;
-        }
-        if (this.metaStore) {
-            await this.metaStore.destroy();
-            this.metaStore = null;
-        }
+    // ── Test-only hooks ──────────────────────────────────
+
+    /** @internal */
+    async __closeDocsHandleForTest(): Promise<void> {
+        if (this.docsGuard) await this.docsGuard.close();
+    }
+
+    /** @internal */
+    async __closeMetaHandleForTest(): Promise<void> {
+        if (this.metaGuard) await this.metaGuard.close();
     }
 }

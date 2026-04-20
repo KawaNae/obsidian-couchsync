@@ -19,11 +19,11 @@
 import type { CouchSyncDoc } from "../../types.ts";
 import type { ICouchClient, ChangesResult } from "../interfaces.ts";
 import { DbError } from "../write-transaction.ts";
-import type { ErrorRecovery } from "../error-recovery.ts";
 import { logDebug, logInfo } from "../../ui/log.ts";
 import type { PullWriter } from "./pull-writer.ts";
 import type { SyncEvents } from "./sync-events.ts";
 import type { Checkpoints } from "./checkpoints.ts";
+import { classifyError } from "./errors.ts";
 
 const CATCHUP_BATCH_SIZE = 200;
 const CATCHUP_IDLE_TIMEOUT_MS = 60_000;
@@ -34,11 +34,15 @@ export interface PullPipelineDeps {
     client: ICouchClient;
     pullWriter: PullWriter;
     checkpoints: Checkpoints;
-    errorRecovery: ErrorRecovery;
     events: SyncEvents;
 
     isCancelled: () => boolean;
     handleLocalDbError: (e: unknown, context: string) => void;
+    /** Called when the longpoll loop hits an error whose class hints at a
+     *  transient upstream issue (auth / 5xx). The supervisor (SyncEngine)
+     *  decides whether to escalate to hard error or keep the pipeline
+     *  alive with backoff. */
+    onTransientError: (err: unknown) => void;
     delay: (ms: number) => Promise<void>;
 }
 
@@ -124,10 +128,10 @@ export class PullPipeline {
                     continue;
                 }
 
-                const detail = this.deps.errorRecovery.classifyError(e);
+                const detail = classifyError(e);
 
                 if (detail.kind === "auth" || detail.kind === "server") {
-                    this.deps.errorRecovery.handleTransientError(e);
+                    this.deps.onTransientError(e);
                 } else {
                     // Deduplicate consecutive identical messages.
                     if (detail.message !== this.lastErrorMsg) {

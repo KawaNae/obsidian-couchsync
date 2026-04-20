@@ -1,14 +1,21 @@
 /**
- * SyncEngine — sync loop using CouchClient HTTP + IDocStore.
+ * SyncEngine — live sync loop supervisor.
  *
- *   - CouchClient.changes() + bulkGet() for catchup pull
- *   - CouchClient.changesLongpoll() loop for live pull
- *   - localDb.changes() poll + CouchClient.bulkDocs() for push
- *   - CouchClient.info() for stall detection
+ * Owns the state machine (`SyncState`) and the single retry timer. All
+ * other collaborators are injected or embedded:
+ *   - SyncSession: the live per-session client + pipelines
+ *   - Checkpoints: durable sync progress markers
+ *   - AuthGate: 401/403 latch
+ *   - BackoffSchedule: pure step counter for retry delays
+ *   - EnvListeners: window.online / visibilitychange wiring
  *
- * Event wiring, auth-latch management, and echo suppression are
- * factored into `SyncEvents`, `AuthGate`, and `EchoTracker` — this
- * class focuses on the sync loops themselves.
+ * Retry is supervised here, not in a sub-object. Every failure path
+ * routes through `enterError(detail)`, which bumps the backoff and
+ * schedules exactly one retry timer. The timer callback runs
+ * `attemptReconnect()` once. If that call `enterError`s again, the next
+ * retry is scheduled inside that call — never from both sides. This
+ * structural rule makes "error retry scheduled" log at most once per
+ * tick, which was the root cause of the v0.15.x infinite-retry storm.
  */
 
 import type { FileDoc, ChunkDoc } from "../types.ts";
@@ -25,17 +32,22 @@ import type {
     SyncErrorDetail,
 } from "./reconnect-policy.ts";
 import { logDebug, logInfo, logWarn, logError, notify } from "../ui/log.ts";
-import { ErrorRecovery } from "./error-recovery.ts";
 import { EnvListeners } from "./env-listeners.ts";
 import { DbError } from "./write-transaction.ts";
 import { AuthGate } from "./sync/auth-gate.ts";
 import { SyncEvents } from "./sync/sync-events.ts";
 import { Checkpoints } from "./sync/checkpoints.ts";
 import { SyncSession } from "./sync/sync-session.ts";
+import { BackoffSchedule } from "./sync/backoff.ts";
+import { classifyError } from "./sync/errors.ts";
 
 // ── Constants ────────────────────────────────────────────
 
 const HEALTH_CHECK_INTERVAL = 30000; // 30s
+
+/** How long a transient error stays in `reconnecting` before escalating
+ *  to a hard `error`. The live session may self-heal inside this window. */
+const TRANSIENT_ESCALATION_MS = 10_000;
 
 // ── SyncEngine ───────────────────────────────────────────
 
@@ -65,7 +77,14 @@ export class SyncEngine {
 
     // ── Error handling ────────────────────────────────────
 
-    private readonly errorRecovery: ErrorRecovery;
+    /** Pure backoff step counter. Reset only via `backoff.recordSuccess()`. */
+    private readonly backoff = new BackoffSchedule();
+    private retryTimer: ReturnType<typeof setTimeout> | null = null;
+    private transientTimer: ReturnType<typeof setTimeout> | null = null;
+    /** True once a degraded local DB has been surfaced to the user; stops
+     *  further retry attempts until the user restarts Obsidian or calls
+     *  `start()` again. */
+    private degraded = false;
 
     // ── Timers & env listeners ────────────────────────────
 
@@ -88,10 +107,6 @@ export class SyncEngine {
 
     // ── Constructor ───────────────────────────────────────
 
-    /** Client factory for the vault DB session. Tests inject a fake
-     *  here so multiple engines can share one in-memory remote; E2E
-     *  specs inject a real CouchClient pre-configured against a docker
-     *  instance. Production callers omit it and get the default. */
     private readonly clientFactory: (s: CouchSyncSettings) => ICouchClient;
 
     constructor(
@@ -107,21 +122,8 @@ export class SyncEngine {
         );
         this.checkpoints = new Checkpoints(localDb);
 
-        this.errorRecovery = new ErrorRecovery(
-            {
-                getState: () => this.state,
-                setState: (s, d) => this.setState(s, d),
-                emitError: (m) => this.events.emit("error", { message: m }),
-                teardown: () => this.teardown(),
-                requestReconnect: (r) => this.requestReconnect(r),
-            },
-            this.auth,
-        );
-
         // External raise (Settings tab probe, config-sync) → pin state=error
         // so the status bar and onError listeners see the auth latch.
-        // ErrorRecovery's internal path raises auth then sets state=error,
-        // so the early-return guard prevents re-entry.
         this.auth.onChange((detail) => {
             if (!detail) return;
             if (this.state === "error") return;
@@ -132,12 +134,12 @@ export class SyncEngine {
                     `Authentication failed (${detail.status})${detail.reason ? ": " + detail.reason : ""}. ` +
                     `Update credentials in the Connection tab.`,
             });
-            this.teardown();
+            this.stopRetryTimer();
+            void this.teardown();
         });
 
-        // Pipelines emit "paused" after applying a batch (live loop only —
-        // catchup paused is fired by firePausedCallbacks below). SyncEngine
-        // owns lastHealthyAt and updates it here.
+        // Pipelines emit "paused" after applying a batch. SyncEngine owns
+        // lastHealthyAt and updates it here.
         this.events.on("paused", () => {
             if (this.state === "connected" || this.state === "syncing") {
                 this.lastHealthyAt = Date.now();
@@ -177,8 +179,6 @@ export class SyncEngine {
         );
         const fetched = await client.bulkGet<ChunkDoc>(missing);
         if (fetched.length > 0) {
-            // Chunks are content-addressed: put-if-absent handled inside
-            // runWrite when passed via the `chunks` field.
             await this.localDb.runWriteTx({ chunks: fetched });
         }
     }
@@ -195,14 +195,10 @@ export class SyncEngine {
         return this.state;
     }
 
-    /** Timestamp (ms) of the most recent proof the session was healthy,
-     *  or 0 if never. Used by the status bar for "X ago" display. */
     getLastHealthyAt(): number {
         return this.lastHealthyAt;
     }
 
-    /** Detail of the current hard error, or null if not in error state.
-     *  Status bar uses this to format labels like `Error (401)`. */
     getLastErrorDetail(): SyncErrorDetail | null {
         return this.lastErrorDetail;
     }
@@ -216,8 +212,9 @@ export class SyncEngine {
     async start(): Promise<void> {
         if (this.session) return;
         // An explicit start() call means the user is trying again — assume
-        // they've fixed their credentials.
+        // they've fixed their credentials and the DB handle.
         this.auth.clear();
+        this.degraded = false;
         this.envListeners.attach();
         this.startHealthTimer();
         await this.openSession();
@@ -226,7 +223,9 @@ export class SyncEngine {
     stop(): void {
         this.envListeners.detach();
         this.stopHealthTimer();
-        this.errorRecovery.reset();
+        this.stopRetryTimer();
+        this.stopTransientTimer();
+        this.backoff.recordSuccess();
         // Fire-and-forget teardown — public stop() shouldn't block on
         // session loops winding down. The disconnect state is set
         // synchronously so the UI updates immediately.
@@ -262,28 +261,134 @@ export class SyncEngine {
         await this.restart();
     }
 
-    // One-shot operations live on VaultRemoteOps (plugin.remoteOps).
-    // SyncEngine is exclusively live-loop from v0.18.0 onward.
+    // ── Internal: Error supervisor ───────────────────────
+
+    /**
+     * Enter hard error state with `detail`. Drops the live session,
+     * bumps the backoff step, and schedules the next retry — unless the
+     * error is auth (latch) or the DB is degraded (halt).
+     *
+     * This is the single gate into `error` state. `setState("error")`
+     * elsewhere is not used; every hard-error path comes through here.
+     */
+    private enterError(detail: SyncErrorDetail): void {
+        this.stopTransientTimer();
+        this.setState("error", detail);
+        this.events.emit("error", { message: detail.message });
+
+        if (detail.kind === "auth") {
+            // Auth is user-gated. Raise the latch, tear down, and leave
+            // the retry timer off — only a fresh start() clears this.
+            this.auth.raise(detail.code ?? 401, detail.message);
+            this.stopRetryTimer();
+            void this.teardown();
+            return;
+        }
+
+        if (this.degraded) {
+            // Degraded local DB has already surfaced to the user; don't
+            // keep polling into a dead handle.
+            this.stopRetryTimer();
+            return;
+        }
+
+        this.backoff.recordFailure();
+        this.scheduleNextAttempt();
+    }
+
+    /**
+     * Soft error path. Route through `reconnecting` state and give
+     * TRANSIENT_ESCALATION_MS for the session to self-heal before
+     * promoting to hard error. Called by pipelines on auth / 5xx hints.
+     */
+    private handleTransientError(err: unknown): void {
+        const detail = classifyError(err);
+        logDebug(
+            `transient error: kind=${detail.kind} code=${detail.code ?? "-"} msg=${detail.message}`,
+        );
+
+        if (detail.kind === "auth") {
+            this.enterError(detail);
+            return;
+        }
+
+        if (this.state !== "reconnecting") {
+            this.setState("reconnecting");
+        }
+        this.stopTransientTimer();
+        this.transientTimer = setTimeout(() => {
+            this.transientTimer = null;
+            if (this.state === "reconnecting") {
+                logDebug(`transient escalated to hard error after ${TRANSIENT_ESCALATION_MS}ms`);
+                this.enterError(detail);
+            }
+        }, TRANSIENT_ESCALATION_MS);
+    }
+
+    /**
+     * Degraded local DB: HandleGuard exhausted its reopen budget. Notify
+     * once, halt retries, and require explicit `start()` to resume.
+     */
+    private handleDegraded(e: DbError): void {
+        if (this.degraded) return;
+        this.degraded = true;
+        if (e.userMessage) notify(e.userMessage, 15000);
+        logError(`local DB degraded: ${e.message}`);
+        this.stopRetryTimer();
+        this.stopTransientTimer();
+        this.setState("error", {
+            kind: "unknown",
+            message: e.userMessage ?? "Local DB is no longer usable — restart Obsidian.",
+        });
+        void this.teardown();
+    }
+
+    /** Lay down one retry timer. Cancels any previous timer. Fires at
+     *  most once; the fire path either succeeds (which resets backoff)
+     *  or re-enters `enterError`, which re-schedules from there. */
+    private scheduleNextAttempt(): void {
+        this.stopRetryTimer();
+        const delay = this.backoff.nextDelay();
+        logDebug(`error retry scheduled in ${delay}ms (step ${this.backoff.currentStep})`);
+        this.retryTimer = setTimeout(async () => {
+            this.retryTimer = null;
+            try {
+                await this.requestReconnect("retry-backoff");
+            } catch (e: any) {
+                logError(`CouchSync: retry reconnect failed: ${e?.message ?? e}`);
+            }
+        }, delay);
+    }
+
+    private stopRetryTimer(): void {
+        if (!this.retryTimer) return;
+        clearTimeout(this.retryTimer);
+        this.retryTimer = null;
+    }
+
+    private stopTransientTimer(): void {
+        if (!this.transientTimer) return;
+        clearTimeout(this.transientTimer);
+        this.transientTimer = null;
+    }
 
     // ── Internal: State management ────────────────────────
 
+    /**
+     * Pure state transition. Emits `state-change` when the state
+     * actually changes. Never touches the retry/backoff state — those
+     * are supervised by `enterError` / `openSession` directly.
+     */
     private setState(state: SyncState, errorDetail?: SyncErrorDetail): void {
         // Always allow re-emit for error state so a kind change reaches UI.
         if (this.state === state && state !== "error") return;
 
-        const wasError = this.state === "error";
         this.state = state;
 
         if (state === "error") {
             this.lastErrorDetail = errorDetail ?? null;
         } else {
             this.lastErrorDetail = null;
-            if (wasError && (state === "syncing" || state === "connected")) {
-                this.errorRecovery.reset();
-            }
-            if (state !== "reconnecting") {
-                this.errorRecovery.reset();
-            }
         }
 
         this.events.emit("state-change", { state });
@@ -291,11 +396,6 @@ export class SyncEngine {
 
     // ── Internal: Session lifecycle ───────────────────────
 
-    /**
-     * Session-internal cleanup: dispose the current session and await its
-     * loops to settle. Does NOT touch env listeners or health timer —
-     * those survive restart() and are owned by start/stop.
-     */
     private async teardown(): Promise<void> {
         const old = this.session;
         this.session = null;
@@ -304,7 +404,6 @@ export class SyncEngine {
         if (!old) return;
         old.dispose();
         await old.settled;
-        // lastHealthyAt and lastErrorDetail intentionally NOT reset.
     }
 
     private async restart(): Promise<void> {
@@ -315,33 +414,60 @@ export class SyncEngine {
 
     /**
      * Build a new SyncSession, run catchup, transition to connected, and
-     * start live loops. Concurrent calls dedup via the `this.session != null`
-     * check at the top.
+     * start live loops. Every failure path routes through `enterError`
+     * or `handleDegraded` — never through silent error swallowing.
      */
     private async openSession(): Promise<void> {
         if (this.session) return;
         if (this.auth.isBlocked()) return;
+        if (this.degraded) return;
 
+        // Register the session synchronously so concurrent start() /
+        // openSession() calls are deduped by the `if (this.session)`
+        // guard above before they reach any await.
         const client = this.makeVaultClient();
         const session = new SyncSession({
             client,
             localDb: this.localDb,
             events: this.events,
-            errorRecovery: this.errorRecovery,
             checkpoints: this.checkpoints,
             getConflictResolver: () => this.conflictResolver,
             ensureChunks: (doc) => this.ensureChunksInternal(client, doc),
             handleLocalDbError: (e, ctx) => this.handleLocalDbError(e, ctx),
+            onTransientError: (err) => this.handleTransientError(err),
         });
         this.session = session;
 
         this.setState("reconnecting");
 
+        // Precondition: local DB has a live handle. HandleGuard reopens
+        // once transparently; `DbError("degraded")` means the reopen
+        // budget is exhausted.
+        try {
+            await this.localDb.ensureHealthy();
+        } catch (e) {
+            if (session.disposed) return;
+            this.session = null;
+            if (e instanceof DbError && e.kind === "degraded") {
+                this.handleDegraded(e);
+            } else {
+                this.enterError(classifyError(e));
+            }
+            return;
+        }
+        if (session.disposed) return;
+
         try {
             await this.checkpoints.load();
         } catch (e) {
-            logDebug(`checkpoint load error: ${e}`);
-            // Start from 0 if meta is unavailable.
+            if (session.disposed) return;
+            this.session = null;
+            if (e instanceof DbError && e.kind === "degraded") {
+                this.handleDegraded(e);
+            } else {
+                this.enterError(classifyError(e));
+            }
+            return;
         }
         if (session.disposed) return;
 
@@ -351,16 +477,24 @@ export class SyncEngine {
             await session.runCatchup();
         } catch (e: any) {
             if (session.disposed) return;
-            this.errorRecovery.enterHardError(this.errorRecovery.classifyError(e));
-            this.events.emit("catchup-failed");
             this.session = null;
+            this.events.emit("catchup-failed");
+            if (e instanceof DbError && e.kind === "degraded") {
+                this.handleDegraded(e);
+            } else {
+                this.enterError(classifyError(e));
+            }
             return;
         }
         if (session.disposed) return;
 
-        // Catchup complete = caught up → connected immediately.
+        // Catchup complete = caught up → connected.
         this.lastHealthyAt = Date.now();
         this.setState("connected");
+        // Success resets both the backoff schedule and any pending
+        // transient-error timer.
+        this.backoff.recordSuccess();
+        this.stopTransientTimer();
         this.firePausedCallbacks();
         this.events.emit("catchup-complete");
 
@@ -369,11 +503,14 @@ export class SyncEngine {
 
     /**
      * Triage a local-DB error from any sync-loop write.
-     *  - `recovery: "halt"` (typically quota): show the user-facing message
-     *    once and tear down the sync loops.
+     *  - `recovery: "halt"` (quota / degraded): surface and tear down.
      *  - Anything else: log at warn and let the caller's retry loop handle it.
      */
     private handleLocalDbError(e: unknown, context: string): void {
+        if (e instanceof DbError && e.kind === "degraded") {
+            this.handleDegraded(e);
+            return;
+        }
         if (e instanceof DbError && e.recovery === "halt") {
             if (this.state !== "error") {
                 if (e.userMessage) notify(e.userMessage, 15000);
@@ -391,13 +528,6 @@ export class SyncEngine {
 
     // ── Internal: Stall detection ──────────────────────────
 
-    /**
-     * Periodic health check (30s interval). In connected/syncing states,
-     * performs stall detection: fetches the remote update_seq and compares
-     * it against our consumed remoteSeq. If the remote has advanced but
-     * our pull loop hasn't consumed those changes, the session is stalled
-     * and we trigger a reconnect.
-     */
     private async checkHealth(): Promise<void> {
         if (this.auth.isBlocked()) return;
 
@@ -406,16 +536,12 @@ export class SyncEngine {
         if (this.state === "disconnected") {
             try {
                 await this.requestReconnect("periodic-tick");
-            } catch (e) {
+            } catch (e: any) {
                 logError(`CouchSync: Health check error: ${e?.message ?? e}`);
             }
             return;
         }
 
-        // Connected / syncing: stall detection via update_seq comparison.
-        // CouchDB 3.x cluster returns opaque seq strings (e.g. "1771-g1AAAA…")
-        // where the opaque suffix can differ between info() and _changes even
-        // for the same logical position. Compare only the numeric prefix.
         const session = this.session;
         if (!session) return;
         try {
@@ -428,8 +554,6 @@ export class SyncEngine {
 
             if (remoteNum !== consumedNum
                 && remoteNum === SyncEngine.seqNumericPrefix(this.lastObservedRemoteSeq)) {
-                // Remote seq hasn't changed since last check, but its
-                // numeric prefix exceeds what we've consumed — stalled.
                 logDebug(`health: stall detected (remote=${remoteNum}, consumed=${consumedNum})`);
                 await this.requestReconnect("stalled");
                 return;
@@ -440,7 +564,7 @@ export class SyncEngine {
         } catch (e: any) {
             if (session.disposed) return;
             logDebug(`health: info() failed ${e?.message ?? e}`);
-            this.errorRecovery.enterHardError(this.errorRecovery.classifyError(e));
+            this.enterError(classifyError(e));
         }
     }
 
@@ -464,9 +588,6 @@ export class SyncEngine {
 
     // ── Internal: Verify reachability ─────────────────────
 
-    /** Verify the server can be reached. On failure, transitions to hard
-     *  error and returns false. Uses the live client when available,
-     *  falling back to a fresh one from saved settings. */
     private async verifyReachable(): Promise<boolean> {
         let err: string | null = null;
         const session = this.session;
@@ -485,13 +606,13 @@ export class SyncEngine {
             }
         }
         if (err) {
-            const detail = this.errorRecovery.classifyError({ message: err });
+            const detail = classifyError({ message: err });
             if (detail.kind === "unknown") {
                 detail.kind = "network";
                 detail.message = `Server unreachable: ${err}`;
             }
             if (this.state !== "error") {
-                this.errorRecovery.enterHardError(detail);
+                this.enterError(detail);
             }
             return false;
         }
@@ -500,18 +621,10 @@ export class SyncEngine {
 
     // ── Internal: Helpers ─────────────────────────────────
 
-    /** Build a client for the vault database session. Uses the injected
-     *  factory (tests / E2E) or the default CouchClient factory (prod). */
     private makeVaultClient(): ICouchClient {
         return this.clientFactory(this.getSettings());
     }
 
-    /**
-     * Extract the numeric prefix from a CouchDB sequence value.
-     * CouchDB 3.x clusters return opaque strings like "1771-g1AAAACReJzL…".
-     * The opaque suffix can differ between `info()` and `_changes` for the
-     * same logical position, so only the numeric prefix is safe to compare.
-     */
     private static seqNumericPrefix(seq: number | string): number {
         if (typeof seq === "number") return seq;
         const n = parseInt(seq, 10);

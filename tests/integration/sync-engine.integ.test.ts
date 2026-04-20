@@ -510,7 +510,7 @@ describe("SyncEngine integration", () => {
             await (a.engine as any).checkHealth();
             expect(spy.mock.calls.length).toBe(baseline);
 
-            (a.engine as any).errorRecovery.enterHardError({ kind: "network", message: "down" });
+            (a.engine as any).enterError({ kind: "network", message: "down" });
             const baselineAfter = spy.mock.calls.length;
             await (a.engine as any).checkHealth();
             expect(spy.mock.calls.length).toBe(baselineAfter);
