@@ -6,7 +6,10 @@ import { fileURLToPath } from "node:url";
  * CouchDB instance; invoke `scripts/integ-start.sh` first.
  *
  * - Single-threaded because all tests share one CouchDB instance.
- * - 30s timeout because Docker-backed HTTP + catchup loops are slower.
+ * - 10 s testTimeout: real measurements are sub-second, so 10 s is already
+ *   ~30× the observed worst case. A larger wall (the old 30 s) was hiding
+ *   flakiness — pull retry loops that would eventually time out looked
+ *   like "passing slow tests". Fail fast instead.
  * - Same `obsidian` alias as the unit config so imported code stays identical.
  */
 export default defineConfig({
@@ -17,14 +20,16 @@ export default defineConfig({
     },
     test: {
         include: ["tests/e2e/**/*.test.ts"],
-        testTimeout: 30000,
-        // beforeEach has to DELETE+PUT the shared CouchDB instance which
-        // can take several seconds when CouchDB hasn't released file shards.
-        hookTimeout: 30000,
+        testTimeout: 10_000,
+        // beforeEach may DELETE+PUT the shared CouchDB instance; keep the
+        // hook window larger than the test window so infra setup still fits.
+        hookTimeout: 15_000,
         // 1 CouchDB instance shared across tests — avoid parallel clashes.
+        // vitest 4 removed `poolOptions`; serialise via fileParallelism +
+        // a single worker so shared CouchDB DB names don't race.
         pool: "forks",
-        poolOptions: {
-            forks: { singleFork: true },
-        },
+        fileParallelism: false,
+        minWorkers: 1,
+        maxWorkers: 1,
     },
 });
