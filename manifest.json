@@ -1,7 +1,7 @@
 {
     "id": "obsidian-couchsync",
     "name": "CouchSync",
-    "version": "0.20.1",
+    "version": "0.20.2",
     "minAppVersion": "0.9.12",
     "description": "Simplified CouchDB-only vault sync for Obsidian. A fork of Self-hosted LiveSync focused on CouchDB reliability.",
     "author": "vorotamoroz (original), KawaNae (fork)",
