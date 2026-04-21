@@ -147,6 +147,25 @@ export function classifyDexieError(e: unknown): DbErrorKind {
     return "unknown";
 }
 
+/**
+ * Debug helper — returns a compact description of an unclassified error
+ * (outer name, inner name, first line of stack, first 200 chars of
+ * message). Used by diagnostic log points to capture the precise shape
+ * of errors that fall through to `"unknown"`, so later releases can
+ * extend the classifier accurately.
+ */
+export function debugDescribeError(e: unknown): string {
+    const err: any = e;
+    const name = err?.name ?? "<no-name>";
+    const innerName = err?.inner?.name ?? "-";
+    const message = ((err?.message ?? String(e)) as string).slice(0, 200);
+    const stack0 =
+        err instanceof Error && err.stack
+            ? err.stack.split("\n").slice(0, 3).join(" | ")
+            : "-";
+    return `name=${name} innerName=${innerName} message="${message}" stack=${stack0}`;
+}
+
 /** Wrap any thrown value as a typed DbError (idempotent if already one). */
 export function toDbError(e: unknown): DbError {
     if (e instanceof DbError) return e;

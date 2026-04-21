@@ -7,7 +7,7 @@
  */
 
 import type { SyncState, ReconnectReason } from "./reconnect-policy.ts";
-import { logError } from "../ui/log.ts";
+import { logDebug, logError } from "../ui/log.ts";
 
 // ── Callbacks supplied by SyncEngine ─────────────────────
 
@@ -54,6 +54,7 @@ export class EnvListeners {
     private handleVisibilityChange(visible: boolean): void {
         if (!visible) {
             this.backgroundedAt = Date.now();
+            logDebug(`visibility: hidden at=${this.backgroundedAt} state=${this.host.getState()}`);
             return;
         }
         const hiddenMs = this.backgroundedAt
@@ -64,11 +65,15 @@ export class EnvListeners {
             this.host.isMobile || hiddenMs >= 30_000
                 ? "app-resume"
                 : "app-foreground";
+        logDebug(
+            `visibility: visible after ${hiddenMs}ms (mobile=${this.host.isMobile}) → reason=${reason} state=${this.host.getState()}`,
+        );
         void this.host.requestReconnect(reason);
     }
 
     private handleOffline(): void {
         const state = this.host.getState();
+        logDebug(`network: offline state=${state}`);
         if (state === "connected" || state === "syncing") {
             this.host.setState("disconnected");
             this.host.emitError("Network offline");
@@ -76,8 +81,9 @@ export class EnvListeners {
     }
 
     private handleOnline(): void {
-        void this.host.requestReconnect("network-online");
         const state = this.host.getState();
+        logDebug(`network: online state=${state}`);
+        void this.host.requestReconnect("network-online");
         if (state === "disconnected" || state === "error") {
             this.host.fireReconnectHandlers();
         }

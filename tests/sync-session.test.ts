@@ -36,6 +36,7 @@ function makeSession(client = makeClient()) {
     const events = new SyncEvents();
     const checkpoints = new Checkpoints(localDb);
     return new SyncSession({
+        epoch: 1,
         client, localDb, events, checkpoints,
         getConflictResolver: () => undefined,
         ensureChunks: async () => {},

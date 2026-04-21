@@ -18,10 +18,12 @@ import { stripRev } from "../../utils/doc.ts";
 import type { LocalDB } from "../local-db.ts";
 import type { ICouchClient } from "../interfaces.ts";
 import { DbError } from "../write-transaction.ts";
-import { logDebug, logInfo } from "../../ui/log.ts";
+import { logDebug, logInfo, logWarn } from "../../ui/log.ts";
 import type { EchoTracker } from "./echo-tracker.ts";
 import type { SyncEvents } from "./sync-events.ts";
 import type { Checkpoints } from "./checkpoints.ts";
+
+type PushStage = "changes" | "pushDocs" | "checkpoint-save" | "idle";
 
 const PUSH_POLL_INTERVAL_MS = 2000;
 
@@ -31,6 +33,8 @@ export interface PushPipelineDeps {
     echoes: EchoTracker;
     events: SyncEvents;
     checkpoints: Checkpoints;
+    /** Session epoch; prefixed onto diagnostic logs. */
+    sessionEpoch: number;
 
     /** Session cancellation signal — pipeline exits its loop when true. */
     isCancelled: () => boolean;
@@ -41,54 +45,77 @@ export interface PushPipelineDeps {
 export class PushPipeline {
     /** Latch so we emit at most one warning per `denied` storm. */
     private deniedWarningEmitted = false;
+    /** Latch so we capture full stack for the first unexpected push error
+     *  in a session. Repeated occurrences log only the message. */
+    private stackCaptured = false;
 
     constructor(private deps: PushPipelineDeps) {}
 
     async run(): Promise<void> {
-        while (!this.deps.isCancelled()) {
-            try {
-                const localChanges = await this.deps.localDb.changes(
-                    this.deps.checkpoints.getLastPushedSeq(),
-                    { include_docs: true },
-                );
+        const sess = this.deps.sessionEpoch;
+        let exitReason: "cancelled" | "halted" = "cancelled";
+        try {
+            while (!this.deps.isCancelled()) {
+                let stage: PushStage = "idle";
+                try {
+                    stage = "changes";
+                    const localChanges = await this.deps.localDb.changes(
+                        this.deps.checkpoints.getLastPushedSeq(),
+                        { include_docs: true },
+                    );
 
-                if (this.deps.isCancelled()) return;
+                    if (this.deps.isCancelled()) return;
 
-                // Filter to replicated docs, excluding pull echoes.
-                const toPush = localChanges.results.filter((r) => {
-                    if (!r.doc || !isReplicatedDocId(r.id) || r.deleted) return false;
-                    const rSeq = typeof r.seq === "number"
-                        ? r.seq
-                        : parseInt(String(r.seq), 10);
-                    return !this.deps.echoes.isPullEcho(r.id, rSeq);
-                });
+                    // Filter to replicated docs, excluding pull echoes.
+                    const toPush = localChanges.results.filter((r) => {
+                        if (!r.doc || !isReplicatedDocId(r.id) || r.deleted) return false;
+                        const rSeq = typeof r.seq === "number"
+                            ? r.seq
+                            : parseInt(String(r.seq), 10);
+                        return !this.deps.echoes.isPullEcho(r.id, rSeq);
+                    });
 
-                this.deps.echoes.sweepPullWritten(
-                    localChanges.results.map((r) => r.id),
-                );
+                    this.deps.echoes.sweepPullWritten(
+                        localChanges.results.map((r) => r.id),
+                    );
 
-                if (toPush.length > 0) {
-                    const docs = toPush.map((r) => r.doc!);
-                    await this.pushDocs(docs);
-                    // SyncEngine subscribes to "paused" to update lastHealthyAt.
-                    this.deps.events.emit("paused");
+                    if (toPush.length > 0) {
+                        const docs = toPush.map((r) => r.doc!);
+                        stage = "pushDocs";
+                        await this.pushDocs(docs);
+                        // SyncEngine subscribes to "paused" to update lastHealthyAt.
+                        this.deps.events.emit("paused");
+                    }
+
+                    stage = "checkpoint-save";
+                    this.deps.checkpoints.setLastPushedSeq(localChanges.last_seq);
+                    await this.deps.checkpoints.save();
+                } catch (e: any) {
+                    if (this.deps.isCancelled()) return;
+                    if (e instanceof DbError) {
+                        this.deps.handleLocalDbError(e, `push loop [stage:${stage}]`);
+                        if (e.recovery === "halt") {
+                            exitReason = "halted";
+                            return;
+                        }
+                    } else {
+                        // Push errors are logged but don't escalate — the next
+                        // cycle will retry. First error in session also logs
+                        // the stack so the call site is visible post-hoc.
+                        logDebug(`[sess#${sess}] push error [stage:${stage}]: ${e?.message ?? e}`);
+                        if (!this.stackCaptured && e instanceof Error && e.stack) {
+                            this.stackCaptured = true;
+                            logWarn(
+                                `[sess#${sess}] push error first-in-session [stage:${stage}] name=${e.name} stack=${e.stack.split("\n").slice(0, 5).join(" | ")}`,
+                            );
+                        }
+                    }
                 }
 
-                this.deps.checkpoints.setLastPushedSeq(localChanges.last_seq);
-                await this.deps.checkpoints.save();
-            } catch (e: any) {
-                if (this.deps.isCancelled()) return;
-                if (e instanceof DbError) {
-                    this.deps.handleLocalDbError(e, "push loop");
-                    if (e.recovery === "halt") return;
-                } else {
-                    // Push errors are logged but don't escalate — the next
-                    // cycle will retry.
-                    logDebug(`push error: ${e?.message ?? e}`);
-                }
+                await this.deps.delay(PUSH_POLL_INTERVAL_MS);
             }
-
-            await this.deps.delay(PUSH_POLL_INTERVAL_MS);
+        } finally {
+            logDebug(`[sess#${sess}] pushLoop exit: reason=${exitReason}`);
         }
     }
 

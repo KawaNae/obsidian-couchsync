@@ -29,6 +29,9 @@ import { PushPipeline } from "./push-pipeline.ts";
 import { logDebug, logError } from "../../ui/log.ts";
 
 export interface SyncSessionDeps {
+    /** Monotonic identifier supplied by SyncEngine. Shows up in pipeline
+     *  and teardown logs so concurrent sessions are distinguishable. */
+    epoch: number;
     client: ICouchClient;
     localDb: LocalDB;
     events: SyncEvents;
@@ -41,13 +44,20 @@ export interface SyncSessionDeps {
     onTransientError: (err: unknown) => void;
 }
 
+interface LabeledTask {
+    label: string;
+    promise: Promise<unknown>;
+    settled: boolean;
+}
+
 export class SyncSession {
+    readonly epoch: number;
     readonly client: ICouchClient;
     readonly echoes: EchoTracker;
     readonly pullWriter: PullWriter;
 
     private _disposed = false;
-    private tasks: Array<Promise<unknown>> = [];
+    private tasks: LabeledTask[] = [];
     /** Pending delay() entries — disposed wakes them all so loops exit
      *  immediately rather than waiting out the remaining backoff. */
     private pendingDelays = new Set<{ timer: ReturnType<typeof setTimeout>; resolve: () => void }>();
@@ -55,6 +65,7 @@ export class SyncSession {
     private readonly pushPipeline: PushPipeline;
 
     constructor(deps: SyncSessionDeps) {
+        this.epoch = deps.epoch;
         this.client = deps.client;
         this.echoes = new EchoTracker();
         this.pullWriter = new PullWriter({
@@ -72,6 +83,7 @@ export class SyncSession {
             pullWriter: this.pullWriter,
             checkpoints: deps.checkpoints,
             events: deps.events,
+            sessionEpoch: deps.epoch,
             isCancelled,
             handleLocalDbError: deps.handleLocalDbError,
             onTransientError: deps.onTransientError,
@@ -83,6 +95,7 @@ export class SyncSession {
             echoes: this.echoes,
             events: deps.events,
             checkpoints: deps.checkpoints,
+            sessionEpoch: deps.epoch,
             isCancelled,
             handleLocalDbError: deps.handleLocalDbError,
             delay,
@@ -93,24 +106,44 @@ export class SyncSession {
 
     async runCatchup(): Promise<void> {
         const p = this.pullPipeline.runCatchup();
-        this.tasks.push(p);
+        this.track("catchup", p);
         await p;
     }
 
     startLive(): void {
-        this.tasks.push(
+        this.track(
+            "pullLoop",
             this.pullPipeline.runLongpoll().catch((e) =>
-                logError(`CouchSync: pullLoop unexpected exit: ${e?.message ?? e}`),
+                logError(`CouchSync: [sess#${this.epoch}] pullLoop unexpected exit: ${e?.message ?? e}`),
             ),
+        );
+        this.track(
+            "pushLoop",
             this.pushPipeline.run().catch((e) =>
-                logError(`CouchSync: pushLoop unexpected exit: ${e?.message ?? e}`),
+                logError(`CouchSync: [sess#${this.epoch}] pushLoop unexpected exit: ${e?.message ?? e}`),
             ),
+        );
+    }
+
+    private track(label: string, promise: Promise<unknown>): void {
+        const entry: LabeledTask = { label, promise, settled: false };
+        this.tasks.push(entry);
+        // Use then(onF, onR) — `.finally()` forwards rejections down a
+        // new chain with no awaiter and trips "unhandled rejection".
+        // Here both branches return void so the tracking chain always
+        // resolves fulfilled.
+        promise.then(
+            () => { entry.settled = true; },
+            () => { entry.settled = true; },
         );
     }
 
     dispose(): void {
         this._disposed = true;
-        logDebug(`session dispose: tasks=${this.tasks.length} pendingDelays=${this.pendingDelays.size}`);
+        const unsettled = this.tasks.filter((t) => !t.settled).map((t) => t.label);
+        logDebug(
+            `[sess#${this.epoch}] session dispose: tasks=${this.tasks.length} (unsettled=[${unsettled.join(",")}]) pendingDelays=${this.pendingDelays.size}`,
+        );
         // Wake any pending delay() so loops exit immediately.
         for (const d of this.pendingDelays) {
             clearTimeout(d.timer);
@@ -120,7 +153,13 @@ export class SyncSession {
     }
 
     get settled(): Promise<void> {
-        return Promise.allSettled(this.tasks).then(() => {});
+        return Promise.allSettled(this.tasks.map((t) => t.promise)).then(() => {});
+    }
+
+    /** Labels of tasks that have not yet resolved/rejected. Used by
+     *  teardown diagnostics to say *which* task kept us waiting. */
+    unsettledLabels(): string[] {
+        return this.tasks.filter((t) => !t.settled).map((t) => t.label);
     }
 
     private delay(ms: number): Promise<void> {

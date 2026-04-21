@@ -35,6 +35,9 @@ export interface PullPipelineDeps {
     pullWriter: PullWriter;
     checkpoints: Checkpoints;
     events: SyncEvents;
+    /** Session epoch, used as `[sess#N]` prefix on diagnostic logs so
+     *  concurrent sessions can be told apart during reconnect races. */
+    sessionEpoch: number;
 
     isCancelled: () => boolean;
     handleLocalDbError: (e: unknown, context: string) => void;
@@ -98,53 +101,62 @@ export class PullPipeline {
     // ── Live longpoll ───────────────────────────────────
 
     async runLongpoll(): Promise<void> {
-        while (!this.deps.isCancelled()) {
-            try {
-                const result = await this.deps.client.changesLongpoll<CouchSyncDoc>({
-                    since: this.deps.checkpoints.getRemoteSeq(),
-                    include_docs: true,
-                });
+        const sess = this.deps.sessionEpoch;
+        let exitReason: "cancelled" | "halted" = "cancelled";
+        try {
+            while (!this.deps.isCancelled()) {
+                try {
+                    const result = await this.deps.client.changesLongpoll<CouchSyncDoc>({
+                        since: this.deps.checkpoints.getRemoteSeq(),
+                        include_docs: true,
+                    });
 
-                if (this.deps.isCancelled()) return;
-
-                if (result.results.length > 0) {
-                    this.retryMs = PULL_RETRY_MIN_MS;
-                    this.lastErrorMsg = null;
-                    await this.applyBatch(result);
                     if (this.deps.isCancelled()) return;
-                    // State machine is SyncEngine's concern; pipeline just
-                    // signals that a batch was applied. SyncEngine subscribes
-                    // to "paused" to update lastHealthyAt.
-                    this.deps.events.emit("paused");
-                }
-                // Empty result (longpoll max-wait): stay connected.
-            } catch (e: any) {
-                if (this.deps.isCancelled()) return;
 
-                if (e instanceof DbError) {
-                    this.deps.handleLocalDbError(e, "pull write");
-                    if (e.recovery === "halt") return; // teardown already invoked
-                    await this.deps.delay(this.retryMs);
-                    continue;
-                }
-
-                const detail = classifyError(e);
-
-                if (detail.kind === "auth" || detail.kind === "server") {
-                    this.deps.onTransientError(e);
-                } else {
-                    // Deduplicate consecutive identical messages.
-                    if (detail.message !== this.lastErrorMsg) {
-                        this.lastErrorMsg = detail.message;
-                        logDebug(
-                            `pullLoop: ${detail.kind} error, retrying — ${detail.message}`,
-                        );
+                    if (result.results.length > 0) {
+                        this.retryMs = PULL_RETRY_MIN_MS;
+                        this.lastErrorMsg = null;
+                        await this.applyBatch(result);
+                        if (this.deps.isCancelled()) return;
+                        // State machine is SyncEngine's concern; pipeline just
+                        // signals that a batch was applied. SyncEngine subscribes
+                        // to "paused" to update lastHealthyAt.
+                        this.deps.events.emit("paused");
                     }
-                }
+                    // Empty result (longpoll max-wait): stay connected.
+                } catch (e: any) {
+                    if (this.deps.isCancelled()) return;
 
-                await this.deps.delay(this.retryMs);
-                this.retryMs = Math.min(this.retryMs * 2, PULL_RETRY_MAX_MS);
+                    if (e instanceof DbError) {
+                        this.deps.handleLocalDbError(e, "pull write");
+                        if (e.recovery === "halt") {
+                            exitReason = "halted";
+                            return; // teardown already invoked
+                        }
+                        await this.deps.delay(this.retryMs);
+                        continue;
+                    }
+
+                    const detail = classifyError(e);
+
+                    if (detail.kind === "auth" || detail.kind === "server") {
+                        this.deps.onTransientError(e);
+                    } else {
+                        // Deduplicate consecutive identical messages.
+                        if (detail.message !== this.lastErrorMsg) {
+                            this.lastErrorMsg = detail.message;
+                            logDebug(
+                                `[sess#${sess}] pullLoop: ${detail.kind} error, retrying — ${detail.message}`,
+                            );
+                        }
+                    }
+
+                    await this.deps.delay(this.retryMs);
+                    this.retryMs = Math.min(this.retryMs * 2, PULL_RETRY_MAX_MS);
+                }
             }
+        } finally {
+            logDebug(`[sess#${sess}] pullLoop exit: reason=${exitReason}`);
         }
     }
 

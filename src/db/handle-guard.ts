@@ -20,7 +20,8 @@
  * always alive.
  */
 
-import { classifyDexieError, DbError } from "./write-transaction.ts";
+import { classifyDexieError, DbError, debugDescribeError } from "./write-transaction.ts";
+import { logDebug, logWarn } from "../ui/log.ts";
 
 export interface HandleGuardOptions<T> {
     /** Build a fresh instance of the wrapped resource. Called lazily on
@@ -43,6 +44,10 @@ export class HandleGuard<T> {
     private readonly cleanup: (inner: T) => Promise<void>;
     private readonly probe?: (inner: T) => Promise<void>;
     private readonly maxReopen: number;
+    /** Per-guard latch: capture stack trace of the first unclassified
+     *  ("unknown" kind) failure so the call site can be pinpointed in
+     *  production logs. Repeated occurrences log only one summary line. */
+    private unknownKindCaptured = false;
 
     constructor(opts: HandleGuardOptions<T>) {
         this.factory = opts.factory;
@@ -62,8 +67,23 @@ export class HandleGuard<T> {
             try {
                 return await op(inner);
             } catch (e: unknown) {
-                if (!isHandleExpired(e)) throw e;
+                if (!isHandleExpired(e)) {
+                    // First unclassified error is logged with full shape so
+                    // we can see whether it *should* have been classified
+                    // as handle-expired (e.g. TransactionInactiveError
+                    // under a different Dexie version).
+                    if (classifyDexieError(e) === "unknown" && !this.unknownKindCaptured) {
+                        this.unknownKindCaptured = true;
+                        logWarn(
+                            `CouchSync: [handle-guard] unclassified DB error in ${context} — ${debugDescribeError(e)}`,
+                        );
+                    }
+                    throw e;
+                }
                 if (reopenAttempts >= this.maxReopen) {
+                    logWarn(
+                        `CouchSync: [handle-guard] giving up after ${this.maxReopen} reopen attempts in ${context} — last trigger: ${debugDescribeError(e)}`,
+                    );
                     throw new DbError(
                         "degraded",
                         e,
@@ -71,6 +91,9 @@ export class HandleGuard<T> {
                     );
                 }
                 reopenAttempts++;
+                logDebug(
+                    `[handle-guard] reopen attempt ${reopenAttempts}/${this.maxReopen} in ${context} — trigger: ${debugDescribeError(e)}`,
+                );
                 await this.resetHandle();
             }
         }

@@ -75,6 +75,17 @@ export class SyncEngine {
      *  between restart() teardown and the next openSession(). */
     private session: SyncSession | null = null;
 
+    // ── Diagnostics ───────────────────────────────────────
+
+    /** Monotonic id stamped on each `requestReconnect` chain so parallel
+     *  reconnects can be told apart in the log (see B/C race analysis). */
+    private reconnectCounter = 0;
+
+    /** Monotonic id stamped on each SyncSession so pipeline logs and
+     *  teardown diagnostics can distinguish new vs. old (still-draining)
+     *  sessions. */
+    private sessionEpoch = 0;
+
     // ── Error handling ────────────────────────────────────
 
     /** Pure backoff step counter. Reset only via `backoff.recordSuccess()`. */
@@ -239,6 +250,7 @@ export class SyncEngine {
      * latch, cool-down, and state-specific guards are always applied.
      */
     async requestReconnect(reason: ReconnectReason): Promise<void> {
+        const rc = ++this.reconnectCounter;
         const decision = decideReconnect({
             state: this.state,
             reason,
@@ -246,19 +258,19 @@ export class SyncEngine {
             coolDownActive: Date.now() - this.lastRestartTime < 5000,
         });
 
-        logDebug(`reconnect: reason=${reason} state=${this.state} → ${decision}`);
+        logDebug(`[rc#${rc}] reconnect: reason=${reason} state=${this.state} → ${decision}`);
 
         if (decision === "skip") return;
 
         if (decision === "verify-then-restart") {
             this.setState("reconnecting");
-            if (!(await this.verifyReachable())) return;
+            if (!(await this.verifyReachable(rc))) return;
         } else {
             this.setState("reconnecting");
         }
 
-        logInfo(`Reconnect (${reason}): restarting`);
-        await this.restart();
+        logInfo(`[rc#${rc}] Reconnect (${reason}): restarting`);
+        await this.restart(rc);
     }
 
     // ── Internal: Error supervisor ───────────────────────
@@ -396,7 +408,8 @@ export class SyncEngine {
 
     // ── Internal: Session lifecycle ───────────────────────
 
-    private async teardown(): Promise<void> {
+    private async teardown(rc = 0): Promise<void> {
+        const tag = rc > 0 ? `[rc#${rc}] ` : "";
         const old = this.session;
         this.session = null;
         this.events.resetIdle();
@@ -404,14 +417,27 @@ export class SyncEngine {
         if (!old) return;
         const t0 = Date.now();
         old.dispose();
-        await old.settled;
-        logDebug(`teardown: settled in ${Date.now() - t0}ms`);
+        // Log the watch every 5s while waiting — captures B (teardown
+        // stuck) by reporting which labels remain unsettled over time.
+        const watch = setInterval(() => {
+            const pending = old.unsettledLabels();
+            if (pending.length === 0) return;
+            logDebug(
+                `[sess#${old.epoch}] ${tag}teardown: waiting ${Date.now() - t0}ms (pending=[${pending.join(",")}])`,
+            );
+        }, 5000);
+        try {
+            await old.settled;
+        } finally {
+            clearInterval(watch);
+        }
+        logDebug(`[sess#${old.epoch}] ${tag}teardown: settled in ${Date.now() - t0}ms`);
     }
 
-    private async restart(): Promise<void> {
+    private async restart(rc = 0): Promise<void> {
         this.lastRestartTime = Date.now();
-        await this.teardown();
-        await this.openSession();
+        await this.teardown(rc);
+        await this.openSession(rc);
     }
 
     /**
@@ -419,7 +445,8 @@ export class SyncEngine {
      * start live loops. Every failure path routes through `enterError`
      * or `handleDegraded` — never through silent error swallowing.
      */
-    private async openSession(): Promise<void> {
+    private async openSession(rc = 0): Promise<void> {
+        const tag = rc > 0 ? `[rc#${rc}] ` : "";
         if (this.session) return;
         if (this.auth.isBlocked()) return;
         if (this.degraded) return;
@@ -428,7 +455,9 @@ export class SyncEngine {
         // openSession() calls are deduped by the `if (this.session)`
         // guard above before they reach any await.
         const client = this.makeVaultClient();
+        const epoch = ++this.sessionEpoch;
         const session = new SyncSession({
+            epoch,
             client,
             localDb: this.localDb,
             events: this.events,
@@ -439,6 +468,7 @@ export class SyncEngine {
             onTransientError: (err) => this.handleTransientError(err),
         });
         this.session = session;
+        logDebug(`${tag}openSession: sess#${epoch} created`);
 
         this.setState("reconnecting");
 
@@ -459,7 +489,7 @@ export class SyncEngine {
             return;
         }
         if (session.disposed) return;
-        logDebug(`openSession: ensureHealthy done in ${Date.now() - ensureStart}ms`);
+        logDebug(`${tag}openSession: ensureHealthy done in ${Date.now() - ensureStart}ms`);
 
         const checkpointsStart = Date.now();
         try {
@@ -475,7 +505,7 @@ export class SyncEngine {
             return;
         }
         if (session.disposed) return;
-        logDebug(`openSession: checkpoints.load done in ${Date.now() - checkpointsStart}ms`);
+        logDebug(`${tag}openSession: checkpoints.load done in ${Date.now() - checkpointsStart}ms`);
 
         // Catchup = actual data transfer → syncing.
         this.setState("syncing");
@@ -594,7 +624,8 @@ export class SyncEngine {
 
     // ── Internal: Verify reachability ─────────────────────
 
-    private async verifyReachable(): Promise<boolean> {
+    private async verifyReachable(rc = 0): Promise<boolean> {
+        const tag = rc > 0 ? `[rc#${rc}] ` : "";
         let err: string | null = null;
         const session = this.session;
         const t0 = Date.now();
@@ -613,7 +644,7 @@ export class SyncEngine {
                 err = e?.message || "Connection failed";
             }
         }
-        logDebug(`verify: info() via ${via} returned in ${Date.now() - t0}ms (err=${err ?? "none"})`);
+        logDebug(`${tag}verify: info() via ${via} returned in ${Date.now() - t0}ms (err=${err ?? "none"})`);
         if (err) {
             const detail = classifyError({ message: err });
             if (detail.kind === "unknown") {

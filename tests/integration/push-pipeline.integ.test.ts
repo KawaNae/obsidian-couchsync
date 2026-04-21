@@ -59,6 +59,7 @@ function attachPushPipeline(opts: {
         echoes,
         events,
         checkpoints,
+        sessionEpoch: 1,
         isCancelled: () => cancelled,
         handleLocalDbError: (err, ctx) => { dbErrorCalls.push({ err, ctx }); },
         delay: async () => {
@@ -178,7 +179,8 @@ describe("PushPipeline integration", () => {
             await rig.pipeline.run();
 
             expect(rig.dbErrorCalls).toHaveLength(1);
-            expect(rig.dbErrorCalls[0].ctx).toBe("push loop");
+            // Context now carries a stage marker for diagnostic logs.
+            expect(rig.dbErrorCalls[0].ctx).toBe("push loop [stage:changes]");
             expect(rig.dbErrorCalls[0].err).toBe(err);
             spy.mockRestore();
         });

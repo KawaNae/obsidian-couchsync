@@ -34,12 +34,14 @@ import { toPathKey } from "../utils/path.ts";
 import {
     DbError,
     classifyDexieError,
+    debugDescribeError,
     toDbError,
     type WriteTransaction,
     type WriteBuilder,
     type WriteSnapshot,
 } from "./write-transaction.ts";
 import type { VectorClock } from "../sync/vector-clock.ts";
+import { logWarn } from "../ui/log.ts";
 
 // ── Stored document shape ───────────────────────────────
 
@@ -177,6 +179,15 @@ export class DexieStore<T extends { _id: string; _rev?: string } = any>
                     await sleep(ABORT_RETRY_DELAYS_MS[attempt]);
                     attempt++;
                     continue;
+                }
+                // Diagnostic: unclassified failures inside a Dexie
+                // transaction are the exact shape we want to study for the
+                // "no in-progress transaction" race. Log each occurrence
+                // with full descriptor — this path is rare, not a hot loop.
+                if (kind === "unknown") {
+                    logWarn(
+                        `CouchSync: [dexie-store] runTx failed unclassified — ${debugDescribeError(e)}`,
+                    );
                 }
                 throw toDbError(e);
             }

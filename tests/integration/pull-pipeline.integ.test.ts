@@ -62,6 +62,7 @@ function attachPullPipeline(opts: {
         pullWriter,
         checkpoints,
         events,
+        sessionEpoch: 1,
         isCancelled: () => cancelled,
         handleLocalDbError: (err, ctx) => { dbErrorCalls.push({ err, ctx }); },
         onTransientError: () => {},
