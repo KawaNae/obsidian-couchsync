@@ -76,7 +76,10 @@ export function e2eConfig(opts?: { uniqueDb?: boolean }): E2EConfig {
         ? `${baseDb}-${Date.now()}-${++dbNameCounter}`
         : baseDb;
     return {
-        couchUrl: process.env.COUCHDB_URL ?? "http://localhost:5984",
+        // IPv4 loopback explicitly: on Windows `localhost` can resolve to
+        // `::1` first, which Docker Desktop's port forwarder does not
+        // bind — leading to multi-second hangs until retries time out.
+        couchUrl: process.env.COUCHDB_URL ?? "http://127.0.0.1:5984",
         user: process.env.COUCHDB_USER ?? "admin",
         password: process.env.COUCHDB_PASSWORD ?? "admin",
         dbName,

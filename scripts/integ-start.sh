@@ -31,16 +31,23 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 echo "integ-start: bringing up CouchDB..."
 (cd "$PROJECT_ROOT" && docker compose up -d couchdb)
 
-echo "integ-start: waiting for /_up to return 200..."
+# Use 127.0.0.1 explicitly. On Windows, `localhost` can resolve to the
+# IPv6 loopback `::1` first, which Docker Desktop's port forwarder does
+# not bind by default — the curl hangs until timeout and the auth-cache
+# warnings below never get silenced. Forcing IPv4 keeps behaviour
+# consistent across platforms.
+COUCH_HOST="http://127.0.0.1:5984"
+
+echo "integ-start: waiting for ${COUCH_HOST}/_up to return 200..."
 for i in $(seq 1 60); do
-    if curl -fsS http://localhost:5984/_up >/dev/null 2>&1; then
+    if curl -fsS "${COUCH_HOST}/_up" >/dev/null 2>&1; then
         echo "integ-start: CouchDB is healthy."
         # Create the three system databases CouchDB expects in "single-node"
         # mode. Without them the logs spam `database_does_not_exist` every
         # few seconds from the auth cache / replicator / global-changes
         # feed. Idempotent — PUT returns 412 if a DB already exists.
         for sysdb in _users _replicator _global_changes; do
-            curl -fsS -u admin:admin -X PUT "http://localhost:5984/$sysdb" \
+            curl -fsS -u admin:admin -X PUT "${COUCH_HOST}/${sysdb}" \
                 >/dev/null 2>&1 || true
         done
         exit 0
