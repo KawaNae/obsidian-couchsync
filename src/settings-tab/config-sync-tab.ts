@@ -27,6 +27,7 @@ import type { ConfigSync } from "../sync/config-sync.ts";
 import type { SyncEngine } from "../db/sync-engine.ts";
 import type { AuthGate } from "../db/sync/auth-gate.ts";
 import type { VaultRemoteOps } from "../db/sync/vault-remote-ops.ts";
+import type { IModalPresenter } from "../types/modal-presenter.ts";
 import { logWarn } from "../ui/log.ts";
 
 export interface ConfigSyncTabDeps {
@@ -37,6 +38,7 @@ export interface ConfigSyncTabDeps {
     replicator: SyncEngine;
     auth: AuthGate;
     remoteOps: VaultRemoteOps;
+    modalPresenter: IModalPresenter;
     refresh: () => void;
 }
 
@@ -209,14 +211,14 @@ export class ConfigSyncTab {
                 btn.setButtonText("Init & Push").setWarning()
                     .setDisabled(!configEnabled)
                     .onClick(async () => {
-                        if (
-                            !confirm(
-                                "Delete the existing config DB and re-scan .obsidian/? " +
-                                    "This cannot be undone.",
-                            )
-                        ) {
-                            return;
-                        }
+                        const ok = await this.deps.modalPresenter.showConfirmModal(
+                            "Init & Push",
+                            "Delete the existing config DB and re-scan .obsidian/? " +
+                                "This cannot be undone.",
+                            "Init & Push",
+                            true,
+                        );
+                        if (!ok) return;
                         btn.setButtonText("Initializing...");
                         btn.setDisabled(true);
                         try { await this.deps.configSync.init(); } catch { /* handled */ }

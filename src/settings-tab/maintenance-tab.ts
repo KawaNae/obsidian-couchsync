@@ -4,6 +4,7 @@ import type { LocalDB } from "../db/local-db.ts";
 import type { ConfigLocalDB } from "../db/config-local-db.ts";
 import type { SyncEngine } from "../db/sync-engine.ts";
 import type { StatusBar } from "../ui/status-bar.ts";
+import type { IModalPresenter } from "../types/modal-presenter.ts";
 import { DOC_ID } from "../types/doc-id.ts";
 import { logError } from "../ui/log.ts";
 import { gcOrphanChunks } from "../db/chunk-gc.ts";
@@ -16,6 +17,7 @@ interface MaintenanceTabDeps {
     configLocalDb: ConfigLocalDB | null;
     replicator: SyncEngine;
     statusBar: StatusBar;
+    modalPresenter: IModalPresenter;
     onRestart: () => void;
     runChunkConsistencyReport: () => Promise<void>;
 }
@@ -99,16 +101,16 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
             .setWarning()
             .setDisabled(true)
             .onClick(async () => {
-                if (
-                    !confirm(
-                        "Delete all `config:*` documents from the vault database? " +
-                            "This is a one-time migration step after the v0.11.0 config-DB split. " +
-                            "Make sure you've already run Config Init in the Config Sync tab so " +
-                            "the new config DB has been seeded.",
-                    )
-                ) {
-                    return;
-                }
+                const ok = await deps.modalPresenter.showConfirmModal(
+                    "Clean up legacy configs",
+                    "Delete all `config:*` documents from the vault database? " +
+                        "This is a one-time migration step after the v0.11.0 config-DB split. " +
+                        "Make sure you've already run Config Init in the Config Sync tab so " +
+                        "the new config DB has been seeded.",
+                    "Clean up",
+                    true,
+                );
+                if (!ok) return;
                 btn.setButtonText("Cleaning...");
                 btn.setDisabled(true);
                 try {

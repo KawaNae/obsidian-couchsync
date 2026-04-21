@@ -47,6 +47,7 @@ export default class CouchSyncPlugin extends Plugin {
     private historyCapture!: HistoryCapture;
     historyManager!: HistoryManager;
     statusBar!: StatusBar;
+    modalPresenter!: ObsidianModalPresenter;
     private conflictOrchestrator!: ConflictOrchestrator;
 
     async onload(): Promise<void> {
@@ -97,7 +98,8 @@ export default class CouchSyncPlugin extends Plugin {
         const vaultIO = new ObsidianVaultIO(this.app);
         const adapterIO = new ObsidianAdapterIO(this.app);
         const vaultEvents = new ObsidianVaultEvents(this.app);
-        const modalPresenter = new ObsidianModalPresenter(this.app);
+        this.modalPresenter = new ObsidianModalPresenter(this.app);
+        const modalPresenter = this.modalPresenter;
 
         this.auth = new AuthGate();
         this.remoteOps = new VaultRemoteOps(this.localDb, () => this.settings, this.auth);

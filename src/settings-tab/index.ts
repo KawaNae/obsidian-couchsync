@@ -109,6 +109,7 @@ export class CouchSyncSettingTab extends PluginSettingTab {
             replicator: this.plugin.replicator,
             auth: this.plugin.auth,
             remoteOps: this.plugin.remoteOps,
+            modalPresenter: this.plugin.modalPresenter,
             refresh: () => this.display(),
         };
         if (!this.configSyncTab) {
@@ -135,6 +136,7 @@ export class CouchSyncSettingTab extends PluginSettingTab {
                 configLocalDb: this.plugin.configLocalDb,
                 replicator: this.plugin.replicator,
                 statusBar: this.plugin.statusBar,
+                modalPresenter: this.plugin.modalPresenter,
                 onRestart: () => {
                     const app = this.plugin.app as any;
                     app.plugins?.disablePlugin("obsidian-couchsync");
