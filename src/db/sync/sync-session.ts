@@ -26,7 +26,7 @@ import type { Checkpoints } from "./checkpoints.ts";
 import { PullWriter } from "./pull-writer.ts";
 import { PullPipeline } from "./pull-pipeline.ts";
 import { PushPipeline } from "./push-pipeline.ts";
-import { logError } from "../../ui/log.ts";
+import { logDebug, logError } from "../../ui/log.ts";
 
 export interface SyncSessionDeps {
     client: ICouchClient;
@@ -110,6 +110,7 @@ export class SyncSession {
 
     dispose(): void {
         this._disposed = true;
+        logDebug(`session dispose: tasks=${this.tasks.length} pendingDelays=${this.pendingDelays.size}`);
         // Wake any pending delay() so loops exit immediately.
         for (const d of this.pendingDelays) {
             clearTimeout(d.timer);

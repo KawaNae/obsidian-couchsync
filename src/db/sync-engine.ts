@@ -402,8 +402,10 @@ export class SyncEngine {
         this.events.resetIdle();
         this.lastObservedRemoteSeq = 0;
         if (!old) return;
+        const t0 = Date.now();
         old.dispose();
         await old.settled;
+        logDebug(`teardown: settled in ${Date.now() - t0}ms`);
     }
 
     private async restart(): Promise<void> {
@@ -443,6 +445,7 @@ export class SyncEngine {
         // Precondition: local DB has a live handle. HandleGuard reopens
         // once transparently; `DbError("degraded")` means the reopen
         // budget is exhausted.
+        const ensureStart = Date.now();
         try {
             await this.localDb.ensureHealthy();
         } catch (e) {
@@ -456,7 +459,9 @@ export class SyncEngine {
             return;
         }
         if (session.disposed) return;
+        logDebug(`openSession: ensureHealthy done in ${Date.now() - ensureStart}ms`);
 
+        const checkpointsStart = Date.now();
         try {
             await this.checkpoints.load();
         } catch (e) {
@@ -470,6 +475,7 @@ export class SyncEngine {
             return;
         }
         if (session.disposed) return;
+        logDebug(`openSession: checkpoints.load done in ${Date.now() - checkpointsStart}ms`);
 
         // Catchup = actual data transfer → syncing.
         this.setState("syncing");
@@ -591,6 +597,8 @@ export class SyncEngine {
     private async verifyReachable(): Promise<boolean> {
         let err: string | null = null;
         const session = this.session;
+        const t0 = Date.now();
+        const via = session ? "session-client" : "probe-client";
         if (session) {
             try {
                 await session.client.info();
@@ -605,6 +613,7 @@ export class SyncEngine {
                 err = e?.message || "Connection failed";
             }
         }
+        logDebug(`verify: info() via ${via} returned in ${Date.now() - t0}ms (err=${err ?? "none"})`);
         if (err) {
             const detail = classifyError({ message: err });
             if (detail.kind === "unknown") {
