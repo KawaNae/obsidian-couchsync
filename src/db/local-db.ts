@@ -1,5 +1,11 @@
 import type { CouchSyncDoc, FileDoc, ChunkDoc } from "../types.ts";
-import type { IDocStore, AllDocsOpts, AllDocsResult, LocalChangesResult } from "./interfaces.ts";
+import type {
+    IDocStore,
+    AllDocsOpts,
+    AllDocsResult,
+    LocalChangesResult,
+    ListIdsRange,
+} from "./interfaces.ts";
 import { DexieStore, VCLOCK_KEY_PREFIX, vclockMetaKey } from "./dexie-store.ts";
 import type { WriteTransaction, WriteBuilder } from "./write-transaction.ts";
 import type { VectorClock } from "../sync/vector-clock.ts";
@@ -127,6 +133,10 @@ export class LocalDB implements IDocStore<CouchSyncDoc> {
 
     async allDocs(opts?: AllDocsOpts): Promise<AllDocsResult<CouchSyncDoc>> {
         return this.runDocsOp((s) => s.allDocs(opts), "allDocs");
+    }
+
+    async listIds(range: ListIdsRange): Promise<string[]> {
+        return this.runDocsOp((s) => s.listIds(range), "listIds");
     }
 
     async info(): Promise<{ updateSeq: number | string }> {

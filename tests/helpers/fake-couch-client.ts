@@ -111,9 +111,14 @@ export class FakeCouchClient implements ICouchClient {
                 }
             }
         } else {
-            for (const [id, stored] of this.docs) {
+            // Real CouchDB `_all_docs` returns rows sorted by id (lex).
+            // Sort first, then apply range+limit so paging via
+            // `startkey = lastId + "\x00"` behaves like production.
+            const sortedIds = Array.from(this.docs.keys()).sort();
+            for (const id of sortedIds) {
                 if (opts.startkey && id < opts.startkey) continue;
                 if (opts.endkey && id > opts.endkey) continue;
+                const stored = this.docs.get(id)!;
                 rows.push({
                     id,
                     key: id,

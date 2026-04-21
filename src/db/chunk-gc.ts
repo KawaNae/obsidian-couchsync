@@ -6,12 +6,14 @@
  *   - A file's content changes and old chunks are no longer referenced
  *   - A FileDoc is deleted but its chunks remain
  *
- * This module scans all ChunkDocs and deletes those not referenced by any
- * live (non-deleted) FileDoc.
+ * Scans the full chunk id range using the body-free `listIds` primitive,
+ * then deletes every chunk not referenced by any live (non-deleted)
+ * FileDoc.
  */
 
 import type { LocalDB } from "./local-db.ts";
 import { ID_RANGE } from "../types/doc-id.ts";
+import { collectReferencedChunks } from "./chunk-refs.ts";
 import { logInfo } from "../ui/log.ts";
 
 export interface GcResult {
@@ -21,33 +23,28 @@ export interface GcResult {
 }
 
 export async function gcOrphanChunks(db: LocalDB): Promise<GcResult> {
-    // 1. Collect chunk IDs referenced by live FileDocs.
+    // 1. Live-FileDoc reference set, via the shared helper.
     const fileDocs = await db.allFileDocs();
-    const referenced = new Set<string>();
-    for (const doc of fileDocs) {
-        if (doc.deleted) continue;
-        for (const id of doc.chunks) referenced.add(id);
-    }
+    const referenced = collectReferencedChunks(fileDocs);
 
-    // 2. Scan all chunk documents.
-    const allChunks = await db.allDocs({
+    // 2. Enumerate chunk ids without loading bodies. For a 50k-chunk
+    //    vault, include_docs-style `allDocs` would pull ~6.5 GB into
+    //    memory; `listIds` uses the primary-key index directly.
+    const chunkIds = await db.listIds({
         startkey: ID_RANGE.chunk.startkey,
         endkey: ID_RANGE.chunk.endkey,
     });
 
-    // 3. Delete orphans (not referenced by any live FileDoc). All in one
-    //    rw tx so a crash mid-GC cannot leave _update_seq inconsistent —
-    //    either every orphan is gone or none of them are.
-    const orphanIds = allChunks.rows
-        .filter((r) => !referenced.has(r.id))
-        .map((r) => r.id);
-
+    // 3. Delete orphans atomically: one rw tx so a crash mid-GC cannot
+    //    leave `_update_seq` inconsistent — either every orphan is gone
+    //    or none of them are.
+    const orphanIds = chunkIds.filter((id) => !referenced.has(id));
     if (orphanIds.length > 0) {
         await db.runWriteTx({ deletes: orphanIds });
     }
 
     const result: GcResult = {
-        scannedChunks: allChunks.rows.length,
+        scannedChunks: chunkIds.length,
         referencedChunks: referenced.size,
         deletedChunks: orphanIds.length,
     };
@@ -55,8 +52,8 @@ export async function gcOrphanChunks(db: LocalDB): Promise<GcResult> {
     if (result.deletedChunks > 0) {
         logInfo(
             `Chunk GC: scanned ${result.scannedChunks}, ` +
-            `referenced ${result.referencedChunks}, ` +
-            `deleted ${result.deletedChunks} orphan(s)`,
+                `referenced ${result.referencedChunks}, ` +
+                `deleted ${result.deletedChunks} orphan(s)`,
         );
     }
 

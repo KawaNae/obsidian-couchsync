@@ -81,7 +81,13 @@ export class VaultRemoteOps {
         );
     }
 
-    private makeClient(): CouchClient {
+    /**
+     * Construct a fresh CouchClient from saved settings. Public so that
+     * other one-shot callers (diagnostic commands, maintenance tooling)
+     * can reuse the exact same factory — settings, auth, URL encoding
+     * all live here in one place.
+     */
+    makeClient(): CouchClient {
         const s = this.getSettings();
         return makeCouchClient(
             s.couchdbUri, s.couchdbDbName, s.couchdbUser, s.couchdbPassword,

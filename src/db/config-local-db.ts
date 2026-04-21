@@ -18,6 +18,7 @@ import type {
     AllDocsOpts,
     AllDocsResult,
     LocalChangesResult,
+    ListIdsRange,
 } from "./interfaces.ts";
 import type { DexieStore } from "./dexie-store.ts";
 import type { WriteTransaction, WriteBuilder } from "./write-transaction.ts";
@@ -34,6 +35,10 @@ export class ConfigLocalDB implements IDocStore<CouchSyncDoc> {
 
     async allDocs(opts?: AllDocsOpts): Promise<AllDocsResult<CouchSyncDoc>> {
         return this.store.allDocs(opts);
+    }
+
+    async listIds(range: ListIdsRange): Promise<string[]> {
+        return this.store.listIds(range);
     }
 
     async changes(

@@ -473,6 +473,65 @@ describe("DexieStore", () => {
         });
     });
 
+    // ── listIds (id-only range scan, no body load) ──────
+
+    describe("listIds", () => {
+        it("returns ids in lex order, inclusive bounds, body never loaded", async () => {
+            await put(store, makeChunk("b", "data"));
+            await put(store, makeChunk("a", "data"));
+            await put(store, makeChunk("c", "data"));
+            await put(store, makeFile("f.md"));
+
+            const ids = await store.listIds({
+                startkey: "chunk:",
+                endkey: "chunk:\ufff0",
+            });
+            expect(ids).toEqual([
+                makeChunkId("a"),
+                makeChunkId("b"),
+                makeChunkId("c"),
+            ]);
+        });
+
+        it("honours limit", async () => {
+            await put(store, makeChunk("a", "x"));
+            await put(store, makeChunk("b", "x"));
+            await put(store, makeChunk("c", "x"));
+            const ids = await store.listIds({
+                startkey: "chunk:",
+                endkey: "chunk:\ufff0",
+                limit: 2,
+            });
+            expect(ids).toEqual([makeChunkId("a"), makeChunkId("b")]);
+        });
+
+        it("returns empty array when range is empty", async () => {
+            const ids = await store.listIds({
+                startkey: "chunk:",
+                endkey: "chunk:\ufff0",
+            });
+            expect(ids).toEqual([]);
+        });
+
+        it("startkey advances for paging via lastId + \\x00", async () => {
+            await put(store, makeChunk("a", "x"));
+            await put(store, makeChunk("b", "x"));
+            await put(store, makeChunk("c", "x"));
+            const first = await store.listIds({
+                startkey: "chunk:",
+                endkey: "chunk:\ufff0",
+                limit: 1,
+            });
+            expect(first).toEqual([makeChunkId("a")]);
+            const second = await store.listIds({
+                startkey: first[0] + "\x00",
+                endkey: "chunk:\ufff0",
+                limit: 1,
+            });
+            expect(second).toEqual([makeChunkId("b")]);
+        });
+    });
+
     // ── info ────────────────────────────────────────────
 
     describe("info", () => {

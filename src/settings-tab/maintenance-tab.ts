@@ -16,6 +16,7 @@ interface MaintenanceTabDeps {
     replicator: SyncEngine;
     statusBar: StatusBar;
     onRestart: () => void;
+    runChunkConsistencyReport: () => Promise<void>;
 }
 
 export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps): void {
@@ -144,6 +145,25 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
             logError(`CouchSync: legacy probe failed: ${e?.message ?? e}`);
         }
     })();
+
+    // Diagnostics
+    el.createEl("h3", { text: "Diagnostics" });
+
+    new Setting(el)
+        .setName("Chunk consistency report")
+        .setDesc(
+            "Compare local and remote chunk inventories. Read-only; no changes are made.",
+        )
+        .addButton((btn) =>
+            btn.setButtonText("Run check").onClick(async () => {
+                btn.setDisabled(true);
+                try {
+                    await deps.runChunkConsistencyReport();
+                } finally {
+                    btn.setDisabled(false);
+                }
+            }),
+        );
 
     // Recovery
     el.createEl("h3", { text: "Recovery" });

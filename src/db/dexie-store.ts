@@ -27,6 +27,7 @@ import type {
     AllDocsResult,
     AllDocsRow,
     LocalChangesResult,
+    ListIdsRange,
 } from "./interfaces.ts";
 import { stripRev } from "../utils/doc.ts";
 import { toPathKey } from "../utils/path.ts";
@@ -407,6 +408,17 @@ export class DexieStore<T extends { _id: string; _rev?: string } = any>
             rows,
             total_rows: rows.length,
         };
+    }
+
+    async listIds(range: ListIdsRange): Promise<string[]> {
+        let query = this.db.docs
+            .where("_id")
+            .between(range.startkey, range.endkey, true, true);
+        if (range.limit !== undefined) query = query.limit(range.limit);
+        const ids = await query.primaryKeys();
+        // Dexie primary-key range queries already return ids in index order
+        // (lex on strings). We don't sort again — trust the index.
+        return ids;
     }
 
     async info(): Promise<{ updateSeq: number | string }> {

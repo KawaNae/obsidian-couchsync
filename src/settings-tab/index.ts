@@ -5,6 +5,7 @@ import { ConfigSyncTab } from "./config-sync-tab.ts";
 import { renderHistoryTab } from "./history-tab.ts";
 import { renderMaintenanceTab } from "./maintenance-tab.ts";
 import { renderStatusTab } from "./status-tab.ts";
+import { runChunkConsistencyReport } from "../commands.ts";
 
 export class CouchSyncSettingTab extends PluginSettingTab {
     plugin: CouchSyncPlugin;
@@ -139,6 +140,8 @@ export class CouchSyncSettingTab extends PluginSettingTab {
                     app.plugins?.disablePlugin("obsidian-couchsync");
                     app.plugins?.enablePlugin("obsidian-couchsync");
                 },
+                runChunkConsistencyReport: () =>
+                    runChunkConsistencyReport(this.plugin),
             });
         }
 

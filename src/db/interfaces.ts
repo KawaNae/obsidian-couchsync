@@ -52,6 +52,14 @@ export interface LocalChangesResult<T> {
     last_seq: number | string;
 }
 
+/** Range query for id-only listings. */
+export interface ListIdsRange {
+    startkey: string;
+    endkey: string;
+    /** Maximum number of ids to return. */
+    limit?: number;
+}
+
 /**
  * Minimal atomic-write local store. Every mutation goes through
  * `runWriteBuilder` (CAS retry on conflict) or `runWriteTx` (single
@@ -60,6 +68,13 @@ export interface LocalChangesResult<T> {
 export interface IDocStore<T = any> {
     get(id: string): Promise<T | null>;
     allDocs(opts?: AllDocsOpts): Promise<AllDocsResult<T>>;
+    /**
+     * Return only the primary keys (document `_id`s) in `[startkey,
+     * endkey]` (inclusive), sorted lexicographically. Document bodies
+     * are never loaded — for large content-addressed stores this is the
+     * only scalable way to enumerate ids.
+     */
+    listIds(range: ListIdsRange): Promise<string[]>;
     info(): Promise<{ updateSeq: number | string }>;
     /**
      * Return documents that changed since `since`. Used by SyncEngine's
