@@ -5,6 +5,7 @@ import { ChunkConsistencyReportModal } from "./ui/chunk-consistency-report-modal
 import { totalDiscrepancies } from "./sync/reconciler.ts";
 import { logWarn, notify } from "./ui/log.ts";
 import { analyzeChunkConsistency } from "./sync/chunk-consistency.ts";
+import { planFromReport, repairChunkDrift } from "./sync/chunk-repair.ts";
 
 /**
  * Register all Command-Palette commands on the plugin.
@@ -96,23 +97,53 @@ export async function runChunkConsistencyReport(
     const progress = new ProgressNotice("Chunk consistency");
     try {
         const remote = plugin.remoteOps.makeClient();
-        const report = await analyzeChunkConsistency({
-            localDb: plugin.localDb,
-            remote,
-            onProgress: (phase, current, total) =>
-                progress.update(
-                    total !== undefined
-                        ? `${phase}: ${current}/${total}`
-                        : `${phase}: ${current}`,
-                ),
-        });
+        const analyze = () =>
+            analyzeChunkConsistency({
+                localDb: plugin.localDb,
+                remote,
+                onProgress: (phase, current, total) =>
+                    progress.update(
+                        total !== undefined
+                            ? `${phase}: ${current}/${total}`
+                            : `${phase}: ${current}`,
+                    ),
+            });
+        const report = await analyze();
         progress.done(
             `Chunk report — ${report.counts.localOnly} local-only, ` +
                 `${report.counts.remoteOnly} remote-only, ` +
                 `${report.counts.missingReferenced} broken, ` +
                 `${report.counts.orphanLocal + report.counts.orphanRemote} orphan(s)`,
         );
-        new ChunkConsistencyReportModal(plugin.app, report).open();
+        new ChunkConsistencyReportModal(plugin.app, report, async (current) => {
+            const plan = planFromReport(current);
+            const repairProgress = new ProgressNotice("Chunk repair");
+            const result = await repairChunkDrift(plan, {
+                localDb: plugin.localDb,
+                remote,
+                onProgress: (phase, current, total) =>
+                    repairProgress.update(`${phase}: ${current}/${total}`),
+            });
+            const summary =
+                `pushed ${result.pushed}, pulled ${result.pulled}, ` +
+                `deleted-local ${result.deletedLocal}, ` +
+                `deleted-remote ${result.deletedRemote}`;
+            if (result.failed.length === 0) {
+                repairProgress.done(`Repair — ${summary}`);
+            } else {
+                repairProgress.fail(
+                    `Repair — ${summary}, ${result.failed.length} failed`,
+                );
+                logWarn(
+                    `CouchSync: chunk repair failures: ${
+                        result.failed
+                            .map((f) => `${f.direction} ${f.id}: ${f.reason}`)
+                            .join("; ")
+                    }`,
+                );
+            }
+            return await analyze();
+        }).open();
     } catch (e: any) {
         progress.fail(`Chunk report failed: ${e?.message ?? e}`);
     }

@@ -68,6 +68,72 @@ export async function pushDocs(
 }
 
 /**
+ * Pull specific documents by id from `remote` to `local`. Counterpart
+ * to `pushDocs` — a symmetric one-shot helper. Ids missing on the
+ * remote are silently skipped (mirrors bulkGet's semantics).
+ */
+export async function pullDocs(
+    local: IDocStore<CouchSyncDoc>,
+    remote: ICouchClient,
+    docIds: string[],
+    onProgress?: ProgressCallback,
+): Promise<number> {
+    if (docIds.length === 0) return 0;
+
+    const fetched = await remote.bulkGet<CouchSyncDoc>(docIds);
+    if (fetched.length === 0) return 0;
+
+    const localDocs = fetched.map((d) => stripRev(d) as CouchSyncDoc);
+    await local.runWriteTx({
+        docs: localDocs.map((doc) => ({ doc })),
+    });
+
+    let total = 0;
+    for (const doc of localDocs) {
+        total++;
+        onProgress?.(doc._id, total);
+    }
+    return total;
+}
+
+/**
+ * Delete specific documents on `remote` by sending tombstones. Fetches
+ * the current remote `_rev` for each id, then issues `_deleted: true`
+ * records via _bulk_docs. Ids that don't currently exist on remote (or
+ * are already tombstoned) are silently skipped. Returns the count of
+ * tombstones actually accepted.
+ */
+export async function deleteRemoteDocs(
+    remote: ICouchClient,
+    docIds: string[],
+    onProgress?: ProgressCallback,
+): Promise<number> {
+    if (docIds.length === 0) return 0;
+
+    const remoteResult = await remote.allDocs<CouchSyncDoc>({
+        keys: docIds,
+    });
+    const tombstones: Array<{ _id: string; _rev: string; _deleted: true }> = [];
+    for (const row of remoteResult.rows) {
+        const rev = row.value?.rev;
+        if (rev && !row.value?.deleted) {
+            tombstones.push({ _id: row.id, _rev: rev, _deleted: true });
+        }
+    }
+    if (tombstones.length === 0) return 0;
+
+    const results = await remote.bulkDocs(tombstones);
+    let total = 0;
+    for (const res of results) {
+        if (res.ok) {
+            total++;
+            onProgress?.(res.id, total);
+        }
+    }
+    return total;
+}
+
+/**
  * Pull every doc whose `_id` matches `prefix` from `remote` into `local`.
  * Used by ConfigSync to fetch all `config:*` docs without touching
  * file/chunk space. Returns the count of docs written locally.

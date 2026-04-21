@@ -8,6 +8,8 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import {
     pushDocs,
+    pullDocs,
+    deleteRemoteDocs,
     pullByPrefix,
     listRemoteByPrefix,
     destroyRemote,
@@ -193,6 +195,99 @@ describe("remote-couch (IDocStore + ICouchClient)", () => {
         it("returns 0 immediately for an empty id list", async () => {
             const written = await pushDocs(local, remote, [], () => {});
             expect(written).toBe(0);
+        });
+    });
+
+    describe("pullDocs", () => {
+        it("pulls specified docs from remote and reports progress", async () => {
+            const docA = { ...makeFileDoc("a.md", "x"), _rev: "1-r" };
+            const docB = { ...makeFileDoc("b.md", "y"), _rev: "1-r" };
+            const docC = { ...makeFileDoc("c.md", "z"), _rev: "1-r" };
+            remote._docs.set(docA._id, docA);
+            remote._docs.set(docB._id, docB);
+            remote._docs.set(docC._id, docC);
+
+            const seen: string[] = [];
+            const written = await pullDocs(
+                local,
+                remote,
+                [makeFileId("a.md"), makeFileId("b.md")],
+                (id) => seen.push(id),
+            );
+            expect(written).toBe(2);
+            expect(new Set(seen)).toEqual(
+                new Set([makeFileId("a.md"), makeFileId("b.md")]),
+            );
+
+            expect(local._docs.has(makeFileId("a.md"))).toBe(true);
+            expect(local._docs.has(makeFileId("b.md"))).toBe(true);
+            expect(local._docs.has(makeFileId("c.md"))).toBe(false);
+        });
+
+        it("strips remote _rev before writing locally", async () => {
+            const docA = { ...makeFileDoc("a.md", "x"), _rev: "7-remote-only" };
+            remote._docs.set(docA._id, docA);
+
+            await pullDocs(local, remote, [docA._id]);
+            const stored = local._docs.get(docA._id);
+            expect(stored._rev).not.toBe("7-remote-only");
+            expect(stored._rev).toMatch(/-stub$/);
+        });
+
+        it("returns 0 immediately for an empty id list", async () => {
+            const written = await pullDocs(local, remote, [], () => {});
+            expect(written).toBe(0);
+        });
+
+        it("silently skips ids that do not exist on remote", async () => {
+            const docA = { ...makeFileDoc("a.md", "x"), _rev: "1-r" };
+            remote._docs.set(docA._id, docA);
+
+            const seen: string[] = [];
+            const written = await pullDocs(
+                local,
+                remote,
+                [makeFileId("a.md"), makeFileId("missing.md")],
+                (id) => seen.push(id),
+            );
+            expect(written).toBe(1);
+            expect(seen).toEqual([makeFileId("a.md")]);
+        });
+    });
+
+    describe("deleteRemoteDocs", () => {
+        it("sends tombstones for the given ids using their current remote rev", async () => {
+            const docA = { ...makeFileDoc("a.md", "x"), _rev: "1-r" };
+            const docB = { ...makeFileDoc("b.md", "y"), _rev: "1-r" };
+            remote._docs.set(docA._id, docA);
+            remote._docs.set(docB._id, docB);
+
+            const seen: string[] = [];
+            const deleted = await deleteRemoteDocs(
+                remote,
+                [makeFileId("a.md"), makeFileId("b.md")],
+                (id) => seen.push(id),
+            );
+            expect(deleted).toBe(2);
+            expect(new Set(seen)).toEqual(
+                new Set([makeFileId("a.md"), makeFileId("b.md")]),
+            );
+        });
+
+        it("returns 0 immediately for an empty id list", async () => {
+            const deleted = await deleteRemoteDocs(remote, [], () => {});
+            expect(deleted).toBe(0);
+        });
+
+        it("silently skips ids not present on remote", async () => {
+            const docA = { ...makeFileDoc("a.md", "x"), _rev: "1-r" };
+            remote._docs.set(docA._id, docA);
+
+            const deleted = await deleteRemoteDocs(
+                remote,
+                [makeFileId("a.md"), makeFileId("missing.md")],
+            );
+            expect(deleted).toBe(1);
         });
     });
 

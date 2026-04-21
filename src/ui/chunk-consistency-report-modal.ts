@@ -1,18 +1,36 @@
 import { App, Modal, Notice, Setting } from "obsidian";
 import type { ChunkConsistencyReport } from "../sync/chunk-consistency.ts";
+import { planFromReport } from "../sync/chunk-repair.ts";
 
 const TRUNCATE_AT = 50;
+
+/**
+ * Invoked by the repair button. Receives the currently displayed
+ * report (so the caller derives the plan from fresh state), performs
+ * the repair, and returns a freshly-generated post-repair report; the
+ * Modal swaps its display in place so the user sees immediate
+ * confirmation.
+ */
+export type ChunkRepairInvoker = (
+    current: ChunkConsistencyReport,
+) => Promise<ChunkConsistencyReport>;
 
 export class ChunkConsistencyReportModal extends Modal {
     constructor(
         app: App,
         private report: ChunkConsistencyReport,
+        private onRepair?: ChunkRepairInvoker,
     ) {
         super(app);
     }
 
     onOpen(): void {
+        this.render();
+    }
+
+    private render(): void {
         const { contentEl, report } = this;
+        contentEl.empty();
         contentEl.createEl("h3", { text: "Chunk consistency" });
 
         contentEl.createEl("p", {
@@ -55,14 +73,63 @@ export class ChunkConsistencyReportModal extends Modal {
             this.renderIds(contentEl, "Orphan (remote)", report.orphanRemote);
         }
 
-        new Setting(contentEl)
+        const plan = planFromReport(report);
+        const planTotal =
+            plan.toPush.length +
+            plan.toPull.length +
+            plan.toDeleteLocal.length +
+            plan.toDeleteRemote.length;
+
+        if (this.onRepair && planTotal > 0) {
+            const breakdown = contentEl.createDiv({ cls: "cs-consistency-section" });
+            breakdown.createEl("h4", { text: "Repair plan" });
+            const ul = breakdown.createEl("ul");
+            if (plan.toPush.length > 0)
+                ul.createEl("li", { text: `push ${plan.toPush.length} → remote` });
+            if (plan.toPull.length > 0)
+                ul.createEl("li", { text: `pull ${plan.toPull.length} ← remote` });
+            if (plan.toDeleteLocal.length > 0)
+                ul.createEl("li", {
+                    text: `delete ${plan.toDeleteLocal.length} local (one-sided orphan)`,
+                });
+            if (plan.toDeleteRemote.length > 0)
+                ul.createEl("li", {
+                    text: `delete ${plan.toDeleteRemote.length} remote (one-sided orphan, tombstone)`,
+                });
+        }
+
+        const actions = new Setting(contentEl);
+
+        if (this.onRepair && planTotal > 0) {
+            const label = `Repair ${planTotal} chunk(s)`;
+            actions.addButton((btn) =>
+                btn
+                    .setButtonText(label)
+                    .setCta()
+                    .onClick(async () => {
+                        btn.setDisabled(true);
+                        btn.setButtonText("Repairing...");
+                        try {
+                            const next = await this.onRepair!(this.report);
+                            this.report = next;
+                            this.render();
+                        } catch (e: any) {
+                            new Notice(`Repair failed: ${e?.message ?? e}`, 6000);
+                            btn.setDisabled(false);
+                            btn.setButtonText(label);
+                        }
+                    }),
+            );
+        }
+
+        actions
             .addButton((btn) =>
                 btn
                     .setButtonText("Copy full report as JSON")
                     .onClick(async () => {
                         try {
                             await navigator.clipboard.writeText(
-                                JSON.stringify(report, null, 2),
+                                JSON.stringify(this.report, null, 2),
                             );
                             new Notice("Report copied to clipboard.");
                         } catch (e: any) {
@@ -73,7 +140,6 @@ export class ChunkConsistencyReportModal extends Modal {
             .addButton((btn) =>
                 btn
                     .setButtonText("Close")
-                    .setCta()
                     .onClick(() => this.close()),
             );
     }
