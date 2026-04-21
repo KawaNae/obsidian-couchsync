@@ -41,12 +41,12 @@ export class ChunkConsistencyReportModal extends Modal {
         });
 
         if (report.snapshotChanged) {
-            const banner = contentEl.createDiv({ cls: "cs-consistency-section" });
-            banner.style.background = "#fff3cd";
-            banner.style.border = "1px solid #ffeeba";
-            banner.style.padding = "8px";
-            banner.style.marginBottom = "8px";
-            banner.createEl("strong", { text: "Sync activity detected during scan. " });
+            const banner = contentEl.createDiv({
+                cls: "cs-chunk-consistency__banner",
+            });
+            banner.createEl("strong", {
+                text: "Sync activity detected during scan. ",
+            });
             banner.createSpan({
                 text: "Re-run to confirm persistent discrepancies.",
             });
@@ -81,7 +81,9 @@ export class ChunkConsistencyReportModal extends Modal {
             plan.toDeleteRemote.length;
 
         if (this.onRepair && planTotal > 0) {
-            const breakdown = contentEl.createDiv({ cls: "cs-consistency-section" });
+            const breakdown = contentEl.createDiv({
+                cls: "cs-chunk-consistency__plan",
+            });
             breakdown.createEl("h4", { text: "Repair plan" });
             const ul = breakdown.createEl("ul");
             if (plan.toPush.length > 0)
@@ -150,7 +152,7 @@ export class ChunkConsistencyReportModal extends Modal {
 
     private renderIds(parent: HTMLElement, title: string, ids: string[]): void {
         if (ids.length === 0) return;
-        const wrap = parent.createDiv({ cls: "cs-consistency-section" });
+        const wrap = parent.createDiv({ cls: "cs-chunk-consistency__section" });
         wrap.createEl("h4", { text: `${title} — ${ids.length}` });
         const list = wrap.createEl("ul");
         for (const id of ids.slice(0, TRUNCATE_AT)) {
@@ -167,7 +169,7 @@ export class ChunkConsistencyReportModal extends Modal {
         refs: Array<{ id: string; referencedBy?: string[] }>,
     ): void {
         if (refs.length === 0) return;
-        const wrap = parent.createDiv({ cls: "cs-consistency-section" });
+        const wrap = parent.createDiv({ cls: "cs-chunk-consistency__section" });
         wrap.createEl("h4", { text: `${title} — ${refs.length}` });
         const list = wrap.createEl("ul");
         for (const ref of refs.slice(0, TRUNCATE_AT)) {

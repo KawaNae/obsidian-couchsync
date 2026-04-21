@@ -437,3 +437,51 @@
 }
 .couchsync-log-error .couchsync-log-level { color: var(--text-error); }
 .couchsync-log-error .couchsync-log-message { color: var(--text-error); }
+
+/* ─── Chunk Consistency Modal ─────────────────────────── */
+
+.cs-chunk-consistency__banner {
+    background: rgba(220, 160, 0, 0.12);
+    border: 1px solid var(--background-modifier-border);
+    border-left: 3px solid var(--color-orange, var(--text-warning));
+    color: var(--text-normal);
+    padding: 8px 12px;
+    margin: 8px 0 12px;
+    border-radius: 4px;
+}
+
+.cs-chunk-consistency__plan {
+    background: rgba(80, 160, 220, 0.08);
+    border: 1px solid var(--background-modifier-border);
+    border-left: 3px solid var(--color-blue, var(--text-accent));
+    padding: 8px 12px;
+    margin: 12px 0;
+    border-radius: 4px;
+}
+
+.cs-chunk-consistency__plan h4,
+.cs-chunk-consistency__section h4 {
+    margin: 0 0 6px;
+    color: var(--text-normal);
+    font-size: 0.95em;
+}
+
+.cs-chunk-consistency__plan ul,
+.cs-chunk-consistency__section ul {
+    margin: 4px 0 4px 1.2em;
+    padding: 0;
+    color: var(--text-muted);
+    font-size: 0.9em;
+}
+
+.cs-chunk-consistency__section {
+    margin: 10px 0;
+}
+
+.cs-chunk-consistency__section ul {
+    max-height: 180px;
+    overflow-y: auto;
+    font-family: var(--font-monospace);
+    font-size: 0.82em;
+    line-height: 1.4;
+}
