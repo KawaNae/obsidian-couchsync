@@ -13,13 +13,29 @@ import "fake-indexeddb/auto";
 import { describe, it, expect, afterEach } from "vitest";
 import { LocalDB } from "../../src/db/local-db.ts";
 import { FakeCouchClient } from "../helpers/fake-couch-client.ts";
-import { analyzeChunkConsistency } from "../../src/sync/chunk-consistency.ts";
+import {
+    analyzeChunkConsistency,
+    type ChunkConsistencyReport,
+    type ChunkConsistencyDeps,
+} from "../../src/sync/chunk-consistency.ts";
 import {
     planFromReport,
     repairChunkDrift,
 } from "../../src/sync/chunk-repair.ts";
 import { makeFileId, makeChunkId } from "../../src/types/doc-id.ts";
 import type { FileDoc, ChunkDoc, CouchSyncDoc } from "../../src/types.ts";
+
+async function analyzeConverged(
+    deps: ChunkConsistencyDeps,
+): Promise<ChunkConsistencyReport> {
+    const result = await analyzeChunkConsistency(deps);
+    if (result.state !== "converged") {
+        throw new Error(
+            `expected converged, got needs-convergence: ${JSON.stringify(result.divergence)}`,
+        );
+    }
+    return result.report;
+}
 
 let counter = 0;
 
@@ -75,7 +91,7 @@ describe("Integration: chunk-repair", () => {
         await putLocal(db, [c, f]);
         await remote.bulkDocs([f]);
 
-        const before = await analyzeChunkConsistency({ localDb: db, remote });
+        const before = await analyzeConverged({ localDb: db, remote });
         expect(before.localOnly).toEqual([c._id]);
 
         const result = await repairChunkDrift(
@@ -85,7 +101,7 @@ describe("Integration: chunk-repair", () => {
         expect(result.pushed).toBe(1);
         expect(result.failed).toEqual([]);
 
-        const after = await analyzeChunkConsistency({ localDb: db, remote });
+        const after = await analyzeConverged({ localDb: db, remote });
         expect(after.counts.localOnly).toBe(0);
         expect(after.counts.remoteOnly).toBe(0);
         expect(after.counts.missingReferenced).toBe(0);
@@ -100,7 +116,7 @@ describe("Integration: chunk-repair", () => {
         await putLocal(db, [f]);
         await remote.bulkDocs([c, f]);
 
-        const before = await analyzeChunkConsistency({ localDb: db, remote });
+        const before = await analyzeConverged({ localDb: db, remote });
         expect(before.remoteOnly).toEqual([c._id]);
 
         const result = await repairChunkDrift(
@@ -109,7 +125,7 @@ describe("Integration: chunk-repair", () => {
         );
         expect(result.pulled).toBe(1);
 
-        const after = await analyzeChunkConsistency({ localDb: db, remote });
+        const after = await analyzeConverged({ localDb: db, remote });
         expect(after.counts.localOnly).toBe(0);
         expect(after.counts.remoteOnly).toBe(0);
     });
@@ -126,7 +142,7 @@ describe("Integration: chunk-repair", () => {
         await putLocal(db, [lc, fLocal, fRemote]);
         await remote.bulkDocs([rc, fLocal, fRemote]);
 
-        const before = await analyzeChunkConsistency({ localDb: db, remote });
+        const before = await analyzeConverged({ localDb: db, remote });
         expect(before.localOnly).toEqual([lc._id]);
         expect(before.remoteOnly).toEqual([rc._id]);
 
@@ -138,7 +154,7 @@ describe("Integration: chunk-repair", () => {
         expect(result.pulled).toBe(1);
         expect(result.failed).toEqual([]);
 
-        const after = await analyzeChunkConsistency({ localDb: db, remote });
+        const after = await analyzeConverged({ localDb: db, remote });
         expect(after.counts.localOnly).toBe(0);
         expect(after.counts.remoteOnly).toBe(0);
     });
@@ -156,7 +172,7 @@ describe("Integration: chunk-repair", () => {
         await putLocal(db, [kept, localOrphan, healthy, broken]);
         await remote.bulkDocs([kept, remoteOrphan, healthy, broken]);
 
-        const before = await analyzeChunkConsistency({ localDb: db, remote });
+        const before = await analyzeConverged({ localDb: db, remote });
         expect(before.orphanLocal).toEqual([localOrphan._id]);
         expect(before.orphanRemote).toEqual([remoteOrphan._id]);
 
@@ -171,7 +187,7 @@ describe("Integration: chunk-repair", () => {
         expect(result.pushed).toBe(0);
         expect(result.pulled).toBe(0);
 
-        const after = await analyzeChunkConsistency({ localDb: db, remote });
+        const after = await analyzeConverged({ localDb: db, remote });
         // Both one-sided orphans are gone. missingReferenced (ghost)
         // remains — it's unrecoverable and out of scope.
         expect(after.counts.orphanLocal).toBe(0);
@@ -192,7 +208,7 @@ describe("Integration: chunk-repair", () => {
         await putLocal(db, [bothSidesOrphan]);
         await remote.bulkDocs([bothSidesOrphan]);
 
-        const before = await analyzeChunkConsistency({ localDb: db, remote });
+        const before = await analyzeConverged({ localDb: db, remote });
         expect(before.localOnly).toEqual([]);
         expect(before.remoteOnly).toEqual([]);
         expect(before.orphanLocal).toEqual([bothSidesOrphan._id]);
@@ -205,7 +221,7 @@ describe("Integration: chunk-repair", () => {
         expect(result.deletedLocal).toBe(0);
         expect(result.deletedRemote).toBe(0);
 
-        const after = await analyzeChunkConsistency({ localDb: db, remote });
+        const after = await analyzeConverged({ localDb: db, remote });
         // Untouched — GC will eventually handle it.
         expect(after.orphanLocal).toEqual([bothSidesOrphan._id]);
         expect(after.orphanRemote).toEqual([bothSidesOrphan._id]);
@@ -219,7 +235,7 @@ describe("Integration: chunk-repair", () => {
         await putLocal(db, [c, f]);
         await remote.bulkDocs([c, f]);
 
-        const before = await analyzeChunkConsistency({ localDb: db, remote });
+        const before = await analyzeConverged({ localDb: db, remote });
         const result = await repairChunkDrift(
             planFromReport(before),
             { localDb: db, remote },
@@ -227,7 +243,7 @@ describe("Integration: chunk-repair", () => {
         expect(result.pushed).toBe(0);
         expect(result.pulled).toBe(0);
 
-        const after = await analyzeChunkConsistency({ localDb: db, remote });
+        const after = await analyzeConverged({ localDb: db, remote });
         expect(after.counts.localOnly).toBe(0);
         expect(after.counts.remoteOnly).toBe(0);
     });

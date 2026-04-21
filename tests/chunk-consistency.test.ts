@@ -13,6 +13,8 @@ import { LocalDB } from "../src/db/local-db.ts";
 import { FakeCouchClient } from "./helpers/fake-couch-client.ts";
 import {
     analyzeChunkConsistency,
+    diffFileDocs,
+    hasDivergence,
     type ChunkConsistencyReport,
 } from "../src/sync/chunk-consistency.ts";
 import { collectReferencedChunks } from "../src/db/chunk-refs.ts";
@@ -73,7 +75,13 @@ async function runWithDefaults(
     remote: FakeCouchClient,
     extra: Partial<Parameters<typeof analyzeChunkConsistency>[0]> = {},
 ): Promise<ChunkConsistencyReport> {
-    return analyzeChunkConsistency({ localDb: db, remote, ...extra });
+    const result = await analyzeChunkConsistency({ localDb: db, remote, ...extra });
+    if (result.state !== "converged") {
+        throw new Error(
+            `expected converged, got needs-convergence: ${JSON.stringify(result.divergence)}`,
+        );
+    }
+    return result.report;
 }
 
 // ── collectReferencedChunks unit ─────────────────────────
@@ -95,6 +103,70 @@ describe("collectReferencedChunks", () => {
 
     it("empty input yields empty map", () => {
         expect(collectReferencedChunks([]).size).toBe(0);
+    });
+});
+
+// ── diffFileDocs unit ────────────────────────────────────
+
+describe("diffFileDocs", () => {
+    it("empty on both sides is not a divergence", () => {
+        const d = diffFileDocs([], []);
+        expect(d).toEqual({ localOnly: [], remoteOnly: [], differing: [] });
+        expect(hasDivergence(d)).toBe(false);
+    });
+
+    it("id in local only → localOnly", () => {
+        const a = makeFile("a.md", []);
+        const d = diffFileDocs([a], []);
+        expect(d.localOnly).toEqual([a._id]);
+        expect(d.remoteOnly).toEqual([]);
+        expect(hasDivergence(d)).toBe(true);
+    });
+
+    it("id in remote only → remoteOnly", () => {
+        const a = makeFile("a.md", []);
+        const d = diffFileDocs([], [a]);
+        expect(d.remoteOnly).toEqual([a._id]);
+        expect(d.localOnly).toEqual([]);
+        expect(hasDivergence(d)).toBe(true);
+    });
+
+    it("equal vclock → no divergence", () => {
+        const a = makeFile("a.md", []); // vclock { A: 1 }
+        const d = diffFileDocs([a], [a]);
+        expect(hasDivergence(d)).toBe(false);
+    });
+
+    it("dominated: local older, remote newer", () => {
+        const base = makeFile("a.md", []);
+        const local: FileDoc = { ...base, vclock: { A: 1 } };
+        const remote: FileDoc = { ...base, vclock: { A: 2 } };
+        const d = diffFileDocs([local], [remote]);
+        expect(d.differing).toHaveLength(1);
+        expect(d.differing[0].relation).toBe("dominated");
+    });
+
+    it("dominates: local newer, remote older", () => {
+        const base = makeFile("a.md", []);
+        const local: FileDoc = { ...base, vclock: { A: 3 } };
+        const remote: FileDoc = { ...base, vclock: { A: 1 } };
+        const d = diffFileDocs([local], [remote]);
+        expect(d.differing[0].relation).toBe("dominates");
+    });
+
+    it("concurrent: forks on different devices", () => {
+        const base = makeFile("a.md", []);
+        const local: FileDoc = { ...base, vclock: { A: 2, B: 1 } };
+        const remote: FileDoc = { ...base, vclock: { A: 1, B: 2 } };
+        const d = diffFileDocs([local], [remote]);
+        expect(d.differing[0].relation).toBe("concurrent");
+    });
+
+    it("output is sorted by id", () => {
+        const z = makeFile("z.md", []);
+        const a = makeFile("a.md", []);
+        const d = diffFileDocs([z, a], []);
+        expect(d.localOnly).toEqual([a._id, z._id]);
     });
 });
 
@@ -220,20 +292,57 @@ describe("analyzeChunkConsistency", () => {
         expect(r.orphanRemote).toEqual([c._id]);
     });
 
-    it("union of FileDocs across stores: reference from local-only FileDoc protects remote chunk", async () => {
+    it("FileDoc present on only one side → needs-convergence, chunks not enumerated", async () => {
+        // Classic lagging-device situation: local has a FileDoc that
+        // hasn't pushed yet (or hasn't pulled from remote). Producing a
+        // report from this state would mis-classify the chunks — by
+        // design the analyser refuses and returns needs-convergence so
+        // the caller can let sync catch up first.
         const c = makeChunk("shared");
         const fLocalOnly = makeFile("only-here.md", [c._id]);
-        // Chunk and local-only FileDoc live locally, chunk also remote, but
-        // the FileDoc is NOT remote. Without the union the chunk would
-        // appear orphan-on-remote — the analysis must join both sides.
         await putLocal(db, c);
         await putLocal(db, fLocalOnly);
         await putRemote(remote, c);
 
-        const r = await runWithDefaults(db, remote);
-        expect(r.orphanLocal).toEqual([]);
-        expect(r.orphanRemote).toEqual([]);
-        expect(r.counts.referencedIds).toBe(1);
+        const result = await analyzeChunkConsistency({ localDb: db, remote });
+        expect(result.state).toBe("needs-convergence");
+        if (result.state === "needs-convergence") {
+            expect(result.divergence.localOnly).toEqual([fLocalOnly._id]);
+            expect(result.divergence.remoteOnly).toEqual([]);
+            expect(result.divergence.differing).toEqual([]);
+        }
+    });
+
+    it("FileDoc vclock differs → needs-convergence with `differing` populated", async () => {
+        const f = makeFile("note.md", []);
+        const older: FileDoc = { ...f, vclock: { A: 1 } };
+        const newer: FileDoc = { ...f, vclock: { A: 2 } };
+        await putLocal(db, older);
+        await putRemote(remote, newer);
+
+        const result = await analyzeChunkConsistency({ localDb: db, remote });
+        expect(result.state).toBe("needs-convergence");
+        if (result.state === "needs-convergence") {
+            expect(result.divergence.differing).toHaveLength(1);
+            expect(result.divergence.differing[0].id).toBe(f._id);
+            expect(result.divergence.differing[0].relation).toBe("dominated");
+            expect(result.divergence.localOnly).toEqual([]);
+            expect(result.divergence.remoteOnly).toEqual([]);
+        }
+    });
+
+    it("concurrent vclock on the same FileDoc is flagged as `concurrent`", async () => {
+        const f = makeFile("c.md", []);
+        const localFork: FileDoc = { ...f, vclock: { A: 2, B: 1 } };
+        const remoteFork: FileDoc = { ...f, vclock: { A: 1, B: 2 } };
+        await putLocal(db, localFork);
+        await putRemote(remote, remoteFork);
+
+        const result = await analyzeChunkConsistency({ localDb: db, remote });
+        expect(result.state).toBe("needs-convergence");
+        if (result.state === "needs-convergence") {
+            expect(result.divergence.differing[0].relation).toBe("concurrent");
+        }
     });
 
     it("pagination: pageSize=2 with 7 chunks walks the full range", async () => {

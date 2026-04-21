@@ -1,25 +1,39 @@
 import { App, Modal, Notice, Setting } from "obsidian";
+import type { ChunkConsistencyResult } from "../sync/chunk-consistency.ts";
 import type { ChunkConsistencyReport } from "../sync/chunk-consistency.ts";
-import { planFromReport } from "../sync/chunk-repair.ts";
-
-const TRUNCATE_AT = 50;
+import {
+    describeChunkConsistencyResult,
+    type ChunkConsistencyView,
+    type ReportSection,
+} from "./chunk-consistency-view.ts";
 
 /**
  * Invoked by the repair button. Receives the currently displayed
  * report (so the caller derives the plan from fresh state), performs
- * the repair, and returns a freshly-generated post-repair report; the
+ * the repair, and returns a freshly-generated post-repair result; the
  * Modal swaps its display in place so the user sees immediate
- * confirmation.
+ * confirmation. The post-repair result may itself be either a new
+ * converged report or a needs-convergence state, so the return type
+ * is the full union.
  */
 export type ChunkRepairInvoker = (
     current: ChunkConsistencyReport,
-) => Promise<ChunkConsistencyReport>;
+) => Promise<ChunkConsistencyResult>;
+
+/**
+ * Invoked by the "Wait for sync & retry" button in needs-convergence
+ * state. Expected to run a one-shot pull + re-analyse. Returning a
+ * fresh `ChunkConsistencyResult` lets the Modal re-render without
+ * needing to know how the retry was performed.
+ */
+export type ChunkRetryInvoker = () => Promise<ChunkConsistencyResult>;
 
 export class ChunkConsistencyReportModal extends Modal {
     constructor(
         app: App,
-        private report: ChunkConsistencyReport,
+        private result: ChunkConsistencyResult,
         private onRepair?: ChunkRepairInvoker,
+        private onRetry?: ChunkRetryInvoker,
     ) {
         super(app);
     }
@@ -29,18 +43,27 @@ export class ChunkConsistencyReportModal extends Modal {
     }
 
     private render(): void {
-        const { contentEl, report } = this;
+        const { contentEl } = this;
         contentEl.empty();
         contentEl.createEl("h3", { text: "Chunk consistency" });
 
-        contentEl.createEl("p", {
-            text:
-                `${report.counts.localChunks} chunk(s) local · ` +
-                `${report.counts.remoteChunks} remote · ` +
-                `${report.counts.referencedIds} referenced by FileDocs`,
-        });
+        const view = describeChunkConsistencyResult(this.result);
+        contentEl.createEl("p", { text: view.headline });
 
-        if (report.snapshotChanged) {
+        if (view.state === "converged") {
+            this.renderConverged(contentEl, view);
+        } else {
+            this.renderNeedsConvergence(contentEl, view);
+        }
+
+        this.renderCommonActions(contentEl);
+    }
+
+    private renderConverged(
+        contentEl: HTMLElement,
+        view: Extract<ChunkConsistencyView, { state: "converged" }>,
+    ): void {
+        if (view.snapshotChanged) {
             const banner = contentEl.createDiv({
                 cls: "cs-chunk-consistency__banner",
             });
@@ -52,68 +75,33 @@ export class ChunkConsistencyReportModal extends Modal {
             });
         }
 
-        const totalIssues =
-            report.counts.localOnly +
-            report.counts.remoteOnly +
-            report.counts.missingReferenced +
-            report.counts.orphanLocal +
-            report.counts.orphanRemote;
-
-        if (totalIssues === 0) {
+        if (!view.hasIssues) {
             contentEl.createEl("p", { text: "No discrepancies found." });
         } else {
-            this.renderIds(contentEl, "Local only (present locally, absent remotely)", report.localOnly);
-            this.renderIds(contentEl, "Remote only (present remotely, absent locally)", report.remoteOnly);
-            this.renderRefs(
-                contentEl,
-                "Missing referenced (broken files)",
-                report.missingReferenced,
-            );
-            this.renderIds(contentEl, "Orphan (local)", report.orphanLocal);
-            this.renderIds(contentEl, "Orphan (remote)", report.orphanRemote);
+            for (const sec of view.sections) this.renderSection(contentEl, sec);
         }
 
-        const plan = planFromReport(report);
-        const planTotal =
-            plan.toPush.length +
-            plan.toPull.length +
-            plan.toDeleteLocal.length +
-            plan.toDeleteRemote.length;
-
-        if (this.onRepair && planTotal > 0) {
+        if (this.onRepair && view.planTotal > 0) {
             const breakdown = contentEl.createDiv({
                 cls: "cs-chunk-consistency__plan",
             });
             breakdown.createEl("h4", { text: "Repair plan" });
             const ul = breakdown.createEl("ul");
-            if (plan.toPush.length > 0)
-                ul.createEl("li", { text: `push ${plan.toPush.length} → remote` });
-            if (plan.toPull.length > 0)
-                ul.createEl("li", { text: `pull ${plan.toPull.length} ← remote` });
-            if (plan.toDeleteLocal.length > 0)
-                ul.createEl("li", {
-                    text: `delete ${plan.toDeleteLocal.length} local (one-sided orphan)`,
-                });
-            if (plan.toDeleteRemote.length > 0)
-                ul.createEl("li", {
-                    text: `delete ${plan.toDeleteRemote.length} remote (one-sided orphan, tombstone)`,
-                });
-        }
+            for (const b of view.planBullets) ul.createEl("li", { text: b });
 
-        const actions = new Setting(contentEl);
-
-        if (this.onRepair && planTotal > 0) {
-            const label = `Repair ${planTotal} chunk(s)`;
+            const actions = new Setting(contentEl);
+            const label = `Repair ${view.planTotal} chunk(s)`;
             actions.addButton((btn) =>
                 btn
                     .setButtonText(label)
                     .setCta()
                     .onClick(async () => {
+                        if (this.result.state !== "converged") return;
                         btn.setDisabled(true);
                         btn.setButtonText("Repairing...");
                         try {
-                            const next = await this.onRepair!(this.report);
-                            this.report = next;
+                            const next = await this.onRepair!(this.result.report);
+                            this.result = next;
                             this.render();
                         } catch (e: any) {
                             new Notice(`Repair failed: ${e?.message ?? e}`, 6000);
@@ -123,17 +111,61 @@ export class ChunkConsistencyReportModal extends Modal {
                     }),
             );
         }
+    }
 
+    private renderNeedsConvergence(
+        contentEl: HTMLElement,
+        view: Extract<ChunkConsistencyView, { state: "needs-convergence" }>,
+    ): void {
+        const banner = contentEl.createDiv({
+            cls: "cs-chunk-consistency__banner",
+        });
+        banner.createEl("strong", { text: "FileDocs not yet converged. " });
+        banner.createSpan({
+            text:
+                "Repair is unavailable until local and remote agree on every " +
+                "FileDoc — running it now can trigger ping-pong with another " +
+                "device. Let sync finish, or press the button below to pull " +
+                "the latest and retry.",
+        });
+
+        for (const sec of view.sections) this.renderSection(contentEl, sec);
+
+        if (this.onRetry) {
+            const actions = new Setting(contentEl);
+            actions.addButton((btn) =>
+                btn
+                    .setButtonText("Wait for sync & retry")
+                    .setCta()
+                    .onClick(async () => {
+                        btn.setDisabled(true);
+                        btn.setButtonText("Pulling & re-analysing...");
+                        try {
+                            const next = await this.onRetry!();
+                            this.result = next;
+                            this.render();
+                        } catch (e: any) {
+                            new Notice(`Retry failed: ${e?.message ?? e}`, 6000);
+                            btn.setDisabled(false);
+                            btn.setButtonText("Wait for sync & retry");
+                        }
+                    }),
+            );
+        }
+    }
+
+    private renderCommonActions(contentEl: HTMLElement): void {
+        const actions = new Setting(contentEl);
         actions
             .addButton((btn) =>
                 btn
-                    .setButtonText("Copy full report as JSON")
+                    .setButtonText("Copy full result as JSON")
                     .onClick(async () => {
                         try {
                             await navigator.clipboard.writeText(
-                                JSON.stringify(this.report, null, 2),
+                                JSON.stringify(this.result, null, 2),
                             );
-                            new Notice("Report copied to clipboard.");
+                            new Notice("Result copied to clipboard.");
                         } catch (e: any) {
                             new Notice(`Copy failed: ${e?.message ?? e}`, 6000);
                         }
@@ -150,37 +182,10 @@ export class ChunkConsistencyReportModal extends Modal {
         this.contentEl.empty();
     }
 
-    private renderIds(parent: HTMLElement, title: string, ids: string[]): void {
-        if (ids.length === 0) return;
+    private renderSection(parent: HTMLElement, section: ReportSection): void {
         const wrap = parent.createDiv({ cls: "cs-chunk-consistency__section" });
-        wrap.createEl("h4", { text: `${title} — ${ids.length}` });
+        wrap.createEl("h4", { text: section.title });
         const list = wrap.createEl("ul");
-        for (const id of ids.slice(0, TRUNCATE_AT)) {
-            list.createEl("li", { text: id });
-        }
-        if (ids.length > TRUNCATE_AT) {
-            list.createEl("li", { text: `... and ${ids.length - TRUNCATE_AT} more` });
-        }
-    }
-
-    private renderRefs(
-        parent: HTMLElement,
-        title: string,
-        refs: Array<{ id: string; referencedBy?: string[] }>,
-    ): void {
-        if (refs.length === 0) return;
-        const wrap = parent.createDiv({ cls: "cs-chunk-consistency__section" });
-        wrap.createEl("h4", { text: `${title} — ${refs.length}` });
-        const list = wrap.createEl("ul");
-        for (const ref of refs.slice(0, TRUNCATE_AT)) {
-            const paths = ref.referencedBy ?? [];
-            const text = paths.length > 0
-                ? `${ref.id} — referenced by ${paths.join(", ")}`
-                : ref.id;
-            list.createEl("li", { text });
-        }
-        if (refs.length > TRUNCATE_AT) {
-            list.createEl("li", { text: `... and ${refs.length - TRUNCATE_AT} more` });
-        }
+        for (const line of section.lines) list.createEl("li", { text: line });
     }
 }

@@ -21,11 +21,40 @@ import type { ICouchClient, AllDocsRow } from "../db/interfaces.ts";
 import type { FileDoc } from "../types.ts";
 import { ID_RANGE } from "../types/doc-id.ts";
 import { collectReferencedChunks } from "../db/chunk-refs.ts";
+import { compareVC, type VCRelation, type VectorClock } from "./vector-clock.ts";
 
 export interface ChunkRef {
     id: string;
     /** Populated only for `missingReferenced` entries. */
     referencedBy?: string[];
+}
+
+/**
+ * A diagnosis is only trustworthy when the local and remote FileDoc
+ * sets agree: orphan / referenced classification is defined only
+ * against a single source of truth. When they disagree, the analyzer
+ * returns `needs-convergence` instead of a report and the caller is
+ * expected to let normal sync catch up before retrying.
+ */
+export type ChunkConsistencyResult =
+    | { state: "converged"; report: ChunkConsistencyReport }
+    | { state: "needs-convergence"; divergence: FileDocDivergence };
+
+export interface FileDocDivergingPair {
+    id: string;
+    localVC: VectorClock;
+    remoteVC: VectorClock;
+    /** Relation of local → remote. `equal` never appears here. */
+    relation: Exclude<VCRelation, "equal">;
+}
+
+export interface FileDocDivergence {
+    /** FileDoc ids present only on local (not yet pushed). */
+    localOnly: string[];
+    /** FileDoc ids present only on remote (not yet pulled). */
+    remoteOnly: string[];
+    /** Ids present on both sides but with non-equal vclocks. */
+    differing: FileDocDivergingPair[];
 }
 
 export interface ChunkConsistencyReport {
@@ -81,7 +110,7 @@ const DEFAULT_PAGE_SIZE = 2000;
 
 export async function analyzeChunkConsistency(
     deps: ChunkConsistencyDeps,
-): Promise<ChunkConsistencyReport> {
+): Promise<ChunkConsistencyResult> {
     const { localDb, remote, onProgress, signal } = deps;
     const pageSize = deps.pageSize ?? DEFAULT_PAGE_SIZE;
 
@@ -112,19 +141,23 @@ export async function analyzeChunkConsistency(
         onProgress?.("scan-remote-files", remoteFiles.length);
     }
 
-    // A FileDoc may appear on both sides (normal in-sync case). Treat
-    // the union as a set keyed by `_id`: local wins only because it was
-    // iterated first — for the purposes of the chunks[] field and
-    // deleted flag the two copies agree in steady state, and if they
-    // diverge the file-level diff is a reconcile concern, not a
-    // chunk-integrity concern. Picking one copy also keeps
-    // `referencedBy` free of path duplicates in the report.
-    const uniqueFiles = new Map<string, FileDoc>();
-    for (const fd of localFiles) uniqueFiles.set(fd._id, fd);
-    for (const fd of remoteFiles) {
-        if (!uniqueFiles.has(fd._id)) uniqueFiles.set(fd._id, fd);
+    // Convergence gate: orphan / referenced classification is only
+    // well-defined when both sides agree on what every FileDoc's chunks
+    // and deleted flag currently are. If they disagree (in-flight push
+    // or pull, or a genuine divergence), bail out without enumerating
+    // chunks — a lagging device running the diagnosis would otherwise
+    // produce a report that can drive a repair into a ping-pong with
+    // the up-to-date device. The caller is expected to let sync catch
+    // up and retry.
+    const divergence = diffFileDocs(localFiles, remoteFiles);
+    if (hasDivergence(divergence)) {
+        return { state: "needs-convergence", divergence };
     }
-    const referenced = collectReferencedChunks(uniqueFiles.values());
+
+    // Past the gate the two sides are identical by id and vclock. Pick
+    // either to build the reference map; `referencedBy` paths are the
+    // same whichever we choose.
+    const referenced = collectReferencedChunks(localFiles);
 
     // ── Phase 2 + 3: sort-merge chunk ids ───────────────────────────
 
@@ -200,7 +233,7 @@ export async function analyzeChunkConsistency(
         localInfoStart.updateSeq !== localInfoEnd.updateSeq ||
         remoteInfoStart.update_seq !== remoteInfoEnd.update_seq;
 
-    return {
+    const report: ChunkConsistencyReport = {
         generatedAt: Date.now(),
         localUpdateSeq: localInfoEnd.updateSeq,
         remoteUpdateSeq: remoteInfoEnd.update_seq,
@@ -221,6 +254,69 @@ export async function analyzeChunkConsistency(
         orphanLocal,
         orphanRemote,
     };
+    return { state: "converged", report };
+}
+
+// ── FileDoc convergence ─────────────────────────────────────────────
+
+/**
+ * Compare two FileDoc iterables (typically `allFileDocs` snapshots from
+ * local and remote) purely by id and vclock. Divergence means at least
+ * one of:
+ *
+ *   - an id is present on exactly one side (pending push or pull), or
+ *   - an id is present on both sides with non-equal vclocks.
+ *
+ * Deleted FileDocs participate: a deletion on one side but not the
+ * other is still divergence — either the tombstone or the live doc
+ * needs to propagate before the diagnosis can be trusted.
+ */
+export function diffFileDocs(
+    localFiles: Iterable<FileDoc>,
+    remoteFiles: Iterable<FileDoc>,
+): FileDocDivergence {
+    const localMap = new Map<string, FileDoc>();
+    for (const fd of localFiles) localMap.set(fd._id, fd);
+    const remoteMap = new Map<string, FileDoc>();
+    for (const fd of remoteFiles) remoteMap.set(fd._id, fd);
+
+    const localOnly: string[] = [];
+    const remoteOnly: string[] = [];
+    const differing: FileDocDivergingPair[] = [];
+
+    for (const [id, lfd] of localMap) {
+        const rfd = remoteMap.get(id);
+        if (!rfd) {
+            localOnly.push(id);
+            continue;
+        }
+        const relation = compareVC(lfd.vclock, rfd.vclock);
+        if (relation !== "equal") {
+            differing.push({
+                id,
+                localVC: lfd.vclock,
+                remoteVC: rfd.vclock,
+                relation,
+            });
+        }
+    }
+    for (const id of remoteMap.keys()) {
+        if (!localMap.has(id)) remoteOnly.push(id);
+    }
+
+    localOnly.sort();
+    remoteOnly.sort();
+    differing.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+
+    return { localOnly, remoteOnly, differing };
+}
+
+export function hasDivergence(d: FileDocDivergence): boolean {
+    return (
+        d.localOnly.length > 0 ||
+        d.remoteOnly.length > 0 ||
+        d.differing.length > 0
+    );
 }
 
 // ── Paging iterators ────────────────────────────────────────────────

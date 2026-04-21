@@ -11,9 +11,25 @@ import "fake-indexeddb/auto";
 import { describe, it, expect, afterEach } from "vitest";
 import { LocalDB } from "../../src/db/local-db.ts";
 import { FakeCouchClient } from "../helpers/fake-couch-client.ts";
-import { analyzeChunkConsistency } from "../../src/sync/chunk-consistency.ts";
+import {
+    analyzeChunkConsistency,
+    type ChunkConsistencyReport,
+    type ChunkConsistencyDeps,
+} from "../../src/sync/chunk-consistency.ts";
 import { makeFileId, makeChunkId } from "../../src/types/doc-id.ts";
 import type { FileDoc, ChunkDoc, CouchSyncDoc } from "../../src/types.ts";
+
+async function analyzeConverged(
+    deps: ChunkConsistencyDeps,
+): Promise<ChunkConsistencyReport> {
+    const result = await analyzeChunkConsistency(deps);
+    if (result.state !== "converged") {
+        throw new Error(
+            `expected converged, got needs-convergence: ${JSON.stringify(result.divergence)}`,
+        );
+    }
+    return result.report;
+}
 
 let counter = 0;
 
@@ -73,7 +89,7 @@ describe("Integration: analyzeChunkConsistency", () => {
         await putLocal(db, [c1, c2, c3, f1, f2, f3]);
         await remote.bulkDocs([c1, c2, c3, f1, f2, f3]);
 
-        const r = await analyzeChunkConsistency({ localDb: db, remote });
+        const r = await analyzeConverged({ localDb: db, remote });
         expect(r.counts.localOnly).toBe(0);
         expect(r.counts.remoteOnly).toBe(0);
         expect(r.counts.missingReferenced).toBe(0);
@@ -97,7 +113,7 @@ describe("Integration: analyzeChunkConsistency", () => {
         const remoteOrphan = chunk("remote-only-orphan");
         await remote.bulkDocs([remoteOrphan]);
 
-        const r = await analyzeChunkConsistency({ localDb: db, remote });
+        const r = await analyzeConverged({ localDb: db, remote });
 
         expect(r.localOnly).toEqual([localOrphan._id]);
         expect(r.remoteOnly).toEqual([remoteOrphan._id]);
@@ -119,7 +135,7 @@ describe("Integration: analyzeChunkConsistency", () => {
         await putLocal(db, [realChunk, okFile, brokenFile]);
         await remote.bulkDocs([realChunk, okFile, brokenFile]);
 
-        const r = await analyzeChunkConsistency({ localDb: db, remote });
+        const r = await analyzeConverged({ localDb: db, remote });
         expect(r.counts.missingReferenced).toBe(1);
         expect(r.missingReferenced[0].id).toBe(ghost);
         expect(r.missingReferenced[0].referencedBy).toEqual(["broken.md"]);
@@ -144,7 +160,7 @@ describe("Integration: analyzeChunkConsistency", () => {
         await putLocal(db, [kept, localOrphan, healthyFile, brokenFile, driftFile]);
         await remote.bulkDocs([kept, remoteOrphan, drifted, healthyFile, brokenFile, driftFile]);
 
-        const r = await analyzeChunkConsistency({ localDb: db, remote });
+        const r = await analyzeConverged({ localDb: db, remote });
 
         // kept  — both sides, referenced
         // localOrphan — local only, unreferenced

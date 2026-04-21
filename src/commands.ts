@@ -108,42 +108,81 @@ export async function runChunkConsistencyReport(
                             : `${phase}: ${current}`,
                     ),
             });
-        const report = await analyze();
-        progress.done(
-            `Chunk report — ${report.counts.localOnly} local-only, ` +
-                `${report.counts.remoteOnly} remote-only, ` +
-                `${report.counts.missingReferenced} broken, ` +
-                `${report.counts.orphanLocal + report.counts.orphanRemote} orphan(s)`,
-        );
-        new ChunkConsistencyReportModal(plugin.app, report, async (current) => {
-            const plan = planFromReport(current);
-            const repairProgress = new ProgressNotice("Chunk repair");
-            const result = await repairChunkDrift(plan, {
-                localDb: plugin.localDb,
-                remote,
-                onProgress: (phase, current, total) =>
-                    repairProgress.update(`${phase}: ${current}/${total}`),
-            });
-            const summary =
-                `pushed ${result.pushed}, pulled ${result.pulled}, ` +
-                `deleted-local ${result.deletedLocal}, ` +
-                `deleted-remote ${result.deletedRemote}`;
-            if (result.failed.length === 0) {
-                repairProgress.done(`Repair — ${summary}`);
-            } else {
-                repairProgress.fail(
-                    `Repair — ${summary}, ${result.failed.length} failed`,
-                );
-                logWarn(
-                    `CouchSync: chunk repair failures: ${
-                        result.failed
-                            .map((f) => `${f.direction} ${f.id}: ${f.reason}`)
-                            .join("; ")
-                    }`,
-                );
-            }
-            return await analyze();
-        }).open();
+        const result = await analyze();
+        if (result.state === "needs-convergence") {
+            const d = result.divergence;
+            progress.done(
+                `Chunk report — not converged: ${d.localOnly.length} pending push, ` +
+                    `${d.remoteOnly.length} pending pull, ${d.differing.length} differing`,
+            );
+        } else {
+            const r = result.report;
+            progress.done(
+                `Chunk report — ${r.counts.localOnly} local-only, ` +
+                    `${r.counts.remoteOnly} remote-only, ` +
+                    `${r.counts.missingReferenced} broken, ` +
+                    `${r.counts.orphanLocal + r.counts.orphanRemote} orphan(s)`,
+            );
+        }
+        new ChunkConsistencyReportModal(
+            plugin.app,
+            result,
+            async (currentReport) => {
+                const plan = planFromReport(currentReport);
+                const repairProgress = new ProgressNotice("Chunk repair");
+                const repairResult = await repairChunkDrift(plan, {
+                    localDb: plugin.localDb,
+                    remote,
+                    onProgress: (phase, current, total) =>
+                        repairProgress.update(`${phase}: ${current}/${total}`),
+                });
+                const summary =
+                    `pushed ${repairResult.pushed}, pulled ${repairResult.pulled}, ` +
+                    `deleted-local ${repairResult.deletedLocal}, ` +
+                    `deleted-remote ${repairResult.deletedRemote}`;
+                if (repairResult.failed.length === 0) {
+                    repairProgress.done(`Repair — ${summary}`);
+                } else {
+                    repairProgress.fail(
+                        `Repair — ${summary}, ${repairResult.failed.length} failed`,
+                    );
+                    logWarn(
+                        `CouchSync: chunk repair failures: ${
+                            repairResult.failed
+                                .map((f) => `${f.direction} ${f.id}: ${f.reason}`)
+                                .join("; ")
+                        }`,
+                    );
+                }
+                return await analyze();
+            },
+            async () => {
+                const pullProgress = new ProgressNotice("Pull & re-analyse");
+                try {
+                    await plugin.remoteOps.pullAll((_docId, n) =>
+                        pullProgress.update(`pulled ${n}`),
+                    );
+                } catch (e: any) {
+                    logWarn(
+                        `CouchSync: chunk-consistency retry pull failed, continuing with whatever landed: ${e?.message ?? e}`,
+                    );
+                }
+                pullProgress.update("re-analysing...");
+                const next = await analyze();
+                if (next.state === "converged") {
+                    pullProgress.done("Re-analyse — converged");
+                } else {
+                    pullProgress.done(
+                        `Re-analyse — still not converged (${
+                            next.divergence.localOnly.length +
+                            next.divergence.remoteOnly.length +
+                            next.divergence.differing.length
+                        } diffs remaining)`,
+                    );
+                }
+                return next;
+            },
+        ).open();
     } catch (e: any) {
         progress.fail(`Chunk report failed: ${e?.message ?? e}`);
     }
