@@ -209,6 +209,14 @@ export class ConfigSyncTab {
                 btn.setButtonText("Init & Push").setWarning()
                     .setDisabled(!configEnabled)
                     .onClick(async () => {
+                        if (
+                            !confirm(
+                                "Delete the existing config DB and re-scan .obsidian/? " +
+                                    "This cannot be undone.",
+                            )
+                        ) {
+                            return;
+                        }
                         btn.setButtonText("Initializing...");
                         btn.setDisabled(true);
                         try { await this.deps.configSync.init(); } catch { /* handled */ }

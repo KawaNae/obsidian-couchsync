@@ -6,6 +6,7 @@ import type { SyncEngine } from "../db/sync-engine.ts";
 import type { StatusBar } from "../ui/status-bar.ts";
 import { DOC_ID } from "../types/doc-id.ts";
 import { logError } from "../ui/log.ts";
+import { gcOrphanChunks } from "../db/chunk-gc.ts";
 
 interface MaintenanceTabDeps {
     getSettings: () => CouchSyncSettings;
@@ -160,6 +161,31 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
                 try {
                     await deps.runChunkConsistencyReport();
                 } finally {
+                    btn.setDisabled(false);
+                }
+            }),
+        );
+
+    new Setting(el)
+        .setName("Clean up orphan chunks")
+        .setDesc(
+            "Remove chunks no longer referenced by any note. Safe cleanup.",
+        )
+        .addButton((btn) =>
+            btn.setButtonText("Clean up").onClick(async () => {
+                btn.setDisabled(true);
+                btn.setButtonText("Cleaning...");
+                try {
+                    const result = await gcOrphanChunks(deps.localDb);
+                    new Notice(
+                        result.deletedChunks > 0
+                            ? `Deleted ${result.deletedChunks} orphan chunk(s) out of ${result.scannedChunks} total.`
+                            : `No orphan chunks found (${result.scannedChunks} chunks, all referenced).`,
+                    );
+                } catch (e: any) {
+                    new Notice(`Cleanup failed: ${e?.message ?? e}`, 10000);
+                } finally {
+                    btn.setButtonText("Clean up");
                     btn.setDisabled(false);
                 }
             }),
