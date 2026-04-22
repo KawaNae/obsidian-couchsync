@@ -40,6 +40,10 @@ export interface PullPipelineDeps {
     sessionEpoch: number;
 
     isCancelled: () => boolean;
+    /** Aborted on session dispose. Passed to every HTTP call so an
+     *  in-flight longpoll / fetch terminates immediately instead of
+     *  waiting for LONGPOLL_MAX_WAIT_MS or the OS-level timeout. */
+    signal: AbortSignal;
     handleLocalDbError: (e: unknown, context: string) => void;
     /** Called when the longpoll loop hits an error whose class hints at a
      *  transient upstream issue (auth / 5xx). The supervisor (SyncEngine)
@@ -47,6 +51,10 @@ export interface PullPipelineDeps {
      *  alive with backoff. */
     onTransientError: (err: unknown) => void;
     delay: (ms: number) => Promise<void>;
+}
+
+function isAbortError(e: unknown): boolean {
+    return !!e && typeof e === "object" && (e as any).name === "AbortError";
 }
 
 export class PullPipeline {
@@ -69,11 +77,17 @@ export class PullPipeline {
                 throw new Error("Catchup timed out");
             }
 
-            const result = await this.deps.client.changes<CouchSyncDoc>({
-                since: this.deps.checkpoints.getRemoteSeq(),
-                include_docs: true,
-                limit: CATCHUP_BATCH_SIZE,
-            });
+            let result;
+            try {
+                result = await this.deps.client.changes<CouchSyncDoc>({
+                    since: this.deps.checkpoints.getRemoteSeq(),
+                    include_docs: true,
+                    limit: CATCHUP_BATCH_SIZE,
+                }, this.deps.signal);
+            } catch (e) {
+                if (isAbortError(e) || this.deps.isCancelled()) return;
+                throw e;
+            }
 
             if (this.deps.isCancelled()) return;
 
@@ -109,7 +123,7 @@ export class PullPipeline {
                     const result = await this.deps.client.changesLongpoll<CouchSyncDoc>({
                         since: this.deps.checkpoints.getRemoteSeq(),
                         include_docs: true,
-                    });
+                    }, this.deps.signal);
 
                     if (this.deps.isCancelled()) return;
 
@@ -126,6 +140,9 @@ export class PullPipeline {
                     // Empty result (longpoll max-wait): stay connected.
                 } catch (e: any) {
                     if (this.deps.isCancelled()) return;
+                    // AbortError = dispose() aborted us. Exit cleanly
+                    // without consuming the transient-retry budget.
+                    if (isAbortError(e)) return;
 
                     if (e instanceof DbError) {
                         this.deps.handleLocalDbError(e, "pull write");

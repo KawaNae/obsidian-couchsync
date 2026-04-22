@@ -31,6 +31,8 @@ interface PipelineRig {
     checkpoints: Checkpoints;
     pausedCount: { value: number };
     cancel: () => void;
+    abort: () => void;
+    signal: AbortSignal;
     dbErrorCalls: Array<{ err: unknown; ctx: string }>;
 }
 
@@ -51,6 +53,7 @@ function attachPushPipeline(opts: {
     events.on("paused", () => { pausedCount.value++; });
 
     let cancelled = false;
+    const controller = new AbortController();
     const dbErrorCalls: Array<{ err: unknown; ctx: string }> = [];
 
     const pipeline = new PushPipeline({
@@ -61,6 +64,7 @@ function attachPushPipeline(opts: {
         checkpoints,
         sessionEpoch: 1,
         isCancelled: () => cancelled,
+        signal: controller.signal,
         handleLocalDbError: (err, ctx) => { dbErrorCalls.push({ err, ctx }); },
         delay: async () => {
             if (opts.runOnce) cancelled = true;
@@ -74,6 +78,8 @@ function attachPushPipeline(opts: {
         checkpoints,
         pausedCount,
         cancel: () => { cancelled = true; },
+        abort: () => controller.abort(),
+        signal: controller.signal,
         dbErrorCalls,
     };
 }
@@ -283,6 +289,66 @@ describe("PushPipeline integration", () => {
 
             expect(rig.echoes.consumePushEcho(idA)).toBe(false);
             expect(rig.echoes.consumePushEcho(idB)).toBe(false);
+            spy.mockRestore();
+        });
+
+        // ── AbortSignal propagation (v0.20.3) ───────────────
+
+        it("passes deps.signal to client.bulkDocs during pushDocs", async () => {
+            h = createSyncHarness();
+            const a = h.addDevice("dev-A");
+            const rig = attachPushPipeline({ device: a, couch: h.couch });
+
+            a.vault.addFile("x.md", "hello");
+            await a.vs.fileToDb("x.md");
+
+            let capturedBulk: AbortSignal | undefined;
+            let capturedAll: AbortSignal | undefined;
+            const bulkSpy = vi.spyOn(h.couch, "bulkDocs").mockImplementation(
+                async (_docs: any, signal?: any) => {
+                    capturedBulk = signal;
+                    return [];
+                },
+            );
+            const allSpy = vi.spyOn(h.couch, "allDocs").mockImplementation(
+                async (_opts: any, signal?: any) => {
+                    capturedAll = signal;
+                    return { rows: [] };
+                },
+            );
+
+            const id = makeFileId("x.md");
+            await rig.pipeline.pushDocs([
+                { _id: id, type: "file", chunks: [], vclock: {}, mtime: 0, ctime: 0, size: 0 } as unknown as CouchSyncDoc,
+            ]);
+
+            expect(capturedAll).toBe(rig.signal);
+            expect(capturedBulk).toBe(rig.signal);
+            bulkSpy.mockRestore();
+            allSpy.mockRestore();
+        });
+
+        it("exits gracefully when signal aborts during push (AbortError treated as cancel)", async () => {
+            h = createSyncHarness();
+            const a = h.addDevice("dev-A");
+            const rig = attachPushPipeline({ device: a, couch: h.couch });
+
+            a.vault.addFile("x.md", "hello");
+            await a.vs.fileToDb("x.md");
+
+            let calls = 0;
+            const spy = vi.spyOn(h.couch, "bulkDocs").mockImplementation(async () => {
+                calls++;
+                if (calls > 2) rig.cancel();
+                rig.abort();
+                const e: any = new Error("aborted");
+                e.name = "AbortError";
+                throw e;
+            });
+
+            await rig.pipeline.run();
+            // AbortError is cancel-class: no stack warn latch.
+            expect(calls).toBe(1);
             spy.mockRestore();
         });
     });

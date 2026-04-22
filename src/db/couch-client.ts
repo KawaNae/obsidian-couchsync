@@ -82,11 +82,25 @@ export class CouchClient implements ICouchClient {
         path: string,
         init: RequestInit = {},
         abortMs?: number,
+        externalSignal?: AbortSignal,
     ): Promise<T> {
+        // Short-circuit: if caller's signal is already aborted we never
+        // touch the network — matches how native fetch() behaves.
+        if (externalSignal?.aborted) throw makeAbortError();
+
         const url = `${this.baseUrl}${path}`;
         const controller = new AbortController();
         const timeout = abortMs ?? this.timeoutMs;
         const timer = setTimeout(() => controller.abort(), timeout);
+        // Track *why* the internal controller aborted so we can decide
+        // between "external-cancel" (propagate AbortError) and "internal-
+        // timeout" (throw timeout error).
+        let externalAborted = false;
+        const onExternalAbort = () => {
+            externalAborted = true;
+            controller.abort();
+        };
+        externalSignal?.addEventListener("abort", onExternalAbort, { once: true });
 
         try {
             const res = await fetch(url, {
@@ -107,6 +121,7 @@ export class CouchClient implements ICouchClient {
             return (await res.json()) as T;
         } catch (e: any) {
             if (e?.name === "AbortError") {
+                if (externalAborted) throw makeAbortError();
                 const err: any = new Error(`CouchDB request timed out after ${timeout}ms`);
                 err.status = 0;
                 throw err;
@@ -114,23 +129,28 @@ export class CouchClient implements ICouchClient {
             throw e;
         } finally {
             clearTimeout(timer);
+            externalSignal?.removeEventListener("abort", onExternalAbort);
         }
     }
 
     // ── ICouchClient implementation ───────────────────────
 
-    async info(): Promise<DbInfo> {
-        return this.request<DbInfo>("");
+    async info(signal?: AbortSignal): Promise<DbInfo> {
+        return this.request<DbInfo>("", {}, undefined, signal);
     }
 
     async getDoc<T>(
         id: string,
         opts?: { conflicts?: boolean },
+        signal?: AbortSignal,
     ): Promise<T | null> {
         const qs = opts?.conflicts ? "?conflicts=true" : "";
         try {
             return await this.request<T>(
                 `/${encodeURIComponent(id)}${qs}`,
+                {},
+                undefined,
+                signal,
             );
         } catch (e: any) {
             if (e?.status === 404) return null;
@@ -138,7 +158,7 @@ export class CouchClient implements ICouchClient {
         }
     }
 
-    async bulkGet<T>(ids: string[]): Promise<T[]> {
+    async bulkGet<T>(ids: string[], signal?: AbortSignal): Promise<T[]> {
         if (ids.length === 0) return [];
 
         const results: T[] = [];
@@ -149,6 +169,8 @@ export class CouchClient implements ICouchClient {
             const res = await this.request<{ results: any[] }>(
                 "/_bulk_get",
                 { method: "POST", body: JSON.stringify(body) },
+                undefined,
+                signal,
             );
             for (const item of res.results) {
                 const docResult = item.docs?.[0];
@@ -161,8 +183,9 @@ export class CouchClient implements ICouchClient {
         return results;
     }
 
-    async bulkDocs(docs: any[]): Promise<BulkDocsResult[]> {
+    async bulkDocs(docs: any[], signal?: AbortSignal): Promise<BulkDocsResult[]> {
         if (docs.length === 0) return [];
+        if (signal?.aborted) throw makeAbortError();
 
         const allResults: BulkDocsResult[] = [];
         for (let i = 0; i < docs.length; i += BULK_BATCH_SIZE) {
@@ -170,13 +193,15 @@ export class CouchClient implements ICouchClient {
             const res = await this.request<BulkDocsResult[]>(
                 "/_bulk_docs",
                 { method: "POST", body: JSON.stringify({ docs: batch }) },
+                undefined,
+                signal,
             );
             allResults.push(...res);
         }
         return allResults;
     }
 
-    async allDocs<T>(opts: AllDocsOpts): Promise<AllDocsResult<T>> {
+    async allDocs<T>(opts: AllDocsOpts, signal?: AbortSignal): Promise<AllDocsResult<T>> {
         // Build query params for GET-style options.
         const params = new URLSearchParams();
         if (opts.startkey !== undefined) params.set("startkey", JSON.stringify(opts.startkey));
@@ -189,19 +214,24 @@ export class CouchClient implements ICouchClient {
         if (opts.keys && opts.keys.length > 0) {
             const qs = params.toString();
             const path = `/_all_docs${qs ? "?" + qs : ""}`;
-            return this.request<AllDocsResult<T>>(path, {
-                method: "POST",
-                body: JSON.stringify({ keys: opts.keys }),
-            });
+            return this.request<AllDocsResult<T>>(
+                path,
+                { method: "POST", body: JSON.stringify({ keys: opts.keys }) },
+                undefined,
+                signal,
+            );
         }
 
         const qs = params.toString();
         return this.request<AllDocsResult<T>>(
             `/_all_docs${qs ? "?" + qs : ""}`,
+            {},
+            undefined,
+            signal,
         );
     }
 
-    async changes<T>(opts: ChangesOpts): Promise<ChangesResult<T>> {
+    async changes<T>(opts: ChangesOpts, signal?: AbortSignal): Promise<ChangesResult<T>> {
         const params = new URLSearchParams();
         params.set("feed", "normal");
         if (opts.since !== undefined) params.set("since", String(opts.since));
@@ -210,6 +240,9 @@ export class CouchClient implements ICouchClient {
 
         return this.request<ChangesResult<T>>(
             `/_changes?${params.toString()}`,
+            {},
+            undefined,
+            signal,
         );
     }
 
@@ -225,7 +258,9 @@ export class CouchClient implements ICouchClient {
      * so the connection is only aborted when the server truly goes
      * silent (3 missed heartbeats = 30s of no data at all).
      */
-    async changesLongpoll<T>(opts: ChangesOpts): Promise<ChangesResult<T>> {
+    async changesLongpoll<T>(opts: ChangesOpts, externalSignal?: AbortSignal): Promise<ChangesResult<T>> {
+        if (externalSignal?.aborted) throw makeAbortError();
+
         const params = new URLSearchParams();
         params.set("feed", "longpoll");
         params.set("heartbeat", String(LONGPOLL_HEARTBEAT_MS));
@@ -236,8 +271,10 @@ export class CouchClient implements ICouchClient {
         const url = `${this.baseUrl}/_changes?${params.toString()}`;
         const controller = new AbortController();
 
-        // Flag to distinguish which timer caused the abort.
+        // Three possible abort sources — track which one fired so we can
+        // map back to the right caller-visible outcome.
         let maxWaitFired = false;
+        let externalAborted = false;
 
         // Stale timer: resets on every chunk (heartbeat or data).
         // 3 missed heartbeats = connection is dead → throw.
@@ -254,6 +291,12 @@ export class CouchClient implements ICouchClient {
             maxWaitFired = true;
             controller.abort();
         }, LONGPOLL_MAX_WAIT_MS);
+
+        const onExternalAbort = () => {
+            externalAborted = true;
+            controller.abort();
+        };
+        externalSignal?.addEventListener("abort", onExternalAbort, { once: true });
 
         try {
             const res = await fetch(url, {
@@ -299,15 +342,17 @@ export class CouchClient implements ICouchClient {
             return JSON.parse(text.trim()) as ChangesResult<T>;
         } catch (e: any) {
             if (e?.name === "AbortError") {
+                // Priority: external (user cancel) > maxWait > stale.
+                // An externally-aborted longpoll is a session teardown,
+                // not a timeout — propagate AbortError so the pipeline
+                // exits via the cancel path, not the transient-retry path.
+                if (externalAborted) throw makeAbortError();
                 if (maxWaitFired) {
-                    // Max-wait expired with no changes — return empty
-                    // result so the caller can proceed (handlePaused, etc.)
                     return {
                         results: [],
                         last_seq: opts.since ?? 0,
                     } as ChangesResult<T>;
                 }
-                // Stale: no data at all (not even heartbeats) → throw.
                 const err: any = new Error(
                     `CouchDB longpoll stale (no data for ${LONGPOLL_STALE_MS}ms)`,
                 );
@@ -318,21 +363,28 @@ export class CouchClient implements ICouchClient {
         } finally {
             clearTimeout(staleTimer);
             clearTimeout(maxWaitTimer);
+            externalSignal?.removeEventListener("abort", onExternalAbort);
         }
     }
 
-    async ensureDb(): Promise<void> {
+    async ensureDb(signal?: AbortSignal): Promise<void> {
         try {
-            await this.request<any>("", { method: "PUT" });
+            await this.request<any>("", { method: "PUT" }, undefined, signal);
         } catch (e: any) {
             if (e?.status === 412) return; // DB already exists
             throw e;
         }
     }
 
-    async destroy(): Promise<void> {
-        await this.request<any>("", { method: "DELETE" });
+    async destroy(signal?: AbortSignal): Promise<void> {
+        await this.request<any>("", { method: "DELETE" }, undefined, signal);
     }
+}
+
+function makeAbortError(): Error {
+    const e: any = new Error("The operation was aborted.");
+    e.name = "AbortError";
+    return e;
 }
 
 // ── Factory helper ────────────────────────────────────────

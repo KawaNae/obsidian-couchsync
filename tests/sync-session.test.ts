@@ -100,4 +100,26 @@ describe("SyncSession", () => {
         const s2 = makeSession();
         expect(s2.echoes.consumePushEcho("file:a.md")).toBe(false);
     });
+
+    it("exposes an AbortSignal that is not aborted initially", () => {
+        const s = makeSession();
+        expect(s.signal).toBeInstanceOf(AbortSignal);
+        expect(s.signal.aborted).toBe(false);
+    });
+
+    it("dispose() aborts the session signal", () => {
+        const s = makeSession();
+        expect(s.signal.aborted).toBe(false);
+        s.dispose();
+        expect(s.signal.aborted).toBe(true);
+    });
+
+    it("signal abort fires listeners once on dispose", () => {
+        const s = makeSession();
+        let fired = 0;
+        s.signal.addEventListener("abort", () => { fired++; });
+        s.dispose();
+        s.dispose();
+        expect(fired).toBe(1);
+    });
 });

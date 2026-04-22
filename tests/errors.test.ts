@@ -23,6 +23,14 @@ describe("classifyError", () => {
         expect(classifyError({ message: "ENOTFOUND host.example" }).kind).toBe("network");
     });
 
+    it("iOS/Safari 'Load failed' → network (not unknown)", () => {
+        // Observed in 2026-04-22 mobile log: WebKit reports fetch failure
+        // as "Load failed" rather than "Failed to fetch". Must still be
+        // classified as a network error so the retry path runs.
+        expect(classifyError({ message: "Load failed" }).kind).toBe("network");
+        expect(classifyError(new Error("Load failed")).kind).toBe("network");
+    });
+
     it("unknown fallback", () => {
         expect(classifyError({ message: "something weird" }).kind).toBe("unknown");
     });

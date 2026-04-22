@@ -42,7 +42,7 @@ export function classifyError(err: unknown): SyncErrorDetail {
     if (/timed?[\s_-]?out|timeout/i.test(rawMessage)) {
         return { kind: "timeout", code, message: rawMessage };
     }
-    if (/network|fetch|econn|enotfound|getaddrinfo|failed to fetch|dns|unreachable|offline/i.test(rawMessage)) {
+    if (/network|fetch|econn|enotfound|getaddrinfo|failed to fetch|load failed|dns|unreachable|offline/i.test(rawMessage)) {
         return { kind: "network", code, message: rawMessage };
     }
     return { kind: "unknown", code, message: rawMessage };

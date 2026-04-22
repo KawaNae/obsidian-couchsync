@@ -166,4 +166,84 @@ describe("SyncEngine retry supervisor", () => {
         expect(a.engine.getState()).toBe("connected");
         a.engine.stop();
     });
+
+    // ── v0.20.3: C-chain fix ────────────────────────────────
+
+    it("successful openSession stops a pending retry timer (C-chain fix)", async () => {
+        // Scenario: enterError scheduled a retry, then an external trigger
+        // (e.g. app-resume) calls restart which succeeds. The old retry
+        // timer should be dead — otherwise it fires after reconnect and
+        // tears the live session down for no reason.
+        h = createSyncHarness();
+        const a = h.addDevice("dev-A");
+        await a.engine.start();
+        expect(a.engine.getState()).toBe("connected");
+
+        // Simulate a pending retry from a prior transient error.
+        (a.engine as any).enterError({ kind: "network", message: "flap" });
+        expect((a.engine as any).retryTimer).not.toBeNull();
+
+        // A fresh reconnect succeeds.
+        await a.engine.requestReconnect("app-resume");
+        expect(a.engine.getState()).toBe("connected");
+
+        // The old retry timer must be cancelled now that we're connected.
+        expect((a.engine as any).retryTimer).toBeNull();
+        a.engine.stop();
+    });
+
+    it("concurrent requestReconnect calls are serialized (in-flight guard)", async () => {
+        // Without the guard, two requestReconnect calls race: both enter
+        // verify-then-restart, each creates a session, and the second
+        // tears down the first. Observable symptom in the field: sess#N
+        // incrementing rapidly during an app-resume + retry-backoff race.
+        h = createSyncHarness();
+        const a = h.addDevice("dev-A");
+        await a.engine.start();
+        const epochBefore = (a.engine as any).sessionEpoch;
+
+        // Fire two reconnects back-to-back from the same tick.
+        await Promise.all([
+            a.engine.requestReconnect("app-resume"),
+            a.engine.requestReconnect("retry-backoff"),
+        ]);
+
+        const epochAfter = (a.engine as any).sessionEpoch;
+        // With the guard, at most ONE new session is created.
+        expect(epochAfter - epochBefore).toBeLessThanOrEqual(1);
+        a.engine.stop();
+    });
+
+    it("verifyReachable aborts info() after 5 seconds when the call hangs", async () => {
+        h = createSyncHarness();
+        const a = h.addDevice("dev-A");
+        await a.engine.start();
+
+        // Replace session.client.info() with one that hangs forever unless
+        // its signal is aborted. The engine must abort it after ~5s.
+        const session = (a.engine as any).session;
+        let gotSignal: AbortSignal | undefined;
+        session.client.info = (signal?: AbortSignal) => {
+            gotSignal = signal;
+            return new Promise((_resolve, reject) => {
+                signal?.addEventListener("abort", () => {
+                    const e: any = new Error("aborted");
+                    e.name = "AbortError";
+                    reject(e);
+                });
+            });
+        };
+
+        const t0 = Date.now();
+        const result = await (a.engine as any).verifyReachable(99);
+        const elapsed = Date.now() - t0;
+
+        // The hang was aborted — verify returned false with err != null.
+        expect(result).toBe(false);
+        expect(gotSignal).toBeDefined();
+        // Tolerate ±1s jitter; test must not wait the default 30s.
+        expect(elapsed).toBeLessThan(7_000);
+        expect(elapsed).toBeGreaterThan(3_500);
+        a.engine.stop();
+    }, 10_000);
 });

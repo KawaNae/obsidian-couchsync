@@ -44,7 +44,8 @@ export class FakeCouchClient implements ICouchClient {
     private tick: Tick = makeTick();
     private destroyed = false;
 
-    async info(): Promise<DbInfo> {
+    async info(signal?: AbortSignal): Promise<DbInfo> {
+        throwIfAborted(signal);
         return {
             db_name: "fake-remote",
             doc_count: this.docs.size,
@@ -52,13 +53,15 @@ export class FakeCouchClient implements ICouchClient {
         };
     }
 
-    async getDoc<T>(id: string): Promise<T | null> {
+    async getDoc<T>(id: string, _opts?: { conflicts?: boolean }, signal?: AbortSignal): Promise<T | null> {
+        throwIfAborted(signal);
         const stored = this.docs.get(id);
         if (!stored || stored.deleted) return null;
         return { ...stored.doc, _rev: stored.rev } as T;
     }
 
-    async bulkGet<T>(ids: string[]): Promise<T[]> {
+    async bulkGet<T>(ids: string[], signal?: AbortSignal): Promise<T[]> {
+        throwIfAborted(signal);
         const result: T[] = [];
         for (const id of ids) {
             const stored = this.docs.get(id);
@@ -69,7 +72,8 @@ export class FakeCouchClient implements ICouchClient {
         return result;
     }
 
-    async bulkDocs(docs: any[]): Promise<BulkDocsResult[]> {
+    async bulkDocs(docs: any[], signal?: AbortSignal): Promise<BulkDocsResult[]> {
+        throwIfAborted(signal);
         const results: BulkDocsResult[] = [];
         for (const doc of docs) {
             const id = doc._id;
@@ -95,7 +99,8 @@ export class FakeCouchClient implements ICouchClient {
         old.resolve();
     }
 
-    async allDocs<T>(opts: AllDocsOpts): Promise<AllDocsResult<T>> {
+    async allDocs<T>(opts: AllDocsOpts, signal?: AbortSignal): Promise<AllDocsResult<T>> {
+        throwIfAborted(signal);
         const rows: any[] = [];
 
         if (opts.keys) {
@@ -132,7 +137,8 @@ export class FakeCouchClient implements ICouchClient {
         return { rows, total_rows: this.docs.size };
     }
 
-    async changes<T>(opts: ChangesOpts): Promise<ChangesResult<T>> {
+    async changes<T>(opts: ChangesOpts, signal?: AbortSignal): Promise<ChangesResult<T>> {
+        throwIfAborted(signal);
         const since = typeof opts.since === "number" ? opts.since : 0;
         const results: ChangeRow<T>[] = [];
         for (const [id, stored] of this.docs) {
@@ -150,11 +156,13 @@ export class FakeCouchClient implements ICouchClient {
 
     /**
      * Longpoll: drains immediately if changes exist past `since`; otherwise
-     * parks the caller until `bulkDocs` produces something or the client is
-     * destroyed. Avoids calling `changes()` on the empty-and-quiet path so
-     * tests that spy on `changes` see only intentional polls.
+     * parks the caller until `bulkDocs` produces something, the client is
+     * destroyed, or the caller's AbortSignal fires. Avoids calling
+     * `changes()` on the empty-and-quiet path so tests that spy on
+     * `changes` see only intentional polls.
      */
-    async changesLongpoll<T>(opts: ChangesOpts): Promise<ChangesResult<T>> {
+    async changesLongpoll<T>(opts: ChangesOpts, signal?: AbortSignal): Promise<ChangesResult<T>> {
+        throwIfAborted(signal);
         while (!this.destroyed) {
             const sinceNum = typeof opts.since === "number"
                 ? opts.since
@@ -162,16 +170,19 @@ export class FakeCouchClient implements ICouchClient {
             if (this.seqCounter > sinceNum) {
                 return this.changes<T>(opts);
             }
-            await this.tick.promise;
+            // Race the tick wake against the abort signal so parked
+            // callers exit immediately when the session is torn down.
+            await raceTickAgainstSignal(this.tick.promise, signal);
+            throwIfAborted(signal);
         }
         return { results: [], last_seq: this.seqCounter };
     }
 
-    async ensureDb(): Promise<void> {
+    async ensureDb(_signal?: AbortSignal): Promise<void> {
         // no-op
     }
 
-    async destroy(): Promise<void> {
+    async destroy(_signal?: AbortSignal): Promise<void> {
         this.destroyed = true;
         // Wake every parked longpoll caller so their loops can exit.
         this.bumpTick();
@@ -179,4 +190,25 @@ export class FakeCouchClient implements ICouchClient {
         this.seqCounter = 0;
         this.revCounter = 0;
     }
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+    if (signal?.aborted) {
+        const e: any = new Error("The operation was aborted.");
+        e.name = "AbortError";
+        throw e;
+    }
+}
+
+function raceTickAgainstSignal(tick: Promise<void>, signal?: AbortSignal): Promise<void> {
+    if (!signal) return tick;
+    if (signal.aborted) return Promise.resolve();
+    return new Promise((resolve) => {
+        const onAbort = () => resolve();
+        signal.addEventListener("abort", onAbort, { once: true });
+        tick.then(() => {
+            signal.removeEventListener("abort", onAbort);
+            resolve();
+        });
+    });
 }

@@ -36,10 +36,18 @@ export interface PushPipelineDeps {
     /** Session epoch; prefixed onto diagnostic logs. */
     sessionEpoch: number;
 
-    /** Session cancellation signal — pipeline exits its loop when true. */
+    /** Session cancellation flag — pipeline exits its loop when true. */
     isCancelled: () => boolean;
+    /** Aborted on session dispose. Threaded through every HTTP call so
+     *  an in-flight bulkDocs / allDocs terminates immediately on
+     *  teardown rather than consuming its 30s request timeout. */
+    signal: AbortSignal;
     handleLocalDbError: (e: unknown, context: string) => void;
     delay: (ms: number) => Promise<void>;
+}
+
+function isAbortError(e: unknown): boolean {
+    return !!e && typeof e === "object" && (e as any).name === "AbortError";
 }
 
 export class PushPipeline {
@@ -92,6 +100,9 @@ export class PushPipeline {
                     await this.deps.checkpoints.save();
                 } catch (e: any) {
                     if (this.deps.isCancelled()) return;
+                    // AbortError = dispose() aborted us. Exit quietly so
+                    // teardown doesn't show up as a session push error.
+                    if (isAbortError(e)) return;
                     if (e instanceof DbError) {
                         this.deps.handleLocalDbError(e, `push loop [stage:${stage}]`);
                         if (e.recovery === "halt") {
@@ -133,7 +144,7 @@ export class PushPipeline {
 
         const remoteResult = await this.deps.client.allDocs<CouchSyncDoc>({
             keys: prepared.map((d) => d._id),
-        });
+        }, this.deps.signal);
         const remoteRevMap = new Map<string, string>();
         for (const row of remoteResult.rows) {
             if (row.value?.rev && !row.value?.deleted) {
@@ -145,7 +156,7 @@ export class PushPipeline {
             if (remoteRev) doc._rev = remoteRev;
         }
 
-        const results = await this.deps.client.bulkDocs(prepared);
+        const results = await this.deps.client.bulkDocs(prepared, this.deps.signal);
 
         let fileCount = 0;
         let chunkCount = 0;

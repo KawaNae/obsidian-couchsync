@@ -140,16 +140,22 @@ export interface BulkDocsResult {
 
 /**
  * Abstraction over the remote CouchDB HTTP API (backed by CouchClient).
+ *
+ * All methods accept an optional `AbortSignal`. When the signal is
+ * aborted (before the call or mid-flight), the promise rejects with an
+ * `AbortError` and any in-flight HTTP request is cancelled. Callers in
+ * the sync pipeline pass the session signal so `SyncSession.dispose()`
+ * tears down all outstanding requests in one shot.
  */
 export interface ICouchClient {
-    info(): Promise<DbInfo>;
-    getDoc<T>(id: string, opts?: { conflicts?: boolean }): Promise<T | null>;
-    bulkGet<T>(ids: string[]): Promise<T[]>;
-    bulkDocs(docs: any[]): Promise<BulkDocsResult[]>;
-    allDocs<T>(opts: AllDocsOpts): Promise<AllDocsResult<T>>;
-    changes<T>(opts: ChangesOpts): Promise<ChangesResult<T>>;
-    changesLongpoll<T>(opts: ChangesOpts): Promise<ChangesResult<T>>;
+    info(signal?: AbortSignal): Promise<DbInfo>;
+    getDoc<T>(id: string, opts?: { conflicts?: boolean }, signal?: AbortSignal): Promise<T | null>;
+    bulkGet<T>(ids: string[], signal?: AbortSignal): Promise<T[]>;
+    bulkDocs(docs: any[], signal?: AbortSignal): Promise<BulkDocsResult[]>;
+    allDocs<T>(opts: AllDocsOpts, signal?: AbortSignal): Promise<AllDocsResult<T>>;
+    changes<T>(opts: ChangesOpts, signal?: AbortSignal): Promise<ChangesResult<T>>;
+    changesLongpoll<T>(opts: ChangesOpts, signal?: AbortSignal): Promise<ChangesResult<T>>;
     /** Create the database if it doesn't exist. Idempotent (412 ignored). */
-    ensureDb(): Promise<void>;
-    destroy(): Promise<void>;
+    ensureDb(signal?: AbortSignal): Promise<void>;
+    destroy(signal?: AbortSignal): Promise<void>;
 }

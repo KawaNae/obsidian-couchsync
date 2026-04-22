@@ -49,6 +49,14 @@ const HEALTH_CHECK_INTERVAL = 30000; // 30s
  *  to a hard `error`. The live session may self-heal inside this window. */
 const TRANSIENT_ESCALATION_MS = 10_000;
 
+/** Upper bound on `info()` during verifyReachable. The default HTTP
+ *  timeout is 30s — too long for an app-resume reachability probe where
+ *  the UI needs to decide within a few seconds whether to keep the old
+ *  session or start a fresh one. 5s captures healthy RTT with slack
+ *  while keeping mobile app-resume responsive (9.4s stuck was observed
+ *  in 2026-04-22 Safari logs). */
+const VERIFY_REACHABLE_TIMEOUT_MS = 5_000;
+
 // ── SyncEngine ───────────────────────────────────────────
 
 export class SyncEngine {
@@ -85,6 +93,18 @@ export class SyncEngine {
      *  teardown diagnostics can distinguish new vs. old (still-draining)
      *  sessions. */
     private sessionEpoch = 0;
+
+    // ── Reconnect single-flight guard ─────────────────────
+
+    /** Promise of the currently-running reconnect chain (or null if
+     *  none). New callers observe this and either drop or queue one
+     *  follow-up by priority. Prevents the sess#N cascade where app-
+     *  resume and retry-backoff both attempted restart. */
+    private reconnectInFlight: Promise<void> | null = null;
+    private reconnectInFlightReason: ReconnectReason | null = null;
+    /** At most one queued follow-up reason (the highest-priority one
+     *  seen while in-flight). Fires after the current chain finishes. */
+    private queuedReconnectReason: ReconnectReason | null = null;
 
     // ── Error handling ────────────────────────────────────
 
@@ -248,8 +268,50 @@ export class SyncEngine {
      * Single entry point for every reconnect request. Funnels all
      * triggers through the policy gateway (decideReconnect) so the auth
      * latch, cool-down, and state-specific guards are always applied.
+     *
+     * Single-flight: only one reconnect chain runs at a time. While one
+     * is in flight, additional calls compare reasons by priority and
+     * either drop (lower-or-equal) or queue exactly one follow-up
+     * (higher). This absorbs the app-resume + retry-backoff race that
+     * produced the sess#1→sess#5 cascade observed in 2026-04-22 logs.
      */
     async requestReconnect(reason: ReconnectReason): Promise<void> {
+        if (this.reconnectInFlight) {
+            const currentP = reasonPriority(this.reconnectInFlightReason ?? "periodic-tick");
+            const newP = reasonPriority(reason);
+            const queuedP = this.queuedReconnectReason
+                ? reasonPriority(this.queuedReconnectReason)
+                : -1;
+            if (newP > currentP && newP > queuedP) {
+                this.queuedReconnectReason = reason;
+                logDebug(`[rc-queue] defer reason=${reason} (in-flight=${this.reconnectInFlightReason})`);
+            } else {
+                logDebug(`[rc-drop] drop reason=${reason} (in-flight=${this.reconnectInFlightReason})`);
+            }
+            return this.reconnectInFlight;
+        }
+
+        this.reconnectInFlightReason = reason;
+        this.reconnectInFlight = this.doReconnect(reason).finally(() => {
+            this.reconnectInFlight = null;
+            this.reconnectInFlightReason = null;
+            const next = this.queuedReconnectReason;
+            if (next) {
+                this.queuedReconnectReason = null;
+                // Fire on next microtask so the awaiter of the completed
+                // promise observes the clean state before the follow-up
+                // starts, and so the caller never sees a recursive stack.
+                queueMicrotask(() => {
+                    this.requestReconnect(next).catch((e: any) =>
+                        logError(`CouchSync: queued reconnect failed: ${e?.message ?? e}`),
+                    );
+                });
+            }
+        });
+        return this.reconnectInFlight;
+    }
+
+    private async doReconnect(reason: ReconnectReason): Promise<void> {
         const rc = ++this.reconnectCounter;
         const decision = decideReconnect({
             state: this.state,
@@ -528,9 +590,13 @@ export class SyncEngine {
         this.lastHealthyAt = Date.now();
         this.setState("connected");
         // Success resets both the backoff schedule and any pending
-        // transient-error timer.
+        // transient-error timer. Also kill the retry timer — otherwise a
+        // retry-backoff scheduled before this success chain started
+        // (e.g. from a push error during visibility=hidden) fires
+        // 5 seconds later and needlessly re-restarts the live session.
         this.backoff.recordSuccess();
         this.stopTransientTimer();
+        this.stopRetryTimer();
         this.firePausedCallbacks();
         this.events.emit("catchup-complete");
 
@@ -630,19 +696,27 @@ export class SyncEngine {
         const session = this.session;
         const t0 = Date.now();
         const via = session ? "session-client" : "probe-client";
-        if (session) {
-            try {
-                await session.client.info();
-            } catch (e: any) {
-                err = e?.message || "Connection failed";
+        // Short-bounded probe: 5s ceiling so a hung socket doesn't block
+        // the reconnect chain for the full 30s HTTP timeout.
+        const timeoutCtl = new AbortController();
+        const timer = setTimeout(() => timeoutCtl.abort(), VERIFY_REACHABLE_TIMEOUT_MS);
+        try {
+            if (session) {
+                try {
+                    await session.client.info(timeoutCtl.signal);
+                } catch (e: any) {
+                    err = e?.message || "Connection failed";
+                }
+            } else {
+                try {
+                    const probe = this.clientFactory(this.getSettings());
+                    await probe.info(timeoutCtl.signal);
+                } catch (e: any) {
+                    err = e?.message || "Connection failed";
+                }
             }
-        } else {
-            try {
-                const probe = this.clientFactory(this.getSettings());
-                await probe.info();
-            } catch (e: any) {
-                err = e?.message || "Connection failed";
-            }
+        } finally {
+            clearTimeout(timer);
         }
         logDebug(`${tag}verify: info() via ${via} returned in ${Date.now() - t0}ms (err=${err ?? "none"})`);
         if (err) {
@@ -669,5 +743,23 @@ export class SyncEngine {
         if (typeof seq === "number") return seq;
         const n = parseInt(seq, 10);
         return Number.isNaN(n) ? 0 : n;
+    }
+}
+
+/**
+ * Ranking of ReconnectReason when the single-flight guard has to pick
+ * between an in-flight reason and a newcomer. Higher wins. User-visible
+ * events (app-resume, app-foreground) trump silent retries.
+ */
+function reasonPriority(reason: ReconnectReason): number {
+    switch (reason) {
+        case "manual":         return 5;
+        case "app-resume":     return 4;
+        case "app-foreground": return 3;
+        case "network-online": return 3;
+        case "stalled":        return 2;
+        case "retry-backoff":  return 1;
+        case "periodic-tick":  return 0;
+        default:               return 0;
     }
 }

@@ -319,6 +319,109 @@ describe("CouchClient", () => {
     });
 });
 
+describe("CouchClient AbortSignal plumbing", () => {
+    let fetchMock: ReturnType<typeof vi.fn>;
+    const originalFetch = globalThis.fetch;
+
+    beforeEach(() => {
+        fetchMock = vi.fn();
+        globalThis.fetch = fetchMock as any;
+    });
+
+    afterEach(() => {
+        globalThis.fetch = originalFetch;
+    });
+
+    function client() {
+        return new CouchClient({
+            baseUrl: "https://couch.example/mydb",
+            auth: { user: "admin", password: "secret" },
+        });
+    }
+
+    it("info() rejects immediately when external signal already aborted", async () => {
+        const controller = new AbortController();
+        controller.abort();
+
+        const err: any = await client().info(controller.signal).catch((e) => e);
+        expect(err?.name).toBe("AbortError");
+        expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it("info() rejects with AbortError when external signal fires mid-flight", async () => {
+        const controller = new AbortController();
+        fetchMock.mockImplementationOnce((_url: string, init: RequestInit) => {
+            // Return a fetch that only rejects on signal abort (simulating
+            // network hang until the outer signal cancels it).
+            return new Promise((_resolve, reject) => {
+                init.signal?.addEventListener("abort", () => {
+                    const e: any = new Error("aborted");
+                    e.name = "AbortError";
+                    reject(e);
+                });
+            });
+        });
+
+        const p = client().info(controller.signal);
+        setTimeout(() => controller.abort(), 10);
+        const err: any = await p.catch((e) => e);
+        expect(err?.name).toBe("AbortError");
+    });
+
+    it("info() uses internal timeout path (non-abort) when no external signal fires", async () => {
+        const controller = new AbortController();
+        fetchMock.mockResolvedValueOnce(
+            new Response(JSON.stringify({ db_name: "t", doc_count: 0, update_seq: "0" }), {
+                status: 200,
+                headers: { "Content-Type": "application/json" },
+            }),
+        );
+
+        const res = await client().info(controller.signal);
+        expect(res.db_name).toBe("t");
+    });
+
+    it("bulkDocs() rejects immediately when external signal already aborted", async () => {
+        const controller = new AbortController();
+        controller.abort();
+        const err: any = await client()
+            .bulkDocs([{ _id: "x" }], controller.signal)
+            .catch((e) => e);
+        expect(err?.name).toBe("AbortError");
+        expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it("changesLongpoll() rejects with AbortError when signal is already aborted", async () => {
+        const controller = new AbortController();
+        controller.abort();
+        const err: any = await client()
+            .changesLongpoll({ since: 0 }, controller.signal)
+            .catch((e) => e);
+        expect(err?.name).toBe("AbortError");
+        expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it("changesLongpoll() propagates external signal abort during fetch as AbortError", async () => {
+        const controller = new AbortController();
+        fetchMock.mockImplementationOnce((_url: string, init: RequestInit) => {
+            // Realistic: fetch() rejects with AbortError when its signal
+            // (the internal composed one) is aborted.
+            return new Promise((_resolve, reject) => {
+                init.signal?.addEventListener("abort", () => {
+                    const e: any = new Error("aborted");
+                    e.name = "AbortError";
+                    reject(e);
+                });
+            });
+        });
+
+        const p = client().changesLongpoll({ since: 0 }, controller.signal);
+        setTimeout(() => controller.abort(), 10);
+        const err: any = await p.catch((e) => e);
+        expect(err?.name).toBe("AbortError");
+    });
+});
+
 describe("makeCouchClient()", () => {
     it("constructs a client with correct URL", async () => {
         const fetchMock = vi.fn().mockResolvedValueOnce(

@@ -55,8 +55,13 @@ export class SyncSession {
     readonly client: ICouchClient;
     readonly echoes: EchoTracker;
     readonly pullWriter: PullWriter;
+    /** Aborted on dispose(). Pipelines, delays, and HTTP calls observe
+     *  this to break out of in-flight awaits without waiting for wall-
+     *  clock timeouts. Single owner = one AbortController per session. */
+    readonly signal: AbortSignal;
 
     private _disposed = false;
+    private readonly controller: AbortController;
     private tasks: LabeledTask[] = [];
     /** Pending delay() entries — disposed wakes them all so loops exit
      *  immediately rather than waiting out the remaining backoff. */
@@ -67,6 +72,8 @@ export class SyncSession {
     constructor(deps: SyncSessionDeps) {
         this.epoch = deps.epoch;
         this.client = deps.client;
+        this.controller = new AbortController();
+        this.signal = this.controller.signal;
         this.echoes = new EchoTracker();
         this.pullWriter = new PullWriter({
             localDb: deps.localDb,
@@ -85,6 +92,7 @@ export class SyncSession {
             events: deps.events,
             sessionEpoch: deps.epoch,
             isCancelled,
+            signal: this.signal,
             handleLocalDbError: deps.handleLocalDbError,
             onTransientError: deps.onTransientError,
             delay,
@@ -97,6 +105,7 @@ export class SyncSession {
             checkpoints: deps.checkpoints,
             sessionEpoch: deps.epoch,
             isCancelled,
+            signal: this.signal,
             handleLocalDbError: deps.handleLocalDbError,
             delay,
         });
@@ -139,6 +148,7 @@ export class SyncSession {
     }
 
     dispose(): void {
+        if (this._disposed) return;
         this._disposed = true;
         const unsettled = this.tasks.filter((t) => !t.settled).map((t) => t.label);
         logDebug(
@@ -150,6 +160,8 @@ export class SyncSession {
             d.resolve();
         }
         this.pendingDelays.clear();
+        // Abort in-flight HTTP/fetch and signal-aware awaits in one shot.
+        this.controller.abort();
     }
 
     get settled(): Promise<void> {

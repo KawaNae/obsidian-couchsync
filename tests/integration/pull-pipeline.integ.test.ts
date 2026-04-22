@@ -31,6 +31,8 @@ interface PipelineRig {
     checkpoints: Checkpoints;
     pausedCount: { value: number };
     cancel: () => void;
+    abort: () => void;
+    signal: AbortSignal;
     /** Calls captured by the handleLocalDbError stub. */
     dbErrorCalls: Array<{ err: unknown; ctx: string }>;
 }
@@ -55,6 +57,7 @@ function attachPullPipeline(opts: {
     });
 
     let cancelled = false;
+    const controller = new AbortController();
     const dbErrorCalls: Array<{ err: unknown; ctx: string }> = [];
 
     const pipeline = new PullPipeline({
@@ -64,6 +67,7 @@ function attachPullPipeline(opts: {
         events,
         sessionEpoch: 1,
         isCancelled: () => cancelled,
+        signal: controller.signal,
         handleLocalDbError: (err, ctx) => { dbErrorCalls.push({ err, ctx }); },
         onTransientError: () => {},
         delay: async () => {},
@@ -75,6 +79,8 @@ function attachPullPipeline(opts: {
         checkpoints,
         pausedCount,
         cancel: () => { cancelled = true; },
+        abort: () => controller.abort(),
+        signal: controller.signal,
         dbErrorCalls,
     };
 }
@@ -260,6 +266,66 @@ describe("PullPipeline integration", () => {
             await rig.pipeline.runLongpoll();
 
             expect(rig.pipeline.getLastErrorMsg()).toContain("offline");
+            spy.mockRestore();
+        });
+
+        // ── AbortSignal propagation (v0.20.3) ───────────────
+
+        it("passes the deps.signal through to client.changesLongpoll", async () => {
+            h = createSyncHarness();
+            const b = h.addDevice("dev-B");
+            const rig = attachPullPipeline({ device: b, couch: h.couch });
+
+            let capturedSignal: AbortSignal | undefined;
+            const spy = vi.spyOn(h.couch, "changesLongpoll").mockImplementation(async (_opts: any, signal?: any) => {
+                capturedSignal = signal;
+                rig.cancel();
+                return { results: [], last_seq: "0" };
+            });
+
+            await rig.pipeline.runLongpoll();
+            expect(capturedSignal).toBe(rig.signal);
+            spy.mockRestore();
+        });
+
+        it("exits gracefully when signal aborts mid-longpoll (AbortError treated as cancel)", async () => {
+            h = createSyncHarness();
+            const b = h.addDevice("dev-B");
+            const rig = attachPullPipeline({ device: b, couch: h.couch });
+
+            let calls = 0;
+            const spy = vi.spyOn(h.couch, "changesLongpoll").mockImplementation(async () => {
+                calls++;
+                // Safety: never infinite loop even if impl is wrong.
+                if (calls > 2) rig.cancel();
+                rig.abort();
+                const e: any = new Error("aborted");
+                e.name = "AbortError";
+                throw e;
+            });
+
+            // Should return cleanly without entering the transient-retry path.
+            // AbortError is a cancel signal, not a network error — no retryMs
+            // growth, no lastErrorMsg update.
+            await rig.pipeline.runLongpoll();
+            expect(rig.pipeline.getLastErrorMsg()).toBeNull();
+            expect(calls).toBe(1);
+            spy.mockRestore();
+        });
+
+        it("passes deps.signal to client.changes during runCatchup", async () => {
+            h = createSyncHarness();
+            const b = h.addDevice("dev-B");
+            const rig = attachPullPipeline({ device: b, couch: h.couch });
+
+            let capturedSignal: AbortSignal | undefined;
+            const spy = vi.spyOn(h.couch, "changes").mockImplementation(async (_opts: any, signal?: any) => {
+                capturedSignal = signal;
+                return { results: [], last_seq: "0" };
+            });
+
+            await rig.pipeline.runCatchup();
+            expect(capturedSignal).toBe(rig.signal);
             spy.mockRestore();
         });
     });
