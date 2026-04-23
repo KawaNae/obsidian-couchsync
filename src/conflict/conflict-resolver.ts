@@ -63,6 +63,9 @@ export class ConflictResolver {
             case "equal":
                 // Identical vclocks — content may or may not differ, but
                 // causally they're the same edit. Keep local (no-op).
+                logDebug(
+                    `keep-local (equal vclock) for ${vaultPath} — vc=${formatVC(localVC)}`,
+                );
                 return "keep-local";
 
             case "dominated":
@@ -72,7 +75,9 @@ export class ConflictResolver {
 
             case "dominates":
                 // Local dominates remote — keep local (push pending).
-                logDebug(`keep-local: local dominates remote for ${vaultPath}`);
+                logDebug(
+                    `keep-local (local dominates) for ${vaultPath} — local=${formatVC(localVC)} remote=${formatVC(remoteVC)}`,
+                );
                 return "keep-local";
 
             case "concurrent":
@@ -83,7 +88,18 @@ export class ConflictResolver {
                 return "concurrent";
 
             default:
+                logDebug(
+                    `keep-local (default branch, cmp=${cmp}) for ${vaultPath} — local=${formatVC(localVC)} remote=${formatVC(remoteVC)}`,
+                );
                 return "keep-local";
         }
     }
+}
+
+/** Compact vclock formatter for diagnostic logs: `{deviceA:3,deviceB:1}`.
+ *  Sorted by device id for stable output across log lines. */
+function formatVC(vc: Record<string, number>): string {
+    const keys = Object.keys(vc).sort();
+    if (keys.length === 0) return "{}";
+    return "{" + keys.map((k) => `${k}:${vc[k]}`).join(",") + "}";
 }
