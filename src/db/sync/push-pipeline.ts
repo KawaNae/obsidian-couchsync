@@ -22,6 +22,7 @@ import { logDebug, logInfo, logWarn } from "../../ui/log.ts";
 import type { EchoTracker } from "./echo-tracker.ts";
 import type { SyncEvents } from "./sync-events.ts";
 import type { Checkpoints } from "./checkpoints.ts";
+import type { VisibilityGate } from "../visibility-gate.ts";
 
 type PushStage = "changes" | "pushDocs" | "checkpoint-save" | "idle";
 
@@ -35,6 +36,10 @@ export interface PushPipelineDeps {
     checkpoints: Checkpoints;
     /** Session epoch; prefixed onto diagnostic logs. */
     sessionEpoch: number;
+    /** Pauses the loop while the page is hidden. iOS Safari aborts
+     *  in-flight IndexedDB transactions on visibilitychange→hidden;
+     *  starting a new tx during that window guarantees a dead handle. */
+    visibility: VisibilityGate;
 
     /** Session cancellation flag — pipeline exits its loop when true. */
     isCancelled: () => boolean;
@@ -64,6 +69,10 @@ export class PushPipeline {
         let exitReason: "cancelled" | "halted" = "cancelled";
         try {
             while (!this.deps.isCancelled()) {
+                if (this.deps.visibility.isHidden()) {
+                    await this.deps.visibility.waitVisible(this.deps.signal);
+                    if (this.deps.isCancelled()) return;
+                }
                 let stage: PushStage = "idle";
                 try {
                     stage = "changes";

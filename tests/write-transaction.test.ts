@@ -56,6 +56,52 @@ describe("classifyDexieError", () => {
         const err = new DbError("abort", null);
         expect(classifyDexieError(err)).toBe("abort");
     });
+
+    // iOS Safari aborts in-flight IndexedDB transactions when the page goes hidden;
+    // subsequent operations on the dead handle throw `UnknownError: Attempt to ...
+    // without an in-progress transaction`. We classify these as `invalid-state` so
+    // HandleGuard transparently reopens the connection.
+    describe("iOS Safari transaction-inactive (page-hide)", () => {
+        function txInactiveErr(verb: "delete range" | "get a record"): any {
+            const err: any = new Error(
+                `Attempt to ${verb} from database without an in-progress transaction`,
+            );
+            err.name = "UnknownError";
+            return err;
+        }
+
+        it("classifies 'Attempt to delete range ... without an in-progress transaction' as invalid-state", () => {
+            expect(classifyDexieError(txInactiveErr("delete range"))).toBe("invalid-state");
+        });
+
+        it("classifies 'Attempt to get a record ... without an in-progress transaction' as invalid-state", () => {
+            expect(classifyDexieError(txInactiveErr("get a record"))).toBe("invalid-state");
+        });
+
+        it("recognises TransactionInactiveError name as invalid-state", () => {
+            expect(classifyDexieError(fakeDexieErr("TransactionInactiveError"))).toBe(
+                "invalid-state",
+            );
+        });
+
+        it("unwraps Dexie wrapper with inner UnknownError carrying the message", () => {
+            const wrapped: any = new Error("Dexie wrapper");
+            wrapped.name = "DexieError";
+            wrapped.inner = {
+                name: "UnknownError",
+                message:
+                    "Attempt to delete range from database without an in-progress transaction",
+            };
+            expect(classifyDexieError(wrapped)).toBe("invalid-state");
+        });
+
+        it("unwraps Dexie wrapper with inner TransactionInactiveError name", () => {
+            const wrapped: any = new Error("Dexie wrapper");
+            wrapped.name = "DexieError";
+            wrapped.inner = { name: "TransactionInactiveError" };
+            expect(classifyDexieError(wrapped)).toBe("invalid-state");
+        });
+    });
 });
 
 describe("DbError", () => {

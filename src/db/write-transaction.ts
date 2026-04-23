@@ -129,7 +129,11 @@ export function classifyDexieError(e: unknown): DbErrorKind {
     const name: string = err?.name ?? err?.inner?.name ?? "";
     if (name === "QuotaExceededError") return "quota";
     if (name === "AbortError") return "abort";
-    if (name === "InvalidStateError") return "invalid-state";
+    // `TransactionInactiveError` is the spec-correct name for an aborted
+    // transaction; Safari sometimes reports the same condition as a
+    // generic `UnknownError` carrying the "without an in-progress
+    // transaction" message (handled in the message fallback below).
+    if (name === "InvalidStateError" || name === "TransactionInactiveError") return "invalid-state";
     if (name === "ConstraintError") return "constraint";
     // Some Dexie errors wrap the underlying IDB error in `.inner`.
     const inner: any = err?.inner;
@@ -137,13 +141,24 @@ export function classifyDexieError(e: unknown): DbErrorKind {
         const iname: string = inner.name ?? "";
         if (iname === "QuotaExceededError") return "quota";
         if (iname === "AbortError") return "abort";
-        if (iname === "InvalidStateError") return "invalid-state";
+        if (iname === "InvalidStateError" || iname === "TransactionInactiveError") return "invalid-state";
         if (iname === "ConstraintError") return "constraint";
     }
     // Fallback: heuristics on message text.
     const msg: string = (err?.message ?? "").toString().toLowerCase();
+    const innerMsg: string = (err?.inner?.message ?? "").toString().toLowerCase();
     if (msg.includes("quota")) return "quota";
     if (msg.includes("invalidstate")) return "invalid-state";
+    // iOS Safari kills in-flight IndexedDB transactions on visibilitychange→hidden.
+    // Subsequent ops on the dead handle throw `UnknownError: Attempt to ...
+    // without an in-progress transaction`. Treat as invalid-state so HandleGuard
+    // reopens the connection rather than letting the push loop spin on a dead tx.
+    if (
+        msg.includes("without an in-progress transaction") ||
+        innerMsg.includes("without an in-progress transaction")
+    ) {
+        return "invalid-state";
+    }
     return "unknown";
 }
 

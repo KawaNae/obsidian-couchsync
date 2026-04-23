@@ -24,6 +24,7 @@ import { Checkpoints } from "../../src/db/sync/checkpoints.ts";
 import { DbError } from "../../src/db/write-transaction.ts";
 import { makeFileId } from "../../src/types/doc-id.ts";
 import type { FileDoc, CouchSyncDoc } from "../../src/types.ts";
+import { ALWAYS_VISIBLE } from "../../src/db/visibility-gate.ts";
 
 interface PipelineRig {
     pipeline: PullPipeline;
@@ -66,6 +67,7 @@ function attachPullPipeline(opts: {
         checkpoints,
         events,
         sessionEpoch: 1,
+        visibility: ALWAYS_VISIBLE,
         isCancelled: () => cancelled,
         signal: controller.signal,
         handleLocalDbError: (err, ctx) => { dbErrorCalls.push({ err, ctx }); },

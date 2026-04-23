@@ -23,6 +23,34 @@ import { Checkpoints } from "../../src/db/sync/checkpoints.ts";
 import { DbError } from "../../src/db/write-transaction.ts";
 import { makeFileId } from "../../src/types/doc-id.ts";
 import type { FileDoc, CouchSyncDoc } from "../../src/types.ts";
+import { ALWAYS_VISIBLE, type VisibilityGate } from "../../src/db/visibility-gate.ts";
+
+/** Controllable gate for tests that need to flip visibility on demand. */
+class FakeVisibilityGate implements VisibilityGate {
+    private hidden = false;
+    private waiters = new Set<() => void>();
+    isHidden(): boolean { return this.hidden; }
+    waitVisible(signal: AbortSignal): Promise<void> {
+        if (!this.hidden) return Promise.resolve();
+        if (signal.aborted) return Promise.resolve();
+        return new Promise<void>((resolve) => {
+            const done = () => {
+                this.waiters.delete(done);
+                signal.removeEventListener("abort", done);
+                resolve();
+            };
+            this.waiters.add(done);
+            signal.addEventListener("abort", done, { once: true });
+        });
+    }
+    setHidden(hidden: boolean): void {
+        this.hidden = hidden;
+        if (!hidden) {
+            for (const fn of [...this.waiters]) fn();
+            this.waiters.clear();
+        }
+    }
+}
 
 interface PipelineRig {
     pipeline: PushPipeline;
@@ -45,6 +73,7 @@ function attachPushPipeline(opts: {
     device: DeviceHarness;
     couch: SyncHarness["couch"];
     runOnce?: boolean;
+    visibility?: VisibilityGate;
 }): PipelineRig {
     const events = new SyncEvents();
     const echoes = new EchoTracker();
@@ -63,6 +92,7 @@ function attachPushPipeline(opts: {
         events,
         checkpoints,
         sessionEpoch: 1,
+        visibility: opts.visibility ?? ALWAYS_VISIBLE,
         isCancelled: () => cancelled,
         signal: controller.signal,
         handleLocalDbError: (err, ctx) => { dbErrorCalls.push({ err, ctx }); },
@@ -172,6 +202,53 @@ describe("PushPipeline integration", () => {
             await rig.pipeline.run();
 
             await expectCouch(h.couch).toHaveDoc(id);
+        });
+
+        it("pauses the loop while visibility gate reports hidden, resumes on visible", async () => {
+            h = createSyncHarness();
+            const a = h.addDevice("dev-A");
+            const gate = new FakeVisibilityGate();
+            gate.setHidden(true);
+            const rig = attachPushPipeline({ device: a, couch: h.couch, runOnce: true, visibility: gate });
+
+            a.vault.addFile("x.md", "hello");
+            await a.vs.fileToDb("x.md");
+
+            const changesSpy = vi.spyOn(a.db, "changes");
+
+            const runP = rig.pipeline.run();
+            // Give the loop time to enter waitVisible.
+            await new Promise((r) => setTimeout(r, 30));
+            expect(changesSpy).not.toHaveBeenCalled();
+
+            // Reveal the page → loop runs one iteration → runOnce cancels it.
+            gate.setHidden(false);
+            await runP;
+
+            expect(changesSpy).toHaveBeenCalled();
+            await expectCouch(h.couch).toHaveDoc(makeFileId("x.md"));
+            changesSpy.mockRestore();
+        });
+
+        it("dispose() during waitVisible exits the loop without running an iteration", async () => {
+            h = createSyncHarness();
+            const a = h.addDevice("dev-A");
+            const gate = new FakeVisibilityGate();
+            gate.setHidden(true);
+            const rig = attachPushPipeline({ device: a, couch: h.couch, visibility: gate });
+
+            const changesSpy = vi.spyOn(a.db, "changes");
+
+            const runP = rig.pipeline.run();
+            await new Promise((r) => setTimeout(r, 30));
+
+            // Cancel + abort while still parked in waitVisible.
+            rig.cancel();
+            rig.abort();
+            await runP;
+
+            expect(changesSpy).not.toHaveBeenCalled();
+            changesSpy.mockRestore();
         });
 
         it("halt DbError from localDb.changes exits the loop", async () => {

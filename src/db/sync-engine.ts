@@ -40,6 +40,7 @@ import { Checkpoints } from "./sync/checkpoints.ts";
 import { SyncSession } from "./sync/sync-session.ts";
 import { BackoffSchedule } from "./sync/backoff.ts";
 import { classifyError } from "./sync/errors.ts";
+import { BrowserVisibilityGate, ALWAYS_VISIBLE, type VisibilityGate } from "./visibility-gate.ts";
 
 // ── Constants ────────────────────────────────────────────
 
@@ -129,6 +130,15 @@ export class SyncEngine {
         fireReconnectHandlers: () => this.events.emit("reconnect"),
         isMobile: this.isMobile,
     });
+
+    /** Pauses live loops while the page is hidden. iOS Safari aborts
+     *  IndexedDB transactions on visibilitychange→hidden; without this
+     *  gate the push loop exhausts HandleGuard's reopen budget. Falls
+     *  back to ALWAYS_VISIBLE in non-browser test contexts. */
+    private readonly visibility: VisibilityGate =
+        typeof document !== "undefined"
+            ? new BrowserVisibilityGate(document)
+            : ALWAYS_VISIBLE;
 
     // ── Checkpoints ───────────────────────────────────────
 
@@ -247,12 +257,18 @@ export class SyncEngine {
         this.auth.clear();
         this.degraded = false;
         this.envListeners.attach();
+        if (this.visibility instanceof BrowserVisibilityGate) {
+            this.visibility.attach();
+        }
         this.startHealthTimer();
         await this.openSession();
     }
 
     stop(): void {
         this.envListeners.detach();
+        if (this.visibility instanceof BrowserVisibilityGate) {
+            this.visibility.detach();
+        }
         this.stopHealthTimer();
         this.stopRetryTimer();
         this.stopTransientTimer();
@@ -528,6 +544,7 @@ export class SyncEngine {
             ensureChunks: (doc) => this.ensureChunksInternal(client, doc),
             handleLocalDbError: (e, ctx) => this.handleLocalDbError(e, ctx),
             onTransientError: (err) => this.handleTransientError(err),
+            visibility: this.visibility,
         });
         this.session = session;
         logDebug(`${tag}openSession: sess#${epoch} created`);

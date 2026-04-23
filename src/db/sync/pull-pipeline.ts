@@ -24,6 +24,7 @@ import type { PullWriter } from "./pull-writer.ts";
 import type { SyncEvents } from "./sync-events.ts";
 import type { Checkpoints } from "./checkpoints.ts";
 import { classifyError } from "./errors.ts";
+import type { VisibilityGate } from "../visibility-gate.ts";
 
 const CATCHUP_BATCH_SIZE = 200;
 const CATCHUP_IDLE_TIMEOUT_MS = 60_000;
@@ -38,6 +39,9 @@ export interface PullPipelineDeps {
     /** Session epoch, used as `[sess#N]` prefix on diagnostic logs so
      *  concurrent sessions can be told apart during reconnect races. */
     sessionEpoch: number;
+    /** Pauses the longpoll loop while the page is hidden. Catchup
+     *  (one-shot, runs on openSession after a resume) does not gate. */
+    visibility: VisibilityGate;
 
     isCancelled: () => boolean;
     /** Aborted on session dispose. Passed to every HTTP call so an
@@ -119,6 +123,10 @@ export class PullPipeline {
         let exitReason: "cancelled" | "halted" = "cancelled";
         try {
             while (!this.deps.isCancelled()) {
+                if (this.deps.visibility.isHidden()) {
+                    await this.deps.visibility.waitVisible(this.deps.signal);
+                    if (this.deps.isCancelled()) return;
+                }
                 try {
                     const result = await this.deps.client.changesLongpoll<CouchSyncDoc>({
                         since: this.deps.checkpoints.getRemoteSeq(),

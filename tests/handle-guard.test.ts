@@ -86,6 +86,47 @@ describe("HandleGuard", () => {
         expect(factory).toHaveBeenCalledTimes(4);
     });
 
+    it("reopens when DexieStore throws UnknownError with 'without an in-progress transaction' (iOS page-hide)", async () => {
+        const factory = vi.fn(() => ({ id: "inner" }));
+        const cleanup = vi.fn().mockResolvedValue(undefined);
+        const guard = new HandleGuard({ factory, cleanup });
+
+        let calls = 0;
+        const result = await guard.runOp(async () => {
+            calls++;
+            if (calls === 1) {
+                const e: any = new Error(
+                    "Attempt to delete range from database without an in-progress transaction",
+                );
+                e.name = "UnknownError";
+                throw e;
+            }
+            return "ok";
+        }, "push.checkpoint-save");
+
+        expect(result).toBe("ok");
+        expect(factory).toHaveBeenCalledTimes(2);
+        expect(cleanup).toHaveBeenCalledTimes(1);
+    });
+
+    it("reopens on TransactionInactiveError name", async () => {
+        const factory = vi.fn(() => ({ id: "inner" }));
+        const guard = new HandleGuard({
+            factory,
+            cleanup: vi.fn().mockResolvedValue(undefined),
+        });
+
+        let calls = 0;
+        const result = await guard.runOp(async () => {
+            calls++;
+            if (calls === 1) throw makeFakeError("TransactionInactiveError");
+            return "ok";
+        }, "write");
+
+        expect(result).toBe("ok");
+        expect(factory).toHaveBeenCalledTimes(2);
+    });
+
     it("also triggers reopen on DatabaseClosedError name", async () => {
         const factory = vi.fn(() => ({ id: "inner" }));
         const guard = new HandleGuard({

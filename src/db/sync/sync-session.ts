@@ -27,6 +27,7 @@ import { PullWriter } from "./pull-writer.ts";
 import { PullPipeline } from "./pull-pipeline.ts";
 import { PushPipeline } from "./push-pipeline.ts";
 import { logDebug, logError } from "../../ui/log.ts";
+import { ALWAYS_VISIBLE, type VisibilityGate } from "../visibility-gate.ts";
 
 export interface SyncSessionDeps {
     /** Monotonic identifier supplied by SyncEngine. Shows up in pipeline
@@ -42,6 +43,9 @@ export interface SyncSessionDeps {
     /** Invoked from pipelines when a transient upstream error (auth /
      *  5xx) occurs. The supervisor (SyncEngine) decides escalation. */
     onTransientError: (err: unknown) => void;
+    /** Optional: gate that pauses live loops while the page is hidden.
+     *  Defaults to ALWAYS_VISIBLE for tests / non-browser hosts. */
+    visibility?: VisibilityGate;
 }
 
 interface LabeledTask {
@@ -85,12 +89,14 @@ export class SyncSession {
         });
         const isCancelled = () => this._disposed;
         const delay = (ms: number) => this.delay(ms);
+        const visibility = deps.visibility ?? ALWAYS_VISIBLE;
         this.pullPipeline = new PullPipeline({
             client: deps.client,
             pullWriter: this.pullWriter,
             checkpoints: deps.checkpoints,
             events: deps.events,
             sessionEpoch: deps.epoch,
+            visibility,
             isCancelled,
             signal: this.signal,
             handleLocalDbError: deps.handleLocalDbError,
@@ -104,6 +110,7 @@ export class SyncSession {
             events: deps.events,
             checkpoints: deps.checkpoints,
             sessionEpoch: deps.epoch,
+            visibility,
             isCancelled,
             signal: this.signal,
             handleLocalDbError: deps.handleLocalDbError,
