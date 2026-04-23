@@ -51,12 +51,26 @@ const HEALTH_CHECK_INTERVAL = 30000; // 30s
 const TRANSIENT_ESCALATION_MS = 10_000;
 
 /** Upper bound on `info()` during verifyReachable. The default HTTP
- *  timeout is 30s — too long for an app-resume reachability probe where
- *  the UI needs to decide within a few seconds whether to keep the old
- *  session or start a fresh one. 5s captures healthy RTT with slack
- *  while keeping mobile app-resume responsive (9.4s stuck was observed
- *  in 2026-04-22 Safari logs). */
-const VERIFY_REACHABLE_TIMEOUT_MS = 5_000;
+ *  timeout is 30s — too long for a reachability probe.
+ *
+ *  - `app-resume` / `network-online` use 15s because the mobile network
+ *    stack often takes several seconds to come back after suspend
+ *    (2026-04-22 main vault log: 5001ms abort followed by 18s recovery
+ *    via retry-backoff). A longer ceiling on these reasons absorbs the
+ *    slow-revival case in one round-trip.
+ *  - All other reasons (retry-backoff, periodic-tick, etc.) stay at 5s.
+ */
+const VERIFY_REACHABLE_TIMEOUT_FAST_MS = 5_000;
+const VERIFY_REACHABLE_TIMEOUT_RESUME_MS = 15_000;
+
+/** Pick the verify-reachable timeout for a reconnect reason. Exported
+ *  for unit testing — production calls go through `verifyReachable`. */
+export function verifyTimeoutMs(reason: ReconnectReason): number {
+    if (reason === "app-resume" || reason === "network-online") {
+        return VERIFY_REACHABLE_TIMEOUT_RESUME_MS;
+    }
+    return VERIFY_REACHABLE_TIMEOUT_FAST_MS;
+}
 
 // ── SyncEngine ───────────────────────────────────────────
 
@@ -342,7 +356,7 @@ export class SyncEngine {
 
         if (decision === "verify-then-restart") {
             this.setState("reconnecting");
-            if (!(await this.verifyReachable(rc))) return;
+            if (!(await this.verifyReachable(rc, reason))) return;
         } else {
             this.setState("reconnecting");
         }
@@ -707,16 +721,18 @@ export class SyncEngine {
 
     // ── Internal: Verify reachability ─────────────────────
 
-    private async verifyReachable(rc = 0): Promise<boolean> {
+    private async verifyReachable(rc = 0, reason: ReconnectReason = "periodic-tick"): Promise<boolean> {
         const tag = rc > 0 ? `[rc#${rc}] ` : "";
         let err: string | null = null;
         const session = this.session;
         const t0 = Date.now();
         const via = session ? "session-client" : "probe-client";
-        // Short-bounded probe: 5s ceiling so a hung socket doesn't block
-        // the reconnect chain for the full 30s HTTP timeout.
+        // Reason-aware probe ceiling: app-resume / network-online get
+        // a longer budget for mobile network revival; faster reasons
+        // stay at 5s so a hung socket can't block the reconnect chain.
+        const timeoutMs = verifyTimeoutMs(reason);
         const timeoutCtl = new AbortController();
-        const timer = setTimeout(() => timeoutCtl.abort(), VERIFY_REACHABLE_TIMEOUT_MS);
+        const timer = setTimeout(() => timeoutCtl.abort(), timeoutMs);
         try {
             if (session) {
                 try {
