@@ -61,6 +61,7 @@ export class CouchClient implements ICouchClient {
     private readonly baseUrl: string;
     private readonly headers: Record<string, string>;
     private readonly timeoutMs: number;
+    private readonly auth: { user: string; password: string } | null;
 
     constructor(opts: CouchClientOpts) {
         // Normalise: strip trailing slash so path concatenation is clean.
@@ -69,11 +70,25 @@ export class CouchClient implements ICouchClient {
             "Content-Type": "application/json",
             Accept: "application/json",
         };
-        if (opts.auth?.user) {
-            const cred = btoa(`${opts.auth.user}:${opts.auth.password}`);
+        this.auth = opts.auth ?? null;
+        if (this.auth?.user) {
+            const cred = btoa(`${this.auth.user}:${this.auth.password}`);
             this.headers["Authorization"] = `Basic ${cred}`;
         }
         this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    }
+
+    /**
+     * Derive a sibling client with the same baseUrl/auth but a different
+     * per-request timeout. Used by ConfigOperation to run a short-timeout
+     * reachability probe (`info()`) before committing to a 30s allDocs.
+     */
+    withTimeout(ms: number): CouchClient {
+        return new CouchClient({
+            baseUrl: this.baseUrl,
+            auth: this.auth,
+            timeoutMs: ms,
+        });
     }
 
     // ── Core HTTP helper ──────────────────────────────────

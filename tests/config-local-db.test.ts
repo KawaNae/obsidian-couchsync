@@ -4,7 +4,6 @@
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import "fake-indexeddb/auto";
-import { DexieStore } from "../src/db/dexie-store.ts";
 import { ConfigLocalDB } from "../src/db/config-local-db.ts";
 import type { ConfigDoc, CouchSyncDoc } from "../src/types.ts";
 import { makeConfigId, makeFileId } from "../src/types/doc-id.ts";
@@ -30,16 +29,15 @@ function put(db: ConfigLocalDB, doc: CouchSyncDoc): Promise<void> {
 }
 
 describe("ConfigLocalDB", () => {
-    let store: DexieStore<CouchSyncDoc>;
     let db: ConfigLocalDB;
 
     beforeEach(() => {
-        store = new DexieStore<CouchSyncDoc>(uniqueName("cdb"));
-        db = new ConfigLocalDB(store);
+        db = new ConfigLocalDB(uniqueName("cdb"));
+        db.open();
     });
 
     afterEach(async () => {
-        await store.destroy().catch(() => {});
+        await db.destroy().catch(() => {});
     });
 
     describe("runWrite + get", () => {
@@ -122,7 +120,7 @@ describe("ConfigLocalDB", () => {
             await put(db, makeConfig(".obsidian/x.json"));
             await put(db, makeConfig(".obsidian/y.json"));
             // Insert an off-prefix doc directly via the underlying store.
-            await store.runWriteTx({
+            await db.runWriteTx({
                 docs: [{
                     doc: {
                         _id: makeFileId("intruder.md"),
@@ -176,7 +174,7 @@ describe("ConfigLocalDB", () => {
 
         it("returns the id of a config without vclock", async () => {
             // Insert a malformed legacy doc via the underlying store.
-            await store.runWriteTx({
+            await db.runWriteTx({
                 docs: [{
                     doc: {
                         _id: makeConfigId(".obsidian/legacy.json"),
@@ -192,7 +190,7 @@ describe("ConfigLocalDB", () => {
         });
 
         it("returns the id of a non-config doc accidentally living here", async () => {
-            await store.runWriteTx({
+            await db.runWriteTx({
                 docs: [{
                     doc: {
                         _id: makeFileId("wrong-place.md"),

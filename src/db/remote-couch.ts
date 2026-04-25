@@ -6,6 +6,10 @@
  *
  * The helpers remain stateless — construct, call, discard. Callers own
  * the lifecycle of both the local store and the remote client.
+ *
+ * AbortSignal: every helper takes an optional `signal` that propagates
+ * into every `client.*` call. ConfigOperation uses this to cancel
+ * in-flight HTTP work when the user cancels or session is disposed.
  */
 
 import type { ICouchClient, IDocStore } from "./interfaces.ts";
@@ -24,6 +28,7 @@ export async function pushDocs(
     remote: ICouchClient,
     docIds: string[],
     onProgress?: ProgressCallback,
+    signal?: AbortSignal,
 ): Promise<number> {
     if (docIds.length === 0) return 0;
 
@@ -44,7 +49,7 @@ export async function pushDocs(
     // Fetch current remote revisions so we can include _rev for updates.
     const remoteResult = await remote.allDocs<CouchSyncDoc>({
         keys: docs.map((d) => d._id),
-    });
+    }, signal);
     const remoteRevMap = new Map<string, string>();
     for (const row of remoteResult.rows) {
         if (row.value?.rev && !row.value?.deleted) {
@@ -56,7 +61,7 @@ export async function pushDocs(
         if (remoteRev) doc._rev = remoteRev;
     }
 
-    const results = await remote.bulkDocs(docs);
+    const results = await remote.bulkDocs(docs, signal);
     let total = 0;
     for (const res of results) {
         if (res.ok) {
@@ -77,10 +82,11 @@ export async function pullDocs(
     remote: ICouchClient,
     docIds: string[],
     onProgress?: ProgressCallback,
+    signal?: AbortSignal,
 ): Promise<number> {
     if (docIds.length === 0) return 0;
 
-    const fetched = await remote.bulkGet<CouchSyncDoc>(docIds);
+    const fetched = await remote.bulkGet<CouchSyncDoc>(docIds, signal);
     if (fetched.length === 0) return 0;
 
     const localDocs = fetched.map((d) => stripRev(d) as CouchSyncDoc);
@@ -107,12 +113,13 @@ export async function deleteRemoteDocs(
     remote: ICouchClient,
     docIds: string[],
     onProgress?: ProgressCallback,
+    signal?: AbortSignal,
 ): Promise<number> {
     if (docIds.length === 0) return 0;
 
     const remoteResult = await remote.allDocs<CouchSyncDoc>({
         keys: docIds,
-    });
+    }, signal);
     const tombstones: Array<{ _id: string; _rev: string; _deleted: true }> = [];
     for (const row of remoteResult.rows) {
         const rev = row.value?.rev;
@@ -122,7 +129,7 @@ export async function deleteRemoteDocs(
     }
     if (tombstones.length === 0) return 0;
 
-    const results = await remote.bulkDocs(tombstones);
+    const results = await remote.bulkDocs(tombstones, signal);
     let total = 0;
     for (const res of results) {
         if (res.ok) {
@@ -142,12 +149,13 @@ export async function pullByPrefix(
     local: IDocStore<CouchSyncDoc>,
     remote: ICouchClient,
     prefix: string,
+    signal?: AbortSignal,
 ): Promise<number> {
     const remoteResult = await remote.allDocs<CouchSyncDoc>({
         startkey: prefix,
         endkey: prefix + "\ufff0",
         include_docs: true,
-    });
+    }, signal);
 
     const docs: CouchSyncDoc[] = [];
     for (const row of remoteResult.rows) {
@@ -174,11 +182,12 @@ export async function pullByPrefix(
 export async function listRemoteByPrefix(
     remote: ICouchClient,
     prefix: string,
+    signal?: AbortSignal,
 ): Promise<string[]> {
     const result = await remote.allDocs<CouchSyncDoc>({
         startkey: prefix,
         endkey: prefix + "\ufff0",
-    });
+    }, signal);
     return result.rows
         .filter((row) => !row.value?.deleted)
         .map((row) => row.id);
@@ -187,9 +196,10 @@ export async function listRemoteByPrefix(
 /** Destroy the remote database. Tolerates 404 (DB already gone). */
 export async function destroyRemote(
     remote: ICouchClient,
+    signal?: AbortSignal,
 ): Promise<void> {
     try {
-        await remote.destroy();
+        await remote.destroy(signal);
     } catch (e: any) {
         if (e?.status === 404) return;
         throw e;
@@ -204,6 +214,7 @@ export async function pushAll(
     local: IDocStore<CouchSyncDoc>,
     remote: ICouchClient,
     onProgress?: ProgressCallback,
+    signal?: AbortSignal,
 ): Promise<number> {
     const result = await local.allDocs({ include_docs: true });
     const docs: Array<CouchSyncDoc & { _rev?: string }> = [];
@@ -217,7 +228,7 @@ export async function pushAll(
     // Fetch current remote revisions for existing docs.
     const remoteResult = await remote.allDocs<CouchSyncDoc>({
         keys: docs.map((d) => d._id),
-    });
+    }, signal);
     const remoteRevMap = new Map<string, string>();
     for (const row of remoteResult.rows) {
         if (row.value?.rev && !row.value?.deleted) {
@@ -229,7 +240,7 @@ export async function pushAll(
         if (remoteRev) doc._rev = remoteRev;
     }
 
-    const results = await remote.bulkDocs(docs);
+    const results = await remote.bulkDocs(docs, signal);
     let total = 0;
     for (const res of results) {
         if (res.ok) {
@@ -249,10 +260,11 @@ export async function pullAll(
     local: IDocStore<CouchSyncDoc>,
     remote: ICouchClient,
     onProgress?: ProgressCallback,
+    signal?: AbortSignal,
 ): Promise<{ written: number; docs: CouchSyncDoc[] }> {
     const remoteResult = await remote.allDocs<CouchSyncDoc>({
         include_docs: true,
-    });
+    }, signal);
 
     const docs: CouchSyncDoc[] = [];
     for (const row of remoteResult.rows) {

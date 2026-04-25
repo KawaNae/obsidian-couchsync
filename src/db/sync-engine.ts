@@ -258,6 +258,13 @@ export class SyncEngine {
         return this.lastErrorDetail;
     }
 
+    /** Expose the VisibilityGate so ConfigSync can share gating with the
+     *  live sync loops. Both must agree on hidden/visible to avoid
+     *  hidden-time fetch failures and dead-tx symptoms on iOS. */
+    getVisibilityGate(): VisibilityGate {
+        return this.visibility;
+    }
+
     // ── Public API: Lifecycle ─────────────────────────────
 
     /**
@@ -786,13 +793,14 @@ export class SyncEngine {
  */
 function reasonPriority(reason: ReconnectReason): number {
     switch (reason) {
-        case "manual":         return 5;
-        case "app-resume":     return 4;
-        case "app-foreground": return 3;
-        case "network-online": return 3;
-        case "stalled":        return 2;
-        case "retry-backoff":  return 1;
-        case "periodic-tick":  return 0;
-        default:               return 0;
+        case "manual":          return 5;
+        case "app-resume":      return 4;
+        case "app-foreground":  return 3;
+        case "network-online":  return 3;
+        case "stalled":         return 2;
+        case "config-failure":  return 2;
+        case "retry-backoff":   return 1;
+        case "periodic-tick":   return 0;
+        default:                return 0;
     }
 }

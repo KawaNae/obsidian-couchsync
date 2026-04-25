@@ -10,8 +10,9 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import "fake-indexeddb/auto";
 import { ConfigSync } from "../src/sync/config-sync.ts";
 import { ConfigLocalDB } from "../src/db/config-local-db.ts";
-import { DexieStore } from "../src/db/dexie-store.ts";
 import { AuthGate } from "../src/db/sync/auth-gate.ts";
+import { ALWAYS_VISIBLE } from "../src/db/visibility-gate.ts";
+import { NoopReconnectBridge } from "../src/sync/reconnect-bridge.ts";
 import { FakeVaultIO } from "./helpers/fake-vault-io.ts";
 import { FakeModalPresenter } from "./helpers/fake-modal-presenter.ts";
 import { makeSettings } from "./helpers/settings-factory.ts";
@@ -30,7 +31,6 @@ function b64(s: string): string {
 describe("ConfigSync", () => {
     let vault: FakeVaultIO;
     let modal: FakeModalPresenter;
-    let store: DexieStore<CouchSyncDoc>;
     let db: ConfigLocalDB;
     let auth: AuthGate;
     let settings: ReturnType<typeof makeSettings>;
@@ -39,15 +39,15 @@ describe("ConfigSync", () => {
     beforeEach(() => {
         vault = new FakeVaultIO();
         modal = new FakeModalPresenter();
-        store = new DexieStore<CouchSyncDoc>(uniqueName());
-        db = new ConfigLocalDB(store);
+        db = new ConfigLocalDB(uniqueName());
+        db.open();
         auth = new AuthGate();
         settings = makeSettings({ deviceId: "dev-A" });
-        cs = new ConfigSync(vault, modal, db, auth, () => settings);
+        cs = new ConfigSync(vault, modal, db, auth, ALWAYS_VISIBLE, NoopReconnectBridge, () => settings);
     });
 
     afterEach(async () => {
-        await store.destroy().catch(() => {});
+        await db.destroy().catch(() => {});
     });
 
     // ── Configuration gates ──────────────────────────────
@@ -64,13 +64,13 @@ describe("ConfigSync", () => {
         });
 
         it("isConfigured: false when configDb is null", () => {
-            const nullDb = new ConfigSync(vault, modal, null, auth, () => settings);
+            const nullDb = new ConfigSync(vault, modal, null, auth, ALWAYS_VISIBLE, NoopReconnectBridge, () => settings);
             settings.couchdbConfigDbName = "vault-config";
             expect(nullDb.isConfigured()).toBe(false);
         });
 
         it("scan throws when configDb is null", async () => {
-            const nullDb = new ConfigSync(vault, modal, null, auth, () => settings);
+            const nullDb = new ConfigSync(vault, modal, null, auth, ALWAYS_VISIBLE, NoopReconnectBridge, () => settings);
             await expect(nullDb.scan()).rejects.toThrow(/no local config DB/);
         });
 

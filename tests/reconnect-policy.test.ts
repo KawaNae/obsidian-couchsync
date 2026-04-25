@@ -77,6 +77,15 @@ const cases: PolicyCase[] = [
     { state: "error",        reason: "periodic-tick",  authError: false, coolDownActive: false, expected: "verify-then-restart", note: "blind tick in error — verify first, server may still be down" },
     { state: "error",        reason: "stalled",        authError: false, coolDownActive: false, expected: "restart-now",         note: "stalled-while-error: strong hint to retry (shouldn't normally happen)" },
 
+    // ── config-failure: ConfigSync transient error ───────────────
+    { state: "syncing",      reason: "config-failure", authError: false, coolDownActive: false, expected: "skip",                note: "vault sync is fine — don't restart for a config DB hiccup" },
+    { state: "connected",    reason: "config-failure", authError: false, coolDownActive: false, expected: "skip",                note: "same: healthy vault should not be torn down for config-only failure" },
+    { state: "disconnected", reason: "config-failure", authError: false, coolDownActive: false, expected: "verify-then-restart", note: "vault dead too — config failure is the same network blip; verify and recover together" },
+    { state: "error",        reason: "config-failure", authError: false, coolDownActive: false, expected: "verify-then-restart", note: "vault errored — piggyback on the config-failure signal to retry verifying" },
+    { state: "reconnecting", reason: "config-failure", authError: false, coolDownActive: false, expected: "verify-then-restart", note: "already reconnecting — config-failure adds another verify, harmless" },
+    { state: "syncing",      reason: "config-failure", authError: true,  coolDownActive: false, expected: "skip",                note: "auth latch beats config-failure — bad creds are bad creds" },
+    { state: "disconnected", reason: "config-failure", authError: false, coolDownActive: true,  expected: "skip",                note: "cool-down beats config-failure" },
+
     // ── retry-backoff: dedicated hard-error recovery ticks ────────
     { state: "error",        reason: "retry-backoff",  authError: false, coolDownActive: false, expected: "verify-then-restart", note: "backoff tick — verify first, don't blindly reconnect to a down server" },
     { state: "error",        reason: "retry-backoff",  authError: false, coolDownActive: true,  expected: "verify-then-restart", note: "backoff bypasses 5s cool-down — the backoff schedule IS the cadence control" },
@@ -113,6 +122,7 @@ describe("decideReconnect — invariants", () => {
             "periodic-tick",
             "stalled",
             "manual",
+            "config-failure",
             "retry-backoff",
         ];
         const states: SyncState[] = ["disconnected", "connected", "syncing", "reconnecting", "error"];
@@ -132,6 +142,7 @@ describe("decideReconnect — invariants", () => {
             "periodic-tick",
             "stalled",
             "manual",
+            "config-failure",
         ];
         const states: SyncState[] = ["disconnected", "connected", "syncing", "reconnecting", "error"];
         for (const state of states) {

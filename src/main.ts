@@ -2,12 +2,12 @@ import { Notice, Platform, Plugin } from "obsidian";
 import { type CouchSyncSettings, DEFAULT_SETTINGS } from "./settings.ts";
 import { LocalDB } from "./db/local-db.ts";
 import { ConfigLocalDB } from "./db/config-local-db.ts";
-import { DexieStore } from "./db/dexie-store.ts";
 import { SyncEngine } from "./db/sync-engine.ts";
 import { AuthGate } from "./db/sync/auth-gate.ts";
 import { VaultRemoteOps } from "./db/sync/vault-remote-ops.ts";
 import { VaultSync } from "./sync/vault-sync.ts";
 import { ConfigSync } from "./sync/config-sync.ts";
+import type { ReconnectBridge } from "./sync/reconnect-bridge.ts";
 import { SetupService } from "./sync/setup.ts";
 import { ChangeTracker } from "./sync/change-tracker.ts";
 import { Reconciler, type ReconcileReason } from "./sync/reconciler.ts";
@@ -86,9 +86,8 @@ export default class CouchSyncPlugin extends Plugin {
         if (this.settings.couchdbConfigDbName) {
             const configLocalName =
                 `couchsync-${vaultName}-config-${this.settings.couchdbConfigDbName}`;
-            this.configLocalDb = new ConfigLocalDB(
-                new DexieStore(configLocalName),
-            );
+            this.configLocalDb = new ConfigLocalDB(configLocalName);
+            this.configLocalDb.open();
         }
 
         initLog(
@@ -109,7 +108,26 @@ export default class CouchSyncPlugin extends Plugin {
         this.vaultSync = new VaultSync(vaultIO, this.localDb, () => this.settings, this.historyCapture);
         this.changeTracker = new ChangeTracker(vaultEvents, this.vaultSync, () => this.settings);
         this.vaultSync.setWriteIgnore(this.changeTracker);
-        this.configSync = new ConfigSync(adapterIO, modalPresenter, this.configLocalDb, this.auth, () => this.settings);
+        const reconnectBridge: ReconnectBridge = {
+            notifyTransient: () => {
+                // Fire-and-forget: ConfigSync surfaces the original error to
+                // the user via ProgressNotice/log; this only nudges the
+                // vault session to verify reachability if it itself is
+                // unhealthy. decideReconnect skips when vault is healthy.
+                this.replicator.requestReconnect("config-failure").catch((e: any) =>
+                    logError(`CouchSync: config-failure reconnect failed: ${e?.message ?? e}`),
+                );
+            },
+        };
+        this.configSync = new ConfigSync(
+            adapterIO,
+            modalPresenter,
+            this.configLocalDb,
+            this.auth,
+            this.replicator.getVisibilityGate(),
+            reconnectBridge,
+            () => this.settings,
+        );
         this.statusBar = new StatusBar(
             this,
             () => this.settings,

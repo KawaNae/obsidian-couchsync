@@ -2,6 +2,7 @@ import type { IVaultIO } from "../types/vault-io.ts";
 import type { IModalPresenter } from "../types/modal-presenter.ts";
 import type { ConfigLocalDB } from "../db/config-local-db.ts";
 import type { AuthGate } from "../db/sync/auth-gate.ts";
+import type { VisibilityGate } from "../db/visibility-gate.ts";
 import type { ConfigDoc, CouchSyncDoc } from "../types.ts";
 import {
     DOC_ID,
@@ -21,6 +22,12 @@ import {
     dangerousForPull,
     type Divergence,
 } from "./config-divergence.ts";
+import {
+    ConfigOperation,
+    CONFIG_TIMEOUTS,
+    type ConfigOpContext,
+} from "./config-operation.ts";
+import type { ReconnectBridge } from "./reconnect-bridge.ts";
 
 /**
  * ConfigSync — scan-based replication of `.obsidian/` configuration files
@@ -36,11 +43,14 @@ import {
  *   - Local storage: `ConfigLocalDB` (Dexie-backed IndexedDB store)
  *   - Remote storage: `settings.couchdbConfigDbName` on the same CouchDB
  *     server as the vault DB (auth shared via a common `AuthGate`)
- *   - Replication: one-shot push/pull/list via `remote-couch` helpers,
- *     never live-sync (manual init/push/pull from the settings UI)
+ *   - Replication: every public op runs inside a `ConfigOperation` epoch
+ *     that owns an AbortController, runs a 15s reachability probe, and
+ *     waits for visibility=visible before fetching. Vault sync's session
+ *     lifecycle disciplines the live loops; ConfigOperation is the same
+ *     discipline for one-shot user-triggered ops.
  *   - Ordering: every write increments the device's `vclock` counter,
  *     same VC discipline as FileDoc — concurrent edits are detected
- *     and surfaced rather than silently LWW-merged
+ *     and surfaced rather than silently LWW-merged.
  */
 export class ConfigSync {
     private static readonly SKIP_DIRS = new Set(["node_modules", ".git"]);
@@ -51,11 +61,16 @@ export class ConfigSync {
     ]);
     private static readonly MAX_CONFIG_SIZE = 5 * 1024 * 1024; // 5MB
 
+    /** In-flight op, or null. Concurrent ops are rejected. */
+    private inflight: ConfigOperation | null = null;
+
     constructor(
         private vault: IVaultIO,
         private modal: IModalPresenter,
         private configDb: ConfigLocalDB | null,
         private auth: AuthGate,
+        private visibility: VisibilityGate,
+        private reconnectBridge: ReconnectBridge,
         private getSettings: () => CouchSyncSettings,
     ) {}
 
@@ -77,57 +92,61 @@ export class ConfigSync {
         );
     }
 
+    // ── Operation runner ───────────────────────────────
+
     /**
-     * Build a CouchClient, run the caller's operation, then return.
-     * Centralises auth-latch checks so every remote call honours the
-     * shared latch.
-     *
-     * Throws "Config sync not configured" if the config DB name is empty.
-     * Latches the shared auth state on 401/403.
+     * Run a config operation inside a ConfigOperation epoch and a
+     * ProgressNotice. Rejects if another op is already in flight —
+     * the settings tab disables buttons during in-flight ops.
      */
-    private async withConfigRemote<T>(
-        op: (client: CouchClient) => Promise<T>,
+    private async runOperation<T>(
+        label: string,
+        body: (ctx: ConfigOpContext, progress: ProgressNotice) => Promise<T>,
     ): Promise<T> {
-        const client = this.makeConfigClient();
-        if (client === null) {
-            throw new Error("Config sync not configured (couchdbConfigDbName is empty)");
+        if (this.inflight !== null) {
+            throw new Error(
+                `Another config operation is already in progress. ` +
+                `Wait for it to finish or cancel it first.`,
+            );
         }
-        if (this.auth.isBlocked()) {
-            throw new Error("Auth blocked — fix credentials in Vault Sync first");
-        }
+        const op = new ConfigOperation({
+            auth: this.auth,
+            visibility: this.visibility,
+            reconnectBridge: this.reconnectBridge,
+            makeClient: () => this.makeConfigClient(),
+        });
+        this.inflight = op;
+        const progress = new ProgressNotice(label);
         try {
-            return await op(client);
+            return await op.run((ctx) => body(ctx, progress));
         } catch (e: any) {
-            if (e?.status === 401 || e?.status === 403) {
-                this.auth.raise(e.status, e?.message);
+            if (e?.name === "AbortError") {
+                progress.fail(`${label} cancelled`);
+            } else {
+                progress.fail(`${label} failed: ${e?.message ?? e}`);
             }
             throw e;
+        } finally {
+            this.inflight = null;
         }
+    }
+
+    /** Cancel the in-flight op (if any). Idempotent / noop when idle. */
+    cancelCurrent(): void {
+        this.inflight?.cancel();
+    }
+
+    /** True iff an op is currently running. UI uses this to disable buttons. */
+    isInflight(): boolean {
+        return this.inflight !== null;
     }
 
     // ── High-level operations ──────────────────────────
 
-    /**
-     * Run a config-sync operation with ProgressNotice lifecycle:
-     * update() during work, done() on success, fail() + rethrow on error.
-     */
-    private async withProgress<T>(
-        label: string,
-        op: (progress: ProgressNotice) => Promise<T>,
-    ): Promise<T> {
-        const progress = new ProgressNotice(label);
-        try {
-            return await op(progress);
-        } catch (e: any) {
-            progress.fail(`${label} failed: ${e?.message ?? e}`);
-            throw e;
-        }
-    }
-
     /** Init: delete all local config docs → scan .obsidian/ → push to remote */
     async init(): Promise<number> {
         const db = this.requireConfigDb();
-        return this.withProgress("Config Init", async (progress) => {
+        return this.runOperation("Config Init", async (ctx, progress) => {
             progress.update("Deleting old config docs...");
             const deletedIds = await db.deleteByPrefix(DOC_ID.CONFIG);
 
@@ -139,15 +158,14 @@ export class ConfigSync {
             const affectedIds = [...new Set([...deletedIds, ...currentIds])];
 
             if (affectedIds.length > 0) {
-                await this.withConfigRemote((client) =>
-                    remoteCouch.pushDocs(
-                        db,
-                        client,
-                        affectedIds,
-                        (docId, n) => {
-                            progress.update(`Pushing: ${configPathFromId(docId)} (${n}/${affectedIds.length})`);
-                        },
-                    ),
+                await remoteCouch.pushDocs(
+                    db,
+                    ctx.client,
+                    affectedIds,
+                    (docId, n) => {
+                        progress.update(`Pushing: ${configPathFromId(docId)} (${n}/${affectedIds.length})`);
+                    },
+                    ctx.signal,
                 );
             }
 
@@ -159,7 +177,7 @@ export class ConfigSync {
     /** Push: scan .obsidian/ → divergence check → push config docs to remote */
     async push(): Promise<number> {
         const db = this.requireConfigDb();
-        return this.withProgress("Config Push", async (progress) => {
+        return this.runOperation("Config Push", async (ctx, progress) => {
             const scanned = await this.scan((path, i, total) => {
                 progress.update(`Scanning: ${path} (${i}/${total})`);
             });
@@ -175,24 +193,21 @@ export class ConfigSync {
             // surfaced" guarantee the class docstring promises.
             progress.update("Checking remote for concurrent edits...");
             const localIds = localDocs.map((d) => d._id);
-            const remoteDocs = await this.withConfigRemote((client) =>
-                this.fetchRemoteConfigDocs(client, localIds),
-            );
+            const remoteDocs = await this.fetchRemoteConfigDocs(ctx.client, ctx.signal, localIds);
             const dangerous = dangerousForPush(detectDivergence(localDocs, remoteDocs));
             if (dangerous.length > 0) {
                 const ok = await this.confirmDivergence(dangerous, "push");
                 if (!ok) throw new Error("Cancelled by user (concurrent edits detected)");
             }
 
-            await this.withConfigRemote((client) =>
-                remoteCouch.pushDocs(
-                    db,
-                    client,
-                    localIds,
-                    (docId, n) => {
-                        progress.update(`Pushing: ${configPathFromId(docId)} (${n}/${localIds.length})`);
-                    },
-                ),
+            await remoteCouch.pushDocs(
+                db,
+                ctx.client,
+                localIds,
+                (docId, n) => {
+                    progress.update(`Pushing: ${configPathFromId(docId)} (${n}/${localIds.length})`);
+                },
+                ctx.signal,
             );
 
             progress.done(`Pushed ${scanned} config file(s).`);
@@ -203,14 +218,12 @@ export class ConfigSync {
     /** Pull: divergence check → pull config docs from remote → write configSyncPaths to filesystem */
     async pull(): Promise<number> {
         const db = this.requireConfigDb();
-        return this.withProgress("Config Pull", async (progress) => {
+        return this.runOperation("Config Pull", async (ctx, progress) => {
             // Divergence check: fetch what we'd be overwriting and compare
             // vclocks before pullByPrefix unconditionally clobbers local.
             progress.update("Checking local for concurrent edits...");
             const localDocs = await db.allConfigDocs();
-            const remoteDocs = await this.withConfigRemote((client) =>
-                this.fetchRemoteConfigDocs(client),
-            );
+            const remoteDocs = await this.fetchRemoteConfigDocs(ctx.client, ctx.signal);
             const dangerous = dangerousForPull(detectDivergence(localDocs, remoteDocs));
             if (dangerous.length > 0) {
                 const ok = await this.confirmDivergence(dangerous, "pull");
@@ -218,9 +231,7 @@ export class ConfigSync {
             }
 
             progress.update("Pulling config from remote...");
-            await this.withConfigRemote((client) =>
-                remoteCouch.pullByPrefix(db, client, DOC_ID.CONFIG),
-            );
+            await remoteCouch.pullByPrefix(db, ctx.client, DOC_ID.CONFIG, ctx.signal);
 
             const written = await this.write((path, i, total) => {
                 progress.update(`Writing: ${path} (${i}/${total})`);
@@ -238,12 +249,13 @@ export class ConfigSync {
      */
     private async fetchRemoteConfigDocs(
         client: CouchClient,
+        signal: AbortSignal,
         ids?: string[],
     ): Promise<ConfigDoc[]> {
         const opts = ids
             ? { keys: ids, include_docs: true }
             : { startkey: DOC_ID.CONFIG, endkey: DOC_ID.CONFIG + "\ufff0", include_docs: true };
-        const result = await client.allDocs<ConfigDoc>(opts);
+        const result = await client.allDocs<ConfigDoc>(opts, signal);
         const docs: ConfigDoc[] = [];
         for (const row of result.rows) {
             if (row.doc && !row.value?.deleted && row.doc.type === "config") {
@@ -402,10 +414,10 @@ export class ConfigSync {
 
     /** List config file paths available on remote */
     async listRemotePaths(): Promise<string[]> {
-        const docIds = await this.withConfigRemote((client) =>
-            remoteCouch.listRemoteByPrefix(client, DOC_ID.CONFIG),
-        );
-        return docIds.map(configPathFromId);
+        return this.runOperation("Config List Remote", async (ctx) => {
+            const docIds = await remoteCouch.listRemoteByPrefix(ctx.client, DOC_ID.CONFIG, ctx.signal);
+            return docIds.map(configPathFromId);
+        });
     }
 
     /** List installed plugin folder paths (fallback when remote unavailable) */
@@ -438,12 +450,15 @@ export class ConfigSync {
      * success, or an error message string. 401/403 latches the shared
      * auth state. 404 means the DB doesn't exist yet — that's not a
      * failure (Config Init will auto-create it on first push).
+     *
+     * Uses a short reachability timeout (15s) so the user doesn't wait
+     * 30s on the Test button when the iPad has flaky network.
      */
     async testConnection(): Promise<string | null> {
         const client = this.makeConfigClient();
         if (client === null) return "Config sync is not configured";
         try {
-            await client.info();
+            await client.withTimeout(CONFIG_TIMEOUTS.reachability).info();
             return null;
         } catch (e: any) {
             if (e?.status === 404) return null; // DB will be created on first push

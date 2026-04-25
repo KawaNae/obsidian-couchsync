@@ -49,6 +49,10 @@ export interface SyncErrorDetail {
  *   - "manual":         user-triggered (Command Palette / Maintenance button)
  *   - "app-resume":     long background or mobile foreground — the sync
  *                        socket may have been silently killed by the OS
+ *   - "config-failure": ConfigSync observed a transient (network/timeout/5xx)
+ *                        error. If the vault session is healthy this is
+ *                        skipped (the vault is fine, only config DB hiccup);
+ *                        if unhealthy, verify the server and restart.
  */
 export type ReconnectReason =
     | "network-online"
@@ -57,6 +61,7 @@ export type ReconnectReason =
     | "periodic-tick"
     | "stalled"
     | "manual"
+    | "config-failure"
     /** Dedicated backoff retry tick from the hard-error recovery timer.
      *  Bypasses the 5s cool-down because the backoff schedule itself
      *  controls cadence — the cool-down would block the fast first
@@ -107,6 +112,15 @@ export function decideReconnect(input: ReconnectInput): ReconnectDecision {
     // been silently killed. Verify reachability regardless of current
     // state, because the state itself may be stale.
     if (input.reason === "app-resume") return "verify-then-restart";
+
+    // Config Sync observed a transient error. Don't restart a healthy
+    // vault session for a config DB hiccup — only verify-then-restart
+    // when the vault session is itself unhealthy (then both can recover
+    // through the same path).
+    if (input.reason === "config-failure") {
+        if (input.state === "connected" || input.state === "syncing") return "skip";
+        return "verify-then-restart";
+    }
 
     switch (input.state) {
         case "syncing":
