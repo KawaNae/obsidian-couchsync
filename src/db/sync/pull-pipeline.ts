@@ -26,7 +26,11 @@ import type { Checkpoints } from "./checkpoints.ts";
 import { classifyError } from "./errors.ts";
 import type { VisibilityGate } from "../visibility-gate.ts";
 
-const CATCHUP_BATCH_SIZE = 200;
+// Lowered from 200 in v0.20.6: 200-row `_changes?include_docs=true`
+// payloads can exceed the 30s wall-clock timeout on flaky mobile
+// networks (Android iPad observed in production). 100 is the safe
+// floor that keeps catchup progressing even on borderline LTE.
+const CATCHUP_BATCH_SIZE = 100;
 const CATCHUP_IDLE_TIMEOUT_MS = 60_000;
 const PULL_RETRY_MIN_MS = 2_000;
 const PULL_RETRY_MAX_MS = 30_000;

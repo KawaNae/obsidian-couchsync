@@ -27,6 +27,7 @@ import {
     CONFIG_TIMEOUTS,
     type ConfigOpContext,
 } from "./config-operation.ts";
+import { paginateAllDocs } from "../db/sync/pagination.ts";
 import type { ReconnectBridge } from "./reconnect-bridge.ts";
 
 /**
@@ -52,6 +53,16 @@ import type { ReconnectBridge } from "./reconnect-bridge.ts";
  *     same VC discipline as FileDoc — concurrent edits are detected
  *     and surfaced rather than silently LWW-merged.
  */
+function defaultClientFactory(settings: CouchSyncSettings): CouchClient | null {
+    if (!settings.couchdbConfigDbName) return null;
+    return makeCouchClient(
+        settings.couchdbUri,
+        settings.couchdbConfigDbName,
+        settings.couchdbUser,
+        settings.couchdbPassword,
+    );
+}
+
 export class ConfigSync {
     private static readonly SKIP_DIRS = new Set(["node_modules", ".git"]);
     private static readonly SKIP_FILES = new Set(["workspace.json", "workspace-mobile.json"]);
@@ -64,6 +75,14 @@ export class ConfigSync {
     /** In-flight op, or null. Concurrent ops are rejected. */
     private inflight: ConfigOperation | null = null;
 
+    /**
+     * Optional override for client construction. Tests inject a fake
+     * here to exercise init/push/pull end-to-end without standing up
+     * a real CouchDB. Production code never sets this, so the default
+     * `makeCouchClient` factory is used.
+     */
+    private readonly clientFactory: (settings: CouchSyncSettings) => CouchClient | null;
+
     constructor(
         private vault: IVaultIO,
         private modal: IModalPresenter,
@@ -72,7 +91,10 @@ export class ConfigSync {
         private visibility: VisibilityGate,
         private reconnectBridge: ReconnectBridge,
         private getSettings: () => CouchSyncSettings,
-    ) {}
+        clientFactory?: (settings: CouchSyncSettings) => CouchClient | null,
+    ) {
+        this.clientFactory = clientFactory ?? defaultClientFactory;
+    }
 
     // ── Remote URL + auth helpers ──────────────────────
 
@@ -82,14 +104,7 @@ export class ConfigSync {
      * sync is not configured.
      */
     private makeConfigClient(): CouchClient | null {
-        const settings = this.getSettings();
-        if (!settings.couchdbConfigDbName) return null;
-        return makeCouchClient(
-            settings.couchdbUri,
-            settings.couchdbConfigDbName,
-            settings.couchdbUser,
-            settings.couchdbPassword,
-        );
+        return this.clientFactory(this.getSettings());
     }
 
     // ── Operation runner ───────────────────────────────
@@ -143,33 +158,71 @@ export class ConfigSync {
 
     // ── High-level operations ──────────────────────────
 
-    /** Init: delete all local config docs → scan .obsidian/ → push to remote */
+    /**
+     * Init: wipe local + remote, then re-seed both from a fresh vault scan.
+     *
+     * Semantically a "make remote match local vault as of now". The
+     * earlier implementation only scanned + pushed, which silently
+     * left stale `config:*` docs on the remote when files had been
+     * deleted from `.obsidian/` between inits. v0.20.6 explicitly
+     * tombstones the remote-only ids so init really is idempotent.
+     */
     async init(): Promise<number> {
         const db = this.requireConfigDb();
         return this.runOperation("Config Init", async (ctx, progress) => {
+            // 1. Wipe local: scan() is additive, so without this stale
+            //    docs from a previous larger scan would persist locally.
             progress.update("Deleting old config docs...");
-            const deletedIds = await db.deleteByPrefix(DOC_ID.CONFIG);
+            await db.deleteByPrefix(DOC_ID.CONFIG);
 
+            // 2. Scan vault to populate local DB with current truth.
             const scanned = await this.scan((path, i, total) => {
                 progress.update(`Scanning: ${path} (${i}/${total})`);
             });
+            const localIds = await this.allDocIds();
+            const localSet = new Set(localIds);
 
-            const currentIds = await this.allDocIds();
-            const affectedIds = [...new Set([...deletedIds, ...currentIds])];
+            // 3. Fetch remote inventory (ids only, paginated). Anything
+            //    on remote not in local-after-scan needs a tombstone so
+            //    the remote view ends up matching local vault.
+            progress.update("Fetching remote inventory...");
+            const remoteIds = await remoteCouch.listRemoteByPrefix(
+                ctx.client,
+                DOC_ID.CONFIG,
+                ctx.signal,
+            );
+            const toTombstone = remoteIds.filter((id) => !localSet.has(id));
 
-            if (affectedIds.length > 0) {
-                await remoteCouch.pushDocs(
-                    db,
+            // 4. Tombstone remote-only ids.
+            if (toTombstone.length > 0) {
+                await remoteCouch.deleteRemoteDocs(
                     ctx.client,
-                    affectedIds,
+                    toTombstone,
                     (docId, n) => {
-                        progress.update(`Pushing: ${configPathFromId(docId)} (${n}/${affectedIds.length})`);
+                        progress.update(
+                            `Removing stale remote: ${configPathFromId(docId)} (${n}/${toTombstone.length})`,
+                        );
                     },
                     ctx.signal,
                 );
             }
 
-            progress.done(`Config init: deleted ${deletedIds.length}, pushed ${scanned} file(s).`);
+            // 5. Push current local docs.
+            if (localIds.length > 0) {
+                await remoteCouch.pushDocs(
+                    db,
+                    ctx.client,
+                    localIds,
+                    (docId, n) => {
+                        progress.update(`Pushing: ${configPathFromId(docId)} (${n}/${localIds.length})`);
+                    },
+                    ctx.signal,
+                );
+            }
+
+            progress.done(
+                `Config init: pushed ${scanned}, tombstoned ${toTombstone.length} stale remote doc(s).`,
+            );
             return scanned;
         });
     }
@@ -223,7 +276,14 @@ export class ConfigSync {
             // vclocks before pullByPrefix unconditionally clobbers local.
             progress.update("Checking local for concurrent edits...");
             const localDocs = await db.allConfigDocs();
-            const remoteDocs = await this.fetchRemoteConfigDocs(ctx.client, ctx.signal);
+            const remoteDocs = await this.fetchRemoteConfigDocs(
+                ctx.client,
+                ctx.signal,
+                undefined,
+                (fetched) => {
+                    progress.update(`Checking local for concurrent edits: ${fetched}...`);
+                },
+            );
             const dangerous = dangerousForPull(detectDivergence(localDocs, remoteDocs));
             if (dangerous.length > 0) {
                 const ok = await this.confirmDivergence(dangerous, "pull");
@@ -231,7 +291,15 @@ export class ConfigSync {
             }
 
             progress.update("Pulling config from remote...");
-            await remoteCouch.pullByPrefix(db, ctx.client, DOC_ID.CONFIG, ctx.signal);
+            await remoteCouch.pullByPrefix(
+                db,
+                ctx.client,
+                DOC_ID.CONFIG,
+                (fetched) => {
+                    progress.update(`Pulling config from remote: ${fetched}...`);
+                },
+                ctx.signal,
+            );
 
             const written = await this.write((path, i, total) => {
                 progress.update(`Writing: ${path} (${i}/${total})`);
@@ -244,22 +312,43 @@ export class ConfigSync {
 
     /**
      * Fetch ConfigDocs from remote: by `keys` if given, otherwise by the
-     * full `config:` prefix range. Filters out tombstones and any non-config
-     * stragglers defensively.
+     * full `config:` prefix range (paginated). Filters out tombstones and
+     * any non-config stragglers defensively.
+     *
+     * The prefix-range path is paginated so the divergence check works on
+     * slow mobile networks where the full ~1000-doc payload would exceed
+     * the 30s wall-clock budget. The `keys` path is single-shot because
+     * the caller already controls the size of the keys list.
      */
     private async fetchRemoteConfigDocs(
         client: CouchClient,
         signal: AbortSignal,
         ids?: string[],
+        onProgress?: (fetched: number) => void,
     ): Promise<ConfigDoc[]> {
-        const opts = ids
-            ? { keys: ids, include_docs: true }
-            : { startkey: DOC_ID.CONFIG, endkey: DOC_ID.CONFIG + "\ufff0", include_docs: true };
-        const result = await client.allDocs<ConfigDoc>(opts, signal);
         const docs: ConfigDoc[] = [];
-        for (const row of result.rows) {
-            if (row.doc && !row.value?.deleted && row.doc.type === "config") {
-                docs.push(row.doc);
+        if (ids) {
+            const result = await client.allDocs<ConfigDoc>({ keys: ids, include_docs: true }, signal);
+            for (const row of result.rows) {
+                if (row.doc && !row.value?.deleted && row.doc.type === "config") {
+                    docs.push(row.doc);
+                }
+            }
+            return docs;
+        }
+        for await (const rows of paginateAllDocs<ConfigDoc>(
+            client,
+            {
+                startkey: DOC_ID.CONFIG,
+                endkey: DOC_ID.CONFIG + "\ufff0",
+                include_docs: true,
+            },
+            { signal, onBatch: onProgress },
+        )) {
+            for (const row of rows) {
+                if (row.doc && !row.value?.deleted && row.doc.type === "config") {
+                    docs.push(row.doc);
+                }
             }
         }
         return docs;

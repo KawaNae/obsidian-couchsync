@@ -15,6 +15,7 @@
 import type { ICouchClient, IDocStore } from "./interfaces.ts";
 import type { CouchSyncDoc } from "../types.ts";
 import { stripRev } from "../utils/doc.ts";
+import { paginateAllDocs, DEFAULT_BATCH_SIZE } from "./sync/pagination.ts";
 
 export type ProgressCallback = (docId: string, count: number) => void;
 
@@ -144,34 +145,48 @@ export async function deleteRemoteDocs(
  * Pull every doc whose `_id` matches `prefix` from `remote` into `local`.
  * Used by ConfigSync to fetch all `config:*` docs without touching
  * file/chunk space. Returns the count of docs written locally.
+ *
+ * Paginated: fetches `DEFAULT_BATCH_SIZE` rows per request (over
+ * keyset continuation), and writes each batch to local in its own
+ * `runWriteTx`. This bounds both per-request HTTP payload size (so the
+ * 30s wall-clock timeout is survivable on slow mobile) and per-tx IDB
+ * write size (so a single dead-handle window doesn't lose the whole
+ * batch).
  */
 export async function pullByPrefix(
     local: IDocStore<CouchSyncDoc>,
     remote: ICouchClient,
     prefix: string,
+    onProgress?: (fetched: number) => void,
     signal?: AbortSignal,
 ): Promise<number> {
-    const remoteResult = await remote.allDocs<CouchSyncDoc>({
-        startkey: prefix,
-        endkey: prefix + "\ufff0",
-        include_docs: true,
-    }, signal);
-
-    const docs: CouchSyncDoc[] = [];
-    for (const row of remoteResult.rows) {
-        if (row.doc && !row.value?.deleted) {
-            docs.push(row.doc);
+    let written = 0;
+    for await (const rows of paginateAllDocs<CouchSyncDoc>(
+        remote,
+        {
+            startkey: prefix,
+            endkey: prefix + "\ufff0",
+            include_docs: true,
+        },
+        { signal, batchSize: DEFAULT_BATCH_SIZE },
+    )) {
+        const docs: CouchSyncDoc[] = [];
+        for (const row of rows) {
+            if (row.doc && !row.value?.deleted) {
+                docs.push(row.doc);
+            }
         }
+        if (docs.length === 0) continue;
+
+        // Strip remote _rev before writing to local.
+        const localDocs = docs.map((d) => stripRev(d) as CouchSyncDoc);
+        await local.runWriteTx({
+            docs: localDocs.map((doc) => ({ doc })),
+        });
+        written += localDocs.length;
+        onProgress?.(written);
     }
-    if (docs.length === 0) return 0;
-
-    // Strip remote _rev before writing to local.
-    const localDocs = docs.map((d) => stripRev(d) as CouchSyncDoc);
-
-    await local.runWriteTx({
-        docs: localDocs.map((doc) => ({ doc })),
-    });
-    return localDocs.length;
+    return written;
 }
 
 /**
@@ -184,13 +199,20 @@ export async function listRemoteByPrefix(
     prefix: string,
     signal?: AbortSignal,
 ): Promise<string[]> {
-    const result = await remote.allDocs<CouchSyncDoc>({
-        startkey: prefix,
-        endkey: prefix + "\ufff0",
-    }, signal);
-    return result.rows
-        .filter((row) => !row.value?.deleted)
-        .map((row) => row.id);
+    const ids: string[] = [];
+    for await (const rows of paginateAllDocs<CouchSyncDoc>(
+        remote,
+        {
+            startkey: prefix,
+            endkey: prefix + "\ufff0",
+        },
+        { signal, batchSize: DEFAULT_BATCH_SIZE },
+    )) {
+        for (const row of rows) {
+            if (!row.value?.deleted) ids.push(row.id);
+        }
+    }
+    return ids;
 }
 
 /** Destroy the remote database. Tolerates 404 (DB already gone). */
