@@ -246,7 +246,14 @@ export class ConfigSync {
             // surfaced" guarantee the class docstring promises.
             progress.update("Checking remote for concurrent edits...");
             const localIds = localDocs.map((d) => d._id);
-            const remoteDocs = await this.fetchRemoteConfigDocs(ctx.client, ctx.signal, localIds);
+            const remoteDocs = await this.fetchRemoteConfigDocs(
+                ctx.client,
+                ctx.signal,
+                localIds,
+                (fetched) => {
+                    progress.update(`Checking remote for concurrent edits: ${fetched}/${localIds.length}...`);
+                },
+            );
             const dangerous = dangerousForPush(detectDivergence(localDocs, remoteDocs));
             if (dangerous.length > 0) {
                 const ok = await this.confirmDivergence(dangerous, "push");
@@ -272,18 +279,26 @@ export class ConfigSync {
     async pull(): Promise<number> {
         const db = this.requireConfigDb();
         return this.runOperation("Config Pull", async (ctx, progress) => {
-            // Divergence check: fetch what we'd be overwriting and compare
-            // vclocks before pullByPrefix unconditionally clobbers local.
+            // Divergence check: fetch ONLY the remote docs that have a
+            // local counterpart, by id. Remote-only docs aren't a
+            // concurrent edit (they're new arrivals to be pulled, no
+            // conflict possible), so there's no reason to download them
+            // here — and on a 3.5 Mbps Android the difference between
+            // "fetch 81 ids" and "fetch all 1241" is whether the
+            // request fits in the body-stale window or stalls forever.
             progress.update("Checking local for concurrent edits...");
             const localDocs = await db.allConfigDocs();
-            const remoteDocs = await this.fetchRemoteConfigDocs(
-                ctx.client,
-                ctx.signal,
-                undefined,
-                (fetched) => {
-                    progress.update(`Checking local for concurrent edits: ${fetched}...`);
-                },
-            );
+            const localIds = localDocs.map((d) => d._id);
+            const remoteDocs = localIds.length > 0
+                ? await this.fetchRemoteConfigDocs(
+                    ctx.client,
+                    ctx.signal,
+                    localIds,
+                    (fetched) => {
+                        progress.update(`Checking local for concurrent edits: ${fetched}/${localIds.length}...`);
+                    },
+                )
+                : [];
             const dangerous = dangerousForPull(detectDivergence(localDocs, remoteDocs));
             if (dangerous.length > 0) {
                 const ok = await this.confirmDivergence(dangerous, "pull");
@@ -315,10 +330,9 @@ export class ConfigSync {
      * full `config:` prefix range (paginated). Filters out tombstones and
      * any non-config stragglers defensively.
      *
-     * The prefix-range path is paginated so the divergence check works on
-     * slow mobile networks where the full ~1000-doc payload would exceed
-     * the 30s wall-clock budget. The `keys` path is single-shot because
-     * the caller already controls the size of the keys list.
+     * Both paths are batched. On slow mobile networks the per-request
+     * payload of an unsplit `keys` list is exactly the same problem as
+     * the unsplit prefix range \u2014 fix it the same way.
      */
     private async fetchRemoteConfigDocs(
         client: CouchClient,
@@ -328,11 +342,20 @@ export class ConfigSync {
     ): Promise<ConfigDoc[]> {
         const docs: ConfigDoc[] = [];
         if (ids) {
-            const result = await client.allDocs<ConfigDoc>({ keys: ids, include_docs: true }, signal);
-            for (const row of result.rows) {
-                if (row.doc && !row.value?.deleted && row.doc.type === "config") {
-                    docs.push(row.doc);
+            const KEYS_BATCH = 100;
+            for (let i = 0; i < ids.length; i += KEYS_BATCH) {
+                if (signal.aborted) throw makeAbortError();
+                const batch = ids.slice(i, i + KEYS_BATCH);
+                const result = await client.allDocs<ConfigDoc>(
+                    { keys: batch, include_docs: true },
+                    signal,
+                );
+                for (const row of result.rows) {
+                    if (row.doc && !row.value?.deleted && row.doc.type === "config") {
+                        docs.push(row.doc);
+                    }
                 }
+                onProgress?.(docs.length);
             }
             return docs;
         }
@@ -587,4 +610,10 @@ export class ConfigSync {
             // skip inaccessible dirs
         }
     }
+}
+
+function makeAbortError(): Error {
+    const e: any = new Error("The operation was aborted.");
+    e.name = "AbortError";
+    return e;
 }

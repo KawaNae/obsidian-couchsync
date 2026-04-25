@@ -23,6 +23,12 @@ import type {
 /** Default per-request timeout (ms). Longpoll has its own. */
 const DEFAULT_TIMEOUT_MS = 30_000;
 
+/** Per-chunk stale threshold for streamed body reads. While bytes are
+ *  arriving, the request can take arbitrarily long; only sustained
+ *  silence aborts. Matches LONGPOLL_STALE_MS by design — same idea,
+ *  different endpoint. */
+const BODY_STALE_MS = 30_000;
+
 /** Heartbeat interval (ms) sent to CouchDB for longpoll. CouchDB sends
  *  a `\n` every heartbeat interval to keep the connection alive through
  *  HTTP/2 proxies and intermediaries. Overrides CouchDB's `timeout`. */
@@ -93,24 +99,58 @@ export class CouchClient implements ICouchClient {
 
     // ── Core HTTP helper ──────────────────────────────────
 
+    /**
+     * Per-request options. `streamed: true` switches the body read to a
+     * chunk loop with per-chunk stale-timer instead of a single
+     * wall-clock body timeout — survivable on slow mobile networks
+     * where a multi-MB JSON response can take minutes but bytes are
+     * always flowing. Used for `_all_docs`, `_changes(feed=normal)`,
+     * `_bulk_docs`, `_bulk_get` — endpoints that return potentially
+     * large JSON bodies.
+     */
     private async request<T>(
         path: string,
         init: RequestInit = {},
-        abortMs?: number,
-        externalSignal?: AbortSignal,
+        opts: {
+            abortMs?: number;
+            externalSignal?: AbortSignal;
+            streamed?: boolean;
+        } = {},
     ): Promise<T> {
+        const { abortMs, externalSignal, streamed = false } = opts;
+
         // Short-circuit: if caller's signal is already aborted we never
         // touch the network — matches how native fetch() behaves.
         if (externalSignal?.aborted) throw makeAbortError();
 
         const url = `${this.baseUrl}${path}`;
         const controller = new AbortController();
-        const timeout = abortMs ?? this.timeoutMs;
-        const timer = setTimeout(() => controller.abort(), timeout);
-        // Track *why* the internal controller aborted so we can decide
-        // between "external-cancel" (propagate AbortError) and "internal-
-        // timeout" (throw timeout error).
+        const headerTimeout = abortMs ?? this.timeoutMs;
+
+        // Three reasons the internal controller might abort, in priority
+        // order: external cancel > stale-body > header/wall-clock timeout.
+        // We track which one fired so the rejection maps cleanly back to
+        // the right caller-visible outcome.
         let externalAborted = false;
+        let staleFired = false;
+
+        // Phase 1: header-arrival timer. Fires if `fetch()` itself never
+        // resolves (server unreachable, TLS handshake stuck, ...).
+        let headerTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
+            controller.abort();
+        }, headerTimeout);
+
+        // Phase 2 (streamed only): per-chunk stale timer. Reset each time
+        // a chunk arrives, fires only after BODY_STALE_MS of total silence.
+        let staleTimer: ReturnType<typeof setTimeout> | null = null;
+        const armStaleTimer = () => {
+            if (staleTimer) clearTimeout(staleTimer);
+            staleTimer = setTimeout(() => {
+                staleFired = true;
+                controller.abort();
+            }, BODY_STALE_MS);
+        };
+
         const onExternalAbort = () => {
             externalAborted = true;
             controller.abort();
@@ -124,6 +164,9 @@ export class CouchClient implements ICouchClient {
                 signal: controller.signal,
             });
 
+            // Headers arrived; the wall-clock header timer's job is done.
+            if (headerTimer) { clearTimeout(headerTimer); headerTimer = null; }
+
             if (!res.ok) {
                 const body = await res.text().catch(() => "");
                 const err: any = new Error(
@@ -133,17 +176,62 @@ export class CouchClient implements ICouchClient {
                 throw err;
             }
 
-            return (await res.json()) as T;
+            if (!streamed) {
+                // Non-streamed path: re-arm a single body timeout so an
+                // unresponsive body read still aborts. Preserves the old
+                // wall-clock semantics for endpoints we know are small.
+                const bodyTimer = setTimeout(() => controller.abort(), headerTimeout);
+                try {
+                    return (await res.json()) as T;
+                } finally {
+                    clearTimeout(bodyTimer);
+                }
+            }
+
+            // Streamed path: read body chunk-by-chunk, resetting the
+            // stale-timer each chunk. As long as bytes are arriving the
+            // request can take indefinitely long. Total silence for
+            // BODY_STALE_MS is what aborts.
+            const reader = res.body!.getReader();
+            const chunks: Uint8Array[] = [];
+            let totalLen = 0;
+
+            armStaleTimer();
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                chunks.push(value);
+                totalLen += value.length;
+                armStaleTimer();
+            }
+            if (staleTimer) { clearTimeout(staleTimer); staleTimer = null; }
+
+            const merged = new Uint8Array(totalLen);
+            let offset = 0;
+            for (const chunk of chunks) {
+                merged.set(chunk, offset);
+                offset += chunk.length;
+            }
+            const text = new TextDecoder().decode(merged);
+            return JSON.parse(text) as T;
         } catch (e: any) {
             if (e?.name === "AbortError") {
                 if (externalAborted) throw makeAbortError();
-                const err: any = new Error(`CouchDB request timed out after ${timeout}ms`);
+                if (staleFired) {
+                    const err: any = new Error(
+                        `CouchDB body stale (no data for ${BODY_STALE_MS}ms)`,
+                    );
+                    err.status = 0;
+                    throw err;
+                }
+                const err: any = new Error(`CouchDB request timed out after ${headerTimeout}ms`);
                 err.status = 0;
                 throw err;
             }
             throw e;
         } finally {
-            clearTimeout(timer);
+            if (headerTimer) clearTimeout(headerTimer);
+            if (staleTimer) clearTimeout(staleTimer);
             externalSignal?.removeEventListener("abort", onExternalAbort);
         }
     }
@@ -151,7 +239,7 @@ export class CouchClient implements ICouchClient {
     // ── ICouchClient implementation ───────────────────────
 
     async info(signal?: AbortSignal): Promise<DbInfo> {
-        return this.request<DbInfo>("", {}, undefined, signal);
+        return this.request<DbInfo>("", {}, { externalSignal: signal });
     }
 
     async getDoc<T>(
@@ -164,8 +252,7 @@ export class CouchClient implements ICouchClient {
             return await this.request<T>(
                 `/${encodeURIComponent(id)}${qs}`,
                 {},
-                undefined,
-                signal,
+                { externalSignal: signal },
             );
         } catch (e: any) {
             if (e?.status === 404) return null;
@@ -184,8 +271,7 @@ export class CouchClient implements ICouchClient {
             const res = await this.request<{ results: any[] }>(
                 "/_bulk_get",
                 { method: "POST", body: JSON.stringify(body) },
-                undefined,
-                signal,
+                { externalSignal: signal, streamed: true },
             );
             for (const item of res.results) {
                 const docResult = item.docs?.[0];
@@ -208,8 +294,7 @@ export class CouchClient implements ICouchClient {
             const res = await this.request<BulkDocsResult[]>(
                 "/_bulk_docs",
                 { method: "POST", body: JSON.stringify({ docs: batch }) },
-                undefined,
-                signal,
+                { externalSignal: signal, streamed: true },
             );
             allResults.push(...res);
         }
@@ -232,8 +317,7 @@ export class CouchClient implements ICouchClient {
             return this.request<AllDocsResult<T>>(
                 path,
                 { method: "POST", body: JSON.stringify({ keys: opts.keys }) },
-                undefined,
-                signal,
+                { externalSignal: signal, streamed: true },
             );
         }
 
@@ -241,8 +325,7 @@ export class CouchClient implements ICouchClient {
         return this.request<AllDocsResult<T>>(
             `/_all_docs${qs ? "?" + qs : ""}`,
             {},
-            undefined,
-            signal,
+            { externalSignal: signal, streamed: true },
         );
     }
 
@@ -256,8 +339,7 @@ export class CouchClient implements ICouchClient {
         return this.request<ChangesResult<T>>(
             `/_changes?${params.toString()}`,
             {},
-            undefined,
-            signal,
+            { externalSignal: signal, streamed: true },
         );
     }
 
@@ -384,7 +466,7 @@ export class CouchClient implements ICouchClient {
 
     async ensureDb(signal?: AbortSignal): Promise<void> {
         try {
-            await this.request<any>("", { method: "PUT" }, undefined, signal);
+            await this.request<any>("", { method: "PUT" }, { externalSignal: signal });
         } catch (e: any) {
             if (e?.status === 412) return; // DB already exists
             throw e;
@@ -392,7 +474,7 @@ export class CouchClient implements ICouchClient {
     }
 
     async destroy(signal?: AbortSignal): Promise<void> {
-        await this.request<any>("", { method: "DELETE" }, undefined, signal);
+        await this.request<any>("", { method: "DELETE" }, { externalSignal: signal });
     }
 }
 
