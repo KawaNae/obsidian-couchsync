@@ -535,5 +535,76 @@ describe("SyncEngine integration", () => {
             reconnectSpy.mockRestore();
             a.engine.stop();
         });
+
+        // Regression: a slow but actively-receiving pull (multi-MB
+        // catchup over a throttled link) used to be misclassified as a
+        // stall after one HEALTH_CHECK_INTERVAL because `consumedNum`
+        // only advances after the body finishes downloading. The
+        // transport-activity guard in `checkHealth()` now suppresses
+        // this false positive.
+        it("transport active suppresses stall", async () => {
+            h = createSyncHarness();
+            const a = h.addDevice("dev-A");
+            await a.engine.start();
+            (a.engine as any).checkpoints.setRemoteSeq("40");
+            const spy = vi.spyOn(h.couch, "info").mockResolvedValue({
+                db_name: "x", doc_count: 0, update_seq: "50",
+            });
+            const reconnectSpy = vi
+                .spyOn(a.engine as any, "requestReconnect")
+                .mockResolvedValue(undefined);
+
+            // Pretend a chunk just arrived — the live pull is still
+            // bringing bytes in even though the checkpoint hasn't
+            // advanced. checkHealth must treat this as healthy.
+            h.couch.setLastPullBodyChunkAt(Date.now());
+
+            const before = Date.now();
+            await (a.engine as any).checkHealth();
+            // Refresh the stamp so it stays inside the grace window for
+            // the second tick too.
+            h.couch.setLastPullBodyChunkAt(Date.now());
+            await (a.engine as any).checkHealth();
+
+            expect(reconnectSpy.mock.calls.length).toBe(0);
+            expect(a.engine.getLastHealthyAt()).toBeGreaterThanOrEqual(before);
+
+            reconnectSpy.mockRestore();
+            spy.mockRestore();
+            a.engine.stop();
+        });
+
+        // Regression backstop: if the seq mismatch persists AND the
+        // pull-transport stamp is older than `TRANSPORT_GRACE_MS`, this
+        // is a non-transport deadlock (e.g. apply/persist hung) and
+        // stall detection must still escalate to a reconnect.
+        it("transport stale → backstop fires", async () => {
+            h = createSyncHarness();
+            const a = h.addDevice("dev-A");
+            await a.engine.start();
+            (a.engine as any).checkpoints.setRemoteSeq("40");
+            const spy = vi.spyOn(h.couch, "info").mockResolvedValue({
+                db_name: "x", doc_count: 0, update_seq: "50",
+            });
+            const reconnectSpy = vi
+                .spyOn(a.engine as any, "requestReconnect")
+                .mockResolvedValue(undefined);
+
+            // Stamp 60s in the past — well past the 30s grace window.
+            h.couch.setLastPullBodyChunkAt(Date.now() - 60_000);
+
+            // First tick records `lastObservedRemoteSeq`, no reconnect.
+            await (a.engine as any).checkHealth();
+            expect(reconnectSpy.mock.calls.length).toBe(0);
+
+            // Second tick: same remote seq, transport still stale → stall.
+            await (a.engine as any).checkHealth();
+            expect(reconnectSpy.mock.calls.length).toBe(1);
+            expect(reconnectSpy.mock.calls[0][0]).toBe("stalled");
+
+            reconnectSpy.mockRestore();
+            spy.mockRestore();
+            a.engine.stop();
+        });
     });
 });

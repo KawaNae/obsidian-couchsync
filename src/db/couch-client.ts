@@ -26,8 +26,11 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 /** Per-chunk stale threshold for streamed body reads. While bytes are
  *  arriving, the request can take arbitrarily long; only sustained
  *  silence aborts. Matches LONGPOLL_STALE_MS by design — same idea,
- *  different endpoint. */
-const BODY_STALE_MS = 30_000;
+ *  different endpoint. Re-used by `SyncEngine` to derive its symmetric
+ *  pull-transport grace window: as long as a chunk arrived within this
+ *  threshold, the per-chunk stale timer would not have fired, so the
+ *  pull is by definition still alive. */
+export const BODY_STALE_MS = 30_000;
 
 /** Heartbeat interval (ms) sent to CouchDB for longpoll. CouchDB sends
  *  a `\n` every heartbeat interval to keep the connection alive through
@@ -68,6 +71,15 @@ export class CouchClient implements ICouchClient {
     private readonly headers: Record<string, string>;
     private readonly timeoutMs: number;
     private readonly auth: { user: string; password: string } | null;
+
+    /** Wall-clock timestamp of the most recent chunk arrival on a
+     *  *pull-side* streamed read (`changes`, `changesLongpoll`,
+     *  `bulkGet`). Pure observability for `SyncEngine`'s stall detector
+     *  — read via `getLastPullBodyChunkAt()`. NOT updated by push
+     *  (`bulkDocs`) or by `info` / `allDocs` since their progress is
+     *  unrelated to the consumer-side seq lag the detector cares about.
+     *  `null` until the first pull-side chunk arrives. */
+    private lastPullBodyChunkAt: number | null = null;
 
     constructor(opts: CouchClientOpts) {
         // Normalise: strip trailing slash so path concatenation is clean.
@@ -115,9 +127,15 @@ export class CouchClient implements ICouchClient {
             abortMs?: number;
             externalSignal?: AbortSignal;
             streamed?: boolean;
+            /** Invoked synchronously after each chunk arrives during a
+             *  streamed read. Used by pull-side endpoints to stamp
+             *  `lastPullBodyChunkAt`; non-pull endpoints (push, allDocs,
+             *  info) leave this unset so their activity does not
+             *  pollute the pull-stall signal. */
+            onChunk?: () => void;
         } = {},
     ): Promise<T> {
-        const { abortMs, externalSignal, streamed = false } = opts;
+        const { abortMs, externalSignal, streamed = false, onChunk } = opts;
 
         // Short-circuit: if caller's signal is already aborted we never
         // touch the network — matches how native fetch() behaves.
@@ -203,6 +221,7 @@ export class CouchClient implements ICouchClient {
                 chunks.push(value);
                 totalLen += value.length;
                 armStaleTimer();
+                onChunk?.();
             }
             if (staleTimer) { clearTimeout(staleTimer); staleTimer = null; }
 
@@ -238,6 +257,20 @@ export class CouchClient implements ICouchClient {
 
     // ── ICouchClient implementation ───────────────────────
 
+    /**
+     * Wall-clock timestamp of the most recent pull-side streamed-read
+     * chunk arrival. Used by `SyncEngine.checkHealth()` to suppress
+     * false-positive stall detection while a slow `_changes`/`_bulk_get`
+     * is actively receiving bytes (e.g. a multi-MB catchup over a
+     * throttled link). Returns `null` until the first pull-side chunk
+     * arrives. Push (`bulkDocs`) and probe (`info`, `allDocs`) traffic
+     * deliberately does not update this stamp — they would otherwise
+     * mask a genuine pull-side stall.
+     */
+    getLastPullBodyChunkAt(): number | null {
+        return this.lastPullBodyChunkAt;
+    }
+
     async info(signal?: AbortSignal): Promise<DbInfo> {
         return this.request<DbInfo>("", {}, { externalSignal: signal });
     }
@@ -271,7 +304,11 @@ export class CouchClient implements ICouchClient {
             const res = await this.request<{ results: any[] }>(
                 "/_bulk_get",
                 { method: "POST", body: JSON.stringify(body) },
-                { externalSignal: signal, streamed: true },
+                {
+                    externalSignal: signal,
+                    streamed: true,
+                    onChunk: () => { this.lastPullBodyChunkAt = Date.now(); },
+                },
             );
             for (const item of res.results) {
                 const docResult = item.docs?.[0];
@@ -339,7 +376,11 @@ export class CouchClient implements ICouchClient {
         return this.request<ChangesResult<T>>(
             `/_changes?${params.toString()}`,
             {},
-            { externalSignal: signal, streamed: true },
+            {
+                externalSignal: signal,
+                streamed: true,
+                onChunk: () => { this.lastPullBodyChunkAt = Date.now(); },
+            },
         );
     }
 
@@ -422,6 +463,11 @@ export class CouchClient implements ICouchClient {
                 chunks.push(value);
                 totalLen += value.length;
                 resetStaleTimer();
+                // Pull-side transport heartbeat for SyncEngine's stall
+                // detector. Heartbeat `\n` chunks count too — they prove
+                // the longpoll's TCP path is alive even when no docs are
+                // arriving. See `getLastPullBodyChunkAt()`.
+                this.lastPullBodyChunkAt = Date.now();
             }
 
             clearTimeout(staleTimer);

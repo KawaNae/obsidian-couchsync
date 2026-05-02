@@ -158,4 +158,14 @@ export interface ICouchClient {
     /** Create the database if it doesn't exist. Idempotent (412 ignored). */
     ensureDb(signal?: AbortSignal): Promise<void>;
     destroy(signal?: AbortSignal): Promise<void>;
+    /**
+     * Wall-clock timestamp of the most recent chunk arrival on a
+     * pull-side streamed read (`changes`, `changesLongpoll`,
+     * `bulkGet`). Used by `SyncEngine.checkHealth()` as a peer
+     * progress signal alongside the persisted checkpoint seq, so a
+     * slow but actively-receiving longpoll is not misclassified as
+     * stalled. `null` until the first pull-side chunk arrives. Push
+     * and probe traffic deliberately do not update this stamp.
+     */
+    getLastPullBodyChunkAt(): number | null;
 }

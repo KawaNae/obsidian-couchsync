@@ -44,6 +44,15 @@ export class FakeCouchClient implements ICouchClient {
     private tick: Tick = makeTick();
     private destroyed = false;
 
+    /** Test-controlled pull-transport activity stamp. Returned by
+     *  `getLastPullBodyChunkAt()`. The fake has no real chunk loop, so
+     *  unlike `CouchClient` it does not auto-stamp on pull calls — that
+     *  would couple tests to incidental fake-side behavior. Tests that
+     *  exercise stall detection's transport-activity branch should set
+     *  this explicitly via `setLastPullBodyChunkAt()`. Default `null`
+     *  preserves the legacy stall predicate path for existing tests. */
+    private lastPullBodyChunkAt: number | null = null;
+
     async info(signal?: AbortSignal): Promise<DbInfo> {
         throwIfAborted(signal);
         return {
@@ -189,6 +198,15 @@ export class FakeCouchClient implements ICouchClient {
         this.docs.clear();
         this.seqCounter = 0;
         this.revCounter = 0;
+    }
+
+    getLastPullBodyChunkAt(): number | null {
+        return this.lastPullBodyChunkAt;
+    }
+
+    /** Test helper: drive `getLastPullBodyChunkAt()` directly. */
+    setLastPullBodyChunkAt(at: number | null): void {
+        this.lastPullBodyChunkAt = at;
     }
 }
 
