@@ -74,6 +74,11 @@ export class PushPipeline {
                     if (this.deps.isCancelled()) return;
                 }
                 let stage: PushStage = "idle";
+                // Per-cycle abort scope: aborts on session dispose OR
+                // visibility:hidden. Threaded into pushDocs() so the
+                // remote-rev allDocs + bulkDocs round-trips are cancelled
+                // together when the page goes background.
+                const cycle = this.deps.visibility.linkedAbortOnHidden(this.deps.signal);
                 try {
                     stage = "changes";
                     const localChanges = await this.deps.localDb.changes(
@@ -99,7 +104,7 @@ export class PushPipeline {
                     if (toPush.length > 0) {
                         const docs = toPush.map((r) => r.doc!);
                         stage = "pushDocs";
-                        await this.pushDocs(docs);
+                        await this.pushDocs(docs, cycle.signal);
                         // SyncEngine subscribes to "paused" to update lastHealthyAt.
                         this.deps.events.emit("paused");
                     }
@@ -120,9 +125,13 @@ export class PushPipeline {
                         return;
                     }
                     if (this.deps.isCancelled()) return;
-                    // AbortError = dispose() aborted us. Exit quietly so
-                    // teardown doesn't show up as a session push error.
-                    if (isAbortError(e)) return;
+                    // Visibility-induced abort: AbortError from cycle.signal
+                    // (proactive cancel on hidden) OR a "Load failed" that
+                    // landed while visibility is now hidden (iOS late-fired
+                    // the visibilitychange after rip-killing fetch).
+                    // Either way: not a real error. Skip log + backoff and
+                    // loop back to top — waitVisible will block until resume.
+                    if (isAbortError(e) || this.deps.visibility.isHidden()) continue;
                     if (e instanceof DbError) {
                         this.deps.handleLocalDbError(e, `push loop [stage:${stage}]`);
                     } else {
@@ -137,6 +146,8 @@ export class PushPipeline {
                             );
                         }
                     }
+                } finally {
+                    cycle.release();
                 }
 
                 await this.deps.delay(PUSH_POLL_INTERVAL_MS);
@@ -150,8 +161,12 @@ export class PushPipeline {
      * Push docs to remote. Fetches current remote revs and threads them
      * onto the docs before bulkDocs, same approach as remote-couch.ts.
      * Exposed for tests and potential one-shot callers.
+     *
+     * `signal` is the per-cycle abort scope (covers both the allDocs
+     * remote-rev fetch and the bulkDocs upload). Defaults to the session
+     * signal so existing test/one-shot callers without a cycle still work.
      */
-    async pushDocs(docs: CouchSyncDoc[]): Promise<void> {
+    async pushDocs(docs: CouchSyncDoc[], signal: AbortSignal = this.deps.signal): Promise<void> {
         if (docs.length === 0) return;
 
         const prepared: Array<CouchSyncDoc & { _rev?: string }> = docs.map(
@@ -160,7 +175,7 @@ export class PushPipeline {
 
         const remoteResult = await this.deps.client.allDocs<CouchSyncDoc>({
             keys: prepared.map((d) => d._id),
-        }, this.deps.signal);
+        }, signal);
         const remoteRevMap = new Map<string, string>();
         for (const row of remoteResult.rows) {
             if (row.value?.rev && !row.value?.deleted) {
@@ -172,7 +187,7 @@ export class PushPipeline {
             if (remoteRev) doc._rev = remoteRev;
         }
 
-        const results = await this.deps.client.bulkDocs(prepared, this.deps.signal);
+        const results = await this.deps.client.bulkDocs(prepared, signal);
 
         let fileCount = 0;
         let chunkCount = 0;

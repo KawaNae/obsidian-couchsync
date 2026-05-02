@@ -131,11 +131,17 @@ export class PullPipeline {
                     await this.deps.visibility.waitVisible(this.deps.signal);
                     if (this.deps.isCancelled()) return;
                 }
+                // Per-cycle abort scope: aborts on session dispose OR
+                // visibility:hidden. Lets us proactively cancel the
+                // longpoll fetch the moment iOS backgrounds the app,
+                // so the next resume sees no "Load failed" artifact
+                // bumping retryMs / polluting the log.
+                const cycle = this.deps.visibility.linkedAbortOnHidden(this.deps.signal);
                 try {
                     const result = await this.deps.client.changesLongpoll<CouchSyncDoc>({
                         since: this.deps.checkpoints.getRemoteSeq(),
                         include_docs: true,
-                    }, this.deps.signal);
+                    }, cycle.signal);
 
                     if (this.deps.isCancelled()) return;
 
@@ -160,9 +166,16 @@ export class PullPipeline {
                         return;
                     }
                     if (this.deps.isCancelled()) return;
-                    // AbortError = dispose() aborted us. Exit cleanly
-                    // without consuming the transient-retry budget.
-                    if (isAbortError(e)) return;
+                    // Visibility-induced abort: session is healthy but the
+                    // cycle signal fired due to hidden transition. Loop
+                    // back to top — waitVisible will block until resume.
+                    // No log, no backoff bump.
+                    if (isAbortError(e)) continue;
+                    // Fallback: iOS occasionally fires visibilitychange
+                    // *after* killing our in-flight fetch (so AbortError
+                    // doesn't trigger), surfacing a "Load failed" while
+                    // we're already hidden. Treat as suspend artifact.
+                    if (this.deps.visibility.isHidden()) continue;
 
                     if (e instanceof DbError) {
                         this.deps.handleLocalDbError(e, "pull write");
@@ -186,6 +199,8 @@ export class PullPipeline {
 
                     await this.deps.delay(this.retryMs);
                     this.retryMs = Math.min(this.retryMs * 2, PULL_RETRY_MAX_MS);
+                } finally {
+                    cycle.release();
                 }
             }
         } finally {

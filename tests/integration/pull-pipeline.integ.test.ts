@@ -271,9 +271,14 @@ describe("PullPipeline integration", () => {
             spy.mockRestore();
         });
 
-        // ── AbortSignal propagation (v0.20.3) ───────────────
+        // ── AbortSignal propagation (v0.20.3 / cycle abort v0.21.x) ─
 
-        it("passes the deps.signal through to client.changesLongpoll", async () => {
+        it("passes a cycle signal (linked to deps.signal) through to client.changesLongpoll", async () => {
+            // Post cycle-abort refactor (v0.21.x): the pipeline wraps
+            // deps.signal in a per-cycle linked signal that ALSO aborts
+            // on visibility:hidden. Caller no longer sees the raw
+            // deps.signal — they see a derived one that aborts when
+            // either source fires.
             h = createSyncHarness();
             const b = h.addDevice("dev-B");
             const rig = attachPullPipeline({ device: b, couch: h.couch });
@@ -286,11 +291,17 @@ describe("PullPipeline integration", () => {
             });
 
             await rig.pipeline.runLongpoll();
+            // ALWAYS_VISIBLE forwards externalSignal verbatim — captured
+            // is exactly rig.signal, no derivation. The BrowserVisibility
+            // case is covered separately in visibility-gate.test.ts.
             expect(capturedSignal).toBe(rig.signal);
             spy.mockRestore();
         });
 
-        it("exits gracefully when signal aborts mid-longpoll (AbortError treated as cancel)", async () => {
+        it("exits cleanly on session dispose (cancel + abort)", async () => {
+            // Session dispose flips both `_disposed` (isCancelled=true)
+            // and aborts the signal in the same synchronous block.
+            // catch order: isCancelled check returns before AbortError.
             h = createSyncHarness();
             const b = h.addDevice("dev-B");
             const rig = attachPullPipeline({ device: b, couch: h.couch });
@@ -298,20 +309,46 @@ describe("PullPipeline integration", () => {
             let calls = 0;
             const spy = vi.spyOn(h.couch, "changesLongpoll").mockImplementation(async () => {
                 calls++;
-                // Safety: never infinite loop even if impl is wrong.
-                if (calls > 2) rig.cancel();
+                rig.cancel();      // simulate dispose: cancel + abort together
                 rig.abort();
                 const e: any = new Error("aborted");
                 e.name = "AbortError";
                 throw e;
             });
 
-            // Should return cleanly without entering the transient-retry path.
-            // AbortError is a cancel signal, not a network error — no retryMs
-            // growth, no lastErrorMsg update.
             await rig.pipeline.runLongpoll();
+            // Dispose path: 1 call, no lastErrorMsg, no backoff bump.
             expect(rig.pipeline.getLastErrorMsg()).toBeNull();
             expect(calls).toBe(1);
+            spy.mockRestore();
+        });
+
+        it("AbortError without cancel = visibility-induced → silent continue (no log, no backoff)", async () => {
+            // When the cycle signal aborts but the session is NOT
+            // cancelled, it's a visibility:hidden trip. We loop back to
+            // the top and waitVisible there — no log, no retryMs bump.
+            // (Real path: BrowserVisibilityGate.linkedAbortOnHidden
+            // fires on hidden transition; here we simulate by raising
+            // AbortError directly without flipping cancel.)
+            h = createSyncHarness();
+            const b = h.addDevice("dev-B");
+            const rig = attachPullPipeline({ device: b, couch: h.couch });
+
+            let calls = 0;
+            const spy = vi.spyOn(h.couch, "changesLongpoll").mockImplementation(async () => {
+                calls++;
+                if (calls >= 3) rig.cancel(); // bound the loop
+                const e: any = new Error("aborted");
+                e.name = "AbortError";
+                throw e;
+            });
+
+            await rig.pipeline.runLongpoll();
+            // Three abort/continue cycles, then cancelled. retryMs and
+            // lastErrorMsg stay pristine because AbortError is silent.
+            expect(rig.pipeline.getLastErrorMsg()).toBeNull();
+            expect(rig.pipeline.getRetryMs()).toBe(2_000); // PULL_RETRY_MIN_MS
+            expect(calls).toBe(3);
             spy.mockRestore();
         });
 

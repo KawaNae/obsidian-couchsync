@@ -29,6 +29,7 @@ import { ALWAYS_VISIBLE, type VisibilityGate } from "../../src/db/visibility-gat
 class FakeVisibilityGate implements VisibilityGate {
     private hidden = false;
     private waiters = new Set<() => void>();
+    private hiddenAbortListeners = new Set<() => void>();
     isHidden(): boolean { return this.hidden; }
     waitVisible(signal: AbortSignal): Promise<void> {
         if (!this.hidden) return Promise.resolve();
@@ -43,11 +44,43 @@ class FakeVisibilityGate implements VisibilityGate {
             signal.addEventListener("abort", done, { once: true });
         });
     }
+    linkedAbortOnHidden(externalSignal: AbortSignal) {
+        const c = new AbortController();
+        if (externalSignal.aborted || this.hidden) {
+            c.abort();
+            return { signal: c.signal, release: () => {} };
+        }
+        let released = false;
+        const trigger = () => {
+            if (released) return;
+            released = true;
+            externalSignal.removeEventListener("abort", trigger);
+            this.hiddenAbortListeners.delete(trigger);
+            c.abort();
+        };
+        externalSignal.addEventListener("abort", trigger, { once: true });
+        this.hiddenAbortListeners.add(trigger);
+        return {
+            signal: c.signal,
+            release: () => {
+                if (released) return;
+                released = true;
+                externalSignal.removeEventListener("abort", trigger);
+                this.hiddenAbortListeners.delete(trigger);
+            },
+        };
+    }
     setHidden(hidden: boolean): void {
+        const wasHidden = this.hidden;
         this.hidden = hidden;
         if (!hidden) {
             for (const fn of [...this.waiters]) fn();
             this.waiters.clear();
+        }
+        if (hidden && !wasHidden) {
+            const snap = [...this.hiddenAbortListeners];
+            this.hiddenAbortListeners.clear();
+            for (const fn of snap) fn();
         }
     }
 }
@@ -230,6 +263,58 @@ describe("PushPipeline integration", () => {
             changesSpy.mockRestore();
         });
 
+        it("visibility:hidden mid-fetch aborts the cycle signal (proactive cancel of in-flight push)", async () => {
+            // End-to-end of the v0.21.x cycle-abort design: pipeline asks
+            // gate for a linked signal, fetch sees hidden→abort, catch
+            // silent-continues, top of loop blocks in waitVisible.
+            h = createSyncHarness();
+            const a = h.addDevice("dev-A");
+            const gate = new FakeVisibilityGate();
+            const rig = attachPushPipeline({ device: a, couch: h.couch, visibility: gate });
+
+            a.vault.addFile("x.md", "hello");
+            await a.vs.fileToDb("x.md");
+
+            const errors: string[] = [];
+            rig.events.on("error", ({ message }) => errors.push(message));
+
+            // Capture the FIRST iteration's signal so the second iter
+            // (after re-show) can't overwrite our reference. Only the
+            // first cycle's signal should be aborted by the hidden flip.
+            let firstSignal: AbortSignal | undefined;
+            let calls = 0;
+            const allDocsSpy = vi.spyOn(h.couch, "allDocs").mockImplementation(
+                async (_opts: any, signal?: any) => {
+                    calls++;
+                    if (calls === 1) {
+                        firstSignal = signal;
+                        // Flip hidden mid-fetch → cycle signal aborts
+                        // synchronously via the gate's hidden listeners.
+                        gate.setHidden(true);
+                        const e: any = new Error("aborted");
+                        e.name = "AbortError";
+                        throw e;
+                    }
+                    // Subsequent iters (after we re-show) satisfy push end-to-end.
+                    rig.cancel(); // bound the loop after the recovery path
+                    return { rows: [] } as any;
+                },
+            );
+
+            const runP = rig.pipeline.run();
+            // Give the loop time to enter waitVisible after the abort.
+            await new Promise((r) => setTimeout(r, 30));
+            // Reveal — pipeline iterates again, then cancels.
+            gate.setHidden(false);
+            await runP;
+
+            // First cycle's signal was aborted by the hidden transition.
+            expect(firstSignal?.aborted).toBe(true);
+            // No surfaced error: visibility-induced abort is silent.
+            expect(errors).toHaveLength(0);
+            allDocsSpy.mockRestore();
+        });
+
         it("dispose() during waitVisible exits the loop without running an iteration", async () => {
             h = createSyncHarness();
             const a = h.addDevice("dev-A");
@@ -405,7 +490,7 @@ describe("PushPipeline integration", () => {
             allSpy.mockRestore();
         });
 
-        it("exits gracefully when signal aborts during push (AbortError treated as cancel)", async () => {
+        it("exits cleanly on session dispose (cancel + abort together)", async () => {
             h = createSyncHarness();
             const a = h.addDevice("dev-A");
             const rig = attachPushPipeline({ device: a, couch: h.couch });
@@ -416,7 +501,7 @@ describe("PushPipeline integration", () => {
             let calls = 0;
             const spy = vi.spyOn(h.couch, "bulkDocs").mockImplementation(async () => {
                 calls++;
-                if (calls > 2) rig.cancel();
+                rig.cancel();    // simulate dispose: cancel + abort together
                 rig.abort();
                 const e: any = new Error("aborted");
                 e.name = "AbortError";
@@ -424,8 +509,38 @@ describe("PushPipeline integration", () => {
             });
 
             await rig.pipeline.run();
-            // AbortError is cancel-class: no stack warn latch.
+            // Dispose path: isCancelled check returns before AbortError.
             expect(calls).toBe(1);
+            spy.mockRestore();
+        });
+
+        it("AbortError without cancel = visibility-induced → silent continue", async () => {
+            // Cycle signal aborted without session cancellation = the
+            // page went hidden mid-fetch. Loop back to top, waitVisible
+            // gates further iterations. Verified here by counting calls
+            // and ensuring no error event is emitted.
+            h = createSyncHarness();
+            const a = h.addDevice("dev-A");
+            const rig = attachPushPipeline({ device: a, couch: h.couch });
+
+            a.vault.addFile("x.md", "hello");
+            await a.vs.fileToDb("x.md");
+
+            const errors: string[] = [];
+            rig.events.on("error", ({ message }) => errors.push(message));
+
+            let calls = 0;
+            const spy = vi.spyOn(h.couch, "bulkDocs").mockImplementation(async () => {
+                calls++;
+                if (calls >= 3) rig.cancel(); // bound the loop
+                const e: any = new Error("aborted");
+                e.name = "AbortError";
+                throw e;
+            });
+
+            await rig.pipeline.run();
+            expect(calls).toBe(3);
+            expect(errors).toHaveLength(0); // silent continue, no surfaced error
             spy.mockRestore();
         });
     });

@@ -37,7 +37,17 @@ function makeFakeClient(opts: {
 class TestVisibilityGate implements VisibilityGate {
     private hidden = false;
     private waiters: Array<() => void> = [];
-    setHidden(h: boolean) { this.hidden = h; if (!h) this.flush(); }
+    private hiddenAbortListeners = new Set<() => void>();
+    setHidden(h: boolean) {
+        const wasHidden = this.hidden;
+        this.hidden = h;
+        if (!h) this.flush();
+        if (h && !wasHidden) {
+            const snap = [...this.hiddenAbortListeners];
+            this.hiddenAbortListeners.clear();
+            for (const fn of snap) fn();
+        }
+    }
     isHidden() { return this.hidden; }
     waitVisible(signal: AbortSignal): Promise<void> {
         if (!this.hidden || signal.aborted) return Promise.resolve();
@@ -51,6 +61,32 @@ class TestVisibilityGate implements VisibilityGate {
             this.waiters.push(done);
             signal.addEventListener("abort", done, { once: true });
         });
+    }
+    linkedAbortOnHidden(externalSignal: AbortSignal) {
+        const c = new AbortController();
+        if (externalSignal.aborted || this.hidden) {
+            c.abort();
+            return { signal: c.signal, release: () => {} };
+        }
+        let released = false;
+        const trigger = () => {
+            if (released) return;
+            released = true;
+            externalSignal.removeEventListener("abort", trigger);
+            this.hiddenAbortListeners.delete(trigger);
+            c.abort();
+        };
+        externalSignal.addEventListener("abort", trigger, { once: true });
+        this.hiddenAbortListeners.add(trigger);
+        return {
+            signal: c.signal,
+            release: () => {
+                if (released) return;
+                released = true;
+                externalSignal.removeEventListener("abort", trigger);
+                this.hiddenAbortListeners.delete(trigger);
+            },
+        };
     }
     private flush() { const ws = this.waiters; this.waiters = []; for (const w of ws) w(); }
 }
