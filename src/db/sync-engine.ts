@@ -437,19 +437,23 @@ export class SyncEngine {
     }
 
     /**
-     * Degraded local DB: HandleGuard exhausted its reopen budget. Notify
-     * once, halt retries, and require explicit `start()` to resume.
+     * Degraded local DB: HandleGuard exhausted its reopen budget. Halt
+     * retries, surface a `degraded` event for the host plugin to render
+     * a recovery affordance (Reload-now Notice in `main.ts`), and
+     * require explicit `start()` to resume.
      */
     private handleDegraded(e: DbError): void {
         if (this.degraded) return;
         this.degraded = true;
-        if (e.userMessage) notify(e.userMessage, 15000);
         logError(`local DB degraded: ${e.message}`);
         this.stopRetryTimer();
         this.stopTransientTimer();
         this.setState("error", {
             kind: "unknown",
             message: e.userMessage ?? "Local DB is no longer usable — restart Obsidian.",
+        });
+        this.events.emit("degraded", {
+            message: e.userMessage ?? "CouchSync: Local DB handle is no longer usable.",
         });
         void this.teardown();
     }

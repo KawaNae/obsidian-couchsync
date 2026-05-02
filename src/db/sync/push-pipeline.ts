@@ -108,16 +108,23 @@ export class PushPipeline {
                     this.deps.checkpoints.setLastPushedSeq(localChanges.last_seq);
                     await this.deps.checkpoints.save();
                 } catch (e: any) {
+                    // halt-class DbError (degraded / quota) must surface
+                    // even when dispose() raced ahead of us — otherwise
+                    // SyncEngine.handleDegraded never latches and the
+                    // next session's openSession→ensureHealthy regenerates
+                    // the same error into an infinite retry-backoff loop
+                    // (iOS WebKit IDB poisoning case).
+                    if (e instanceof DbError && e.recovery === "halt") {
+                        this.deps.handleLocalDbError(e, `push loop [stage:${stage}]`);
+                        exitReason = "halted";
+                        return;
+                    }
                     if (this.deps.isCancelled()) return;
                     // AbortError = dispose() aborted us. Exit quietly so
                     // teardown doesn't show up as a session push error.
                     if (isAbortError(e)) return;
                     if (e instanceof DbError) {
                         this.deps.handleLocalDbError(e, `push loop [stage:${stage}]`);
-                        if (e.recovery === "halt") {
-                            exitReason = "halted";
-                            return;
-                        }
                     } else {
                         // Push errors are logged but don't escalate — the next
                         // cycle will retry. First error in session also logs

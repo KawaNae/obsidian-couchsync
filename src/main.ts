@@ -157,6 +157,22 @@ export default class CouchSyncPlugin extends Plugin {
         );
         this.replicator.events.on("state-change", ({ state }) => this.statusBar.update(state));
         this.replicator.events.on("error", ({ message }) => notify(message, 8000));
+        // Local DB handle is poisoned (typically iOS WebKit IDB after a
+        // long suspend — only a page reload reseats the IDB connection).
+        // Surface a sticky Notice with a "Reload now" button that fires
+        // `app:reload`; emitted at most once per SyncEngine lifecycle.
+        this.replicator.events.on("degraded", ({ message }) => {
+            const notice = new Notice(`${message} Tap "Reload now" to recover.`, 0);
+            const btn = notice.noticeEl.createEl("button", {
+                text: "Reload now",
+                cls: "mod-cta",
+            });
+            btn.style.marginLeft = "8px";
+            btn.addEventListener("click", () => {
+                notice.hide();
+                (this.app as any).commands.executeCommandById("app:reload");
+            });
+        });
         this.reconciler = new Reconciler(
             vaultIO,
             this.localDb,

@@ -151,6 +151,14 @@ export class PullPipeline {
                     }
                     // Empty result (longpoll max-wait): stay connected.
                 } catch (e: any) {
+                    // halt-class DbError (degraded / quota) must surface
+                    // even when dispose() raced ahead — see push-pipeline
+                    // for the same rationale (iOS WebKit IDB poisoning).
+                    if (e instanceof DbError && e.recovery === "halt") {
+                        this.deps.handleLocalDbError(e, "pull write");
+                        exitReason = "halted";
+                        return;
+                    }
                     if (this.deps.isCancelled()) return;
                     // AbortError = dispose() aborted us. Exit cleanly
                     // without consuming the transient-retry budget.
@@ -158,10 +166,6 @@ export class PullPipeline {
 
                     if (e instanceof DbError) {
                         this.deps.handleLocalDbError(e, "pull write");
-                        if (e.recovery === "halt") {
-                            exitReason = "halted";
-                            return; // teardown already invoked
-                        }
                         await this.deps.delay(this.retryMs);
                         continue;
                     }

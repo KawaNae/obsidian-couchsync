@@ -99,20 +99,21 @@ export class HandleGuard<T> {
         }
     }
 
-    /** Probe the handle and reopen once if the probe fails. Unlike
-     *  `runOp`, this does NOT throw degraded on the first failure — it
-     *  tries one reopen, then surfaces whatever error remains. */
+    /** Probe the handle and transparently reopen on handle-expired
+     *  errors, sharing `runOp`'s `maxReopen` budget. After exhaustion
+     *  throws `DbError("degraded", { recovery: "halt" })` — same contract
+     *  as `runOp`, so SyncEngine's openSession path always sees the
+     *  degraded signal (instead of a raw IDB error that would be routed
+     *  through `enterError` into an infinite retry-backoff loop, as on
+     *  iOS WebKit after IDB-process death). */
     async ensureHealthy(): Promise<void> {
-        const run = async (inner: T): Promise<void> => {
-            if (this.probe) await this.probe(inner);
-        };
-        try {
-            await run(this.get());
-        } catch (e) {
-            if (!isHandleExpired(e)) throw e;
-            await this.resetHandle();
-            await run(this.get());
+        if (!this.probe) {
+            // No probe configured — just ensure a handle is materialised.
+            this.get();
+            return;
         }
+        const probe = this.probe;
+        await this.runOp(async (inner) => { await probe(inner); }, "ensureHealthy");
     }
 
     /** Release the current handle (if any). The next runOp will build a

@@ -45,6 +45,12 @@ export interface SyncEventMap {
     "auto-resolve": { filePath: string };
     "catchup-complete": void;
     "catchup-failed": void;
+    /** Local DB handle is unrecoverable in this WebView (HandleGuard
+     *  exhausted its reopen budget — typically iOS WebKit IDB poisoning
+     *  after a long suspend). Subscribers should surface a recovery
+     *  affordance to the user (e.g. a Reload-now Notice). Emitted at
+     *  most once per SyncEngine lifecycle (`degraded` latch). */
+    degraded: { message: string };
 }
 
 export interface SyncAsyncEventMap {
@@ -90,6 +96,7 @@ export class SyncEvents {
         "auto-resolve": new Set(),
         "catchup-complete": new Set(),
         "catchup-failed": new Set(),
+        degraded: new Set(),
     };
     private awaited: AwaitedHandlers = {
         "pull-write": new Set(),

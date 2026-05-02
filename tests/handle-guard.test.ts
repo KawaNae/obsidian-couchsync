@@ -165,6 +165,42 @@ describe("HandleGuard", () => {
         expect(cleanup).toHaveBeenCalledTimes(1);
     });
 
+    it("ensureHealthy() throws DbError(degraded, halt) after maxReopen exhaustion (iOS WebKit IDB poisoning)", async () => {
+        const factory = vi.fn(() => ({ id: "inner" }));
+        const cleanup = vi.fn().mockResolvedValue(undefined);
+        let probeCalls = 0;
+        const guard = new HandleGuard({
+            factory,
+            cleanup,
+            probe: async () => {
+                probeCalls++;
+                throw makeFakeError("DatabaseClosedError");
+            },
+            maxReopen: 3,
+        });
+
+        const err = await guard.ensureHealthy().catch((e) => e);
+
+        expect(err).toBeInstanceOf(DbError);
+        expect((err as DbError).kind).toBe("degraded");
+        expect((err as DbError).recovery).toBe("halt");
+        // 1 initial probe + 3 reopen attempts = 4 probe calls
+        expect(probeCalls).toBe(4);
+        expect(factory).toHaveBeenCalledTimes(4);
+    });
+
+    it("ensureHealthy() with no probe is a no-op that just materialises the handle", async () => {
+        const factory = vi.fn(() => ({ id: "inner" }));
+        const guard = new HandleGuard({
+            factory,
+            cleanup: vi.fn().mockResolvedValue(undefined),
+        });
+
+        await guard.ensureHealthy();
+
+        expect(factory).toHaveBeenCalledTimes(1);
+    });
+
     it("close() cleans up the handle and drops the reference", async () => {
         const factory = vi.fn(() => ({ id: "inner" }));
         const cleanup = vi.fn().mockResolvedValue(undefined);
