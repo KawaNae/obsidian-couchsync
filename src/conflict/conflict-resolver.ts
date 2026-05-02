@@ -61,11 +61,10 @@ export class ConflictResolver {
 
         switch (cmp) {
             case "equal":
-                // Identical vclocks — content may or may not differ, but
-                // causally they're the same edit. Keep local (no-op).
-                logDebug(
-                    `keep-local (equal vclock) for ${vaultPath} — vc=${formatVC(localVC)}`,
-                );
+                // Identical vclocks — caller should normally short-circuit
+                // before reaching this branch (pull-writer treats equal
+                // vclocks as data-level idempotency and skips silently).
+                // Kept as a safe fallback for any future direct caller.
                 return "keep-local";
 
             case "dominated":

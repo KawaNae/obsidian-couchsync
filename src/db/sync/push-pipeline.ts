@@ -216,7 +216,6 @@ export class PushPipeline {
                 logDebug(`  → ${path} (conflict, will resolve on next pull)`);
                 conflictCount++;
             } else {
-                this.deps.echoes.recordPushEcho(doc._id);
                 if (isFile) {
                     logDebug(`  → ${filePathFromId(doc._id)}`);
                     fileCount++;

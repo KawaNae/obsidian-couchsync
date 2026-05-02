@@ -381,20 +381,6 @@ describe("PushPipeline integration", () => {
             spy.mockRestore();
         });
 
-        it("records push-echo for successful pushes", async () => {
-            h = createSyncHarness();
-            const a = h.addDevice("dev-A");
-            const rig = attachPushPipeline({ device: a, couch: h.couch });
-
-            const id = makeFileId("pushed.md");
-            await rig.pipeline.pushDocs([
-                { _id: id, type: "file", chunks: [], vclock: {}, mtime: 0, ctime: 0, size: 0 } as unknown as CouchSyncDoc,
-            ]);
-
-            // consumePushEcho returns true once for a recorded id.
-            expect(rig.echoes.consumePushEcho(id)).toBe(true);
-        });
-
         it("emits error event once per session on a 403 storm", async () => {
             h = createSyncHarness();
             const a = h.addDevice("dev-A");
@@ -428,29 +414,6 @@ describe("PushPipeline integration", () => {
                 { _id: makeFileId("c.md"), type: "file", chunks: [], vclock: {}, mtime: 0, ctime: 0, size: 0 } as unknown as CouchSyncDoc,
             ]);
             expect(errors).toHaveLength(1);
-            spy.mockRestore();
-        });
-
-        it("does not record push-echo for conflicted or denied docs", async () => {
-            h = createSyncHarness();
-            const a = h.addDevice("dev-A");
-            const rig = attachPushPipeline({ device: a, couch: h.couch });
-
-            const idA = makeFileId("a.md");
-            const idB = makeFileId("b.md");
-
-            const spy = vi.spyOn(h.couch, "bulkDocs").mockResolvedValueOnce([
-                { ok: false, error: "conflict", id: idA },
-                { ok: false, error: "forbidden", reason: "no perm", id: idB },
-            ] as any);
-
-            await rig.pipeline.pushDocs([
-                { _id: idA, type: "file", chunks: [], vclock: {}, mtime: 0, ctime: 0, size: 0 } as unknown as CouchSyncDoc,
-                { _id: idB, type: "file", chunks: [], vclock: {}, mtime: 0, ctime: 0, size: 0 } as unknown as CouchSyncDoc,
-            ]);
-
-            expect(rig.echoes.consumePushEcho(idA)).toBe(false);
-            expect(rig.echoes.consumePushEcho(idB)).toBe(false);
             spy.mockRestore();
         });
 

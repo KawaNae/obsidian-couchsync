@@ -273,23 +273,89 @@ describe("PullWriter integration", () => {
             expect(rig.echoes.isPullEcho(chunkId, seq + 1)).toBe(false);
         });
 
-        it("consumes push echo before writing (skips the echo doc entirely)", async () => {
+        it("R1b: session-boundary self-pushed file doc is silently skipped (vclock equal)", async () => {
+            // Simulates the R1b race: in session N, B pushed a file with
+            // vclock {B:1}. Session N tore down before the pull longpoll
+            // consumed the echo, so EchoTracker is empty in session N+1.
+            // The catchup re-delivers the same doc — it must NOT surface
+            // as keep-local; the resolver should never even see it.
+            h = createSyncHarness();
+            const b = h.addDevice("dev-B");
+            const rig = attachPullWriter({ device: b, withResolver: true });
+
+            await seedLocalFileDoc(b, "self-pushed.md", { B: 1 });
+            const remote = makeRemoteFileDoc("self-pushed.md", { B: 1 });
+
+            const pullWrites: FileDoc[] = [];
+            rig.events.onAsync("pull-write", async ({ doc }) => { pullWrites.push(doc); });
+
+            const applied = await rig.writer.apply(makeChangesResult(
+                [{ id: remote._id, seq: "1", doc: remote }], "1",
+            ));
+
+            // Local doc unchanged, no pull-write fired. The batch reports
+            // empty=true so the pull-pipeline takes the saveEmptyPullBatch
+            // path (advancing remote-seq via Checkpoints.save) — that's
+            // out of PullWriter scope.
+            await expectDb(b.db).toHaveFileDoc("self-pushed.md").withVclock({ B: 1 });
+            expect(pullWrites).toHaveLength(0);
+            expect(applied.empty).toBe(true);
+            expect(applied.nextRemoteSeq).toBe("1");
+        });
+
+        it("chunk that already exists locally is silently skipped (idempotent)", async () => {
+            // Catchup re-delivers a self-pushed chunk after a session
+            // boundary. Content-addressed (id = hash) means re-put is a
+            // no-op; pull-writer short-circuits to skip the IDB write.
             h = createSyncHarness();
             const b = h.addDevice("dev-B");
             const rig = attachPullWriter({ device: b });
 
-            const chunkId = makeChunkId("echo");
-            rig.echoes.recordPushEcho(chunkId);
+            const chunkId = makeChunkId("preexisting");
+            await b.db.runWriteTx({
+                docs: [{ doc: { _id: chunkId, type: "chunk", data: "x" } as unknown as CouchSyncDoc }],
+            });
 
+            const spy = vi.spyOn(b.db, "runWriteTx");
             await rig.writer.apply(makeChangesResult(
                 [{ id: chunkId, seq: "1", doc: { _id: chunkId, type: "chunk", data: "x" } }],
                 "1",
             ));
 
-            // The echo doc should not have landed in B's DB.
-            expect(await b.db.get(chunkId)).toBeNull();
-            // And the push-echo mark was consumed during processing.
-            expect(rig.echoes.consumePushEcho(chunkId)).toBe(false);
+            // No second write tx — chunk skipped via existence check.
+            // Empty batch path runs saveEmptyPullBatch instead, which
+            // does call runWriteTx via Checkpoints.save → meta-only.
+            const docCarryingCalls = spy.mock.calls.filter(
+                ([arg]) => Array.isArray(arg.docs) && arg.docs.length > 0,
+            );
+            expect(docCarryingCalls).toHaveLength(0);
+            spy.mockRestore();
+        });
+
+        it("empty vclocks fall through to the resolver (not silently skipped)", async () => {
+            // Two empty vclocks compare as equal but are not causally
+            // equal — that pair shows up for tombstones / legacy docs
+            // and must reach the resolver, not the converged-skip path.
+            h = createSyncHarness();
+            const b = h.addDevice("dev-B");
+            const rig = attachPullWriter({ device: b, withResolver: true });
+
+            await seedLocalFileDoc(b, "legacy.md", {});
+            const remote = makeRemoteFileDoc("legacy.md", {});
+
+            const pullWrites: FileDoc[] = [];
+            rig.events.onAsync("pull-write", async ({ doc }) => { pullWrites.push(doc); });
+
+            await rig.writer.apply(makeChangesResult(
+                [{ id: remote._id, seq: "1", doc: remote }], "1",
+            ));
+
+            // resolver returns keep-local for equal (the safe fallback);
+            // the important behaviour is that the converged-skip
+            // shortcut did NOT swallow it. resolver dropped it as
+            // keep-local, so no pull-write fires either way — but the
+            // local doc is observed via the resolver's localDb.get path.
+            expect(pullWrites).toHaveLength(0);
         });
 
         it("fires pull-write for accepted FileDocs and emits auto-resolve", async () => {

@@ -27,6 +27,7 @@ import {
     filePathFromId, configPathFromId, isFileDocId,
 } from "../../types/doc-id.ts";
 import { stripRev } from "../../utils/doc.ts";
+import { compareVC } from "../../sync/vector-clock.ts";
 import type { LocalDB } from "../local-db.ts";
 import type { ChangesResult } from "../interfaces.ts";
 import type { ConflictResolver } from "../../conflict/conflict-resolver.ts";
@@ -57,6 +58,11 @@ interface BatchStats {
     keepLocalCount: number;
     chunkCount: number;
     deletedCount: number;
+    /** Docs already converged with local (vclock equal for file/config,
+     *  or chunk already on disk). Counts the doc-level idempotency
+     *  short-circuits that replaced the old session-scoped push-echo
+     *  Map — see echo-tracker.ts for history. */
+    convergedSkipCount: number;
 }
 
 interface ConcurrentEntry {
@@ -101,6 +107,7 @@ export class PullWriter {
             keepLocalCount: 0,
             chunkCount: 0,
             deletedCount: 0,
+            convergedSkipCount: 0,
         };
         const resolver = this.deps.getConflictResolver();
 
@@ -115,10 +122,19 @@ export class PullWriter {
             if (!row.doc) continue;
             const remoteDoc = stripRev(row.doc) as CouchSyncDoc;
 
-            if (this.deps.echoes.consumePushEcho(remoteDoc._id)) continue;
-
-            // ChunkDocs have no vclock — always accept.
+            // ChunkDocs have no vclock and are content-addressed (id =
+            // hash of payload). If the chunk already exists locally, the
+            // re-put is a no-op — short-circuit to avoid pointless I/O
+            // when a session-boundary catchup re-delivers self-pushed
+            // chunks. R1b path: the old recordPushEcho/consumePushEcho
+            // pair gated this; with that gone, content-addressing is
+            // the durable check.
             if (!isFileDoc(remoteDoc) && !isConfigDoc(remoteDoc)) {
+                const existing = await this.deps.localDb.get(remoteDoc._id);
+                if (existing) {
+                    stats.convergedSkipCount++;
+                    continue;
+                }
                 accepted.push(remoteDoc);
                 stats.chunkCount++;
                 continue;
@@ -128,6 +144,21 @@ export class PullWriter {
             if (resolver) {
                 const localDoc = await this.deps.localDb.get(remoteDoc._id);
                 if (localDoc && (isFileDoc(localDoc) || isConfigDoc(localDoc))) {
+                    // Data-level idempotency: identical vclocks mean the
+                    // local already reflects this revision (self-push
+                    // echo OR a foreign write that was previously pulled
+                    // in). Skip silently before reaching the resolver so
+                    // session-boundary echo loss doesn't surface as
+                    // keep-local noise. Empty-vs-empty vclocks are not
+                    // causally equal (tombstones, legacy docs) and must
+                    // fall through to the resolver.
+                    const localVC = localDoc.vclock ?? {};
+                    const remoteVC = remoteDoc.vclock ?? {};
+                    if (Object.keys(localVC).length > 0 &&
+                        compareVC(localVC, remoteVC) === "equal") {
+                        stats.convergedSkipCount++;
+                        continue;
+                    }
                     const verdict = await resolver.resolveOnPull(localDoc, remoteDoc);
                     if (verdict === "keep-local") {
                         const path = isFileDoc(remoteDoc)
@@ -233,13 +264,15 @@ export class PullWriter {
             || stats.keepLocalCount > 0
             || concurrentCount > 0
             || stats.writeFailCount > 0
-            || stats.deletedCount > 0;
+            || stats.deletedCount > 0
+            || stats.convergedSkipCount > 0;
         if (!active) return;
 
         const parts: string[] = [];
         if (stats.writtenCount > 0) parts.push(`${stats.writtenCount} written`);
         if (stats.deletedCount > 0) parts.push(`${stats.deletedCount} deleted`);
         if (stats.keepLocalCount > 0) parts.push(`${stats.keepLocalCount} keep-local`);
+        if (stats.convergedSkipCount > 0) parts.push(`${stats.convergedSkipCount} converged`);
         if (concurrentCount > 0) parts.push(`${concurrentCount} concurrent`);
         if (stats.writeFailCount > 0) parts.push(`${stats.writeFailCount} failed`);
         if (stats.chunkCount > 0) parts.push(`${stats.chunkCount} chunks`);

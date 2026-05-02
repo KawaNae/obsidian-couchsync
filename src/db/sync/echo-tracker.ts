@@ -1,22 +1,23 @@
 /**
- * EchoTracker — unifies the two echo-suppression concepts that used to
- * live in SyncEngine as separate structures:
+ * EchoTracker — pull-echo suppression for the push pipeline.
  *
- *   1. Pull-echo suppression (`pullWrittenIds`, seq-indexed Map).
- *      After writing pulled docs to localDB, the push loop must not
- *      send those same docs back to the server. We compare the local
- *      change's seq to the seq captured at pull-write time: any change
- *      with seq <= recorded is the pull echo; seq > recorded is a
- *      genuine post-pull user edit that must be pushed.
+ * After the pull-writer commits pulled docs to localDb, those writes
+ * surface in the push loop's local-changes feed. We compare each local
+ * change's seq to the seq captured at pull-write time: any change with
+ * seq <= recorded is the pull echo and must not be pushed back; seq >
+ * recorded is a genuine post-pull user edit.
  *
- *   2. Push-echo suppression (`recentlyPushedIds`, Set).
- *      After pushing a doc, it comes back via the _changes feed. Mark
- *      it as "we just pushed this" so the pull writer skips logging it.
- *      These are consumed on first pull-return.
+ * Push-echo suppression used to live here too, as a session-scoped
+ * `recentlyPushed` Map. That structure had a R1b-class race: a session
+ * teardown between push completion and the next pull longpoll dropped
+ * the in-memory marks, so the new session's catchup re-delivered the
+ * self-pushed docs and the resolver hit `equal vclock → keep-local`.
+ * The replacement is data-level: pull-writer compares local vs remote
+ * vclock and skips on `equal` directly. No echo bookkeeping needed.
  *
- * Both apply a TTL as a safety net: if a doc somehow escapes the
- * ordinary consumption path (remote rewrite, network glitch), the
- * entry expires instead of leaking forever.
+ * The TTL is a safety net for pullWritten: if a doc somehow escapes the
+ * ordinary consumption path (remote rewrite, network glitch), the entry
+ * expires instead of leaking forever.
  */
 
 interface PullWriteRecord {
@@ -31,16 +32,8 @@ export class EchoTracker {
     static readonly DEFAULT_TTL_MS = 60_000;
 
     private pullWritten = new Map<string, PullWriteRecord>();
-    /**
-     * Push echoes carry an insertion timestamp so the TTL sweep can
-     * expire stragglers (prior implementation was a bare Set that could
-     * leak a doc forever if its pull echo never arrived).
-     */
-    private recentlyPushed = new Map<string, number>();
 
     constructor(private readonly ttlMs: number = EchoTracker.DEFAULT_TTL_MS) {}
-
-    // ── Pull-echo API ────────────────────────────────────────
 
     /** Record that pull wrote these doc IDs at the given localDb seq. */
     recordPullWrites(ids: string[], seq: number): void {
@@ -77,41 +70,11 @@ export class EchoTracker {
         }
     }
 
-    // ── Push-echo API ────────────────────────────────────────
-
-    /** Mark that we just successfully pushed this doc. */
-    recordPushEcho(id: string): void {
-        this.recentlyPushed.set(id, Date.now());
-    }
-
-    /**
-     * Consume the push-echo mark. Returns true if the doc was marked
-     * (and clears the mark) — caller should skip pull-logging for it.
-     * Also sweeps stale entries so a stuck mark can't live forever.
-     */
-    consumePushEcho(id: string): boolean {
-        const hit = this.recentlyPushed.delete(id);
-        const now = Date.now();
-        for (const [k, addedAt] of this.recentlyPushed) {
-            if (now - addedAt > this.ttlMs) {
-                this.recentlyPushed.delete(k);
-            }
-        }
-        return hit;
-    }
-
-    // ── Lifecycle ────────────────────────────────────────────
-
     /** Drop everything — called on session teardown. */
     clear(): void {
         this.pullWritten.clear();
-        this.recentlyPushed.clear();
     }
-
-    // ── Introspection (tests) ────────────────────────────────
 
     /** @internal test helper */
     sizePullWritten(): number { return this.pullWritten.size; }
-    /** @internal test helper */
-    sizeRecentlyPushed(): number { return this.recentlyPushed.size; }
 }

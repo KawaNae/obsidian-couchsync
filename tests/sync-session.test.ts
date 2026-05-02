@@ -95,10 +95,10 @@ describe("SyncSession", () => {
 
     it("owns its own echoes (session-scoped state)", () => {
         const s = makeSession();
-        s.echoes.recordPushEcho("file:a.md");
-        expect(s.echoes.consumePushEcho("file:a.md")).toBe(true);
+        s.echoes.recordPullWrites(["file:a.md"], 10);
+        expect(s.echoes.isPullEcho("file:a.md", 10)).toBe(true);
         const s2 = makeSession();
-        expect(s2.echoes.consumePushEcho("file:a.md")).toBe(false);
+        expect(s2.echoes.isPullEcho("file:a.md", 10)).toBe(false);
     });
 
     it("exposes an AbortSignal that is not aborted initially", () => {

@@ -54,50 +54,14 @@ describe("EchoTracker", () => {
         });
     });
 
-    describe("push-echo suppression", () => {
-        it("consumePushEcho returns true then false (one-shot consumption)", () => {
-            const t = new EchoTracker();
-            t.recordPushEcho("file:a.md");
-            expect(t.consumePushEcho("file:a.md")).toBe(true);
-            expect(t.consumePushEcho("file:a.md")).toBe(false);
-        });
-
-        it("consumePushEcho returns false for unrecorded IDs", () => {
-            const t = new EchoTracker();
-            expect(t.consumePushEcho("file:a.md")).toBe(false);
-        });
-    });
-
-    describe("push-echo TTL (closes leak bug from bare Set)", () => {
-        beforeEach(() => { vi.useFakeTimers(); });
-        afterEach(() => { vi.useRealTimers(); });
-
-        it("expired push-echo marks are swept on next consumePushEcho", () => {
-            const t = new EchoTracker(1_000);
-            t.recordPushEcho("file:stale.md");
-            t.recordPushEcho("file:fresh.md");
-
-            vi.advanceTimersByTime(500);
-            t.recordPushEcho("file:fresh.md"); // bump timestamp
-            vi.advanceTimersByTime(700);
-            // stale is now 1200ms old; fresh is 700ms old.
-            t.consumePushEcho("file:something-else"); // triggers sweep
-
-            expect(t.sizeRecentlyPushed()).toBe(1);
-            expect(t.consumePushEcho("file:fresh.md")).toBe(true);
-        });
-    });
-
     describe("clear (teardown)", () => {
-        it("clear removes pull + push state in one call", () => {
+        it("clear removes pull-echo state", () => {
             const t = new EchoTracker();
             t.recordPullWrites(["file:a.md"], 10);
-            t.recordPushEcho("file:b.md");
 
             t.clear();
 
             expect(t.sizePullWritten()).toBe(0);
-            expect(t.sizeRecentlyPushed()).toBe(0);
         });
     });
 });
