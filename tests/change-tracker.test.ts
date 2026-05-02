@@ -84,44 +84,14 @@ describe("ChangeTracker", () => {
         });
     });
 
-    // ── ignoreWrite / ignoreDelete ──────────────────────
+    // ── ignoreDelete ─────────────────────────────────────
+    //
+    // ignoreWrite / clearIgnore retired in v0.21.0: the modify-path
+    // echo is now suppressed by `chunksEqual` idempotency in
+    // fileToDb. ignoreDelete remains because deletions have no
+    // chunksEqual analog.
 
-    describe("ignoreWrite / ignoreDelete", () => {
-        it("suppresses next modify for ignored path", async () => {
-            tracker.start();
-            tracker.ignoreWrite("a.md");
-            events.emit("modify", "a.md", stat);
-
-            vi.advanceTimersByTime(200);
-            await vi.runAllTimersAsync();
-
-            expect(vaultSync.calls.fileToDb).toHaveLength(0);
-        });
-
-        it("consumes ignore token after first use", async () => {
-            tracker.start();
-            tracker.ignoreWrite("a.md");
-            events.emit("modify", "a.md", stat); // consumed
-            events.emit("modify", "a.md", stat); // not consumed
-
-            vi.advanceTimersByTime(200);
-            await vi.runAllTimersAsync();
-
-            expect(vaultSync.calls.fileToDb).toEqual(["a.md"]);
-        });
-
-        it("clearIgnore removes pending token", async () => {
-            tracker.start();
-            tracker.ignoreWrite("a.md");
-            tracker.clearIgnore("a.md");
-            events.emit("modify", "a.md", stat);
-
-            vi.advanceTimersByTime(200);
-            await vi.runAllTimersAsync();
-
-            expect(vaultSync.calls.fileToDb).toEqual(["a.md"]);
-        });
-
+    describe("ignoreDelete", () => {
         it("suppresses next delete for ignored path", async () => {
             tracker.start();
             tracker.ignoreDelete("d.md");

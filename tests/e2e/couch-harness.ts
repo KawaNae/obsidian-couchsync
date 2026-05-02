@@ -35,6 +35,7 @@ import { AuthGate } from "../../src/db/sync/auth-gate.ts";
 import { VaultSync } from "../../src/sync/vault-sync.ts";
 import { ChangeTracker } from "../../src/sync/change-tracker.ts";
 import { ConflictResolver } from "../../src/conflict/conflict-resolver.ts";
+import { FilesystemVaultWriter } from "../../src/sync/vault-writer.ts";
 import { CouchClient, makeCouchClient } from "../../src/db/couch-client.ts";
 import type { CouchSyncSettings } from "../../src/settings.ts";
 import type { ICouchClient } from "../../src/db/interfaces.ts";
@@ -177,9 +178,9 @@ export async function createE2EHarness(opts: CreateE2EHarnessOpts = {}): Promise
         const clientFactory = (_s: CouchSyncSettings): ICouchClient => client;
         const engine = new SyncEngine(db, getSettings, /* isMobile */ false, auth, clientFactory);
 
-        const vs = new VaultSync(vault, db, getSettings);
+        const writer = new FilesystemVaultWriter(vault);
+        const vs = new VaultSync(vault, db, getSettings, writer);
         const ct = new ChangeTracker(vaultEvents, vs, getSettings);
-        vs.setWriteIgnore(ct);
 
         const resolver = new ConflictResolver();
         engine.setConflictResolver(resolver);

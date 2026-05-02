@@ -8,16 +8,6 @@ export class ChangeTracker implements IWriteIgnore {
     private pendingMinInterval = new Map<string, ReturnType<typeof setTimeout>>();
     private lastSyncTime = new Map<string, number>();
     private eventRefs: VaultEventRef[] = [];
-    /**
-     * Paths whose next `modify` / `create` event should be treated as a
-     * sync-driven echo and dropped. VaultSync.dbToFile registers the path
-     * before calling vault.modifyBinary; Obsidian fires the resulting modify
-     * event synchronously during the write, so by the time modifyBinary's
-     * promise resolves the token has already been consumed. If the event
-     * never fires (e.g. the write was a no-op), dbToFile's finally block
-     * clears the stale token to avoid suppressing a later user edit.
-     */
-    private pendingWriteIgnores = new Set<string>();
     /** Paths whose next `delete` event should be treated as sync-driven. */
     private pendingDeleteIgnores = new Set<string>();
 
@@ -29,17 +19,11 @@ export class ChangeTracker implements IWriteIgnore {
 
     start(): void {
         this.eventRefs.push(
-            this.events.on("modify", (path) => {
-                if (this.pendingWriteIgnores.delete(path)) return;
-                this.scheduleSync(path);
-            })
+            this.events.on("modify", (path) => this.scheduleSync(path)),
         );
 
         this.eventRefs.push(
-            this.events.on("create", (path) => {
-                if (this.pendingWriteIgnores.delete(path)) return;
-                this.scheduleSync(path);
-            })
+            this.events.on("create", (path) => this.scheduleSync(path)),
         );
 
         this.eventRefs.push(
@@ -75,25 +59,9 @@ export class ChangeTracker implements IWriteIgnore {
         this.pendingMinInterval.clear();
     }
 
-
-    /**
-     * Mark the next `modify` / `create` event on `path` as sync-driven so
-     * the change handler drops it instead of enqueuing a push. Callers MUST
-     * pair this with clearIgnore() in a finally block to avoid leaking a
-     * stale token when the write is a no-op (content unchanged, no event).
-     */
-    ignoreWrite(path: string): void {
-        this.pendingWriteIgnores.add(path);
-    }
-
     /** Register that the next `delete` event on `path` is sync-driven. */
     ignoreDelete(path: string): void {
         this.pendingDeleteIgnores.add(path);
-    }
-
-    /** Drop any pending write ignore for `path`. Safe to call redundantly. */
-    clearIgnore(path: string): void {
-        this.pendingWriteIgnores.delete(path);
     }
 
     private scheduleSync(path: string): void {

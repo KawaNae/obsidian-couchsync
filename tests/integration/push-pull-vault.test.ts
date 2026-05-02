@@ -9,6 +9,7 @@
 import "fake-indexeddb/auto";
 import { describe, it, expect, afterEach } from "vitest";
 import { VaultSync } from "../../src/sync/vault-sync.ts";
+import { FilesystemVaultWriter } from "../../src/sync/vault-writer.ts";
 import { LocalDB } from "../../src/db/local-db.ts";
 import { ConflictResolver } from "../../src/conflict/conflict-resolver.ts";
 import { FakeVaultIO } from "../helpers/fake-vault-io.ts";
@@ -29,7 +30,8 @@ describe("Integration: push → pull → vault", () => {
         const db = new LocalDB(uniqueDbName(deviceId));
         db.open();
         const settings = makeSettings({ deviceId });
-        const vs = new VaultSync(vault, db, () => settings);
+        const writer = new FilesystemVaultWriter(vault);
+        const vs = new VaultSync(vault, db, () => settings, writer);
         cleanups.push(async () => { await db.destroy(); });
         return { vault, db, vs, settings };
     }

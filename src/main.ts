@@ -29,6 +29,9 @@ import { ObsidianVaultIO } from "./adapters/obsidian-vault-io.ts";
 import { ObsidianAdapterIO } from "./adapters/obsidian-adapter-io.ts";
 import { ObsidianVaultEvents } from "./adapters/obsidian-vault-events.ts";
 import { ObsidianModalPresenter } from "./adapters/obsidian-modal-presenter.ts";
+import { ObsidianCompositionTracker } from "./adapters/obsidian-composition-tracker.ts";
+import { EditorAwareVaultWriter } from "./adapters/editor-aware-vault-writer.ts";
+import { CompositionGate } from "./sync/composition-gate.ts";
 
 export default class CouchSyncPlugin extends Plugin {
     settings!: CouchSyncSettings;
@@ -49,6 +52,9 @@ export default class CouchSyncPlugin extends Plugin {
     statusBar!: StatusBar;
     modalPresenter!: ObsidianModalPresenter;
     private conflictOrchestrator!: ConflictOrchestrator;
+    private compositionTracker!: ObsidianCompositionTracker;
+    private compositionGate!: CompositionGate;
+    private vaultWriter!: EditorAwareVaultWriter;
 
     async onload(): Promise<void> {
         await this.loadSettings();
@@ -105,9 +111,24 @@ export default class CouchSyncPlugin extends Plugin {
         this.replicator = new SyncEngine(this.localDb, () => this.settings, Platform.isMobile, this.auth);
         this.historyStorage = new HistoryStorage(this.app.vault.getName());
         this.historyCapture = new HistoryCapture(vaultIO, vaultEvents, this.historyStorage, () => this.settings);
-        this.vaultSync = new VaultSync(vaultIO, this.localDb, () => this.settings, this.historyCapture);
+
+        // Editor-aware write layer: defers vault writes while the
+        // path's editor is in IME composition, dispatches CodeMirror
+        // transactions instead of triggering Obsidian's external-edit
+        // reload (which would break IME), and falls back to disk
+        // write when no editor session exists.
+        this.compositionTracker = new ObsidianCompositionTracker(this.app);
+        this.compositionGate = new CompositionGate(this.compositionTracker);
+        this.vaultWriter = new EditorAwareVaultWriter(
+            this.app, vaultIO, this.compositionGate,
+            null, this.historyCapture,
+        );
+        this.vaultSync = new VaultSync(vaultIO, this.localDb, () => this.settings, this.vaultWriter);
         this.changeTracker = new ChangeTracker(vaultEvents, this.vaultSync, () => this.settings);
-        this.vaultSync.setWriteIgnore(this.changeTracker);
+        // Late-bind the writeIgnore once ChangeTracker exists. It is
+        // used by VaultWriter only on the deletion path (the modify
+        // path now relies on chunksEqual idempotency in fileToDb).
+        this.vaultWriter.setWriteIgnore(this.changeTracker);
         const reconnectBridge: ReconnectBridge = {
             notifyTransient: () => {
                 // Fire-and-forget: ConfigSync surfaces the original error to
@@ -204,6 +225,8 @@ export default class CouchSyncPlugin extends Plugin {
         this.app.workspace.onLayoutReady(async () => {
             this.historyCapture.start();
             this.historyManager.startCleanup();
+            this.compositionTracker.start();
+            this.compositionGate.start();
 
             // Schema guard. Two checks:
             //
@@ -290,6 +313,9 @@ export default class CouchSyncPlugin extends Plugin {
         this.changeTracker?.stop();
         this.historyCapture?.stop();
         this.historyManager?.stopCleanup();
+        this.vaultWriter?.flushAll();
+        this.compositionGate?.stop();
+        this.compositionTracker?.stop();
         this.replicator?.stop();
         await this.vaultSync?.teardown();
         this.reconciler?.destroy();

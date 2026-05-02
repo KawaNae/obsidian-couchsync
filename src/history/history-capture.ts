@@ -97,14 +97,18 @@ export class HistoryCapture {
     }
 
     /**
-     * Capture a history entry for a sync-driven write. Called by VaultSync
-     * after dbToFile() successfully writes remote content to the vault.
-     * Bypasses debounce/rate-limit (sync events are discrete, not continuous input)
-     * and tags the entry with source="sync".
+     * Capture a history entry for a sync-driven write. Called by
+     * VaultWriter immediately after dispatching the remote content
+     * (CM transaction or disk write). When `content` is provided the
+     * capture skips the disk read — used by the editor-aware writer
+     * because Obsidian's autosave hasn't yet written the new content
+     * to disk at the time of capture (~2 s gap between CM dispatch
+     * and autosave). Bypasses debounce/rate-limit and tags the entry
+     * with source="sync".
      */
-    async captureSyncWrite(path: string): Promise<void> {
+    async captureSyncWrite(path: string, content?: string): Promise<void> {
         if (!this.isTargetPath(path)) return;
-        await this.captureChange(path, "sync");
+        await this.captureChange(path, "sync", content);
     }
 
     private isTargetPath(path: string): boolean {
@@ -159,14 +163,21 @@ export class HistoryCapture {
         }
     }
 
-    private async captureChange(path: string, source: HistorySource = "local"): Promise<void> {
+    private async captureChange(
+        path: string,
+        source: HistorySource = "local",
+        providedContent?: string,
+    ): Promise<void> {
         try {
             // Local edits use cachedRead (memory-cached parsed text) for the
             // typing hot path. Sync writes go through the byte-sniff path so
             // binary files don't pollute history. We re-encode the cached
             // string to validate it's diffable UTF-8 either way.
             let currentContent: string;
-            if (source === "sync") {
+            if (providedContent !== undefined) {
+                if (!isDiffableText(new TextEncoder().encode(providedContent))) return;
+                currentContent = providedContent;
+            } else if (source === "sync") {
                 const buffer = await this.vault.readBinary(path);
                 if (!isDiffableText(buffer)) return;
                 currentContent = new TextDecoder("utf-8").decode(buffer);

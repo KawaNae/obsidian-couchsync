@@ -2,7 +2,7 @@ import type { IVaultIO } from "../types/vault-io.ts";
 import type { LocalDB } from "../db/local-db.ts";
 import type { FileDoc, ChunkDoc, CouchSyncDoc } from "../types.ts";
 import type { CouchSyncSettings } from "../settings.ts";
-import type { HistoryCapture } from "../history/history-capture.ts";
+import type { VaultWriter, WriteResult } from "./vault-writer.ts";
 import { splitIntoChunks, joinChunks } from "../db/chunker.ts";
 import { notify } from "../ui/log.ts";
 import { compareVC, incrementVC } from "./vector-clock.ts";
@@ -22,14 +22,16 @@ import { DbError } from "../db/write-transaction.ts";
 export type CompareResult = "identical" | "local-unpushed" | "remote-pending";
 
 /**
- * Subset of ChangeTracker that VaultSync needs. Breaks the circular
- * dependency: ChangeTracker depends on VaultSync, and VaultSync needs to
- * mark sync-driven writes so the tracker can drop their echoes.
+ * Subset of ChangeTracker that EditorAwareVaultWriter needs.
+ *
+ * Modify-path echo suppression no longer flows through this token —
+ * the `chunksEqual` short-circuit in `fileToDb` provides data-level
+ * idempotency. Only the deletion path still needs explicit signalling
+ * (deletions have no chunksEqual analog).
  */
 export interface IWriteIgnore {
-    ignoreWrite(path: string): void;
+    /** Mark the next `delete` event on `path` as sync-driven. */
     ignoreDelete(path: string): void;
-    clearIgnore(path: string): void;
 }
 
 /** Max snapshot→commit retries inside runWrite when a concurrent pull lands
@@ -60,13 +62,8 @@ export class VaultSync {
         private vault: IVaultIO,
         private db: LocalDB,
         private getSettings: () => CouchSyncSettings,
-        private historyCapture: HistoryCapture | null = null,
-        private writeIgnore: IWriteIgnore | null = null,
+        private vaultWriter: VaultWriter,
     ) {}
-
-    setWriteIgnore(wi: IWriteIgnore): void {
-        this.writeIgnore = wi;
-    }
 
     /**
      * Load persisted lastSyncedVclock entries. Called once during plugin
@@ -160,10 +157,7 @@ export class VaultSync {
         }
 
         if (fileDoc.deleted) {
-            if (await this.vault.exists(vaultPath)) {
-                this.writeIgnore?.ignoreDelete(vaultPath);
-                await this.vault.delete(vaultPath);
-            }
+            await this.vaultWriter.applyRemoteDeletion(vaultPath);
             return;
         }
 
@@ -190,35 +184,40 @@ export class VaultSync {
         }
 
         const content = joinChunks(orderedChunks);
-        this.writeIgnore?.ignoreWrite(vaultPath);
 
-        let written = false;
-        try {
-            if (existingStat) {
-                await this.vault.writeBinary(vaultPath, content);
-            } else {
-                await this.ensureParentDir(vaultPath);
-                await this.vault.createBinary(vaultPath, content);
-            }
-            written = true;
-        } finally {
-            this.writeIgnore?.clearIgnore(vaultPath);
+        // Delegate the vault write to the editor-aware VaultWriter.
+        // For new files we use createFile (no editor session can exist
+        // yet); for existing files applyRemoteContent picks the right
+        // strategy (CM dispatch, defer-on-composing, or fallback).
+        let result: WriteResult;
+        if (existingStat) {
+            result = await this.vaultWriter.applyRemoteContent(vaultPath, content);
+        } else {
+            await this.ensureParentDir(vaultPath);
+            await this.vaultWriter.createFile(vaultPath, content);
+            result = { applied: true };
         }
 
-        if (written) {
-            const clock = { ...(fileDoc.vclock ?? {}) };
-            // Persist the vclock in the docs store's meta so it lives in
-            // the same IDB as the FileDoc itself. Pure meta write — no CAS
-            // needed, so pass a fixed tx rather than a builder.
-            await this.db.runWriteTx({
-                vclocks: [{ path: vaultPath, op: "set", clock }],
-            });
-            this.lastSyncedVclock.set(toPathKey(vaultPath), clock);
+        if (result.applied === false) {
+            // VaultWriter declined to apply (e.g., the local doc
+            // diverged during IME composition). Leave bookkeeping
+            // untouched so Reconciler picks up the discrepancy on
+            // its next pass.
+            logDebug(`dbToFile: skipped ${vaultPath} (${result.reason})`);
+            return;
         }
 
-        if (written && this.historyCapture) {
-            await this.historyCapture.captureSyncWrite(vaultPath);
-        }
+        const clock = { ...(fileDoc.vclock ?? {}) };
+        // Persist the vclock in the docs store's meta so it lives in
+        // the same IDB as the FileDoc itself. Pure meta write — no CAS
+        // needed, so pass a fixed tx rather than a builder.
+        await this.db.runWriteTx({
+            vclocks: [{ path: vaultPath, op: "set", clock }],
+        });
+        this.lastSyncedVclock.set(toPathKey(vaultPath), clock);
+
+        // History capture is now owned by VaultWriter (it knows when
+        // the content has actually landed in the editor/disk).
     }
 
     /**
@@ -292,10 +291,7 @@ export class VaultSync {
     }
 
     async applyRemoteDeletion(path: string): Promise<void> {
-        if (await this.vault.exists(path)) {
-            this.writeIgnore?.ignoreDelete(path);
-            await this.vault.delete(path);
-        }
+        await this.vaultWriter.applyRemoteDeletion(path);
         await this.markDeleted(path);
     }
 

@@ -1,6 +1,7 @@
 import "fake-indexeddb/auto";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { VaultSync, type IWriteIgnore } from "../../src/sync/vault-sync.ts";
+import { VaultSync } from "../../src/sync/vault-sync.ts";
+import { FilesystemVaultWriter } from "../../src/sync/vault-writer.ts";
 import { LocalDB } from "../../src/db/local-db.ts";
 import { FakeVaultIO } from "../helpers/fake-vault-io.ts";
 import { makeSettings } from "../helpers/settings-factory.ts";
@@ -15,21 +16,14 @@ describe("VaultSync", () => {
     let db: LocalDB;
     let vs: VaultSync;
     let settings: ReturnType<typeof makeSettings>;
-    let writeIgnoreCalls: { method: string; path: string }[];
-    let writeIgnore: IWriteIgnore;
 
     beforeEach(() => {
         vault = new FakeVaultIO();
         db = new LocalDB(uniqueDbName());
         db.open();
         settings = makeSettings({ deviceId: "dev-A" });
-        writeIgnoreCalls = [];
-        writeIgnore = {
-            ignoreWrite(path) { writeIgnoreCalls.push({ method: "ignoreWrite", path }); },
-            ignoreDelete(path) { writeIgnoreCalls.push({ method: "ignoreDelete", path }); },
-            clearIgnore(path) { writeIgnoreCalls.push({ method: "clearIgnore", path }); },
-        };
-        vs = new VaultSync(vault, db, () => settings, null, writeIgnore);
+        const writer = new FilesystemVaultWriter(vault);
+        vs = new VaultSync(vault, db, () => settings, writer);
     });
 
     afterEach(async () => {
@@ -185,59 +179,18 @@ describe("VaultSync", () => {
             expect(vault.files.has("a.md")).toBe(false);
         });
 
-        it("registers writeIgnore for sync-driven writes", async () => {
-            vault.addFile("a.md", "v1");
-            await vs.fileToDb("a.md");
-            writeIgnoreCalls = []; // reset
-
-            // Modify content to force write
-            vault.addFile("a.md", "DIFFERENT");
-            const doc = await db.get(makeFileId("a.md")) as FileDoc;
-            await vs.dbToFile(doc);
-
-            const ignoreCall = writeIgnoreCalls.find(
-                (c) => c.method === "ignoreWrite" && c.path === "a.md",
-            );
-            const clearCall = writeIgnoreCalls.find(
-                (c) => c.method === "clearIgnore" && c.path === "a.md",
-            );
-            expect(ignoreCall).toBeDefined();
-            expect(clearCall).toBeDefined();
-        });
-
         it("skips write when vault content already matches", async () => {
             vault.addFile("a.md", "same");
             await vs.fileToDb("a.md");
-            writeIgnoreCalls = [];
 
+            // Capture vault state, run dbToFile with the doc that
+            // matches what's already on disk, expect no mutation.
+            const beforeMtime = (await vault.stat("a.md"))?.mtime;
             const doc = await db.get(makeFileId("a.md")) as FileDoc;
             await vs.dbToFile(doc);
+            const afterMtime = (await vault.stat("a.md"))?.mtime;
 
-            // No writeIgnore needed — content was identical
-            expect(writeIgnoreCalls.filter((c) => c.method === "ignoreWrite")).toHaveLength(0);
-        });
-
-        it("registers ignoreDelete for tombstone", async () => {
-            vault.addFile("a.md", "content");
-            writeIgnoreCalls = [];
-
-            const doc: FileDoc = {
-                _id: makeFileId("a.md"),
-                type: "file",
-                chunks: [],
-                mtime: 1000,
-                ctime: 1000,
-                size: 0,
-                vclock: { A: 1 },
-                deleted: true,
-            };
-
-            await vs.dbToFile(doc);
-
-            const ignoreCall = writeIgnoreCalls.find(
-                (c) => c.method === "ignoreDelete" && c.path === "a.md",
-            );
-            expect(ignoreCall).toBeDefined();
+            expect(afterMtime).toBe(beforeMtime);
         });
     });
 
