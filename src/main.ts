@@ -108,7 +108,6 @@ export default class CouchSyncPlugin extends Plugin {
 
         this.auth = new AuthGate();
         this.remoteOps = new VaultRemoteOps(this.localDb, () => this.settings, this.auth);
-        this.replicator = new SyncEngine(this.localDb, () => this.settings, Platform.isMobile, this.auth);
         this.historyStorage = new HistoryStorage(this.app.vault.getName());
         this.historyCapture = new HistoryCapture(vaultIO, vaultEvents, this.historyStorage, () => this.settings);
 
@@ -129,6 +128,17 @@ export default class CouchSyncPlugin extends Plugin {
         // used by VaultWriter only on the deletion path (the modify
         // path now relies on chunksEqual idempotency in fileToDb).
         this.vaultWriter.setWriteIgnore(this.changeTracker);
+        // SyncEngine constructed AFTER vaultSync so the pull-writer can
+        // call vaultSync.dbToFile directly via constructor DI (replaces
+        // the former events.onAsync("pull-write", ...) bus, whose catch-
+        // all swallowed write errors and let `Pull: N written` lie).
+        this.replicator = new SyncEngine(
+            this.localDb,
+            () => this.settings,
+            (doc) => this.vaultSync.dbToFile(doc),
+            Platform.isMobile,
+            this.auth,
+        );
         const reconnectBridge: ReconnectBridge = {
             notifyTransient: () => {
                 // Fire-and-forget: ConfigSync surfaces the original error to
@@ -196,12 +206,6 @@ export default class CouchSyncPlugin extends Plugin {
             getSettings: () => this.settings,
         });
         this.conflictOrchestrator.register();
-
-        // Pull-driven vault writes: accepted FileDocs are written directly
-        // to vault in the pull path. Reconciler handles only drift detection.
-        this.replicator.events.onAsync("pull-write", async ({ doc }) => {
-            await this.vaultSync.dbToFile(doc);
-        });
 
         // Pull-driven deletions: if the remote deleted a file, apply
         // locally unless there are unpushed local edits (→ concurrent).

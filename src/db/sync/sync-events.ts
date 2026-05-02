@@ -1,18 +1,13 @@
 /**
- * SyncEvents — typed event bus that subsumes the eleven handler arrays
+ * SyncEvents — typed event bus that subsumes the handler arrays
  * SyncEngine used to carry as individual public methods (`onStateChange`,
- * `onError`, `onPullWrite`, …).
+ * `onError`, etc.).
  *
- * Three flavours of event, matching the semantics they need:
+ * Two flavours of event, matching the semantics they need:
  *
  *   - Fire-and-forget notifications (`emit`): the controller emits,
  *     subscribers react. Handler exceptions are logged and swallowed so
  *     one buggy subscriber can't block the controller.
- *
- *   - Awaited notifications (`emitAsync`): the controller awaits all
- *     subscribers. Used for `pull-write`, where the vault write must
- *     complete before the next pull batch is written (otherwise chunks
- *     could be GC'd mid-flight).
  *
  *   - Queries (`emitAsyncAny`): each subscriber returns a boolean; the
  *     aggregate answer is "any subscriber said true". Used for
@@ -24,6 +19,15 @@
  * every registered callback exactly once when the session first reaches
  * idle. Registrations after the latch has been tripped fire
  * immediately — a late subscriber still sees the "catchup done" signal.
+ *
+ * History note: an awaited-broadcast API (`emitAsync` + `onAsync`) used
+ * to live here for `pull-write`. Its only subscriber was the vault
+ * writer, and the bus's catch-all swallowed write errors, causing
+ * `Pull: N written` log lines to misreport silently failed writes. The
+ * single subscriber was promoted to a function DI parameter on
+ * SyncEngine (`applyPullWrite`) and the awaited API was removed so the
+ * trap can't be fallen into again — re-introduce only when a real
+ * multi-subscriber awaited use case appears.
  */
 
 import { logError } from "../../ui/log.ts";
@@ -53,10 +57,6 @@ export interface SyncEventMap {
     degraded: { message: string };
 }
 
-export interface SyncAsyncEventMap {
-    "pull-write": { doc: FileDoc };
-}
-
 export interface SyncQueryEventMap {
     /** Return true if local has unpushed edits for this path (→ concurrent conflict). */
     "pull-delete": { path: string; localDoc: FileDoc };
@@ -66,7 +66,6 @@ type SyncHandler<T> = T extends void
     ? () => void
     : (payload: T) => void;
 
-type SyncAsyncHandler<T> = (payload: T) => Promise<void>;
 type SyncQueryHandler<T> = (payload: T) => Promise<boolean>;
 
 // Fire-and-forget uses a normalized `(p: T) => void` storage signature:
@@ -76,9 +75,6 @@ type InternalHandler<T> = (payload: T) => void;
 
 type FireAndForgetHandlers = {
     [K in keyof SyncEventMap]: Set<InternalHandler<SyncEventMap[K]>>;
-};
-type AwaitedHandlers = {
-    [K in keyof SyncAsyncEventMap]: Set<SyncAsyncHandler<SyncAsyncEventMap[K]>>;
 };
 type QueryHandlers = {
     [K in keyof SyncQueryEventMap]: Set<SyncQueryHandler<SyncQueryEventMap[K]>>;
@@ -97,9 +93,6 @@ export class SyncEvents {
         "catchup-complete": new Set(),
         "catchup-failed": new Set(),
         degraded: new Set(),
-    };
-    private awaited: AwaitedHandlers = {
-        "pull-write": new Set(),
     };
     private queries: QueryHandlers = {
         "pull-delete": new Set(),
@@ -135,31 +128,6 @@ export class SyncEvents {
                 h(payload);
             } catch (e: any) {
                 logError(`SyncEvents[${String(type)}] handler error: ${e?.message ?? e}`);
-            }
-        }
-    }
-
-    // ── Awaited notifications ───────────────────────────
-
-    onAsync<K extends keyof SyncAsyncEventMap>(
-        type: K,
-        handler: SyncAsyncHandler<SyncAsyncEventMap[K]>,
-    ): () => void {
-        const set = this.awaited[type];
-        set.add(handler);
-        return () => { set.delete(handler); };
-    }
-
-    async emitAsync<K extends keyof SyncAsyncEventMap>(
-        type: K,
-        payload: SyncAsyncEventMap[K],
-    ): Promise<void> {
-        const set = this.awaited[type];
-        for (const h of set) {
-            try {
-                await h(payload);
-            } catch (e: any) {
-                logError(`SyncEvents[${String(type)}] async handler error: ${e?.message ?? e}`);
             }
         }
     }

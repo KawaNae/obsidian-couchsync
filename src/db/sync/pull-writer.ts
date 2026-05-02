@@ -10,8 +10,8 @@
  *   2. `commit()` — delegates to `Checkpoints.commitPullBatch`, which
  *      owns the atomic `runWriteTx` that lands accepted docs and the
  *      new remoteSeq together. The onCommit closure passed in here
- *      runs post-durable-write: echo recording, pull-write emission,
- *      vault writes, auto-resolve events.
+ *      runs post-durable-write: pull-echo recording, vault writes via
+ *      the injected `applyPullWrite` callback, auto-resolve events.
  *
  *   3. `dispatch()` — emit concurrent events + format the log summary.
  *      Pure post-commit bookkeeping.
@@ -50,6 +50,12 @@ export interface PullWriterDeps {
     checkpoints: Checkpoints;
     getConflictResolver: () => ConflictResolver | undefined;
     ensureChunks: (doc: FileDoc) => Promise<void>;
+    /** Apply a pulled FileDoc to the vault. Called inside the post-
+     *  commit closure; throws here are caught into `writeFailCount`
+     *  so the `Pull: N written/failed` log tells the truth. Replaces
+     *  the former `events.emitAsync("pull-write", ...)` indirection,
+     *  whose try/catch swallowed errors and let `writtenCount` lie. */
+    applyPullWrite: (doc: FileDoc) => Promise<void>;
 }
 
 interface BatchStats {
@@ -218,9 +224,12 @@ export class PullWriter {
 
     /**
      * Hand the batch to Checkpoints, which owns the atomic tx. The
-     * onCommit closure here records echoes, fires pull-write, and emits
-     * auto-resolve — all after the durable write and after `remoteSeq`
-     * has advanced in memory.
+     * onCommit closure here records pull echoes, applies vault writes
+     * via the injected `applyPullWrite`, and emits auto-resolve — all
+     * after the durable write and after `remoteSeq` has advanced in
+     * memory. Vault-write throws are caught into `writeFailCount` so
+     * the batch log reflects reality rather than counting unwritten
+     * docs as `written`.
      */
     private async commit(
         accepted: CouchSyncDoc[],
@@ -244,7 +253,7 @@ export class PullWriter {
                     const path = filePathFromId(doc._id);
                     try {
                         await this.deps.ensureChunks(doc);
-                        await this.deps.events.emitAsync("pull-write", { doc });
+                        await this.deps.applyPullWrite(doc);
                         logDebug(`  ← ${path} (take-remote)`);
                         stats.writtenCount++;
                         this.deps.events.emit("auto-resolve", { filePath: path });

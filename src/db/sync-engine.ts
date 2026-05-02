@@ -75,7 +75,8 @@ export function verifyTimeoutMs(reason: ReconnectReason): number {
 // ── SyncEngine ───────────────────────────────────────────
 
 export class SyncEngine {
-    /** Typed event bus. External subscribers use `events.on(...)` / `events.onAsync(...)`. */
+    /** Typed event bus. External subscribers use `events.on(...)` (fire-
+     *  and-forget) or `events.onQuery(...)` (boolean-aggregated query). */
     readonly events = new SyncEvents();
 
     /** Auth latch. External callers read `auth.isBlocked()` and call `auth.raise/clear`. */
@@ -167,6 +168,12 @@ export class SyncEngine {
     constructor(
         private localDb: LocalDB,
         private getSettings: () => CouchSyncSettings,
+        /** Apply a pulled FileDoc to the vault. The pull-writer awaits
+         *  this inside its commit closure; throws are caught into
+         *  `writeFailCount` so the batch log reflects reality (vs the
+         *  former event-bus path that silently swallowed errors and let
+         *  `writtenCount` lie). */
+        private applyPullWrite: (doc: FileDoc) => Promise<void>,
         private isMobile: boolean = false,
         auth?: AuthGate,
         clientFactory?: (s: CouchSyncSettings) => ICouchClient,
@@ -567,6 +574,7 @@ export class SyncEngine {
             checkpoints: this.checkpoints,
             getConflictResolver: () => this.conflictResolver,
             ensureChunks: (doc) => this.ensureChunksInternal(client, doc),
+            applyPullWrite: (doc) => this.applyPullWrite(doc),
             handleLocalDbError: (e, ctx) => this.handleLocalDbError(e, ctx),
             onTransientError: (err) => this.handleTransientError(err),
             visibility: this.visibility,

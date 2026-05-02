@@ -119,11 +119,21 @@ export function createSyncHarness(opts: SyncHarnessOptions = {}): SyncHarness {
         const auth = new AuthGate();
         // clientFactory: 全デバイスが同じ couch を共有する。
         const clientFactory = (_s: CouchSyncSettings): ICouchClient => couch;
-        const engine = new SyncEngine(db, getSettings, /* isMobile */ false, auth, clientFactory);
 
+        // VaultSync を SyncEngine より先に構築 (production main.ts と
+        // 同じ順序)。SyncEngine の applyPullWrite に vs.dbToFile を渡す。
         const writer = new FilesystemVaultWriter(vault);
         const vs = new VaultSync(vault, db, getSettings, writer);
         const ct = new ChangeTracker(vaultEvents, vs, getSettings);
+
+        const engine = new SyncEngine(
+            db,
+            getSettings,
+            (doc) => vs.dbToFile(doc),
+            /* isMobile */ false,
+            auth,
+            clientFactory,
+        );
 
         const resolver = new ConflictResolver();
         engine.setConflictResolver(resolver);

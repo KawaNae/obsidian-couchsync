@@ -64,37 +64,11 @@ describe("SyncEvents", () => {
         });
     });
 
-    describe("awaited notifications (emitAsync / onAsync)", () => {
-        it("awaits every subscriber serially", async () => {
-            const ev = new SyncEvents();
-            const order: string[] = [];
-
-            ev.onAsync("pull-write", async () => {
-                await new Promise((r) => setTimeout(r, 5));
-                order.push("a-done");
-            });
-            ev.onAsync("pull-write", async () => {
-                order.push("b-start");
-            });
-
-            await ev.emitAsync("pull-write", { doc: makeFileDoc("file:a.md") });
-
-            expect(order).toEqual(["a-done", "b-start"]);
-        });
-
-        it("rejection in one async handler is logged but not thrown", async () => {
-            const ev = new SyncEvents();
-            const boom = vi.fn(async () => { throw new Error("boom"); });
-            const other = vi.fn(async () => {});
-            ev.onAsync("pull-write", boom);
-            ev.onAsync("pull-write", other);
-
-            await expect(
-                ev.emitAsync("pull-write", { doc: makeFileDoc("file:a.md") }),
-            ).resolves.toBeUndefined();
-            expect(other).toHaveBeenCalled();
-        });
-    });
+    // The awaited-broadcast API (emitAsync / onAsync) was removed: its
+    // sole subscriber was promoted to a constructor-injected callback
+    // (`SyncEngine.applyPullWrite`) so vault-write throws now propagate
+    // into PullWriter's existing try/catch and increment writeFailCount
+    // instead of being silently swallowed by the bus's catch-all.
 
     describe("queries (emitAsyncAny / onQuery)", () => {
         it("returns true when any handler returns true", async () => {

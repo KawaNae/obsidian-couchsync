@@ -39,6 +39,11 @@ export interface SyncSessionDeps {
     checkpoints: Checkpoints;
     getConflictResolver: () => ConflictResolver | undefined;
     ensureChunks: (doc: FileDoc) => Promise<void>;
+    /** Apply a pulled FileDoc to the vault. Called from PullWriter.commit
+     *  inside its commit closure. Throws are caught into `writeFailCount`
+     *  so the batch log reflects reality — the former event-bus path
+     *  silently swallowed errors. */
+    applyPullWrite: (doc: FileDoc) => Promise<void>;
     handleLocalDbError: (e: unknown, ctx: string) => void;
     /** Invoked from pipelines when a transient upstream error (auth /
      *  5xx) occurs. The supervisor (SyncEngine) decides escalation. */
@@ -86,6 +91,7 @@ export class SyncSession {
             checkpoints: deps.checkpoints,
             getConflictResolver: deps.getConflictResolver,
             ensureChunks: deps.ensureChunks,
+            applyPullWrite: deps.applyPullWrite,
         });
         const isCancelled = () => this._disposed;
         const delay = (ms: number) => this.delay(ms);

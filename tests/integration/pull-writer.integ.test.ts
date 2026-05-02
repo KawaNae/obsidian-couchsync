@@ -23,6 +23,7 @@ import { ConflictResolver } from "../../src/conflict/conflict-resolver.ts";
 import { makeFileId, makeChunkId } from "../../src/types/doc-id.ts";
 import type { ChangesResult } from "../../src/db/interfaces.ts";
 import type { FileDoc, CouchSyncDoc } from "../../src/types.ts";
+import * as log from "../../src/ui/log.ts";
 
 interface WriterRig {
     writer: PullWriter;
@@ -35,6 +36,9 @@ function attachPullWriter(opts: {
     device: DeviceHarness;
     /** Provide a ConflictResolver to enable the vclock guard. Defaults to undefined. */
     withResolver?: boolean;
+    /** Override the vault-write callback. Defaults to a no-op. Tests
+     *  that want to observe pulled docs pass `(doc) => collected.push(doc)`. */
+    applyPullWrite?: (doc: FileDoc) => Promise<void>;
 }): WriterRig {
     const events = new SyncEvents();
     const echoes = new EchoTracker();
@@ -47,6 +51,7 @@ function attachPullWriter(opts: {
         checkpoints,
         getConflictResolver: () => resolver,
         ensureChunks: async () => {},
+        applyPullWrite: opts.applyPullWrite ?? (async () => {}),
     });
     return { writer, echoes, events, checkpoints };
 }
@@ -281,22 +286,24 @@ describe("PullWriter integration", () => {
             // as keep-local; the resolver should never even see it.
             h = createSyncHarness();
             const b = h.addDevice("dev-B");
-            const rig = attachPullWriter({ device: b, withResolver: true });
+            const pullWrites: FileDoc[] = [];
+            const rig = attachPullWriter({
+                device: b,
+                withResolver: true,
+                applyPullWrite: async (doc) => { pullWrites.push(doc); },
+            });
 
             await seedLocalFileDoc(b, "self-pushed.md", { B: 1 });
             const remote = makeRemoteFileDoc("self-pushed.md", { B: 1 });
-
-            const pullWrites: FileDoc[] = [];
-            rig.events.onAsync("pull-write", async ({ doc }) => { pullWrites.push(doc); });
 
             const applied = await rig.writer.apply(makeChangesResult(
                 [{ id: remote._id, seq: "1", doc: remote }], "1",
             ));
 
-            // Local doc unchanged, no pull-write fired. The batch reports
-            // empty=true so the pull-pipeline takes the saveEmptyPullBatch
-            // path (advancing remote-seq via Checkpoints.save) — that's
-            // out of PullWriter scope.
+            // Local doc unchanged, applyPullWrite never invoked. The
+            // batch reports empty=true so the pull-pipeline takes the
+            // saveEmptyPullBatch path (advancing remote-seq via
+            // Checkpoints.save) — that's out of PullWriter scope.
             await expectDb(b.db).toHaveFileDoc("self-pushed.md").withVclock({ B: 1 });
             expect(pullWrites).toHaveLength(0);
             expect(applied.empty).toBe(true);
@@ -338,13 +345,15 @@ describe("PullWriter integration", () => {
             // and must reach the resolver, not the converged-skip path.
             h = createSyncHarness();
             const b = h.addDevice("dev-B");
-            const rig = attachPullWriter({ device: b, withResolver: true });
+            const pullWrites: FileDoc[] = [];
+            const rig = attachPullWriter({
+                device: b,
+                withResolver: true,
+                applyPullWrite: async (doc) => { pullWrites.push(doc); },
+            });
 
             await seedLocalFileDoc(b, "legacy.md", {});
             const remote = makeRemoteFileDoc("legacy.md", {});
-
-            const pullWrites: FileDoc[] = [];
-            rig.events.onAsync("pull-write", async ({ doc }) => { pullWrites.push(doc); });
 
             await rig.writer.apply(makeChangesResult(
                 [{ id: remote._id, seq: "1", doc: remote }], "1",
@@ -353,18 +362,20 @@ describe("PullWriter integration", () => {
             // resolver returns keep-local for equal (the safe fallback);
             // the important behaviour is that the converged-skip
             // shortcut did NOT swallow it. resolver dropped it as
-            // keep-local, so no pull-write fires either way — but the
-            // local doc is observed via the resolver's localDb.get path.
+            // keep-local, so applyPullWrite never fires either way —
+            // but the local doc is observed via the resolver's localDb.get path.
             expect(pullWrites).toHaveLength(0);
         });
 
-        it("fires pull-write for accepted FileDocs and emits auto-resolve", async () => {
+        it("invokes applyPullWrite for accepted FileDocs and emits auto-resolve", async () => {
             h = createSyncHarness();
             const b = h.addDevice("dev-B");
-            const rig = attachPullWriter({ device: b });
-
             const pullWrites: FileDoc[] = [];
-            rig.events.onAsync("pull-write", async ({ doc }) => { pullWrites.push(doc); });
+            const rig = attachPullWriter({
+                device: b,
+                applyPullWrite: async (doc) => { pullWrites.push(doc); },
+            });
+
             const autoResolved: string[] = [];
             rig.events.on("auto-resolve", ({ filePath }) => autoResolved.push(filePath));
 
@@ -376,6 +387,52 @@ describe("PullWriter integration", () => {
             expect(pullWrites).toHaveLength(1);
             expect(pullWrites[0]._id).toBe(remote._id);
             expect(autoResolved).toEqual(["a.md"]);
+        });
+
+        it("P1: applyPullWrite throw → writeFailCount, never `written`, never auto-resolve", async () => {
+            // Regression for the former event-bus path where
+            // `events.emitAsync("pull-write")` swallowed handler errors,
+            // so pull-writer's own `try/catch` never fired and the batch
+            // log claimed success for unwritten docs. With the function-
+            // DI replacement, throws propagate into the existing catch
+            // and increment writeFailCount; the success log line and
+            // auto-resolve event must NOT fire.
+            h = createSyncHarness();
+            const b = h.addDevice("dev-B");
+            const failing = async (_doc: FileDoc) => {
+                throw new Error("vault write boom");
+            };
+            const rig = attachPullWriter({
+                device: b,
+                applyPullWrite: failing,
+            });
+
+            const autoResolved: string[] = [];
+            rig.events.on("auto-resolve", ({ filePath }) => autoResolved.push(filePath));
+            const logSpy = vi.spyOn(log, "logInfo");
+
+            const remote = makeRemoteFileDoc("a.md", { A: 1 });
+            await rig.writer.apply(makeChangesResult(
+                [{ id: remote._id, seq: "1", doc: remote }], "1",
+            ));
+
+            // The DB write committed atomically (Checkpoints.commitPullBatch).
+            await expectDb(b.db).toHaveFileDoc("a.md").withVclock({ A: 1 });
+
+            // No auto-resolve emitted (the success path never reached it).
+            expect(autoResolved).toEqual([]);
+
+            // The summary log says "1 failed", not "1 written". The
+            // string contract is the load-bearing invariant of this PR.
+            const summaryLines = logSpy.mock.calls
+                .map((c) => String(c[0]))
+                .filter((m) => m.startsWith("Pull:"));
+            expect(summaryLines.length).toBeGreaterThan(0);
+            const summary = summaryLines.join(" | ");
+            expect(summary).toContain("1 failed");
+            expect(summary).not.toContain("written");
+
+            logSpy.mockRestore();
         });
     });
 

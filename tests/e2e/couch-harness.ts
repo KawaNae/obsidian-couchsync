@@ -176,11 +176,20 @@ export async function createE2EHarness(opts: CreateE2EHarnessOpts = {}): Promise
 
         const auth = new AuthGate();
         const clientFactory = (_s: CouchSyncSettings): ICouchClient => client;
-        const engine = new SyncEngine(db, getSettings, /* isMobile */ false, auth, clientFactory);
 
+        // VaultSync を SyncEngine より先に構築 (production と同じ順序)。
         const writer = new FilesystemVaultWriter(vault);
         const vs = new VaultSync(vault, db, getSettings, writer);
         const ct = new ChangeTracker(vaultEvents, vs, getSettings);
+
+        const engine = new SyncEngine(
+            db,
+            getSettings,
+            (doc) => vs.dbToFile(doc),
+            /* isMobile */ false,
+            auth,
+            clientFactory,
+        );
 
         const resolver = new ConflictResolver();
         engine.setConflictResolver(resolver);

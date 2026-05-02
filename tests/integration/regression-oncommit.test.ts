@@ -51,13 +51,10 @@ describe("Regression: onCommit must fire after pull write", () => {
             ...(chunksA as unknown as CouchSyncDoc[]),
         ]);
 
-        // Step 2: build PullWriter on B that wires pull-write → vs.dbToFile.
+        // Step 2: build PullWriter on B that wires applyPullWrite → vs.dbToFile.
         // Using B's resolver + B's localDb + a fresh SyncEvents so the wiring
         // is entirely session-scoped (mimics main.ts without engine.start()).
         const events = new SyncEvents();
-        events.onAsync("pull-write", async ({ doc }) => {
-            await b.vs.dbToFile(doc);
-        });
         const echoes = new EchoTracker();
         const checkpoints = new Checkpoints(b.db);
         await checkpoints.load();
@@ -69,6 +66,7 @@ describe("Regression: onCommit must fire after pull write", () => {
             getConflictResolver: () => b.resolver,
             // chunks already shipped via the harness transfer below
             ensureChunks: async () => {},
+            applyPullWrite: (doc) => b.vs.dbToFile(doc),
         });
 
         // Copy chunks from shared couch to B's localDb (ensureChunks is no-op).
