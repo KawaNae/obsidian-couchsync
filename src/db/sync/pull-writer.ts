@@ -31,6 +31,7 @@ import { compareVC } from "../../sync/vector-clock.ts";
 import type { LocalDB } from "../local-db.ts";
 import type { ChangesResult } from "../interfaces.ts";
 import type { ConflictResolver } from "../../conflict/conflict-resolver.ts";
+import type { WriteResult } from "../../sync/vault-writer.ts";
 import { logDebug, logError, logInfo } from "../../ui/log.ts";
 import type { EchoTracker } from "./echo-tracker.ts";
 import type { SyncEvents } from "./sync-events.ts";
@@ -51,16 +52,27 @@ export interface PullWriterDeps {
     getConflictResolver: () => ConflictResolver | undefined;
     ensureChunks: (doc: FileDoc) => Promise<void>;
     /** Apply a pulled FileDoc to the vault. Called inside the post-
-     *  commit closure; throws here are caught into `writeFailCount`
-     *  so the `Pull: N written/failed` log tells the truth. Replaces
+     *  commit closure. Returns `WriteResult`: `applied:true` means the
+     *  vault now matches the doc; `applied:false` means the writer
+     *  declined (e.g., IME composition divergence) and the LocalDB doc
+     *  is now ahead of the vault — a divergent state that the pull-
+     *  skipped → reconcile schedule path retries on the next cycle.
+     *
+     *  Throws are caught into `writeFailCount` so the
+     *  `Pull: ... applied/skipped/failed` log reflects reality. Replaces
      *  the former `events.emitAsync("pull-write", ...)` indirection,
      *  whose try/catch swallowed errors and let `writtenCount` lie. */
-    applyPullWrite: (doc: FileDoc) => Promise<void>;
+    applyPullWrite: (doc: FileDoc) => Promise<WriteResult>;
 }
 
 interface BatchStats {
     writtenCount: number;
     writeFailCount: number;
+    /** VaultWriter declined (`applied:false`) and the LocalDB doc was
+     *  committed but vault content is stale. The pull-skipped event
+     *  fires when `skipCount > 0` and triggers a reconcile so the next
+     *  cycle re-attempts dbToFile. */
+    skipCount: number;
     keepLocalCount: number;
     chunkCount: number;
     deletedCount: number;
@@ -90,6 +102,14 @@ export class PullWriter {
         this.logSummary(stats, concurrent.length);
         this.emitConcurrent(concurrent);
 
+        // Notify the supervisor that this batch left N files in a divergent
+        // state (LocalDB ahead of vault). The supervisor schedules a
+        // reconciler pass so dbToFile retries on the next cycle, instead
+        // of waiting for visibility/reconnect to bring the catchup pass.
+        if (stats.skipCount > 0) {
+            this.deps.events.emit("pull-skipped", { count: stats.skipCount });
+        }
+
         return {
             nextRemoteSeq: result.last_seq,
             empty: accepted.length === 0,
@@ -110,6 +130,7 @@ export class PullWriter {
         const stats: BatchStats = {
             writtenCount: 0,
             writeFailCount: 0,
+            skipCount: 0,
             keepLocalCount: 0,
             chunkCount: 0,
             deletedCount: 0,
@@ -253,10 +274,15 @@ export class PullWriter {
                     const path = filePathFromId(doc._id);
                     try {
                         await this.deps.ensureChunks(doc);
-                        await this.deps.applyPullWrite(doc);
-                        logDebug(`  ← ${path} (take-remote)`);
-                        stats.writtenCount++;
-                        this.deps.events.emit("auto-resolve", { filePath: path });
+                        const result = await this.deps.applyPullWrite(doc);
+                        if (result.applied === true) {
+                            logDebug(`  ← ${path} (take-remote)`);
+                            stats.writtenCount++;
+                            this.deps.events.emit("auto-resolve", { filePath: path });
+                        } else {
+                            logDebug(`  ← ${path} (pull-skipped: ${result.reason})`);
+                            stats.skipCount++;
+                        }
                     } catch (e: any) {
                         logError(`pull vault write failed: ${path}: ${e?.message ?? e}`);
                         stats.writeFailCount++;
@@ -273,12 +299,14 @@ export class PullWriter {
             || stats.keepLocalCount > 0
             || concurrentCount > 0
             || stats.writeFailCount > 0
+            || stats.skipCount > 0
             || stats.deletedCount > 0
             || stats.convergedSkipCount > 0;
         if (!active) return;
 
         const parts: string[] = [];
         if (stats.writtenCount > 0) parts.push(`${stats.writtenCount} written`);
+        if (stats.skipCount > 0) parts.push(`${stats.skipCount} skipped (will retry)`);
         if (stats.deletedCount > 0) parts.push(`${stats.deletedCount} deleted`);
         if (stats.keepLocalCount > 0) parts.push(`${stats.keepLocalCount} keep-local`);
         if (stats.convergedSkipCount > 0) parts.push(`${stats.convergedSkipCount} converged`);

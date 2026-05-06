@@ -147,10 +147,20 @@ describe("Integration: push → pull → vault", () => {
         await devA.vs.fileToDb("shared.md");
         const original = await devA.db.get(makeFileId("shared.md")) as FileDoc;
         const origChunks = await devA.db.getChunks(original.chunks);
+        // Seed B as if B had pulled the original cleanly: doc + chunks +
+        // lastSyncedVclock (so the divergent guard recognizes B as
+        // integrated up to dev-A:1 and B's local edit becomes a
+        // legitimate push, not a pending pull integration).
         await devB.db.runWriteTx({
             docs: [{ doc: original as unknown as CouchSyncDoc }],
             chunks: origChunks as unknown as CouchSyncDoc[],
+            vclocks: [{ path: "shared.md", op: "set", clock: original.vclock ?? {} }],
         });
+        // Also seed devB.vault with the original content + reload the
+        // VaultSync's in-memory lastSyncedVclock cache from the meta we
+        // just persisted. (In production, dbToFile populates both.)
+        devB.vault.addFile("shared.md", "original");
+        await devB.vs.loadLastSyncedVclocks();
 
         // Both devices edit independently
         devA.vault.addFile("shared.md", "version A");

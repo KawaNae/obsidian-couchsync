@@ -20,6 +20,7 @@ import { EchoTracker } from "../../src/db/sync/echo-tracker.ts";
 import { SyncEvents } from "../../src/db/sync/sync-events.ts";
 import { Checkpoints } from "../../src/db/sync/checkpoints.ts";
 import { ConflictResolver } from "../../src/conflict/conflict-resolver.ts";
+import type { WriteResult } from "../../src/sync/vault-writer.ts";
 import { makeFileId, makeChunkId } from "../../src/types/doc-id.ts";
 import type { ChangesResult } from "../../src/db/interfaces.ts";
 import type { FileDoc, CouchSyncDoc } from "../../src/types.ts";
@@ -36,14 +37,17 @@ function attachPullWriter(opts: {
     device: DeviceHarness;
     /** Provide a ConflictResolver to enable the vclock guard. Defaults to undefined. */
     withResolver?: boolean;
-    /** Override the vault-write callback. Defaults to a no-op. Tests
-     *  that want to observe pulled docs pass `(doc) => collected.push(doc)`. */
-    applyPullWrite?: (doc: FileDoc) => Promise<void>;
+    /** Override the vault-write callback. Defaults to applied:true (= success).
+     *  Tests that want to observe pulled docs pass `(doc) => collected.push(doc)`.
+     *  Pass an async returning `{applied:false, reason}` to simulate vault writer
+     *  decline (IME divergence etc.). */
+    applyPullWrite?: (doc: FileDoc) => Promise<WriteResult> | Promise<void>;
 }): WriterRig {
     const events = new SyncEvents();
     const echoes = new EchoTracker();
     const checkpoints = new Checkpoints(opts.device.db);
     const resolver = opts.withResolver ? new ConflictResolver() : undefined;
+    const callback = opts.applyPullWrite;
     const writer = new PullWriter({
         localDb: opts.device.db,
         events,
@@ -51,7 +55,12 @@ function attachPullWriter(opts: {
         checkpoints,
         getConflictResolver: () => resolver,
         ensureChunks: async () => {},
-        applyPullWrite: opts.applyPullWrite ?? (async () => {}),
+        applyPullWrite: async (doc) => {
+            if (!callback) return { applied: true };
+            const ret = await callback(doc);
+            // Backwards-compat: legacy callbacks returning void are treated as success.
+            return ret ?? { applied: true };
+        },
     });
     return { writer, echoes, events, checkpoints };
 }

@@ -222,6 +222,13 @@ export default class CouchSyncPlugin extends Plugin {
         this.replicator.events.on("catchup-complete", () => this.fireReconcile("onload"));
         this.replicator.events.on("catchup-failed", () => this.fireReconcile("onload"));
 
+        // Pull-write skip leaves LocalDB ahead of vault for N files.
+        // Without this trigger, idle longpoll persists divergent state
+        // until the next visibility/reconnect cycle. Fire reconcile so
+        // dbToFile retries on the next pass — typically resolves the
+        // divergence within seconds rather than hours.
+        this.replicator.events.on("pull-skipped", () => this.fireReconcile("paused"));
+
         // Run orphan-chunk GC once after the first idle (catchup done,
         // no pending pull/push). Cleans up chunks left by pre-v0.15
         // non-atomic writes and stale content changes.

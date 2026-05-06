@@ -47,6 +47,13 @@ export interface SyncEventMap {
         remoteDoc: CouchSyncDoc;
     };
     "auto-resolve": { filePath: string };
+    /** Pull batch left N files in a divergent state (LocalDB doc advanced
+     *  but vault write declined by VaultWriter). The supervisor schedules
+     *  a reconciler pass so dbToFile retries on the next cycle, instead
+     *  of waiting for visibility/reconnect to bring the next catchup.
+     *  Without this trigger, idle longpoll persists divergent state
+     *  indefinitely (verified by the 2026-05-06 phantom-write probe). */
+    "pull-skipped": { count: number };
     "catchup-complete": void;
     "catchup-failed": void;
     /** Local DB handle is unrecoverable in this WebView (HandleGuard
@@ -90,6 +97,7 @@ export class SyncEvents {
         reconnect: new Set(),
         concurrent: new Set(),
         "auto-resolve": new Set(),
+        "pull-skipped": new Set(),
         "catchup-complete": new Set(),
         "catchup-failed": new Set(),
         degraded: new Set(),

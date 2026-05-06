@@ -20,6 +20,7 @@
 
 import type { FileDoc, ChunkDoc } from "../types.ts";
 import type { LocalDB } from "./local-db.ts";
+import type { WriteResult } from "../sync/vault-writer.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { ICouchClient } from "./interfaces.ts";
 import type { ConflictResolver } from "../conflict/conflict-resolver.ts";
@@ -179,11 +180,14 @@ export class SyncEngine {
         private localDb: LocalDB,
         private getSettings: () => CouchSyncSettings,
         /** Apply a pulled FileDoc to the vault. The pull-writer awaits
-         *  this inside its commit closure; throws are caught into
-         *  `writeFailCount` so the batch log reflects reality (vs the
-         *  former event-bus path that silently swallowed errors and let
-         *  `writtenCount` lie). */
-        private applyPullWrite: (doc: FileDoc) => Promise<void>,
+         *  this inside its commit closure. Returns `WriteResult`:
+         *  `applied:true` means vault now matches doc; `applied:false`
+         *  means writer declined (IME divergence etc.) and the LocalDB
+         *  doc is now ahead of vault — pull-writer counts these as
+         *  `skipCount` and emits `pull-skipped` so the supervisor
+         *  schedules a reconciler retry. Throws are caught into
+         *  `writeFailCount` so the batch log reflects reality. */
+        private applyPullWrite: (doc: FileDoc) => Promise<WriteResult>,
         private isMobile: boolean = false,
         auth?: AuthGate,
         clientFactory?: (s: CouchSyncSettings) => ICouchClient,

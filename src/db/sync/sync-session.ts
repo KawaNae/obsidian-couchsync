@@ -20,6 +20,7 @@ import type { FileDoc } from "../../types.ts";
 import type { LocalDB } from "../local-db.ts";
 import type { ICouchClient } from "../interfaces.ts";
 import type { ConflictResolver } from "../../conflict/conflict-resolver.ts";
+import type { WriteResult } from "../../sync/vault-writer.ts";
 import { EchoTracker } from "./echo-tracker.ts";
 import type { SyncEvents } from "./sync-events.ts";
 import type { Checkpoints } from "./checkpoints.ts";
@@ -40,10 +41,10 @@ export interface SyncSessionDeps {
     getConflictResolver: () => ConflictResolver | undefined;
     ensureChunks: (doc: FileDoc) => Promise<void>;
     /** Apply a pulled FileDoc to the vault. Called from PullWriter.commit
-     *  inside its commit closure. Throws are caught into `writeFailCount`
-     *  so the batch log reflects reality — the former event-bus path
-     *  silently swallowed errors. */
-    applyPullWrite: (doc: FileDoc) => Promise<void>;
+     *  inside its commit closure. Returns `WriteResult` so PullWriter can
+     *  account skips separately and emit `pull-skipped` for the supervisor
+     *  to reconcile. Throws are caught into `writeFailCount`. */
+    applyPullWrite: (doc: FileDoc) => Promise<WriteResult>;
     handleLocalDbError: (e: unknown, ctx: string) => void;
     /** Invoked from pipelines when a transient upstream error (auth /
      *  5xx) occurs. The supervisor (SyncEngine) decides escalation. */

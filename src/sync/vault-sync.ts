@@ -117,6 +117,29 @@ export class VaultSync {
                     if (existing && VaultSync.chunksEqual(existing.chunks, chunkIds)) {
                         return null; // already on disk
                     }
+                    // Divergent guard: when the LocalDB doc has been advanced
+                    // by a pull but the Vault has not yet integrated that
+                    // remote content (lastSyncedVclock strictly behind
+                    // existing.vclock), pushing here would assert causality
+                    // we never integrated locally — the rev 197 phantom-write
+                    // shape. Yield to the reconciler, which routes through
+                    // dbToFile retry on the next pull cycle (or immediately
+                    // via the pull-skipped → reconcile schedule path).
+                    if (existing) {
+                        const existingVC = existing.vclock ?? {};
+                        const lastSynced = this.lastSyncedVclock.get(toPathKey(path));
+                        const isDivergent = lastSynced
+                            ? compareVC(existingVC, lastSynced) === "dominates"
+                            : Object.keys(existingVC).length > 0;
+                        if (isDivergent) {
+                            logWarn(
+                                `fileToDb: skipping push for ${path} — pending pull integration ` +
+                                `(observed=${JSON.stringify(existingVC)} ` +
+                                `integrated=${lastSynced ? JSON.stringify(lastSynced) : "null"})`,
+                            );
+                            return null;
+                        }
+                    }
                     const newVclock = incrementVC(existing?.vclock, deviceId);
                     const newDoc: FileDoc = {
                         _id: fileId,
@@ -147,18 +170,18 @@ export class VaultSync {
         }
     }
 
-    async dbToFile(fileDoc: FileDoc): Promise<void> {
+    async dbToFile(fileDoc: FileDoc): Promise<WriteResult> {
         const vaultPath = filePathFromId(fileDoc._id);
 
         // Deletion tombstones pass through the filter — deletions are always applied.
         if (!fileDoc.deleted && !this.shouldSync(vaultPath)) {
             logDebug(`dbToFile: skipped filtered path ${vaultPath}`);
-            return;
+            return { applied: false, reason: "filtered" };
         }
 
         if (fileDoc.deleted) {
             await this.vaultWriter.applyRemoteDeletion(vaultPath);
-            return;
+            return { applied: true };
         }
 
         const existingStat = await this.vault.stat(vaultPath);
@@ -166,7 +189,7 @@ export class VaultSync {
         if (existingStat && existingStat.size === fileDoc.size) {
             const ids = await this.localChunkIds(vaultPath);
             if (VaultSync.chunksEqual(ids, fileDoc.chunks)) {
-                return; // identical content
+                return { applied: true }; // identical content
             }
         }
 
@@ -199,12 +222,14 @@ export class VaultSync {
         }
 
         if (result.applied === false) {
-            // VaultWriter declined to apply (e.g., the local doc
-            // diverged during IME composition). Leave bookkeeping
-            // untouched so Reconciler picks up the discrepancy on
-            // its next pass.
-            logDebug(`dbToFile: skipped ${vaultPath} (${result.reason})`);
-            return;
+            // VaultWriter declined to apply (e.g., the local doc diverged
+            // during IME composition). Leave lastSyncedVclock untouched so
+            // the divergent state is detectable: the LocalDB doc has been
+            // advanced to fileDoc.vclock by PullWriter, but vault content
+            // is stale. fileToDb's divergent guard refuses any push from
+            // this state; the pull-skipped → reconcile schedule path
+            // re-attempts dbToFile on the next cycle.
+            return result;
         }
 
         const clock = { ...(fileDoc.vclock ?? {}) };
@@ -218,6 +243,7 @@ export class VaultSync {
 
         // History capture is now owned by VaultWriter (it knows when
         // the content has actually landed in the editor/disk).
+        return { applied: true };
     }
 
     /**
@@ -252,6 +278,25 @@ export class VaultSync {
                             vclocks: [{ path, op: "delete" }],
                             onCommit: () => { this.lastSyncedVclock.delete(toPathKey(path)); },
                         };
+                    }
+                    // Divergent guard: same shape as fileToDb. A delete during
+                    // pending pull integration would produce a phantom tombstone
+                    // that stealth-deletes the file on every other device.
+                    // Yield: user re-deletes after the integration completes.
+                    {
+                        const existingVC = existing.vclock ?? {};
+                        const lastSynced = this.lastSyncedVclock.get(toPathKey(path));
+                        const isDivergent = lastSynced
+                            ? compareVC(existingVC, lastSynced) === "dominates"
+                            : Object.keys(existingVC).length > 0;
+                        if (isDivergent) {
+                            logWarn(
+                                `markDeleted: skipping tombstone for ${path} — pending pull integration ` +
+                                `(observed=${JSON.stringify(existingVC)} ` +
+                                `integrated=${lastSynced ? JSON.stringify(lastSynced) : "null"})`,
+                            );
+                            return null;
+                        }
                     }
                     const newVclock = incrementVC(existing.vclock, deviceId);
                     return {

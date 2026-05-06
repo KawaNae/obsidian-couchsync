@@ -101,7 +101,7 @@ describe("ConflictOrchestrator", () => {
             localDb: db as any,
             replicator: replicator as any,
             historyCapture: historyCapture as any,
-            dbToFile: async (doc: FileDoc) => { dbToFileCalls.push(doc); },
+            dbToFile: async (doc: FileDoc) => { dbToFileCalls.push(doc); return { applied: true }; },
             getSettings: () => settings,
         });
         orch.register();

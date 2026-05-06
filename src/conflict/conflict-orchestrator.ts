@@ -3,6 +3,7 @@ import type { SyncEngine } from "../db/sync-engine.ts";
 import { ConflictResolver } from "./conflict-resolver.ts";
 import type { HistoryCapture } from "../history/history-capture.ts";
 import type { CouchSyncSettings } from "../settings.ts";
+import type { WriteResult } from "../sync/vault-writer.ts";
 import type { FileDoc, CouchSyncDoc } from "../types.ts";
 import type { IModalPresenter, ConflictChoice } from "../types/modal-presenter.ts";
 import { isFileDoc, isConfigDoc } from "../types.ts";
@@ -10,14 +11,14 @@ import { joinChunks } from "../db/chunker.ts";
 import { isDiffableText } from "../utils/binary.ts";
 import { incrementVC, mergeVC } from "../sync/vector-clock.ts";
 import { stripRev } from "../utils/doc.ts";
-import { logDebug, logInfo, logError, notify } from "../ui/log.ts";
+import { logDebug, logInfo, logWarn, logError, notify } from "../ui/log.ts";
 
 export interface ConflictOrchestratorDeps {
     modal: IModalPresenter;
     localDb: LocalDB;
     replicator: SyncEngine;
     historyCapture: HistoryCapture;
-    dbToFile: (doc: FileDoc) => Promise<void>;
+    dbToFile: (doc: FileDoc) => Promise<WriteResult>;
     getSettings: () => CouchSyncSettings;
 }
 
@@ -178,7 +179,17 @@ export class ConflictOrchestrator {
                 docs: [{ doc: stripRev(updated) as CouchSyncDoc }],
             });
             await replicator.ensureFileChunks(updated as FileDoc);
-            await this.deps.dbToFile(updated as FileDoc);
+            const writeResult = await this.deps.dbToFile(updated as FileDoc);
+            if (writeResult.applied === false) {
+                // Conflict resolution wrote to LocalDB but vault writer
+                // declined (e.g., the file is currently in IME composition).
+                // Reconciler will retry dbToFile on the next pass via the
+                // pull-skipped → reconcile schedule path.
+                logWarn(
+                    `Conflict take-remote applied to LocalDB but vault write skipped: ` +
+                    `${fileName} (${writeResult.reason})`,
+                );
+            }
         } else {
             logInfo(`Conflict resolved: keep-local for ${fileName}`);
             const merged = mergeVC(
