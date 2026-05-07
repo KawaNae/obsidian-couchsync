@@ -157,14 +157,15 @@ export class SyncEngine {
         isMobile: this.isMobile,
     });
 
-    /** Pauses live loops while the page is hidden. iOS Safari aborts
-     *  IndexedDB transactions on visibilitychange→hidden; without this
-     *  gate the push loop exhausts HandleGuard's reopen budget. Falls
-     *  back to ALWAYS_VISIBLE in non-browser test contexts. */
-    private readonly visibility: VisibilityGate =
-        typeof document !== "undefined"
-            ? new BrowserVisibilityGate(document)
-            : ALWAYS_VISIBLE;
+    /** Pauses live loops while the page is hidden. The gate exists for
+     *  iOS Safari (WKWebView), which force-aborts in-flight IndexedDB
+     *  transactions on visibilitychange→hidden — without it the push
+     *  loop exhausts HandleGuard's reopen budget. Chromium/Blink (Android
+     *  WebView, Electron on every desktop OS including macOS) has no
+     *  such issue, so we use ALWAYS_VISIBLE there to keep sync alive
+     *  while the window is minimised / occluded / on another workspace.
+     *  Initialised in the constructor body once `isIosApp` is known. */
+    private readonly visibility: VisibilityGate;
 
     // ── Checkpoints ───────────────────────────────────────
 
@@ -189,6 +190,13 @@ export class SyncEngine {
          *  `writeFailCount` so the batch log reflects reality. */
         private applyPullWrite: (doc: FileDoc) => Promise<WriteResult>,
         private isMobile: boolean = false,
+        /** True iff running inside iOS / iPadOS Obsidian (WKWebView).
+         *  Selects BrowserVisibilityGate to dodge WebKit's IDB
+         *  force-abort on visibilitychange→hidden. Every other client
+         *  (Android WebView, Electron desktop on Win/Mac/Linux) uses
+         *  Blink and gets ALWAYS_VISIBLE so sync keeps running while
+         *  hidden. */
+        private isIosApp: boolean = false,
         auth?: AuthGate,
         clientFactory?: (s: CouchSyncSettings) => ICouchClient,
     ) {
@@ -197,6 +205,9 @@ export class SyncEngine {
             makeCouchClient(s.couchdbUri, s.couchdbDbName, s.couchdbUser, s.couchdbPassword)
         );
         this.checkpoints = new Checkpoints(localDb);
+        this.visibility = (isIosApp && typeof document !== "undefined")
+            ? new BrowserVisibilityGate(document)
+            : ALWAYS_VISIBLE;
 
         // External raise (Settings tab probe, config-sync) → pin state=error
         // so the status bar and onError listeners see the auth latch.
