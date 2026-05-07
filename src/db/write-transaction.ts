@@ -68,7 +68,7 @@ export type MetaWrite =
     | { op: "delete"; key: string };
 
 export type VclockUpdate =
-    | { path: string; op: "set"; clock: VectorClock }
+    | { path: string; op: "set"; clock: VectorClock; chunks: string[]; size: number }
     | { path: string; op: "delete" };
 
 /**

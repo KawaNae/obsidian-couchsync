@@ -9,6 +9,7 @@ import type {
 import { DexieStore, VCLOCK_KEY_PREFIX, vclockMetaKey } from "./dexie-store.ts";
 import type { WriteTransaction, WriteBuilder } from "./write-transaction.ts";
 import type { VectorClock } from "../sync/vector-clock.ts";
+import { parseStoredLastSynced, type LastSynced } from "../sync/last-synced.ts";
 import { toPathKey, type PathKey } from "../utils/path.ts";
 import {
     ID_RANGE,
@@ -317,61 +318,77 @@ export class LocalDB implements IDocStore<CouchSyncDoc> {
     }
 
     /**
-     * Load every per-path lastSyncedVclock from the docs store's meta
-     * table. Per-path entries (`_local/vclock/<path>`) are written in the
-     * same Dexie transaction as the FileDoc / chunks they refer to, so
-     * the on-disk view never lags behind the doc state.
+     * Load every per-path lastSynced from the docs store's meta table.
+     * Per-path entries (`_local/vclock/<path>`) are written in the same
+     * Dexie transaction as the FileDoc / chunks they refer to, so the
+     * on-disk view never lags behind the doc state.
      *
-     * Performs a one-shot migration from the legacy single-doc layout
-     * (`_local/last-synced-vclocks`, formerly stored on the *separate*
-     * meta store) when detected, so existing vaults upgrade transparently.
+     * Returns the new `LastSynced` shape (`{vclock, chunks?, size?}`).
+     * Pre-extension entries on disk carry only the raw `VectorClock`;
+     * `parseStoredLastSynced` adapts them transparently. Such legacy
+     * entries lack `chunks`/`size`, so divergent-edit detection skips
+     * them until the next push/pull rewrites the entry in full shape.
+     *
+     * Also performs a one-shot migration from the very-old single-doc
+     * layout (`_local/last-synced-vclocks`, formerly on the meta store).
      */
-    async loadAllSyncedVclocks(): Promise<Map<PathKey, VectorClock>> {
-        const out = new Map<PathKey, VectorClock>();
+    async loadAllSyncedVclocks(): Promise<Map<PathKey, LastSynced>> {
+        const out = new Map<PathKey, LastSynced>();
         const staleKeys: string[] = [];
 
-        const rows = await this.getMetaByPrefix<VectorClock>(VCLOCK_KEY_PREFIX);
+        const rows = await this.getMetaByPrefix<unknown>(VCLOCK_KEY_PREFIX);
         for (const { key, value } of rows) {
             const rawPath = key.slice(VCLOCK_KEY_PREFIX.length);
             const normalized = toPathKey(rawPath);
-            out.set(normalized, value);
+            out.set(normalized, parseStoredLastSynced(value));
             if (rawPath !== (normalized as string)) {
                 staleKeys.push(key);
             }
         }
 
-        // One-shot migration: legacy single-doc lived on the *meta* store.
+        // One-shot migration: very-old single-doc lived on the *meta* store.
+        // It carried only vclocks; entries get the legacy partial shape
+        // (no chunks/size) and ramp up on next push/pull.
         const legacy = await this.getMetaStoreValue<{ clocks: Record<string, VectorClock> }>(
             LAST_SYNCED_VCLOCKS_ID,
         );
         if (legacy?.clocks) {
-            const newVclocks: Array<{ path: string; op: "set"; clock: VectorClock }> = [];
             for (const [path, vc] of Object.entries(legacy.clocks)) {
                 const normalized = toPathKey(path);
                 if (!out.has(normalized)) {
-                    out.set(normalized, vc);
-                    newVclocks.push({ path, op: "set", clock: vc });
+                    out.set(normalized, { vclock: vc });
                 }
-            }
-            if (newVclocks.length > 0) {
-                await this.runWriteTx({ vclocks: newVclocks });
             }
             await this.runMetaWriteTx({
                 meta: [{ op: "delete", key: LAST_SYNCED_VCLOCKS_ID }],
             });
         }
 
-        // Stale-key cleanup: delete non-normalized keys, re-write with normalized keys.
+        // Stale-key cleanup (path-normalization legacy): delete the
+        // non-normalized keys. Entries that already have the full shape
+        // get re-written under the normalized key; partial-shape entries
+        // are left to be rewritten by the next push/pull.
         if (staleKeys.length > 0) {
             await this.runWriteTx({
                 meta: staleKeys.map((key) => ({ op: "delete" as const, key })),
             });
-            const rewriteOps = [...out.entries()].map(([pathKey, clock]) => ({
-                path: pathKey as string,
-                op: "set" as const,
-                clock,
-            }));
-            await this.runWriteTx({ vclocks: rewriteOps });
+            const rewriteOps: Array<{
+                path: string; op: "set"; clock: VectorClock; chunks: string[]; size: number;
+            }> = [];
+            for (const [pathKey, entry] of out) {
+                if (entry.chunks !== undefined && entry.size !== undefined) {
+                    rewriteOps.push({
+                        path: pathKey as string,
+                        op: "set",
+                        clock: entry.vclock,
+                        chunks: entry.chunks,
+                        size: entry.size,
+                    });
+                }
+            }
+            if (rewriteOps.length > 0) {
+                await this.runWriteTx({ vclocks: rewriteOps });
+            }
         }
 
         return out;

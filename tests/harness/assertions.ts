@@ -114,8 +114,8 @@ export function expectDb(db: LocalDB) {
             const all = await db.loadAllSyncedVclocks();
             const key = toPathKey(path);
             const actual = all.get(key);
-            expect(actual, `no lastSyncedVclock entry for "${path}"`).toBeTruthy();
-            expect(vclockEqual(actual!, expected)).toBe(true);
+            expect(actual, `no lastSynced entry for "${path}"`).toBeTruthy();
+            expect(vclockEqual(actual!.vclock, expected)).toBe(true);
         },
     };
 }

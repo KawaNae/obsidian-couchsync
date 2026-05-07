@@ -275,7 +275,10 @@ describe("DexieStore", () => {
             await store.runWriteTx({
                 chunks: [chunk],
                 docs: [{ doc: { ...makeFile("compound.md", { A: 1 }), chunks: [chunk._id] } }],
-                vclocks: [{ path: "compound.md", op: "set", clock: { A: 1 } }],
+                vclocks: [{
+                    path: "compound.md", op: "set", clock: { A: 1 },
+                    chunks: [chunk._id], size: 1,
+                }],
                 meta: [{ op: "put", key: "marker", value: 42 }],
             });
 
@@ -284,7 +287,7 @@ describe("DexieStore", () => {
             expect(await store.getMeta("marker")).toBe(42);
             expect(
                 await store.getDexie().meta.get("_local/vclock/compound.md"),
-            ).toMatchObject({ value: { A: 1 } });
+            ).toMatchObject({ value: { vclock: { A: 1 }, chunks: [chunk._id], size: 1 } });
         });
 
         it("bumps _update_seq exactly once per compound tx", async () => {
@@ -292,7 +295,10 @@ describe("DexieStore", () => {
             await store.runWriteTx({
                 chunks: [makeChunk("a", "QQ=="), makeChunk("b", "Qg==")],
                 docs: [{ doc: { ...makeFile("seq.md"), chunks: ["chunk:a", "chunk:b"] } }],
-                vclocks: [{ path: "seq.md", op: "set", clock: { A: 1 } }],
+                vclocks: [{
+                    path: "seq.md", op: "set", clock: { A: 1 },
+                    chunks: ["chunk:a", "chunk:b"], size: 2,
+                }],
             });
             const after = await store.info();
             expect((after.updateSeq as number) - (before.updateSeq as number)).toBe(1);
@@ -577,14 +583,18 @@ describe("DexieStore", () => {
         it("getMetaByPrefix returns all matching entries", async () => {
             await store.runWriteTx({
                 vclocks: [
-                    { path: "a.md", op: "set", clock: { A: 1 } },
-                    { path: "sub/b.md", op: "set", clock: { B: 2 } },
+                    { path: "a.md", op: "set", clock: { A: 1 }, chunks: ["c1"], size: 10 },
+                    { path: "sub/b.md", op: "set", clock: { B: 2 }, chunks: ["c2"], size: 20 },
                 ],
             });
             const rows = await store.getMetaByPrefix("_local/vclock/");
             const map = new Map(rows.map((r) => [r.key, r.value]));
-            expect(map.get("_local/vclock/a.md")).toEqual({ A: 1 });
-            expect(map.get("_local/vclock/sub/b.md")).toEqual({ B: 2 });
+            expect(map.get("_local/vclock/a.md")).toEqual({
+                vclock: { A: 1 }, chunks: ["c1"], size: 10,
+            });
+            expect(map.get("_local/vclock/sub/b.md")).toEqual({
+                vclock: { B: 2 }, chunks: ["c2"], size: 20,
+            });
         });
     });
 

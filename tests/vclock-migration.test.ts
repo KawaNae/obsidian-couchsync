@@ -35,16 +35,12 @@ describe("vclock per-path migration", () => {
             }],
         });
 
-        // First load — should migrate.
+        // First load — should migrate. Legacy entries lack chunks/size
+        // (the old layout didn't track them); they get the partial
+        // LastSynced shape and ramp up on the next push/pull.
         const loaded = await db.loadAllSyncedVclocks();
-        expect(loaded.get("alpha.md")).toEqual({ A: 1, B: 2 });
-        expect(loaded.get("sub/beta.md")).toEqual({ A: 3 });
-
-        // Per-path entries now live in the docs store's meta table.
-        const alpha = await db.getMeta<{ A: number; B: number }>("_local/vclock/alpha.md");
-        expect(alpha).toEqual({ A: 1, B: 2 });
-        const beta = await db.getMeta<{ A: number }>("_local/vclock/sub/beta.md");
-        expect(beta).toEqual({ A: 3 });
+        expect(loaded.get("alpha.md")).toEqual({ vclock: { A: 1, B: 2 } });
+        expect(loaded.get("sub/beta.md")).toEqual({ vclock: { A: 3 } });
 
         // Legacy doc is gone from the (separate) meta store.
         const legacy = await db.getMetaStoreValue("_local/last-synced-vclocks");
@@ -56,20 +52,24 @@ describe("vclock per-path migration", () => {
         db.open();
         await db.runWriteTx({
             vclocks: [
-                { path: "x.md", op: "set", clock: { A: 1 } },
+                { path: "x.md", op: "set", clock: { A: 1 }, chunks: ["c1"], size: 5 },
             ],
         });
         const first = await db.loadAllSyncedVclocks();
         const second = await db.loadAllSyncedVclocks();
-        expect(first.get("x.md")).toEqual({ A: 1 });
-        expect(second.get("x.md")).toEqual({ A: 1 });
+        const expected = { vclock: { A: 1 }, chunks: ["c1"], size: 5 };
+        expect(first.get("x.md")).toEqual(expected);
+        expect(second.get("x.md")).toEqual(expected);
     });
 
     it("per-path values supersede legacy on conflict", async () => {
         db = new LocalDB(`mig3-${Date.now()}`);
         db.open();
         await db.runWriteTx({
-            vclocks: [{ path: "shared.md", op: "set", clock: { A: 9 } }],
+            vclocks: [{
+                path: "shared.md", op: "set", clock: { A: 9 },
+                chunks: ["c1"], size: 7,
+            }],
         });
         // Now seed legacy with a stale value for the same path.
         await db.runMetaWriteTx({
@@ -80,7 +80,27 @@ describe("vclock per-path migration", () => {
             }],
         });
         const loaded = await db.loadAllSyncedVclocks();
-        // Per-path wins.
-        expect(loaded.get("shared.md")).toEqual({ A: 9 });
+        // Per-path wins (full new shape).
+        expect(loaded.get("shared.md")).toEqual({
+            vclock: { A: 9 }, chunks: ["c1"], size: 7,
+        });
+    });
+
+    it("treats pre-extension entries (raw VectorClock value) as legacy", async () => {
+        // Pre-extension write: someone wrote a raw VectorClock to the
+        // vclock meta key (matches the old DexieStore.runWriteTx code).
+        db = new LocalDB(`mig4-${Date.now()}`);
+        db.open();
+        await db.runWriteTx({
+            meta: [{
+                op: "put",
+                key: "_local/vclock/legacy.md",
+                value: { A: 7, B: 3 } as any,
+            }],
+        });
+        const loaded = await db.loadAllSyncedVclocks();
+        // chunks/size undefined → divergent-edit guard skips the path
+        // until the next push/pull rewrites it in the full shape.
+        expect(loaded.get("legacy.md")).toEqual({ vclock: { A: 7, B: 3 } });
     });
 });

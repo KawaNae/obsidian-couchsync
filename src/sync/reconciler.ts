@@ -3,7 +3,8 @@ import type { LocalDB, VaultManifest } from "../db/local-db.ts";
 import type { VaultSync, CompareResult } from "./vault-sync.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { FileDoc } from "../types.ts";
-import { latestDevice } from "./vector-clock.ts";
+import type { ConflictOrchestrator } from "../conflict/conflict-orchestrator.ts";
+import { compareVC, latestDevice } from "./vector-clock.ts";
 import { filePathFromId } from "../types/doc-id.ts";
 import { toPathKey, type PathKey } from "../utils/path.ts";
 import { logDebug, logInfo, logWarn, logError } from "../ui/log.ts";
@@ -112,6 +113,8 @@ export class Reconciler {
     private autoPendingTotal = 0;
     private autoPendingTimer: ReturnType<typeof setTimeout> | null = null;
 
+    private conflictOrchestrator: ConflictOrchestrator | null = null;
+
     constructor(
         private vault: IVaultIO,
         private localDb: LocalDB,
@@ -120,6 +123,17 @@ export class Reconciler {
         private notify: ReconcileNotify = () => {},
         private ensureChunks: (doc: FileDoc) => Promise<void> = async () => {},
     ) {}
+
+    /**
+     * Late-binding setter for `conflictOrchestrator`. Reconciler is
+     * constructed before ConflictOrchestrator in main.ts; this setter
+     * resolves the dependency cycle. When the orchestrator is null
+     * (tests / pre-init), divergent routing falls back to the prior
+     * silent dbToFile behavior.
+     */
+    setConflictOrchestrator(co: ConflictOrchestrator): void {
+        this.conflictOrchestrator = co;
+    }
 
     isRunning(): boolean {
         return this.currentRun !== null;
@@ -246,6 +260,24 @@ export class Reconciler {
 
             // Case D: vault doesn't have it, DB alive
             if (!file && doc && !doc.deleted) {
+                // Divergent-delete guard runs before classifyMissingFromVault.
+                // Signal: lastSynced exists (= this device integrated the
+                // path) AND doc.vclock dominates lastSynced.vclock (= a pull
+                // advanced the doc beyond integration baseline). User
+                // deleted the file during that window — surface as conflict
+                // instead of either auto-deleting (no-op via the guard,
+                // then auto-restore on the next cycle) or auto-restoring.
+                const lastSynced = this.vaultSync.getLastSynced(displayPath);
+                if (lastSynced && this.conflictOrchestrator
+                    && compareVC(doc.vclock ?? {}, lastSynced.vclock) === "dominates") {
+                    if (await this.tryStep(displayPath, "conflict-delete",
+                        () => this.conflictOrchestrator!.handleDivergentLocalDelete(displayPath, doc),
+                        mode)) {
+                        report.deleted.push(displayPath);
+                    }
+                    continue;
+                }
+
                 const decision = this.classifyMissingFromVault(doc, deviceId, manifestPaths);
                 if (decision === "delete") {
                     if (await this.tryStep(displayPath, "delete", () => this.vaultSync.markDeleted(displayPath), mode)) {
@@ -275,8 +307,33 @@ export class Reconciler {
                         report.localWins.push(displayPath);
                     }
                 } else {
-                    if (await this.tryStep(displayPath, "pull", async () => { await this.ensureChunks(doc); await this.vaultSync.dbToFile(doc); }, mode)) {
-                        report.remoteWins.push(displayPath);
+                    // Divergent-edit guard: if vault drifted from the last
+                    // integration baseline, the user edited stale content
+                    // during a pull-decline window. Route to conflict
+                    // orchestrator instead of overwriting.
+                    let divergent = false;
+                    const lastSynced = this.vaultSync.getLastSynced(displayPath);
+                    if (lastSynced?.chunks !== undefined && lastSynced.size !== undefined
+                        && this.conflictOrchestrator) {
+                        // Size fast-path: differing size guarantees content
+                        // divergence (skips chunk computation).
+                        if (file.stat.size !== lastSynced.size) {
+                            divergent = true;
+                        } else {
+                            const currentChunks = await this.vaultSync.computeVaultChunks(file.path);
+                            divergent = !chunkListsEqual(currentChunks, lastSynced.chunks);
+                        }
+                    }
+                    if (divergent) {
+                        if (await this.tryStep(displayPath, "conflict-edit",
+                            () => this.conflictOrchestrator!.handleDivergentLocalEdit(file.path, doc),
+                            mode)) {
+                            report.remoteWins.push(displayPath);
+                        }
+                    } else {
+                        if (await this.tryStep(displayPath, "pull", async () => { await this.ensureChunks(doc); await this.vaultSync.dbToFile(doc); }, mode)) {
+                            report.remoteWins.push(displayPath);
+                        }
                     }
                 }
             }
@@ -401,5 +458,11 @@ export class Reconciler {
 function setEquals<T>(a: Set<T>, b: Set<T>): boolean {
     if (a.size !== b.size) return false;
     for (const v of a) if (!b.has(v)) return false;
+    return true;
+}
+
+function chunkListsEqual(a: string[], b: string[]): boolean {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
     return true;
 }

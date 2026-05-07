@@ -204,8 +204,11 @@ export default class CouchSyncPlugin extends Plugin {
             historyCapture: this.historyCapture,
             dbToFile: (doc) => this.vaultSync.dbToFile(doc),
             getSettings: () => this.settings,
+            vault: vaultIO,
+            vaultSync: this.vaultSync,
         });
         this.conflictOrchestrator.register();
+        this.reconciler.setConflictOrchestrator(this.conflictOrchestrator);
 
         // Pull-driven deletions: if the remote deleted a file, apply
         // locally unless there are unpushed local edits (→ concurrent).

@@ -5,8 +5,9 @@ import type { CouchSyncSettings } from "../settings.ts";
 import type { VaultWriter, WriteResult } from "./vault-writer.ts";
 import { splitIntoChunks, joinChunks } from "../db/chunker.ts";
 import { notify } from "../ui/log.ts";
-import { compareVC, incrementVC } from "./vector-clock.ts";
+import { compareVC, incrementVC, mergeVC } from "./vector-clock.ts";
 import type { VectorClock } from "./vector-clock.ts";
+import type { LastSynced } from "./last-synced.ts";
 import { makeFileId, filePathFromId } from "../types/doc-id.ts";
 import { toPathKey, type PathKey } from "../utils/path.ts";
 import { logDebug, logWarn } from "../ui/log.ts";
@@ -40,17 +41,27 @@ const CAS_MAX_ATTEMPTS = 4;
 
 export class VaultSync {
     /**
-     * vault path → vclock at the time of the last successful sync write.
+     * vault path → integration point at the last successful sync write.
+     *
+     * Each entry records `{vclock, chunks, size}` — the causality and
+     * the content snapshot at the moment the path was integrated. The
+     * pair lets the reconciler distinguish "vault is pure stale" from
+     * "user edited the stale state" (= divergent edit), and route the
+     * latter to the conflict orchestrator instead of overwriting.
      *
      * **Read cache only** — every mutation is the in-memory mirror of an
      * already-committed `runWrite({ vclocks })` so the persisted state and
      * the cache stay in lock-step. There is no flush window: a crash after
-     * any successful write loses no vclock information.
+     * any successful write loses no information.
      *
      * Loaded once via `loadLastSyncedVclocks()` at plugin init; the on-disk
      * representation is per-path meta entries (`_local/vclock/<path>`).
+     * Entries written before the chunks/size extension carry only the
+     * vclock (`chunks`/`size` undefined); they are treated as "legacy
+     * skip" by the divergent-edit guard until the next push/pull
+     * rewrites them in full shape.
      */
-    private lastSyncedVclock = new Map<PathKey, VectorClock>();
+    private lastSynced = new Map<PathKey, LastSynced>();
 
     /**
      * In-memory mirror of `_local/skipped-files` paths. Lets the hot path
@@ -72,10 +83,21 @@ export class VaultSync {
      */
     async loadLastSyncedVclocks(): Promise<void> {
         const stored = await this.db.loadAllSyncedVclocks();
-        this.lastSyncedVclock.clear();
-        for (const [path, vc] of stored) {
-            this.lastSyncedVclock.set(path, vc);
+        this.lastSynced.clear();
+        for (const [path, entry] of stored) {
+            this.lastSynced.set(path, entry);
         }
+    }
+
+    /** Public read accessor for divergent-edit detection in Reconciler. */
+    getLastSynced(path: string): LastSynced | undefined {
+        return this.lastSynced.get(toPathKey(path));
+    }
+
+    /** Compute the chunk-id list for a vault file (content fingerprint).
+     *  Used by Reconciler to compare against `lastSynced.chunks`. */
+    async computeVaultChunks(path: string): Promise<string[]> {
+        return this.localChunkIds(path);
     }
 
     /** Cancel anything still in flight at unload. No flush needed — every
@@ -127,15 +149,15 @@ export class VaultSync {
                     // via the pull-skipped → reconcile schedule path).
                     if (existing) {
                         const existingVC = existing.vclock ?? {};
-                        const lastSynced = this.lastSyncedVclock.get(toPathKey(path));
+                        const lastSynced = this.lastSynced.get(toPathKey(path));
                         const isDivergent = lastSynced
-                            ? compareVC(existingVC, lastSynced) === "dominates"
+                            ? compareVC(existingVC, lastSynced.vclock) === "dominates"
                             : Object.keys(existingVC).length > 0;
                         if (isDivergent) {
                             logWarn(
                                 `fileToDb: skipping push for ${path} — pending pull integration ` +
                                 `(observed=${JSON.stringify(existingVC)} ` +
-                                `integrated=${lastSynced ? JSON.stringify(lastSynced) : "null"})`,
+                                `integrated=${lastSynced ? JSON.stringify(lastSynced.vclock) : "null"})`,
                             );
                             return null;
                         }
@@ -156,9 +178,16 @@ export class VaultSync {
                             doc: newDoc as unknown as CouchSyncDoc,
                             expectedVclock: existing?.vclock ?? {},
                         }],
-                        vclocks: [{ path, op: "set", clock: newVclock }],
+                        vclocks: [{
+                            path, op: "set", clock: newVclock,
+                            chunks: chunkIds, size: fileStat.size,
+                        }],
                         onCommit: () => {
-                            this.lastSyncedVclock.set(toPathKey(path), newVclock);
+                            this.lastSynced.set(toPathKey(path), {
+                                vclock: newVclock,
+                                chunks: chunkIds,
+                                size: fileStat.size,
+                            });
                         },
                     };
                 },
@@ -233,13 +262,20 @@ export class VaultSync {
         }
 
         const clock = { ...(fileDoc.vclock ?? {}) };
-        // Persist the vclock in the docs store's meta so it lives in
-        // the same IDB as the FileDoc itself. Pure meta write — no CAS
-        // needed, so pass a fixed tx rather than a builder.
+        // Persist the integration point in the docs store's meta so it
+        // lives in the same IDB as the FileDoc itself. Pure meta write —
+        // no CAS needed, so pass a fixed tx rather than a builder.
         await this.db.runWriteTx({
-            vclocks: [{ path: vaultPath, op: "set", clock }],
+            vclocks: [{
+                path: vaultPath, op: "set", clock,
+                chunks: fileDoc.chunks, size: fileDoc.size,
+            }],
         });
-        this.lastSyncedVclock.set(toPathKey(vaultPath), clock);
+        this.lastSynced.set(toPathKey(vaultPath), {
+            vclock: clock,
+            chunks: fileDoc.chunks,
+            size: fileDoc.size,
+        });
 
         // History capture is now owned by VaultWriter (it knows when
         // the content has actually landed in the editor/disk).
@@ -258,9 +294,9 @@ export class VaultSync {
                 return "identical";
             }
         }
-        const lastSynced = this.lastSyncedVclock.get(toPathKey(filePathFromId(fileDoc._id)));
+        const lastSynced = this.lastSynced.get(toPathKey(filePathFromId(fileDoc._id)));
         if (lastSynced) {
-            const rel = compareVC(fileDoc.vclock ?? {}, lastSynced);
+            const rel = compareVC(fileDoc.vclock ?? {}, lastSynced.vclock);
             return rel === "equal" ? "local-unpushed" : "remote-pending";
         }
         return "remote-pending";
@@ -276,7 +312,7 @@ export class VaultSync {
                     if (!existing || existing.deleted) {
                         return {
                             vclocks: [{ path, op: "delete" }],
-                            onCommit: () => { this.lastSyncedVclock.delete(toPathKey(path)); },
+                            onCommit: () => { this.lastSynced.delete(toPathKey(path)); },
                         };
                     }
                     // Divergent guard: same shape as fileToDb. A delete during
@@ -285,15 +321,15 @@ export class VaultSync {
                     // Yield: user re-deletes after the integration completes.
                     {
                         const existingVC = existing.vclock ?? {};
-                        const lastSynced = this.lastSyncedVclock.get(toPathKey(path));
+                        const lastSynced = this.lastSynced.get(toPathKey(path));
                         const isDivergent = lastSynced
-                            ? compareVC(existingVC, lastSynced) === "dominates"
+                            ? compareVC(existingVC, lastSynced.vclock) === "dominates"
                             : Object.keys(existingVC).length > 0;
                         if (isDivergent) {
                             logWarn(
                                 `markDeleted: skipping tombstone for ${path} — pending pull integration ` +
                                 `(observed=${JSON.stringify(existingVC)} ` +
-                                `integrated=${lastSynced ? JSON.stringify(lastSynced) : "null"})`,
+                                `integrated=${lastSynced ? JSON.stringify(lastSynced.vclock) : "null"})`,
                             );
                             return null;
                         }
@@ -310,7 +346,7 @@ export class VaultSync {
                             expectedVclock: existing.vclock,
                         }],
                         vclocks: [{ path, op: "delete" }],
-                        onCommit: () => { this.lastSyncedVclock.delete(toPathKey(path)); },
+                        onCommit: () => { this.lastSynced.delete(toPathKey(path)); },
                     };
                 },
                 { maxAttempts: CAS_MAX_ATTEMPTS },
@@ -341,14 +377,116 @@ export class VaultSync {
     }
 
     /**
+     * Force-push the local vault content for `path`, merging the supplied
+     * `baselineVclock` into the new doc's vclock. Bypasses the divergent
+     * guard. Used by ConflictOrchestrator when the user picks keep-local
+     * in the divergent-edit modal — at that point the divergent state IS
+     * the resolution, and the user's content must reach the LocalDB so
+     * the push loop carries it to remote.
+     */
+    async forceLocalEdit(path: string, baselineVclock: VectorClock): Promise<void> {
+        const settings = this.getSettings();
+        const fileStat = await this.vault.stat(path);
+        if (!fileStat) return;
+        const content = await this.vault.readBinary(path);
+        const chunks = await splitIntoChunks(content);
+        const chunkIds = chunks.map((c) => c._id);
+        const fileId = makeFileId(path);
+        const deviceId = settings.deviceId;
+        try {
+            await this.db.runWriteBuilder(
+                async (snap) => {
+                    const existing = (await snap.get(fileId)) as FileDoc | null;
+                    const merged = mergeVC(baselineVclock, existing?.vclock ?? {});
+                    const newVclock = incrementVC(merged, deviceId);
+                    const newDoc: FileDoc = {
+                        _id: fileId,
+                        type: "file",
+                        chunks: chunkIds,
+                        mtime: fileStat.mtime,
+                        ctime: fileStat.ctime,
+                        size: fileStat.size,
+                        vclock: newVclock,
+                    };
+                    return {
+                        chunks: chunks as unknown as CouchSyncDoc[],
+                        docs: [{
+                            doc: newDoc as unknown as CouchSyncDoc,
+                            expectedVclock: existing?.vclock ?? {},
+                        }],
+                        vclocks: [{
+                            path, op: "set", clock: newVclock,
+                            chunks: chunkIds, size: fileStat.size,
+                        }],
+                        onCommit: () => {
+                            this.lastSynced.set(toPathKey(path), {
+                                vclock: newVclock,
+                                chunks: chunkIds,
+                                size: fileStat.size,
+                            });
+                        },
+                    };
+                },
+                { maxAttempts: CAS_MAX_ATTEMPTS },
+            );
+        } catch (e) {
+            this.surfaceWriteError(e, `forceLocalEdit ${path}`);
+            throw e;
+        }
+    }
+
+    /**
+     * Force-tombstone the local doc for `path`, merging `baselineVclock`
+     * into the tombstone's vclock. Bypasses the divergent guard. Used by
+     * ConflictOrchestrator when the user picks keep-local (= keep
+     * deletion) in the divergent-delete modal.
+     */
+    async forceMarkDeleted(path: string, baselineVclock: VectorClock): Promise<void> {
+        const fileId = makeFileId(path);
+        const deviceId = this.getSettings().deviceId;
+        try {
+            await this.db.runWriteBuilder(
+                async (snap) => {
+                    const existing = (await snap.get(fileId)) as FileDoc | null;
+                    if (!existing || existing.deleted) {
+                        return {
+                            vclocks: [{ path, op: "delete" }],
+                            onCommit: () => { this.lastSynced.delete(toPathKey(path)); },
+                        };
+                    }
+                    const merged = mergeVC(baselineVclock, existing.vclock ?? {});
+                    const newVclock = incrementVC(merged, deviceId);
+                    return {
+                        docs: [{
+                            doc: {
+                                ...existing,
+                                deleted: true,
+                                mtime: Date.now(),
+                                vclock: newVclock,
+                            } as unknown as CouchSyncDoc,
+                            expectedVclock: existing.vclock,
+                        }],
+                        vclocks: [{ path, op: "delete" }],
+                        onCommit: () => { this.lastSynced.delete(toPathKey(path)); },
+                    };
+                },
+                { maxAttempts: CAS_MAX_ATTEMPTS },
+            );
+        } catch (e) {
+            this.surfaceWriteError(e, `forceMarkDeleted ${path}`);
+            throw e;
+        }
+    }
+
+    /**
      * True when the local file has changes not yet synced. Compares the
      * given vclock against the last-synced snapshot. Returns false when
      * no record exists (plugin just loaded — assume nothing pending).
      */
     hasUnpushedChanges(path: string, localVclock: VectorClock): boolean {
-        const lastSynced = this.lastSyncedVclock.get(toPathKey(path));
+        const lastSynced = this.lastSynced.get(toPathKey(path));
         if (!lastSynced) return false;
-        return compareVC(localVclock, lastSynced) !== "equal";
+        return compareVC(localVclock, lastSynced.vclock) !== "equal";
     }
 
     async handleRename(newPath: string, oldPath: string): Promise<void> {

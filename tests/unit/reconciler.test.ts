@@ -75,6 +75,8 @@ interface FakeVaultSync {
     dbToFile(doc: FileDoc): Promise<void>;
     markDeleted(path: string): Promise<void>;
     compareFileToDoc(doc: FileDoc, path: string, size: number): Promise<CompareResult>;
+    getLastSynced(path: string): undefined;
+    computeVaultChunks(path: string): Promise<string[]>;
 }
 
 function makeVaultSync(): FakeVaultSync {
@@ -98,6 +100,11 @@ function makeVaultSync(): FakeVaultSync {
             }
             return override;
         },
+        // Tests in this file don't exercise the divergent-edit / divergent-
+        // delete routing (no ConflictOrchestrator wired); always report no
+        // lastSynced so the reconciler keeps the legacy paths.
+        getLastSynced(_path) { return undefined; },
+        async computeVaultChunks(_path) { return []; },
     };
 }
 

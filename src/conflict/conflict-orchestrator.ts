@@ -4,6 +4,8 @@ import { ConflictResolver } from "./conflict-resolver.ts";
 import type { HistoryCapture } from "../history/history-capture.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { WriteResult } from "../sync/vault-writer.ts";
+import type { VaultSync } from "../sync/vault-sync.ts";
+import type { IVaultIO } from "../types/vault-io.ts";
 import type { FileDoc, CouchSyncDoc } from "../types.ts";
 import type { IModalPresenter, ConflictChoice } from "../types/modal-presenter.ts";
 import { isFileDoc, isConfigDoc } from "../types.ts";
@@ -20,14 +22,28 @@ export interface ConflictOrchestratorDeps {
     historyCapture: HistoryCapture;
     dbToFile: (doc: FileDoc) => Promise<WriteResult>;
     getSettings: () => CouchSyncSettings;
+    vault: IVaultIO;
+    vaultSync: VaultSync;
 }
+
+const EMPTY_BUF = new ArrayBuffer(0);
 
 /**
  * Wires conflict detection into the SyncEngine and handles UI-level conflict
  * resolution (modals, history persistence, vclock merging).
  *
- * Extracted from main.ts to keep the plugin shell thin. All conflict-related
- * callbacks that were registered in onload() now live here.
+ * Three entry points:
+ *   - `concurrent` event from PullWriter — pull-time vclock-concurrent
+ *     (CRDT-level conflict, neither side dominates)
+ *   - `handleDivergentLocalEdit` from Reconciler — vault-content drifted
+ *     from last integration baseline while LocalDB doc was advanced by a
+ *     pull (Regression A path)
+ *   - `handleDivergentLocalDelete` from Reconciler — vault file removed
+ *     by user while LocalDB doc was advanced by a pull (Regression B
+ *     path)
+ *
+ * All three funnel through the same modal pipeline; only the apply
+ * callbacks differ.
  */
 export class ConflictOrchestrator {
     private openConflictDismiss = new Map<string, () => void>();
@@ -41,20 +57,13 @@ export class ConflictOrchestrator {
     register(): void {
         const { replicator } = this.deps;
 
-        // ConflictResolver is a pure vclock comparison utility — no callbacks.
         const conflictResolver = new ConflictResolver();
-
-        // Wire ConflictResolver into SyncEngine for pull-time vclock guard.
         replicator.setConflictResolver(conflictResolver);
 
-        // Interactive conflict resolution via modal (SyncEngine's concurrent event).
-        // Return the promise so subscribers that want to await (e.g. tests) can.
         replicator.events.on("concurrent", ({ filePath, localDoc, remoteDoc }) =>
             this.handleConcurrent(filePath, localDoc, remoteDoc),
         );
 
-        // Auto-dismiss conflict modals when a resolved version arrives
-        // from another device (take-remote auto-resolve).
         replicator.events.on("auto-resolve", ({ filePath }) => {
             const dismiss = this.openConflictDismiss.get(filePath);
             if (dismiss) {
@@ -70,73 +79,33 @@ export class ConflictOrchestrator {
         localDoc: CouchSyncDoc,
         remoteDoc: CouchSyncDoc,
     ): Promise<void> {
-        const { modal: modalPresenter, localDb, historyCapture } = this.deps;
-        const fileName = filePath.split("/").pop();
-
         if (isFileDoc(localDoc) && isFileDoc(remoteDoc)) {
             try {
-                const dec = new TextDecoder("utf-8");
-                const localChunks = await localDb.getChunks(localDoc.chunks);
+                const localChunks = await this.deps.localDb.getChunks(localDoc.chunks);
                 const localBuf = joinChunks(localChunks);
-                const remoteChunks = await localDb.getChunks(remoteDoc.chunks);
+                const remoteChunks = await this.deps.localDb.getChunks(remoteDoc.chunks);
                 const remoteBuf = joinChunks(remoteChunks);
-
-                if (isDiffableText(localBuf) && isDiffableText(remoteBuf)) {
-                    const { result, dismiss } = modalPresenter.showConflictModal(
-                        filePath,
-                        dec.decode(localBuf), dec.decode(remoteBuf),
-                    );
-                    this.openConflictDismiss.set(filePath, dismiss);
-                    const { choice, dismissed } = await result;
-                    this.openConflictDismiss.delete(filePath);
-
-                    if (dismissed) {
-                        logInfo(`Conflict auto-resolved for ${fileName} (other device resolved)`);
-                    } else {
-                        await this.applyConflictChoice(
-                            choice, filePath, localDoc, remoteDoc,
-                        );
-                        // Record conflict history AFTER choice is applied,
-                        // with correct winner/loser assignment.
-                        const winner = choice === "take-remote" ? "remote" as const : "local" as const;
-                        await historyCapture.saveConflict(
-                            filePath,
-                            dec.decode(localBuf),
-                            dec.decode(remoteBuf),
-                            winner,
-                        );
-                    }
-                } else {
-                    // Binary — auto keep-local + merge vclocks for push.
-                    logInfo(`Conflict resolved: keep-local (binary) for ${fileName}`);
-                    await this.applyConflictChoice(
+                await this.runConflictModalAndApply({
+                    filePath,
+                    localBuf,
+                    remoteBuf,
+                    applyTakeRemote: () => this.applyConflictChoice(
+                        "take-remote", filePath, localDoc, remoteDoc,
+                    ),
+                    applyKeepLocal: () => this.applyConflictChoice(
                         "keep-local", filePath, localDoc, remoteDoc,
-                    );
-                    // Record conflict history for binary files too.
-                    await historyCapture.saveConflict(
-                        filePath,
-                        isDiffableText(localBuf) ? dec.decode(localBuf) : "",
-                        isDiffableText(remoteBuf) ? dec.decode(remoteBuf) : "",
-                        "local",
-                    );
-                    notify(
-                        `CouchSync: concurrent edit on binary file ${fileName} — ` +
-                            "keeping local version. Check Diff History for details.",
-                        10000,
-                    );
-                }
+                    ),
+                });
             } catch (e: any) {
                 this.openConflictDismiss.delete(filePath);
-                logError(`Conflict resolution error for ${fileName}: ${e?.message ?? e}`);
+                logError(`Conflict resolution error for ${filePath.split("/").pop()}: ${e?.message ?? e}`);
                 notify(
-                    `CouchSync: conflict on ${fileName} — keeping local version due to error.`,
+                    `CouchSync: conflict on ${filePath.split("/").pop()} — keeping local version due to error.`,
                     10000,
                 );
             }
         } else {
             // ConfigDoc (or unknown) — keep local, merge vclocks for push.
-            // Narrow to the vclock-bearing union (FileDoc | ConfigDoc);
-            // ChunkDocs have no vclock, so we skip those paths silently.
             if (
                 (isFileDoc(localDoc) || isConfigDoc(localDoc))
                 && (isFileDoc(remoteDoc) || isConfigDoc(remoteDoc))
@@ -144,20 +113,161 @@ export class ConflictOrchestrator {
                 const deviceId = this.deps.getSettings().deviceId;
                 const merged = mergeVC(localDoc.vclock, remoteDoc.vclock);
                 const updated = { ...localDoc, vclock: incrementVC(merged, deviceId) };
-                await localDb.runWriteTx({
+                await this.deps.localDb.runWriteTx({
                     docs: [{ doc: stripRev(updated) as CouchSyncDoc }],
                 });
             }
             notify(
-                `CouchSync: concurrent config edit on ${fileName} — keeping local version.`,
+                `CouchSync: concurrent config edit on ${filePath.split("/").pop()} — keeping local version.`,
                 8000,
             );
         }
     }
 
     /**
-     * Apply user's conflict resolution choice. Merges vclocks and writes
-     * to localDB so the push loop carries the result to remote.
+     * Reconciler entry: vault has user edits that drifted from the last
+     * integration baseline while a pull advanced the LocalDB doc beyond
+     * what was integrated to the vault. Surface as a conflict instead of
+     * letting the next dbToFile retry overwrite the user's edit.
+     */
+    async handleDivergentLocalEdit(filePath: string, remoteDoc: FileDoc): Promise<void> {
+        try {
+            const localBuf = await this.deps.vault.readBinary(filePath);
+            const remoteChunks = await this.deps.localDb.getChunks(remoteDoc.chunks);
+            const remoteBuf = joinChunks(remoteChunks);
+            await this.runConflictModalAndApply({
+                filePath,
+                localBuf,
+                remoteBuf,
+                applyTakeRemote: async () => {
+                    const writeResult = await this.deps.dbToFile(remoteDoc);
+                    if (writeResult.applied === false) {
+                        logWarn(
+                            `Divergent-edit take-remote: vault write skipped: ` +
+                            `${filePath.split("/").pop()} (${writeResult.reason})`,
+                        );
+                    }
+                },
+                applyKeepLocal: () => this.deps.vaultSync.forceLocalEdit(
+                    filePath, remoteDoc.vclock ?? {},
+                ),
+            });
+        } catch (e: any) {
+            this.openConflictDismiss.delete(filePath);
+            logError(
+                `Divergent-edit resolution error for ${filePath.split("/").pop()}: ${e?.message ?? e}`,
+            );
+            notify(
+                `CouchSync: divergent edit on ${filePath.split("/").pop()} — keeping local version due to error.`,
+                10000,
+            );
+        }
+    }
+
+    /**
+     * Reconciler entry: user deleted a file in the vault while a pull
+     * advanced the LocalDB doc beyond what was integrated. The deletion
+     * intent was suppressed by `markDeleted`'s divergent guard. Surface
+     * as a conflict so the user picks "keep deletion" or "restore from
+     * remote" instead of the auto-restore default.
+     */
+    async handleDivergentLocalDelete(filePath: string, remoteDoc: FileDoc): Promise<void> {
+        try {
+            const remoteChunks = await this.deps.localDb.getChunks(remoteDoc.chunks);
+            const remoteBuf = joinChunks(remoteChunks);
+            await this.runConflictModalAndApply({
+                filePath,
+                localBuf: EMPTY_BUF,
+                remoteBuf,
+                applyTakeRemote: async () => {
+                    const writeResult = await this.deps.dbToFile(remoteDoc);
+                    if (writeResult.applied === false) {
+                        logWarn(
+                            `Divergent-delete take-remote: vault write skipped: ` +
+                            `${filePath.split("/").pop()} (${writeResult.reason})`,
+                        );
+                    }
+                },
+                applyKeepLocal: () => this.deps.vaultSync.forceMarkDeleted(
+                    filePath, remoteDoc.vclock ?? {},
+                ),
+            });
+        } catch (e: any) {
+            this.openConflictDismiss.delete(filePath);
+            logError(
+                `Divergent-delete resolution error for ${filePath.split("/").pop()}: ${e?.message ?? e}`,
+            );
+            notify(
+                `CouchSync: divergent delete on ${filePath.split("/").pop()} — keeping local deletion due to error.`,
+                10000,
+            );
+        }
+    }
+
+    /**
+     * Shared modal+apply pipeline used by all three conflict entries.
+     * Decodes the bufs, picks text/binary path, shows the modal, awaits
+     * the user's choice (or auto-dismiss), invokes the matching apply
+     * callback, and persists conflict history.
+     */
+    private async runConflictModalAndApply(args: {
+        filePath: string;
+        localBuf: ArrayBuffer;
+        remoteBuf: ArrayBuffer;
+        applyTakeRemote: () => Promise<void>;
+        applyKeepLocal: () => Promise<void>;
+    }): Promise<void> {
+        const { filePath, localBuf, remoteBuf, applyTakeRemote, applyKeepLocal } = args;
+        const { modal, historyCapture } = this.deps;
+        const fileName = filePath.split("/").pop();
+        const dec = new TextDecoder("utf-8");
+
+        const localDiffable = isDiffableText(localBuf);
+        const remoteDiffable = isDiffableText(remoteBuf);
+
+        if (localDiffable && remoteDiffable) {
+            const localText = dec.decode(localBuf);
+            const remoteText = dec.decode(remoteBuf);
+            const { result, dismiss } = modal.showConflictModal(filePath, localText, remoteText);
+            this.openConflictDismiss.set(filePath, dismiss);
+            const { choice, dismissed } = await result;
+            this.openConflictDismiss.delete(filePath);
+
+            if (dismissed) {
+                logInfo(`Conflict auto-resolved for ${fileName} (other device resolved)`);
+                return;
+            }
+            if (choice === "take-remote") {
+                await applyTakeRemote();
+                await historyCapture.saveConflict(filePath, localText, remoteText, "remote");
+            } else {
+                await applyKeepLocal();
+                await historyCapture.saveConflict(filePath, localText, remoteText, "local");
+            }
+            return;
+        }
+
+        // Binary path — auto keep-local (matches existing concurrent
+        // behavior). saveConflict captures whichever side is text-like.
+        logInfo(`Conflict resolved: keep-local (binary) for ${fileName}`);
+        await applyKeepLocal();
+        await historyCapture.saveConflict(
+            filePath,
+            localDiffable ? dec.decode(localBuf) : "",
+            remoteDiffable ? dec.decode(remoteBuf) : "",
+            "local",
+        );
+        notify(
+            `CouchSync: concurrent edit on binary file ${fileName} — ` +
+                "keeping local version. Check Diff History for details.",
+            10000,
+        );
+    }
+
+    /**
+     * Apply user's conflict resolution choice for the pull-time
+     * `concurrent` event. Merges vclocks and writes to localDB so the
+     * push loop carries the result to remote.
      */
     private async applyConflictChoice(
         choice: ConflictChoice,
@@ -181,10 +291,6 @@ export class ConflictOrchestrator {
             await replicator.ensureFileChunks(updated as FileDoc);
             const writeResult = await this.deps.dbToFile(updated as FileDoc);
             if (writeResult.applied === false) {
-                // Conflict resolution wrote to LocalDB but vault writer
-                // declined (e.g., the file is currently in IME composition).
-                // Reconciler will retry dbToFile on the next pass via the
-                // pull-skipped → reconcile schedule path.
                 logWarn(
                     `Conflict take-remote applied to LocalDB but vault write skipped: ` +
                     `${fileName} (${writeResult.reason})`,

@@ -321,12 +321,17 @@ export class DexieStore<T extends { _id: string; _rev?: string } = any>
                 await this.db.docs.bulkDelete(tx.deletes);
             }
 
-            // 4. per-path vclock meta updates.
+            // 4. per-path lastSynced meta updates.
+            //    Payload shape: { vclock, chunks, size }. Legacy entries on
+            //    disk (raw VectorClock) are migrated transparently on read.
             if (tx.vclocks && tx.vclocks.length > 0) {
                 for (const v of tx.vclocks) {
                     const key = vclockMetaKey(v.path);
                     if (v.op === "set") {
-                        await this.db.meta.put({ key, value: v.clock });
+                        await this.db.meta.put({
+                            key,
+                            value: { vclock: v.clock, chunks: v.chunks, size: v.size },
+                        });
                     } else {
                         await this.db.meta.delete(key);
                     }

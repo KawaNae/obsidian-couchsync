@@ -149,7 +149,7 @@ describe("regression: phantom-write guard", () => {
         // Sanity: divergent state established.
         const docBefore = await db.get(makeFileId(path)) as FileDoc;
         expect(docBefore.vclock).toEqual(remoteDoc.vclock);
-        expect(vs["lastSyncedVclock"].get(toPathKey(path))).toEqual({ "dev-B": 1 });
+        expect(vs["lastSynced"].get(toPathKey(path))?.vclock).toEqual({ "dev-B": 1 });
 
         // Trigger a modify event by re-emitting fileToDb. The guard must
         // refuse to construct a phantom doc.
@@ -160,7 +160,7 @@ describe("regression: phantom-write guard", () => {
         expect(docAfter.vclock).toEqual(docBefore.vclock);
         expect(docAfter.chunks).toEqual(docBefore.chunks);
         // lastSynced still at the pre-divergent value (recovery hasn't fired yet).
-        expect(vs["lastSyncedVclock"].get(toPathKey(path))).toEqual({ "dev-B": 1 });
+        expect(vs["lastSynced"].get(toPathKey(path))?.vclock).toEqual({ "dev-B": 1 });
     });
 
     it("markDeleted refuses to produce a tombstone in divergent state", async () => {
@@ -191,7 +191,7 @@ describe("regression: phantom-write guard", () => {
         const result = await vs.dbToFile(remoteDoc);
 
         expect(result).toEqual({ applied: true });
-        expect(vs["lastSyncedVclock"].get(toPathKey(path))).toEqual(remoteDoc.vclock);
+        expect(vs["lastSynced"].get(toPathKey(path))?.vclock).toEqual(remoteDoc.vclock);
         // Vault now matches the remote content.
         const vaultBytes = await vault.readBinary(path);
         const vaultText = new TextDecoder().decode(vaultBytes);
