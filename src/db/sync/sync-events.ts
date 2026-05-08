@@ -45,6 +45,9 @@ export interface SyncEventMap {
         filePath: string;
         localDoc: CouchSyncDoc;
         remoteDoc: CouchSyncDoc;
+        /** Pipeline that detected the divergence. Diagnostic only — the
+         *  ConflictOrchestrator reaction is identical regardless of source. */
+        source?: "pull" | "push";
     };
     "auto-resolve": { filePath: string };
     /** Pull batch left N files in a divergent state (LocalDB doc advanced
