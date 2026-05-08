@@ -168,6 +168,73 @@ describe("ConfigSync", () => {
             expect(await db.get(makeConfigId(".obsidian/plugins/foo/main.js"))).not.toBeNull();
             expect(await db.get(makeConfigId(".obsidian/themes/bar/theme.css"))).not.toBeNull();
         });
+
+        // ── short-circuit: lastSynced cache (PR1, audit 2026-05-08) ──
+        // Pre-PR1 every scan rev-bumped every config doc, inflating the
+        // remote rev tree. The cache should detect "vault content same
+        // as last sync" via {size, dataHash} and skip the rewrite.
+        it("does not rewrite when content is unchanged across scans", async () => {
+            vault.addFile(".obsidian/app.json", `{"theme":"dark"}`);
+
+            await cs.scan();
+            const after1 = await db.get(makeConfigId(".obsidian/app.json"));
+            expect(after1!.vclock).toEqual({ "dev-A": 1 });
+
+            // Second scan with identical content → must not bump vclock.
+            await cs.scan();
+            const after2 = await db.get(makeConfigId(".obsidian/app.json"));
+            expect(after2!.vclock).toEqual({ "dev-A": 1 });
+            expect(after2!._rev).toBe(after1!._rev);
+        });
+
+        it("rewrites when content changes (size diff)", async () => {
+            vault.addFile(".obsidian/app.json", "v1");
+            await cs.scan();
+
+            vault.addFile(".obsidian/app.json", "v22");
+            await cs.scan();
+
+            const doc = await db.get(makeConfigId(".obsidian/app.json"));
+            expect(doc!.vclock["dev-A"]).toBe(2);
+        });
+
+        it("rewrites when content changes at the same size (hash diff)", async () => {
+            vault.addFile(".obsidian/app.json", "abc");
+            await cs.scan();
+
+            vault.addFile(".obsidian/app.json", "xyz"); // same size, different bytes
+            await cs.scan();
+
+            const doc = await db.get(makeConfigId(".obsidian/app.json"));
+            expect(doc!.vclock["dev-A"]).toBe(2);
+        });
+
+        it("init() clears lastSynced so a subsequent scan rewrites unchanged files", async () => {
+            // This guarantees PR5's destructive Init still rebuilds local
+            // state correctly even before remote-side destroy is wired in.
+            vault.addFile(".obsidian/app.json", `{"theme":"dark"}`);
+
+            await cs.scan();
+            const before = await db.get(makeConfigId(".obsidian/app.json"));
+            expect(before!.vclock).toEqual({ "dev-A": 1 });
+
+            // init wipes local docs + lastSynced meta, then re-scans.
+            // (The remote-side phases need a CouchClient, so they're
+            // exercised only via integration tests; here we just verify
+            // the local clearing→rescan path.)
+            try {
+                await cs.init();
+            } catch {
+                // remote-side phases will fail with no client, but the
+                // local clearing happens first. Tolerate the error.
+            }
+
+            const after = await db.get(makeConfigId(".obsidian/app.json"));
+            expect(after).not.toBeNull();
+            // After init, the doc has been re-created from scratch — vclock
+            // resets because init's deleteByPrefix dropped the existing one.
+            expect(after!.vclock).toEqual({ "dev-A": 1 });
+        });
     });
 
     // ── write ───────────────────────────────────────────

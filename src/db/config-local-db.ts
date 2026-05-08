@@ -102,6 +102,18 @@ export class ConfigLocalDB implements IDocStore<CouchSyncDoc> {
         return this.runOp((s) => s.info(), "info");
     }
 
+    // ── Meta read surface ───────────────────────────────
+
+    async getMeta<V = unknown>(key: string): Promise<V | null> {
+        return this.runOp((s) => s.getMeta<V>(key), "getMeta");
+    }
+
+    async getMetaByPrefix<V = unknown>(
+        prefix: string,
+    ): Promise<Array<{ key: string; value: V }>> {
+        return this.runOp((s) => s.getMetaByPrefix<V>(prefix), "getMetaByPrefix");
+    }
+
     // ── Write surface ───────────────────────────────────
 
     /** Builder-style atomic write with CAS retry. */

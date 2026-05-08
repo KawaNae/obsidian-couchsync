@@ -29,6 +29,12 @@ import {
 } from "./config-operation.ts";
 import { paginateAllDocs } from "../db/sync/pagination.ts";
 import type { ReconnectBridge } from "./reconnect-bridge.ts";
+import {
+    ConfigLastSynced,
+    computeConfigDataHash,
+    configLastSyncedKey,
+    CONFIG_LAST_SYNCED_PREFIX,
+} from "../db/sync/config-last-synced.ts";
 
 /**
  * ConfigSync — scan-based replication of `.obsidian/` configuration files
@@ -83,6 +89,11 @@ export class ConfigSync {
      */
     private readonly clientFactory: (settings: CouchSyncSettings) => CouchClient | null;
 
+    /** Per-path `{vclock, size, dataHash}` cache. Drives the scan()
+     *  short-circuit so unchanged files don't get rewritten on every
+     *  scan-triggered op. Mirror of VaultSync.lastSynced. */
+    private readonly lastSynced: ConfigLastSynced | null;
+
     constructor(
         private vault: IVaultIO,
         private modal: IModalPresenter,
@@ -94,6 +105,7 @@ export class ConfigSync {
         clientFactory?: (settings: CouchSyncSettings) => CouchClient | null,
     ) {
         this.clientFactory = clientFactory ?? defaultClientFactory;
+        this.lastSynced = configDb ? new ConfigLastSynced(configDb) : null;
     }
 
     // ── Remote URL + auth helpers ──────────────────────
@@ -174,6 +186,10 @@ export class ConfigSync {
             //    docs from a previous larger scan would persist locally.
             progress.update("Deleting old config docs...");
             await db.deleteByPrefix(DOC_ID.CONFIG);
+            // Drop per-path lastSynced meta + in-memory cache so the
+            // following scan() doesn't short-circuit against stale
+            // baselines for docs that no longer exist.
+            await this.clearLastSyncedMeta();
 
             // 2. Scan vault to populate local DB with current truth.
             const scanned = await this.scan((path, i, total) => {
@@ -413,9 +429,35 @@ export class ConfigSync {
 
     // ── Low-level operations ───────────────────────────
 
-    /** Scan entire .obsidian/ directory to local DB */
+    /** Wipe per-path lastSynced meta + in-memory cache. Called from
+     *  init() before scan() so the short-circuit can't be tricked by
+     *  baselines whose corresponding ConfigDocs were just deleted. */
+    private async clearLastSyncedMeta(): Promise<void> {
+        const db = this.requireConfigDb();
+        const rows = await db.getMetaByPrefix(CONFIG_LAST_SYNCED_PREFIX);
+        if (rows.length > 0) {
+            await db.runWriteTx({
+                meta: rows.map(({ key }) => ({ op: "delete", key })),
+            });
+        }
+        this.lastSynced?.clear();
+    }
+
+    /** Scan entire .obsidian/ directory to local DB.
+     *
+     *  Short-circuit: if the per-path lastSynced cache reports a matching
+     *  `{size, dataHash}`, skip the rewrite entirely. This is the config
+     *  symmetric to VaultSync.fileToDb's `chunksEqual` early-out — without
+     *  it every scan rev-bumps every config doc, which inflates the remote
+     *  rev tree and produces phantom divergence for peers (see audit
+     *  2026-05-08). Hash + size compared, not base64 equality, to avoid
+     *  holding the full 5MB×N base64 in memory. */
     async scan(onProgress?: (path: string, index: number, total: number) => void): Promise<number> {
         const db = this.requireConfigDb();
+        const lastSynced = this.lastSynced;
+        if (!lastSynced) throw new Error("ConfigSync.scan: lastSynced not initialised");
+        await lastSynced.ensureLoaded();
+
         const files: string[] = [];
         await this.listFilesRecursive(".obsidian", files);
 
@@ -433,20 +475,41 @@ export class ConfigSync {
                 if (!stat || stat.size > ConfigSync.MAX_CONFIG_SIZE) continue;
 
                 const buf = await this.vault.readBinary(file);
-                const data = arrayBufferToBase64(buf);
+                const dataHash = await computeConfigDataHash(buf);
 
+                const cached = lastSynced.get(file);
+                if (cached && cached.size === stat.size && cached.dataHash === dataHash) {
+                    continue; // unchanged since last sync — no rewrite
+                }
+
+                const data = arrayBufferToBase64(buf);
                 const configId = makeConfigId(file);
                 await db.runWriteBuilder(async (snap) => {
                     const existing = (await snap.get(configId)) as ConfigDoc | null;
+                    const newVclock = incrementVC(existing?.vclock, deviceId);
                     const doc: ConfigDoc = {
                         _id: configId,
                         type: "config",
                         data,
                         mtime: stat.mtime,
                         size: stat.size,
-                        vclock: incrementVC(existing?.vclock, deviceId),
+                        vclock: newVclock,
                     };
-                    return { docs: [{ doc }] };
+                    return {
+                        docs: [{ doc }],
+                        meta: [{
+                            op: "put",
+                            key: configLastSyncedKey(file),
+                            value: { vclock: newVclock, size: stat.size, dataHash },
+                        }],
+                        onCommit: () => {
+                            lastSynced.set(file, {
+                                vclock: newVclock,
+                                size: stat.size,
+                                dataHash,
+                            });
+                        },
+                    };
                 });
                 count++;
             } catch (e) {
