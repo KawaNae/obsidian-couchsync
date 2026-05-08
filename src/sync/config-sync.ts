@@ -17,23 +17,15 @@ import { CouchClient, makeCouchClient } from "../db/couch-client.ts";
 import { logError, logWarn } from "../ui/log.ts";
 import * as remoteCouch from "../db/remote-couch.ts";
 import {
-    detectDivergence,
-    dangerousForPush,
-    dangerousForPull,
-    type Divergence,
-} from "./config-divergence.ts";
-import {
     ConfigOperation,
     CONFIG_TIMEOUTS,
     type ConfigOpContext,
 } from "./config-operation.ts";
-import { paginateAllDocs } from "../db/sync/pagination.ts";
 import type { ReconnectBridge } from "./reconnect-bridge.ts";
 import {
     ConfigLastSynced,
     computeConfigDataHash,
     configLastSyncedKey,
-    CONFIG_LAST_SYNCED_PREFIX,
 } from "../db/sync/config-last-synced.ts";
 import { ConfigCheckpoints } from "../db/sync/config-checkpoints.ts";
 import {
@@ -45,6 +37,7 @@ import {
     type ConfigPushDivergence,
 } from "../db/sync/config-push-pipeline.ts";
 import { ConflictResolver } from "../conflict/conflict-resolver.ts";
+import { ConfigSetupService } from "./config-setup.ts";
 
 /**
  * ConfigSync — scan-based replication of `.obsidian/` configuration files
@@ -202,75 +195,41 @@ export class ConfigSync {
     // ── High-level operations ──────────────────────────
 
     /**
-     * Init: wipe local + remote, then re-seed both from a fresh vault scan.
+     * Init: real clean slate.
      *
-     * Semantically a "make remote match local vault as of now". The
-     * earlier implementation only scanned + pushed, which silently
-     * left stale `config:*` docs on the remote when files had been
-     * deleted from `.obsidian/` between inits. v0.20.6 explicitly
-     * tombstones the remote-only ids so init really is idempotent.
+     * 1. Local: destroy + reopen ConfigLocalDB (drops docs, meta, vclock
+     *    baselines, cursors atomically — the IndexedDB store goes away).
+     * 2. Remote: DELETE /<configDb> + PUT /<configDb> via the operation
+     *    epoch's CouchClient. True rev-tree reset, not the legacy
+     *    "tombstone-only" pseudo-reset that left rev tree intact.
+     * 3. Scan vault → seed local from current `.obsidian/` truth.
+     * 4. Push to empty remote (no conflicts possible).
+     *
+     * Symmetric with `SetupService.init()` for vault sync. Resolves the
+     * audit-2026-05-08 finding where init() left rev=N+1 with vclock
+     * reset to {device:1}, silently destroying peer causality history.
      */
     async init(): Promise<number> {
         const db = this.requireConfigDb();
         return this.runOperation("Config Init", async (ctx, progress) => {
-            // 1. Wipe local: scan() is additive, so without this stale
-            //    docs from a previous larger scan would persist locally.
-            progress.update("Deleting old config docs...");
-            await db.deleteByPrefix(DOC_ID.CONFIG);
-            // Drop per-path lastSynced meta + in-memory cache so the
-            // following scan() doesn't short-circuit against stale
-            // baselines for docs that no longer exist.
-            await this.clearLastSyncedMeta();
-
-            // 2. Scan vault to populate local DB with current truth.
-            const scanned = await this.scan((path, i, total) => {
-                progress.update(`Scanning: ${path} (${i}/${total})`);
-            });
-            const localIds = await this.allDocIds();
-            const localSet = new Set(localIds);
-
-            // 3. Fetch remote inventory (ids only, paginated). Anything
-            //    on remote not in local-after-scan needs a tombstone so
-            //    the remote view ends up matching local vault.
-            progress.update("Fetching remote inventory...");
-            const remoteIds = await remoteCouch.listRemoteByPrefix(
+            const setup = new ConfigSetupService(
+                db,
+                this.getSettings,
+                {
+                    clearLastSynced: () => this.lastSynced?.clear(),
+                    invalidateCheckpoints: () => { this.checkpointsLoaded = false; },
+                    scan: (cb) => this.scan(cb),
+                },
+            );
+            const result = await setup.init(
                 ctx.client,
-                DOC_ID.CONFIG,
                 ctx.signal,
+                (msg) => progress.update(msg),
             );
-            const toTombstone = remoteIds.filter((id) => !localSet.has(id));
-
-            // 4. Tombstone remote-only ids.
-            if (toTombstone.length > 0) {
-                await remoteCouch.deleteRemoteDocs(
-                    ctx.client,
-                    toTombstone,
-                    (docId, n) => {
-                        progress.update(
-                            `Removing stale remote: ${configPathFromId(docId)} (${n}/${toTombstone.length})`,
-                        );
-                    },
-                    ctx.signal,
-                );
-            }
-
-            // 5. Push current local docs.
-            if (localIds.length > 0) {
-                await remoteCouch.pushDocs(
-                    db,
-                    ctx.client,
-                    localIds,
-                    (docId, n) => {
-                        progress.update(`Pushing: ${configPathFromId(docId)} (${n}/${localIds.length})`);
-                    },
-                    ctx.signal,
-                );
-            }
-
             progress.done(
-                `Config init: pushed ${scanned}, tombstoned ${toTombstone.length} stale remote doc(s).`,
+                `Config init: scanned ${result.scanned} file(s), pushed ${result.pushed}.`,
             );
-            return scanned;
+            return result.scanned;
         });
     }
 
@@ -366,58 +325,6 @@ export class ConfigSync {
     }
 
     /**
-     * Fetch ConfigDocs from remote: by `keys` if given, otherwise by the
-     * full `config:` prefix range (paginated). Filters out tombstones and
-     * any non-config stragglers defensively.
-     *
-     * Both paths are batched. On slow mobile networks the per-request
-     * payload of an unsplit `keys` list is exactly the same problem as
-     * the unsplit prefix range \u2014 fix it the same way.
-     */
-    private async fetchRemoteConfigDocs(
-        client: CouchClient,
-        signal: AbortSignal,
-        ids?: string[],
-        onProgress?: (fetched: number) => void,
-    ): Promise<ConfigDoc[]> {
-        const docs: ConfigDoc[] = [];
-        if (ids) {
-            const KEYS_BATCH = 100;
-            for (let i = 0; i < ids.length; i += KEYS_BATCH) {
-                if (signal.aborted) throw makeAbortError();
-                const batch = ids.slice(i, i + KEYS_BATCH);
-                const result = await client.allDocs<ConfigDoc>(
-                    { keys: batch, include_docs: true },
-                    signal,
-                );
-                for (const row of result.rows) {
-                    if (row.doc && !row.value?.deleted && row.doc.type === "config") {
-                        docs.push(row.doc);
-                    }
-                }
-                onProgress?.(docs.length);
-            }
-            return docs;
-        }
-        for await (const rows of paginateAllDocs<ConfigDoc>(
-            client,
-            {
-                startkey: DOC_ID.CONFIG,
-                endkey: DOC_ID.CONFIG + "\ufff0",
-                include_docs: true,
-            },
-            { signal, onBatch: onProgress },
-        )) {
-            for (const row of rows) {
-                if (row.doc && !row.value?.deleted && row.doc.type === "config") {
-                    docs.push(row.doc);
-                }
-            }
-        }
-        return docs;
-    }
-
-    /**
      * Surface concurrent-edit findings collected during a diff pull.
      * Pull is already committed by the time this runs — concurrent docs
      * were filtered out of `accepted` by the resolver, so the only effect
@@ -483,55 +390,7 @@ export class ConfigSync {
         );
     }
 
-    /**
-     * Show a confirm modal listing the divergent paths, returning true if
-     * the user chose to proceed (overwrite the other side) and false on
-     * cancel. The full path list is also written to the log so the user
-     * can review it after the modal closes.
-     */
-    private async confirmDivergence(
-        divs: Divergence[],
-        direction: "push" | "pull",
-    ): Promise<boolean> {
-        const verb = direction === "push" ? "Pushing" : "Pulling";
-        const target = direction === "push" ? "remote" : "local";
-        const paths = divs.map((d) => `  • ${d.path} (${d.relation})`).join("\n");
-        logWarn(
-            `CouchSync: Config ${direction} would overwrite concurrent edits on ${divs.length} doc(s):\n${paths}`,
-        );
-        const previewLimit = 5;
-        const preview = divs
-            .slice(0, previewLimit)
-            .map((d) => d.path)
-            .join(", ");
-        const more = divs.length > previewLimit ? ` (+${divs.length - previewLimit} more)` : "";
-        const message =
-            `${verb} would overwrite ${target} for ${divs.length} doc(s) ` +
-            `with concurrent edits: ${preview}${more}. ` +
-            `See the Log View for the full list. Continue anyway?`;
-        return await this.modal.showConfirmModal(
-            `Config ${direction}: concurrent edits detected`,
-            message,
-            direction === "push" ? "Push anyway" : "Pull anyway",
-            true,
-        );
-    }
-
     // ── Low-level operations ───────────────────────────
-
-    /** Wipe per-path lastSynced meta + in-memory cache. Called from
-     *  init() before scan() so the short-circuit can't be tricked by
-     *  baselines whose corresponding ConfigDocs were just deleted. */
-    private async clearLastSyncedMeta(): Promise<void> {
-        const db = this.requireConfigDb();
-        const rows = await db.getMetaByPrefix(CONFIG_LAST_SYNCED_PREFIX);
-        if (rows.length > 0) {
-            await db.runWriteTx({
-                meta: rows.map(({ key }) => ({ op: "delete", key })),
-            });
-        }
-        this.lastSynced?.clear();
-    }
 
     /** Scan entire .obsidian/ directory to local DB.
      *
@@ -736,11 +595,6 @@ export class ConfigSync {
 
     // ── Private ────────────────────────────────────────
 
-    private async allDocIds(): Promise<string[]> {
-        const docs = await this.requireConfigDb().allConfigDocs();
-        return docs.map((d) => d._id);
-    }
-
     private async ensureDir(filePath: string): Promise<void> {
         const dir = filePath.split("/").slice(0, -1).join("/");
         if (dir && !(await this.vault.exists(dir))) {
@@ -763,10 +617,4 @@ export class ConfigSync {
             // skip inaccessible dirs
         }
     }
-}
-
-function makeAbortError(): Error {
-    const e: any = new Error("The operation was aborted.");
-    e.name = "AbortError";
-    return e;
 }
