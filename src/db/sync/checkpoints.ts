@@ -14,7 +14,9 @@
 
 import type { CouchSyncDoc } from "../../types.ts";
 import type { LocalDB } from "../local-db.ts";
+import type { MetaWrite } from "../write-transaction.ts";
 import { logDebug } from "../../ui/log.ts";
+import { unpushedKey, type UnpushedEntry, type UnpushedReason } from "./unpushed-ids.ts";
 
 export const META_REMOTE_SEQ = "_sync/remote-seq";
 export const META_PUSH_SEQ = "_sync/push-seq";
@@ -98,5 +100,45 @@ export class Checkpoints {
     async saveEmptyPullBatch(nextRemoteSeq: number | string): Promise<void> {
         this.remoteSeq = nextRemoteSeq;
         await this.save();
+    }
+
+    /**
+     * Commit one push-pipeline cycle: advance `lastPushedSeq` and update
+     * the unpushed-id set in a single atomic tx. Cursor advance is
+     * unconditional — the set carries any ids that need to be retried.
+     *
+     * Without this pairing a crash between cursor write and set write
+     * would leak the old silent-loss path (cursor moved past an id that
+     * never made the retry set). Bundling them keeps the post-refactor
+     * invariant: "an id is unpushed iff its meta entry exists, and the
+     * cursor reflects every cycle that did or did not cover it."
+     *
+     * `unpushedAdd` and `unpushedRemove` may overlap (same id seen as
+     * resolved earlier in the cycle and re-flagged at the end); the
+     * caller is responsible for de-duplicating, but we apply removes
+     * before adds so an in-cycle re-flag wins.
+     */
+    async commitPushCycle(params: {
+        nextPushSeq: number | string;
+        unpushedAdd: Array<{ id: string; reason: UnpushedReason; attempts: number }>;
+        unpushedRemove: string[];
+    }): Promise<void> {
+        const meta: MetaWrite[] = [
+            { op: "put", key: META_PUSH_SEQ, value: params.nextPushSeq },
+        ];
+        for (const id of params.unpushedRemove) {
+            meta.push({ op: "delete", key: unpushedKey(id) });
+        }
+        const now = Date.now();
+        for (const { id, reason, attempts } of params.unpushedAdd) {
+            const entry: UnpushedEntry = { addedAt: now, reason, attempts };
+            meta.push({ op: "put", key: unpushedKey(id), value: entry });
+        }
+        await this.localDb.runWriteTx({
+            meta,
+            onCommit: async () => {
+                this.lastPushedSeq = params.nextPushSeq;
+            },
+        });
     }
 }

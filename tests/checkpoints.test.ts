@@ -143,4 +143,82 @@ describe("Checkpoints", () => {
             expect(localDb._meta["_sync/push-seq"]).toBe(5);
         });
     });
+
+    describe("commitPushCycle", () => {
+        it("advances pushSeq and writes set adds + removes in one tx", async () => {
+            const localDb = makeLocalDb();
+            const cp = new Checkpoints(localDb);
+            cp.setLastPushedSeq(10);
+            // Pre-existing entry to be removed.
+            localDb._meta["_sync/unpushed/file:gone.md"] = {
+                addedAt: 1, reason: "race-stale", attempts: 1,
+            };
+
+            await cp.commitPushCycle({
+                nextPushSeq: 42,
+                unpushedAdd: [
+                    { id: "file:new.md", reason: "race-stale", attempts: 1 },
+                    { id: "file:diverged.md", reason: "divergent", attempts: 0 },
+                ],
+                unpushedRemove: ["file:gone.md"],
+            });
+
+            expect(cp.getLastPushedSeq()).toBe(42);
+            expect(localDb._meta["_sync/push-seq"]).toBe(42);
+            expect(localDb._meta["_sync/unpushed/file:gone.md"]).toBeUndefined();
+            expect(localDb._meta["_sync/unpushed/file:new.md"]).toMatchObject({
+                reason: "race-stale", attempts: 1,
+            });
+            expect(localDb._meta["_sync/unpushed/file:diverged.md"]).toMatchObject({
+                reason: "divergent", attempts: 0,
+            });
+            // One tx round-trip — atomic with cursor advance.
+            expect(localDb.runWriteTx).toHaveBeenCalledTimes(1);
+        });
+
+        it("advance is unconditional even with empty add/remove", async () => {
+            const localDb = makeLocalDb();
+            const cp = new Checkpoints(localDb);
+            cp.setLastPushedSeq(0);
+
+            await cp.commitPushCycle({
+                nextPushSeq: 17,
+                unpushedAdd: [],
+                unpushedRemove: [],
+            });
+
+            expect(cp.getLastPushedSeq()).toBe(17);
+            expect(localDb._meta["_sync/push-seq"]).toBe(17);
+        });
+
+        it("removes are applied before adds (in-cycle re-flag wins)", async () => {
+            const localDb = makeLocalDb();
+            const cp = new Checkpoints(localDb);
+            await cp.commitPushCycle({
+                nextPushSeq: 1,
+                unpushedAdd: [{ id: "file:x.md", reason: "divergent", attempts: 0 }],
+                unpushedRemove: ["file:x.md"],
+            });
+            // The add wins because we apply removes first, then adds.
+            expect(localDb._meta["_sync/unpushed/file:x.md"]).toMatchObject({
+                reason: "divergent",
+            });
+        });
+
+        it("entry includes addedAt timestamp", async () => {
+            const localDb = makeLocalDb();
+            const cp = new Checkpoints(localDb);
+            const before = Date.now();
+            await cp.commitPushCycle({
+                nextPushSeq: 1,
+                unpushedAdd: [{ id: "file:x.md", reason: "race-stale", attempts: 2 }],
+                unpushedRemove: [],
+            });
+            const after = Date.now();
+            const entry = localDb._meta["_sync/unpushed/file:x.md"];
+            expect(entry.addedAt).toBeGreaterThanOrEqual(before);
+            expect(entry.addedAt).toBeLessThanOrEqual(after);
+            expect(entry.attempts).toBe(2);
+        });
+    });
 });
