@@ -35,6 +35,12 @@ import {
     configLastSyncedKey,
     CONFIG_LAST_SYNCED_PREFIX,
 } from "../db/sync/config-last-synced.ts";
+import { ConfigCheckpoints } from "../db/sync/config-checkpoints.ts";
+import {
+    ConfigPullWriter,
+    type ConfigConcurrentEntry,
+} from "../db/sync/config-pull-writer.ts";
+import { ConflictResolver } from "../conflict/conflict-resolver.ts";
 
 /**
  * ConfigSync — scan-based replication of `.obsidian/` configuration files
@@ -94,6 +100,16 @@ export class ConfigSync {
      *  scan-triggered op. Mirror of VaultSync.lastSynced. */
     private readonly lastSynced: ConfigLastSynced | null;
 
+    /** Persistent pull/push cursors for `_changes`-based incremental
+     *  replication. Loaded lazily on first pull/push. Mirror of
+     *  vault sync's `Checkpoints`. */
+    private readonly checkpoints: ConfigCheckpoints | null;
+    private checkpointsLoaded = false;
+
+    /** vclock-based pull-time conflict classifier. Stateless; one
+     *  shared instance is enough. Same class as vault sync. */
+    private readonly conflictResolver: ConflictResolver;
+
     constructor(
         private vault: IVaultIO,
         private modal: IModalPresenter,
@@ -106,6 +122,17 @@ export class ConfigSync {
     ) {
         this.clientFactory = clientFactory ?? defaultClientFactory;
         this.lastSynced = configDb ? new ConfigLastSynced(configDb) : null;
+        this.checkpoints = configDb ? new ConfigCheckpoints(configDb) : null;
+        this.conflictResolver = new ConflictResolver();
+    }
+
+    /** Lazy-load the persisted pull/push cursors. Idempotent — safe to
+     *  call from every public op. */
+    private async ensureCheckpointsLoaded(): Promise<void> {
+        if (this.checkpointsLoaded) return;
+        if (!this.checkpoints) throw new Error("ConfigSync.ensureCheckpointsLoaded: not configured");
+        await this.checkpoints.load();
+        this.checkpointsLoaded = true;
     }
 
     // ── Remote URL + auth helpers ──────────────────────
@@ -291,52 +318,44 @@ export class ConfigSync {
         });
     }
 
-    /** Pull: divergence check → pull config docs from remote → write configSyncPaths to filesystem */
+    /** Pull: incremental `_changes`-based delta + write configSyncPaths to filesystem.
+     *
+     *  Replaces the snapshot-style pullByPrefix in PR3 of the diff-sync plan.
+     *  Concurrent edits are surfaced AFTER the batch commit (informational),
+     *  not pre-flight — the resolver classifies them as keep-local equivalents
+     *  and the cursor advances past them, so re-running pull() will surface
+     *  them again until manually resolved (matches vault-sync semantics). */
     async pull(): Promise<number> {
         const db = this.requireConfigDb();
         return this.runOperation("Config Pull", async (ctx, progress) => {
-            // Divergence check: fetch ONLY the remote docs that have a
-            // local counterpart, by id. Remote-only docs aren't a
-            // concurrent edit (they're new arrivals to be pulled, no
-            // conflict possible), so there's no reason to download them
-            // here — and on a 3.5 Mbps Android the difference between
-            // "fetch 81 ids" and "fetch all 1241" is whether the
-            // request fits in the body-stale window or stalls forever.
-            progress.update("Checking local for concurrent edits...");
-            const localDocs = await db.allConfigDocs();
-            const localIds = localDocs.map((d) => d._id);
-            const remoteDocs = localIds.length > 0
-                ? await this.fetchRemoteConfigDocs(
-                    ctx.client,
-                    ctx.signal,
-                    localIds,
-                    (fetched) => {
-                        progress.update(`Checking local for concurrent edits: ${fetched}/${localIds.length}...`);
-                    },
-                )
-                : [];
-            const dangerous = dangerousForPull(detectDivergence(localDocs, remoteDocs));
-            if (dangerous.length > 0) {
-                const ok = await this.confirmDivergence(dangerous, "pull");
-                if (!ok) throw new Error("Cancelled by user (concurrent edits detected)");
+            await this.ensureCheckpointsLoaded();
+
+            const writer = new ConfigPullWriter({
+                db,
+                client: ctx.client,
+                checkpoints: this.checkpoints!,
+                lastSynced: this.lastSynced!,
+                getConflictResolver: () => this.conflictResolver,
+                signal: ctx.signal,
+            });
+            const result = await writer.run((msg) => progress.update(msg));
+
+            if (result.concurrent.length > 0) {
+                this.notifyConcurrentPull(result.concurrent);
             }
 
-            progress.update("Pulling config from remote...");
-            await remoteCouch.pullByPrefix(
-                db,
-                ctx.client,
-                DOC_ID.CONFIG,
-                (fetched) => {
-                    progress.update(`Pulling config from remote: ${fetched}...`);
-                },
-                ctx.signal,
-            );
-
+            progress.update("Writing config files...");
             const written = await this.write((path, i, total) => {
                 progress.update(`Writing: ${path} (${i}/${total})`);
             });
 
-            progress.done(`Pulled ${written} config file(s). Reload Obsidian to apply.`);
+            const summaryParts: string[] = [];
+            if (result.stats.accepted) summaryParts.push(`${result.stats.accepted} accepted`);
+            if (result.stats.deleted) summaryParts.push(`${result.stats.deleted} deleted`);
+            if (result.stats.convergedSkip) summaryParts.push(`${result.stats.convergedSkip} converged`);
+            if (result.stats.concurrent) summaryParts.push(`${result.stats.concurrent} concurrent`);
+            const summary = summaryParts.length > 0 ? summaryParts.join(", ") : "no changes";
+            progress.done(`Pull: ${summary}. Wrote ${written} file(s). Reload Obsidian to apply.`);
             return written;
         });
     }
@@ -391,6 +410,37 @@ export class ConfigSync {
             }
         }
         return docs;
+    }
+
+    /**
+     * Surface concurrent-edit findings collected during a diff pull.
+     * Pull is already committed by the time this runs — concurrent docs
+     * were filtered out of `accepted` by the resolver, so the only effect
+     * here is informational. Logs the full list and shows a single-button
+     * notice modal so the user can investigate without blocking the op.
+     *
+     * Re-running pull() will re-classify the same docs as concurrent
+     * until the local copy is causally advanced (i.e., the user edits
+     * the file or accepts a manual resolve), matching the vault-sync
+     * conflict-orchestrator UX.
+     */
+    private notifyConcurrentPull(entries: ConfigConcurrentEntry[]): void {
+        const paths = entries.map((e) => `  • ${e.path}`).join("\n");
+        logWarn(
+            `CouchSync: Config pull surfaced ${entries.length} concurrent edit(s):\n${paths}`,
+        );
+        const previewLimit = 5;
+        const preview = entries.slice(0, previewLimit).map((e) => e.path).join(", ");
+        const more = entries.length > previewLimit ? ` (+${entries.length - previewLimit} more)` : "";
+        // Fire-and-forget: this is informational, the op already completed.
+        void this.modal.showConfirmModal(
+            `Config pull: ${entries.length} concurrent edit(s) detected`,
+            `Local copies of ${preview}${more} have diverged from remote. ` +
+            `See the Log View for the full list. ` +
+            `Edit a file or trigger Init to advance past the conflict.`,
+            "OK",
+            false,
+        );
     }
 
     /**
