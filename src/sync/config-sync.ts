@@ -40,6 +40,10 @@ import {
     ConfigPullWriter,
     type ConfigConcurrentEntry,
 } from "../db/sync/config-pull-writer.ts";
+import {
+    ConfigPushPipeline,
+    type ConfigPushDivergence,
+} from "../db/sync/config-push-pipeline.ts";
 import { ConflictResolver } from "../conflict/conflict-resolver.ts";
 
 /**
@@ -270,51 +274,52 @@ export class ConfigSync {
         });
     }
 
-    /** Push: scan .obsidian/ → divergence check → push config docs to remote */
+    /** Push: scan .obsidian/ → enumerate local delta via changes feed →
+     *  per-doc remote-rev fetch → bulkDocs.
+     *
+     *  Replaces the snapshot-style push (full `fetchRemoteConfigDocs` +
+     *  `pushDocs` by id list) in PR4 of the diff-sync plan. Divergence is
+     *  detected per pair via `compareVC`; on hit, the modal asks for
+     *  confirm-and-overwrite (matches the prior UX). Confirmed → bump
+     *  local vclocks above remote and re-run the pipeline. */
     async push(): Promise<number> {
         const db = this.requireConfigDb();
         return this.runOperation("Config Push", async (ctx, progress) => {
+            await this.ensureCheckpointsLoaded();
+
             const scanned = await this.scan((path, i, total) => {
                 progress.update(`Scanning: ${path} (${i}/${total})`);
             });
 
-            const localDocs = await db.allConfigDocs();
-            if (localDocs.length === 0) {
-                progress.done(`Pushed 0 config file(s).`);
-                return scanned;
-            }
-
-            // Divergence check: fetch remote counterparts and compare vclocks.
-            // Surfacing here is the "concurrent edits are detected and
-            // surfaced" guarantee the class docstring promises.
-            progress.update("Checking remote for concurrent edits...");
-            const localIds = localDocs.map((d) => d._id);
-            const remoteDocs = await this.fetchRemoteConfigDocs(
-                ctx.client,
-                ctx.signal,
-                localIds,
-                (fetched) => {
-                    progress.update(`Checking remote for concurrent edits: ${fetched}/${localIds.length}...`);
-                },
-            );
-            const dangerous = dangerousForPush(detectDivergence(localDocs, remoteDocs));
-            if (dangerous.length > 0) {
-                const ok = await this.confirmDivergence(dangerous, "push");
-                if (!ok) throw new Error("Cancelled by user (concurrent edits detected)");
-            }
-
-            await remoteCouch.pushDocs(
+            const pipeline = new ConfigPushPipeline({
                 db,
-                ctx.client,
-                localIds,
-                (docId, n) => {
-                    progress.update(`Pushing: ${configPathFromId(docId)} (${n}/${localIds.length})`);
-                },
-                ctx.signal,
-            );
+                client: ctx.client,
+                checkpoints: this.checkpoints!,
+                getDeviceId: () => this.getSettings().deviceId,
+                signal: ctx.signal,
+            });
 
-            progress.done(`Pushed ${scanned} config file(s).`);
-            return scanned;
+            let result = await pipeline.run((msg) => progress.update(msg));
+
+            if (result.divergent.length > 0) {
+                const ok = await this.confirmPushDivergence(result.divergent);
+                if (!ok) {
+                    throw new Error(
+                        "Cancelled by user (concurrent edits detected)",
+                    );
+                }
+                progress.update("Resolving divergence (advancing vclocks)...");
+                await pipeline.forcePushAdvanceVclocks(result.divergent);
+                result = await pipeline.run((msg) => progress.update(msg));
+            }
+
+            const summaryParts: string[] = [];
+            if (result.stats.pushed) summaryParts.push(`${result.stats.pushed} pushed`);
+            if (result.stats.skipped) summaryParts.push(`${result.stats.skipped} skipped`);
+            if (result.stats.conflicts) summaryParts.push(`${result.stats.conflicts} conflicts (will retry)`);
+            const summary = summaryParts.length > 0 ? summaryParts.join(", ") : "no changes";
+            progress.done(`Push: ${summary}. (Scanned ${scanned} local file(s).)`);
+            return result.stats.pushed;
         });
     }
 
@@ -440,6 +445,41 @@ export class ConfigSync {
             `Edit a file or trigger Init to advance past the conflict.`,
             "OK",
             false,
+        );
+    }
+
+    /**
+     * Push-side confirm for divergent local↔remote vclock pairs.
+     * Returns true on "push anyway", false on cancel.
+     *
+     * "Push anyway" means: bump each divergent doc's local vclock to
+     * dominate remote (mergeVC + bump), then retry the push pipeline.
+     * Peers will see the new revision as a normal `dominated` update,
+     * not a conflict — same end-state as the legacy snapshot push, but
+     * without the rev-tree inflation.
+     */
+    private async confirmPushDivergence(
+        divergent: ConfigPushDivergence[],
+    ): Promise<boolean> {
+        const paths = divergent
+            .map((d) => `  • ${d.path} (${d.relation})`).join("\n");
+        logWarn(
+            `CouchSync: Config push would overwrite ${divergent.length} divergent doc(s):\n${paths}`,
+        );
+        const previewLimit = 5;
+        const preview = divergent.slice(0, previewLimit)
+            .map((d) => d.path).join(", ");
+        const more = divergent.length > previewLimit
+            ? ` (+${divergent.length - previewLimit} more)` : "";
+        const message =
+            `Pushing would overwrite remote for ${divergent.length} doc(s) ` +
+            `with concurrent / outdated edits: ${preview}${more}. ` +
+            `See the Log View for the full list. Continue anyway?`;
+        return await this.modal.showConfirmModal(
+            `Config push: ${divergent.length} divergent doc(s)`,
+            message,
+            "Push anyway",
+            true,
         );
     }
 
