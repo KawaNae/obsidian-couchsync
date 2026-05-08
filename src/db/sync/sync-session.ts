@@ -133,6 +133,27 @@ export class SyncSession {
         await p;
     }
 
+    /**
+     * One-pass classify of the persisted unpushed-set, run after catchup
+     * and before live loops start. Drops ids that have converged since
+     * the last session so the live push loop's first cycle isn't burdened
+     * with redundant retries.
+     *
+     * Best-effort and idempotent: failures are logged inside
+     * `pushPipeline.warmup` and never throw to the caller.
+     */
+    async warmup(): Promise<void> {
+        if (this._disposed) return;
+        try {
+            await this.pushPipeline.warmup();
+        } catch (e: any) {
+            // pushPipeline.warmup is already best-effort; this is a
+            // belt-and-suspenders guard so a thrown error here can't
+            // ever block session startup.
+            logError(`[sess#${this.epoch}] pushPipeline.warmup unexpected throw: ${e?.message ?? e}`);
+        }
+    }
+
     startLive(): void {
         this.track(
             "pullLoop",

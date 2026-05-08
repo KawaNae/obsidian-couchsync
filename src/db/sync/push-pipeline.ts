@@ -141,6 +141,81 @@ export class PushPipeline {
 
     constructor(private deps: PushPipelineDeps) {}
 
+    /**
+     * One-pass classify of the unpushed-set on session open. Drops ids
+     * that have converged with remote since the last session (e.g., a
+     * peer landed our local rev, or pull integrated remote so vclocks
+     * are now equal). Divergent entries stay — the live loop will route
+     * them to ConflictOrchestrator on its next cycle.
+     *
+     * Best-effort: any error (remote unreachable, AbortError on dispose)
+     * leaves the set untouched. The live loop will revisit the entries
+     * naturally, so a dropped warmup just means the bookkeeping happens
+     * a few seconds later.
+     */
+    async warmup(): Promise<void> {
+        if (this.deps.isCancelled()) return;
+        const rows = await loadAllUnpushed(this.deps.localDb);
+        if (rows.length === 0) return;
+
+        const fileDocs: FileDoc[] = [];
+        const prevAttempts = new Map<string, number>();
+        const zombieRemove: string[] = [];
+
+        for (const row of rows) {
+            prevAttempts.set(row.id, row.entry.attempts);
+            if (!isFileDocId(row.id)) {
+                // Only file: ids should ever land in the set; anything
+                // else is leakage from an older format or a bug.
+                zombieRemove.push(row.id);
+                continue;
+            }
+            const doc = await this.deps.localDb.get(row.id);
+            if (!doc || !isFileDoc(doc)) {
+                zombieRemove.push(row.id);
+                continue;
+            }
+            fileDocs.push(doc as FileDoc);
+        }
+
+        let classified: FileClassifyResult;
+        try {
+            classified = await this.classifyFiles(
+                fileDocs, prevAttempts, this.deps.signal,
+            );
+        } catch (e: any) {
+            if (isAbortError(e)) return;
+            // Remote unreachable / classify failure: leave set untouched
+            // and let the live loop retry naturally.
+            logWarn(`pushPipeline.warmup classify failed: ${e?.message ?? e}`);
+            // Still drop zombies — those are local-only judgments and
+            // do not depend on remote state.
+            if (zombieRemove.length === 0) return;
+            await this.deps.checkpoints.commitPushCycle({
+                nextPushSeq: this.deps.checkpoints.getLastPushedSeq(),
+                unpushedAdd: [],
+                unpushedRemove: zombieRemove,
+            });
+            return;
+        }
+
+        const unpushedRemove = [...zombieRemove, ...classified.skippedEqual];
+        // Divergent (concurrent / dominated) entries STAY: the live loop
+        // will route them to the orchestrator on the next cycle. We
+        // could emit("concurrent") here to surface them at startup, but
+        // doing so would mean session-open becomes a modal-popping moment
+        // which is poor UX during catchup churn; let the live loop do it
+        // when the user is past startup.
+        if (unpushedRemove.length === 0) return;
+
+        await this.deps.checkpoints.commitPushCycle({
+            nextPushSeq: this.deps.checkpoints.getLastPushedSeq(),
+            unpushedAdd: [],
+            unpushedRemove,
+        });
+        logInfo(`Push warmup: dropped ${unpushedRemove.length} converged unpushed ids`);
+    }
+
     async run(): Promise<void> {
         const sess = this.deps.sessionEpoch;
         let exitReason: "cancelled" | "halted" = "cancelled";

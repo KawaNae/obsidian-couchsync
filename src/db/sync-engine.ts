@@ -675,6 +675,14 @@ export class SyncEngine {
         this.firePausedCallbacks();
         this.events.emit("catchup-complete");
 
+        // Warmup: drop unpushed-set entries that converged since last
+        // session (peer landed our rev, pull integrated remote, etc.).
+        // Runs *after* catchup so remote vclocks are freshly mirrored
+        // into LocalDB — that maximises the equal-classification rate
+        // and minimises stale entries the live loop has to revisit.
+        await session.warmup();
+        if (session.disposed) return;
+
         session.startLive();
     }
 
