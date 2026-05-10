@@ -15,9 +15,12 @@
  *
  * - `identical`         — chunks equal and vclock equal
  * - `vclock-only-drift` — chunks equal but vclock not equal. Caller MUST
- *                         silent-merge via `mergeVC` and MUST NOT push or
- *                         emit `concurrent`. Closes the audit-2026-05-08
- *                         false-positive concurrent class.
+ *                         adopt the FileDoc's vclock as the integration
+ *                         baseline (`lastSynced.vclock = fileDoc.vclock`)
+ *                         and MUST NOT push or emit `concurrent`. Closes
+ *                         the audit-2026-05-08 false-positive concurrent
+ *                         class plus the 2026-05-10 phantom-loop shape
+ *                         (project_phantom_lastsynced_stamp.md).
  * - `remote-edit`       — chunks differ + right side dominates. Pure pull
  *                         case (left content matches the integration
  *                         baseline; safe to overwrite).
@@ -56,10 +59,24 @@
  *   Call sites consume the discriminated union; they do not branch on
  *   `compareVC` directly.
  *
- * **Invariant 3 — vclock-only drift = silent merge.**
- *   `vclock-only-drift` callers must `mergeVC` and accept; pushing or
- *   emitting `concurrent` on this state is the false-positive concurrent
- *   bug shape (audit-2026-05-08).
+ * **Invariant 3 — chunks-equal vclock authority.**
+ *   `vclock-only-drift` callers MUST adopt `fileDoc.vclock` as the new
+ *   `lastSynced.vclock` (no `mergeVC`). Chunks-equal means the FileDoc is
+ *   the canonical authority for this path's vclock identity; any extra
+ *   stamps on the prior `lastSynced.vclock` are either phantom orphans
+ *   or echoes of rev-tree conflict branches, neither of which need to
+ *   live in the local integration baseline. Pushing or emitting
+ *   `concurrent` here is the false-positive concurrent bug shape
+ *   (audit-2026-05-08); a `mergeVC`-based resolver here is the
+ *   phantom-loop bug shape (project_phantom_lastsynced_stamp.md, 2026-05-10)
+ *   because lastSynced ends up dominating fileDoc and the next reconcile
+ *   re-triggers vclock-only-drift forever. Note the asymmetry with
+ *   `pull-writer` / `config-pull-writer`, which DO write the merged
+ *   clock back to doc.vclock (replicated to remote, so identity follows).
+ *   Reconciler vault-scan keeps the FileDoc untouched to avoid
+ *   rev-tree inflation across the hundreds of paths a steady vault
+ *   holds, so adopting fileDoc.vclock on the lastSynced side is the
+ *   only convergence path.
  *
  * **Invariant 4 — pending-edit oracle.**
  *   "Has the vault been edited but not yet pushed?" is answered by

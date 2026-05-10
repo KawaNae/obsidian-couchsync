@@ -317,12 +317,14 @@ export class Reconciler {
                             mode);
                         break;
                     case "vclock-only-drift":
-                        // Same content, different causality — silent merge.
-                        // Closes audit-2026-05-08 MEDIUM (false-positive
-                        // concurrent on initial-sync devices) when reached
-                        // through the vault scan path.
-                        if (await this.tryStep(displayPath, "vclock-merge",
-                            () => this.vaultSync.silentReconvergeVclock(file.path, doc), mode)) {
+                        // Same content, different causality. Adopt fileDoc.vclock
+                        // as the lastSynced baseline (Invariant 3, chunks-equal
+                        // vclock authority). Closes audit-2026-05-08 MEDIUM
+                        // (false-positive concurrent on initial-sync devices)
+                        // and the 2026-05-10 phantom-loop shape
+                        // (project_phantom_lastsynced_stamp.md).
+                        if (await this.tryStep(displayPath, "vclock-adopt",
+                            () => this.vaultSync.adoptDocVclock(file.path, doc), mode)) {
                             report.inSync++;
                         }
                         break;

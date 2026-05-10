@@ -8,7 +8,7 @@
  *    identical-content rev with its own deviceId). Pre-PR3 the legacy
  *    `compareFileToDoc` would have classified this as "identical" only
  *    when the chunks matched (size+chunk equality short-circuit), but
- *    the post-classifier branch now also exercises `silentReconvergeVclock`
+ *    the post-classifier branch now also exercises `adoptDocVclock`
  *    when the disk and FileDoc happen to disagree on size while sharing
  *    chunks — the classifier sees this and routes to merge. Asserts that
  *    no fileToDb / dbToFile is emitted (no content change).

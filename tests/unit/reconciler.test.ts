@@ -77,7 +77,7 @@ interface FakeVaultSync {
     fileToDbCalls: string[];
     dbToFileCalls: string[];
     markDeletedCalls: string[];
-    silentMergeCalls: string[];
+    adoptVclockCalls: string[];
     alignCalls: string[];
     /** Per-path classifier override. Tests must set this explicitly. */
     compareResults: Map<string, ClassifyResult>;
@@ -85,7 +85,7 @@ interface FakeVaultSync {
     dbToFile(doc: FileDoc): Promise<void>;
     markDeleted(path: string): Promise<void>;
     classifyFileVsDoc(doc: FileDoc, path: string, size: number): Promise<ClassifyResult>;
-    silentReconvergeVclock(path: string, doc: FileDoc): Promise<void>;
+    adoptDocVclock(path: string, doc: FileDoc): Promise<void>;
     alignLastSyncedToDoc(path: string, doc: FileDoc): Promise<"already-aligned" | "upgraded-legacy" | "recovered-stale">;
     getLastSynced(path: string): undefined;
     computeVaultChunks(path: string): Promise<string[]>;
@@ -96,7 +96,7 @@ function makeVaultSync(): FakeVaultSync {
         fileToDbCalls: [],
         dbToFileCalls: [],
         markDeletedCalls: [],
-        silentMergeCalls: [],
+        adoptVclockCalls: [],
         alignCalls: [],
         compareResults: new Map(),
         async fileToDb(path) { this.fileToDbCalls.push(path); },
@@ -114,8 +114,8 @@ function makeVaultSync(): FakeVaultSync {
             }
             return override;
         },
-        async silentReconvergeVclock(path, _doc) {
-            this.silentMergeCalls.push(path);
+        async adoptDocVclock(path, _doc) {
+            this.adoptVclockCalls.push(path);
         },
         async alignLastSyncedToDoc(path, _doc) {
             this.alignCalls.push(path);

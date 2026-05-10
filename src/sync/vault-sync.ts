@@ -377,29 +377,43 @@ export class VaultSync {
     }
 
     /**
-     * Reconverge `lastSynced.vclock` with a FileDoc whose content matches
-     * the vault but whose vclock has drifted (= `vclock-only-drift` from the
-     * classifier). Pure meta write — no chunk/file write needed because
-     * content is already aligned. The merged vclock dominates both sides
-     * so future scans see them as equal.
+     * Adopt the FileDoc's vclock as `lastSynced.vclock` when the classifier
+     * returned `vclock-only-drift` (= chunks already match the FileDoc but
+     * vclocks differ). Pure meta write — no chunk/file write needed because
+     * content is already aligned.
+     *
+     * Invariant 3 (chunks-equal vclock authority): chunks match means the
+     * FileDoc is the canonical authority for this path's vclock identity.
+     * Any extra stamps on the prior `lastSynced.vclock` are either phantom
+     * orphans (stamps never on remote — see project_phantom_lastsynced_stamp.md,
+     * 2026-05-10) or echoes of rev-tree conflict branches that already live
+     * on remote — neither needs preservation in the local integration baseline.
+     *
+     * Asymmetry note: `pull-writer` and `config-pull-writer` write merged
+     * vclocks back to doc.vclock (replicated to remote, so the next reconcile
+     * naturally sees identity). Reconciler vault-scan keeps the FileDoc
+     * untouched to avoid rev-tree inflation across the ~hundreds of paths
+     * a steady vault holds, so adopting fileDoc.vclock on the lastSynced
+     * side is the only convergence path. A merge-based resolver here
+     * produces a `lastSynced > fileDoc` state that re-triggers
+     * `vclock-only-drift` forever (the phantom-loop bug shape).
      */
-    async silentReconvergeVclock(path: string, fileDoc: FileDoc): Promise<void> {
+    async adoptDocVclock(path: string, fileDoc: FileDoc): Promise<void> {
         const key = toPathKey(path);
-        const lastSynced = this.lastSynced.get(key);
-        const baseVC = lastSynced?.vclock ?? {};
-        const merged = mergeVC(baseVC, fileDoc.vclock ?? {});
+        const before = this.lastSynced.get(key)?.vclock ?? {};
+        const docVC = fileDoc.vclock ?? {};
         await this.db.runWriteTx({
             vclocks: [{
-                path, op: "set", clock: merged,
+                path, op: "set", clock: docVC,
                 chunks: fileDoc.chunks, size: fileDoc.size,
             }],
         });
         this.lastSynced.set(key, {
-            vclock: merged,
+            vclock: docVC,
             chunks: fileDoc.chunks,
             size: fileDoc.size,
         });
-        logDebug(`silentReconvergeVclock: ${path} ${JSON.stringify(baseVC)} ⊔ ${JSON.stringify(fileDoc.vclock ?? {})} = ${JSON.stringify(merged)}`);
+        logDebug(`adoptDocVclock: ${path} ${JSON.stringify(before)} → ${JSON.stringify(docVC)}`);
     }
 
     /**
