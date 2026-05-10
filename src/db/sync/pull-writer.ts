@@ -27,7 +27,7 @@ import {
     filePathFromId, configPathFromId, isFileDocId,
 } from "../../types/doc-id.ts";
 import { stripRev } from "../../utils/doc.ts";
-import { compareVC } from "../../sync/vector-clock.ts";
+import { compareVC, mergeVC } from "../../sync/vector-clock.ts";
 import type { LocalDB } from "../local-db.ts";
 import type { ChangesResult } from "../interfaces.ts";
 import type { ConflictResolver } from "../../conflict/conflict-resolver.ts";
@@ -81,6 +81,11 @@ interface BatchStats {
      *  short-circuits that replaced the old session-scoped push-echo
      *  Map — see echo-tracker.ts for history. */
     convergedSkipCount: number;
+    /** `silent-merge` verdicts — same content but vclocks drifted. The
+     *  remote doc is committed with `mergeVC(local, remote)` and no
+     *  concurrent event is emitted. Counts toward audit-2026-05-08
+     *  MEDIUM (false-positive concurrent) reduction. */
+    vclockOnlyDriftCount: number;
 }
 
 interface ConcurrentEntry {
@@ -135,6 +140,7 @@ export class PullWriter {
             chunkCount: 0,
             deletedCount: 0,
             convergedSkipCount: 0,
+            vclockOnlyDriftCount: 0,
         };
         const resolver = this.deps.getConflictResolver();
 
@@ -206,6 +212,26 @@ export class PullWriter {
                         }
                         logDebug(`  ⚡ ${filePath} (concurrent)`);
                         concurrent.push({ filePath, localDoc, remoteDoc });
+                        continue;
+                    }
+                    if (verdict === "silent-merge") {
+                        // Same content, drifted vclocks. Commit remote with
+                        // mergeVC so causal info from both sides is
+                        // preserved. No concurrent event.
+                        const path = isFileDoc(remoteDoc)
+                            ? filePathFromId(remoteDoc._id)
+                            : configPathFromId(remoteDoc._id);
+                        const merged = mergeVC(
+                            localDoc.vclock ?? {},
+                            remoteDoc.vclock ?? {},
+                        );
+                        const mergedDoc = {
+                            ...remoteDoc,
+                            vclock: merged,
+                        } as CouchSyncDoc;
+                        logDebug(`  ⊔ ${path} (silent-merge)`);
+                        stats.vclockOnlyDriftCount++;
+                        accepted.push(mergedDoc);
                         continue;
                     }
                     // "take-remote" falls through.
@@ -301,7 +327,8 @@ export class PullWriter {
             || stats.writeFailCount > 0
             || stats.skipCount > 0
             || stats.deletedCount > 0
-            || stats.convergedSkipCount > 0;
+            || stats.convergedSkipCount > 0
+            || stats.vclockOnlyDriftCount > 0;
         if (!active) return;
 
         const parts: string[] = [];
@@ -310,6 +337,7 @@ export class PullWriter {
         if (stats.deletedCount > 0) parts.push(`${stats.deletedCount} deleted`);
         if (stats.keepLocalCount > 0) parts.push(`${stats.keepLocalCount} keep-local`);
         if (stats.convergedSkipCount > 0) parts.push(`${stats.convergedSkipCount} converged`);
+        if (stats.vclockOnlyDriftCount > 0) parts.push(`${stats.vclockOnlyDriftCount} silent-merge`);
         if (concurrentCount > 0) parts.push(`${concurrentCount} concurrent`);
         if (stats.writeFailCount > 0) parts.push(`${stats.writeFailCount} failed`);
         if (stats.chunkCount > 0) parts.push(`${stats.chunkCount} chunks`);

@@ -137,28 +137,55 @@ export class VaultSync {
                     if (existing && VaultSync.chunksEqual(existing.chunks, chunkIds)) {
                         return null; // already on disk
                     }
-                    // Divergent guard: when the LocalDB doc has been advanced
-                    // by a pull but the Vault has not yet integrated that
-                    // remote content (lastSyncedVclock strictly behind
-                    // existing.vclock), pushing here would assert causality
-                    // we never integrated locally — the rev 197 phantom-write
-                    // shape. Yield to the reconciler, which routes through
-                    // dbToFile retry on the next pull cycle (or immediately
-                    // via the pull-skipped → reconcile schedule path).
+                    // CLASSIFIER: do not duplicate inline. The push-side
+                    // divergent guard delegates to `classifySyncRelation`
+                    // so the rev 197 phantom-write check, the pending-
+                    // pull-integration check, and the user-edited-stale
+                    // check all share one matrix. Skip when the local
+                    // disk lags the LocalDB doc (= remote-edit pending
+                    // integration) or both sides have drifted
+                    // (= true-divergent). Push only when the classifier
+                    // confirms `local-edit`.
                     if (existing) {
                         const existingVC = existing.vclock ?? {};
                         const lastSynced = this.lastSynced.get(toPathKey(path));
-                        const isDivergent = lastSynced
-                            ? compareVC(existingVC, lastSynced.vclock) === "dominates"
-                            : Object.keys(existingVC).length > 0;
-                        if (isDivergent) {
+                        const relation = classifySyncRelation({
+                            leftVC: lastSynced?.vclock ?? {},
+                            leftChunks: chunkIds,
+                            leftSize: fileStat.size,
+                            rightVC: existingVC,
+                            rightChunks: existing.chunks,
+                            rightSize: existing.size,
+                            lastSynced,
+                        });
+                        if (relation === "remote-edit" || relation === "true-divergent") {
                             logWarn(
-                                `fileToDb: skipping push for ${path} — pending pull integration ` +
+                                `fileToDb: skipping push for ${path} — ${relation} ` +
                                 `(observed=${JSON.stringify(existingVC)} ` +
                                 `integrated=${lastSynced ? JSON.stringify(lastSynced.vclock) : "null"})`,
                             );
                             return null;
                         }
+                        if (relation === "legacy-skip") {
+                            // Pre-extension lastSynced — fall back to the
+                            // legacy vclock-only check until PR5 sweep
+                            // upgrades the entry to the {chunks,size}
+                            // shape.
+                            const isDivergent = lastSynced
+                                ? compareVC(existingVC, lastSynced.vclock) === "dominates"
+                                : Object.keys(existingVC).length > 0;
+                            if (isDivergent) {
+                                logWarn(
+                                    `fileToDb: skipping push for ${path} — legacy-skip divergent ` +
+                                    `(observed=${JSON.stringify(existingVC)})`,
+                                );
+                                return null;
+                            }
+                        }
+                        // identical / local-edit / vclock-only-drift fall
+                        // through to push. (vclock-only-drift requires
+                        // chunks equal, which the chunksEqual short-circuit
+                        // above already handled — defensive only.)
                     }
                     const newVclock = incrementVC(existing?.vclock, deviceId);
                     const newDoc: FileDoc = {

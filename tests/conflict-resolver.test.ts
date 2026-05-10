@@ -42,8 +42,8 @@ describe("ConflictResolver — resolveOnPull (Phase 2)", () => {
 
     it("returns take-remote without callback when remote dominates (not a conflict)", async () => {
         const resolver = new ConflictResolver();
-        const local = makeFile("doc.md", { A: 1, B: 1 });
-        const remote = makeFile("doc.md", { A: 2, B: 1 });
+        const local = makeFile("doc.md", { A: 1, B: 1 }, "chunk:local");
+        const remote = makeFile("doc.md", { A: 2, B: 1 }, "chunk:remote");
 
         const verdict = await resolver.resolveOnPull(local, remote);
 
@@ -51,19 +51,19 @@ describe("ConflictResolver — resolveOnPull (Phase 2)", () => {
         // No onAutoResolved — dominated is a normal update, not a conflict.
     });
 
-    it("returns keep-local when local dominates remote", async () => {
+    it("returns keep-local when local dominates remote (chunks differ)", async () => {
         const resolver = new ConflictResolver();
-        const local = makeFile("doc.md", { A: 2, B: 1 });
-        const remote = makeFile("doc.md", { A: 1, B: 1 });
+        const local = makeFile("doc.md", { A: 2, B: 1 }, "chunk:local");
+        const remote = makeFile("doc.md", { A: 1, B: 1 }, "chunk:remote");
 
         const verdict = await resolver.resolveOnPull(local, remote);
         expect(verdict).toBe("keep-local");
     });
 
-    it("returns keep-local when local dominates (no side effects)", async () => {
+    it("returns keep-local when local dominates (no side effects, chunks differ)", async () => {
         const resolver = new ConflictResolver();
-        const local = makeFile("doc.md", { A: 2 });
-        const remote = makeFile("doc.md", { A: 1 });
+        const local = makeFile("doc.md", { A: 2 }, "chunk:local");
+        const remote = makeFile("doc.md", { A: 1 }, "chunk:remote");
 
         const verdict = await resolver.resolveOnPull(local, remote);
         expect(verdict).toBe("keep-local");
@@ -78,7 +78,7 @@ describe("ConflictResolver — resolveOnPull (Phase 2)", () => {
         expect(verdict).toBe("keep-local");
     });
 
-    it("returns concurrent when vclocks are incomparable", async () => {
+    it("returns concurrent when vclocks are incomparable AND content differs", async () => {
         const resolver = new ConflictResolver();
 
         const local = makeFile("doc.md", { A: 1, B: 0 }, "chunk:local");
@@ -88,35 +88,50 @@ describe("ConflictResolver — resolveOnPull (Phase 2)", () => {
         expect(verdict).toBe("concurrent");
     });
 
-    it("returns concurrent for multiple incomparable paths", async () => {
+    it("PR4: returns silent-merge when vclocks are incomparable but content is identical", async () => {
+        // audit-2026-05-08 MEDIUM: false-positive concurrent on initial-sync
+        // devices. Pre-PR4 this returned "concurrent" and triggered a modal;
+        // post-PR4 the classifier detects content equality and silently
+        // merges the vclocks.
         const resolver = new ConflictResolver();
 
-        const local = makeFile("concurrent.md", { A: 1 });
-        const remote = makeFile("concurrent.md", { B: 1 });
+        const local = makeFile("concurrent.md", { A: 1 }, "shared-chunk");
+        const remote = makeFile("concurrent.md", { B: 1 }, "shared-chunk");
 
         const verdict = await resolver.resolveOnPull(local, remote);
-        expect(verdict).toBe("concurrent");
+        expect(verdict).toBe("silent-merge");
     });
 
-    it("does NOT use mtime as a tiebreaker", async () => {
+    it("PR4: returns silent-merge when local dominates but content is identical", async () => {
+        // Edge case from project_false_positive_concurrent.md: re-introduced
+        // device with chunks-equal but vclock-divergent post sync.
+        const resolver = new ConflictResolver();
+        const local = makeFile("doc.md", { A: 5, B: 1 }, "shared-chunk");
+        const remote = makeFile("doc.md", { A: 5 }, "shared-chunk");
+
+        const verdict = await resolver.resolveOnPull(local, remote);
+        expect(verdict).toBe("silent-merge");
+    });
+
+    it("does NOT use mtime as a tiebreaker (chunks differ → concurrent)", async () => {
         const resolver = new ConflictResolver();
 
-        const local = makeFile("tiebreak.md", { A: 1, B: 0 });
+        const local = makeFile("tiebreak.md", { A: 1, B: 0 }, "chunk:local");
         local.mtime = 9999; // very new
-        const remote = makeFile("tiebreak.md", { A: 0, B: 1 });
+        const remote = makeFile("tiebreak.md", { A: 0, B: 1 }, "chunk:remote");
         remote.mtime = 1; // very old
 
         const verdict = await resolver.resolveOnPull(local, remote);
         expect(verdict).toBe("concurrent");
     });
 
-    it("handles missing vclock as empty", async () => {
+    it("handles missing vclock as empty (chunks differ → take-remote)", async () => {
         const resolver = new ConflictResolver();
-        const local = makeFile("no-vc.md", {});
+        const local = makeFile("no-vc.md", {}, "chunk:local");
         delete (local as any).vclock;
-        const remote = makeFile("no-vc.md", { A: 1 });
+        const remote = makeFile("no-vc.md", { A: 1 }, "chunk:remote");
 
-        // Remote has a vclock, local doesn't — remote dominates.
+        // Remote has a vclock, local doesn't, content differs — remote dominates.
         const verdict = await resolver.resolveOnPull(local, remote);
         expect(verdict).toBe("take-remote");
     });

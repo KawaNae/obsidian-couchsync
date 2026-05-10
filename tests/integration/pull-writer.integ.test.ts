@@ -70,11 +70,12 @@ async function seedLocalFileDoc(
     device: DeviceHarness,
     path: string,
     vclock: Record<string, number>,
+    chunks: string[] = [],
 ): Promise<FileDoc> {
     const doc: FileDoc = {
         _id: makeFileId(path),
         type: "file",
-        chunks: [],
+        chunks,
         vclock,
         mtime: 1,
         ctime: 1,
@@ -156,13 +157,20 @@ describe("PullWriter integration", () => {
             await expectDb(b.db).toHaveFileDoc("test.md").withVclock({ A: 5 });
         });
 
-        it("concurrent: skips doc and fires concurrent event", async () => {
+        it("concurrent: skips doc and fires concurrent event (chunks differ)", async () => {
             h = createSyncHarness();
             const b = h.addDevice("dev-B");
             const rig = attachPullWriter({ device: b, withResolver: true });
 
-            await seedLocalFileDoc(b, "test.md", { A: 2 });
-            const remote = makeRemoteFileDoc("test.md", { B: 1 });
+            // Seed with a non-empty local chunk so the remote (different
+            // chunk) is genuinely concurrent. Pre-PR4 this test passed with
+            // empty chunks on both sides because the resolver ignored
+            // content; post-PR4 the classifier silent-merges chunk-equal
+            // pairs, so the chunks must differ to exercise concurrent.
+            await seedLocalFileDoc(b, "test.md", { A: 2 }, ["chunk:local"]);
+            const remote = makeRemoteFileDoc("test.md", { B: 1 }, {
+                chunks: ["chunk:remote"],
+            });
 
             const fired: string[] = [];
             rig.events.on("concurrent", ({ filePath }) => fired.push(filePath));
@@ -173,6 +181,32 @@ describe("PullWriter integration", () => {
 
             await expectDb(b.db).toHaveFileDoc("test.md").withVclock({ A: 2 });
             expect(fired).toContain("test.md");
+        });
+
+        it("PR4: silent-merge when vclocks divergent but chunks identical (audit MEDIUM)", async () => {
+            // audit-2026-05-08 MEDIUM: a re-imported device pushed under its
+            // own deviceId, then catchup brings remote with same content but
+            // a foreign device's vclock. Pre-PR4 fired a `concurrent` event
+            // (false positive); post-PR4 silently merges.
+            h = createSyncHarness();
+            const b = h.addDevice("dev-B");
+            const rig = attachPullWriter({ device: b, withResolver: true });
+
+            await seedLocalFileDoc(b, "shared.md", { B: 1 }, ["shared-chunk"]);
+            const remote = makeRemoteFileDoc("shared.md", { A: 5 }, {
+                chunks: ["shared-chunk"],
+            });
+
+            const fired: string[] = [];
+            rig.events.on("concurrent", ({ filePath }) => fired.push(filePath));
+
+            await rig.writer.apply(makeChangesResult(
+                [{ id: remote._id, seq: "1", doc: remote }], "1",
+            ));
+
+            // Doc committed with merged vclock. No concurrent event.
+            await expectDb(b.db).toHaveFileDoc("shared.md").withVclock({ A: 5, B: 1 });
+            expect(fired).toEqual([]);
         });
 
         it("chunk docs bypass the vclock guard (no resolver call)", async () => {
