@@ -193,48 +193,57 @@ export class PullWriter {
                         continue;
                     }
                     const verdict = await resolver.resolveOnPull(localDoc, remoteDoc);
-                    if (verdict === "keep-local") {
-                        const path = isFileDoc(remoteDoc)
-                            ? filePathFromId(remoteDoc._id)
-                            : configPathFromId(remoteDoc._id);
-                        logDebug(`  × ${path} (keep-local)`);
-                        stats.keepLocalCount++;
-                        continue;
-                    }
-                    if (verdict === "concurrent") {
-                        const filePath = isFileDoc(remoteDoc)
-                            ? filePathFromId(remoteDoc._id)
-                            : configPathFromId(remoteDoc._id);
-                        // Ensure remote chunks are available locally so the
-                        // conflict modal can display remote content.
-                        if (isFileDoc(remoteDoc)) {
-                            await this.deps.ensureChunks(remoteDoc);
+                    const docPath = isFileDoc(remoteDoc)
+                        ? filePathFromId(remoteDoc._id)
+                        : configPathFromId(remoteDoc._id);
+                    // **Invariant 5 (PullVerdict 完全網羅).** Every
+                    // verdict must be handled explicitly. The trailing
+                    // `_exhaustive: never` makes future verdict additions
+                    // a compile error rather than a silent regression
+                    // (this was the audit-2026-05-08 MEDIUM bug shape on
+                    // the ConfigSync side, fixed in PR-C).
+                    switch (verdict) {
+                        case "keep-local":
+                            logDebug(`  × ${docPath} (keep-local)`);
+                            stats.keepLocalCount++;
+                            continue;
+                        case "concurrent":
+                            // Ensure remote chunks are available locally so
+                            // the conflict modal can display remote content.
+                            if (isFileDoc(remoteDoc)) {
+                                await this.deps.ensureChunks(remoteDoc);
+                            }
+                            logDebug(`  ⚡ ${docPath} (concurrent)`);
+                            concurrent.push({
+                                filePath: docPath, localDoc, remoteDoc,
+                            });
+                            continue;
+                        case "silent-merge": {
+                            // Same content, drifted vclocks. Commit remote
+                            // with mergeVC so causal info from both sides
+                            // is preserved. No concurrent event.
+                            const merged = mergeVC(
+                                localDoc.vclock ?? {},
+                                remoteDoc.vclock ?? {},
+                            );
+                            const mergedDoc = {
+                                ...remoteDoc,
+                                vclock: merged,
+                            } as CouchSyncDoc;
+                            logDebug(`  ⊔ ${docPath} (silent-merge)`);
+                            stats.vclockOnlyDriftCount++;
+                            accepted.push(mergedDoc);
+                            continue;
                         }
-                        logDebug(`  ⚡ ${filePath} (concurrent)`);
-                        concurrent.push({ filePath, localDoc, remoteDoc });
-                        continue;
+                        case "take-remote":
+                            // Fall through to the accepted.push below.
+                            break;
+                        default: {
+                            const _exhaustive: never = verdict;
+                            void _exhaustive;
+                            break;
+                        }
                     }
-                    if (verdict === "silent-merge") {
-                        // Same content, drifted vclocks. Commit remote with
-                        // mergeVC so causal info from both sides is
-                        // preserved. No concurrent event.
-                        const path = isFileDoc(remoteDoc)
-                            ? filePathFromId(remoteDoc._id)
-                            : configPathFromId(remoteDoc._id);
-                        const merged = mergeVC(
-                            localDoc.vclock ?? {},
-                            remoteDoc.vclock ?? {},
-                        );
-                        const mergedDoc = {
-                            ...remoteDoc,
-                            vclock: merged,
-                        } as CouchSyncDoc;
-                        logDebug(`  ⊔ ${path} (silent-merge)`);
-                        stats.vclockOnlyDriftCount++;
-                        accepted.push(mergedDoc);
-                        continue;
-                    }
-                    // "take-remote" falls through.
                 }
             }
 

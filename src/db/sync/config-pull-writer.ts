@@ -28,7 +28,7 @@ import type { ConfigDoc, CouchSyncDoc } from "../../types.ts";
 import { isConfigDoc } from "../../types.ts";
 import { configPathFromId, isConfigDocId } from "../../types/doc-id.ts";
 import { stripRev } from "../../utils/doc.ts";
-import { compareVC } from "../../sync/vector-clock.ts";
+import { compareVC, mergeVC } from "../../sync/vector-clock.ts";
 import type { ICouchClient } from "../interfaces.ts";
 import type { ChangesResult } from "../interfaces.ts";
 import type { ConfigLocalDB } from "../config-local-db.ts";
@@ -63,6 +63,11 @@ export interface ConfigPullStats {
     keepLocal: number;
     deleted: number;
     concurrent: number;
+    /** PR-C: chunks-equal but vclocks drifted — committed with mergeVC,
+     *  no concurrent modal. Closes audit-2026-05-08 MEDIUM on the
+     *  ConfigSync side (vault PullWriter has the same counter under the
+     *  name `vclockOnlyDriftCount`). */
+    vclockOnlyDrift: number;
 }
 
 export interface ConfigPullResult {
@@ -91,7 +96,8 @@ export class ConfigPullWriter {
     async run(onProgress?: (msg: string) => void): Promise<ConfigPullResult> {
         await this.deps.lastSynced.ensureLoaded();
         const stats: ConfigPullStats = {
-            accepted: 0, convergedSkip: 0, keepLocal: 0, deleted: 0, concurrent: 0,
+            accepted: 0, convergedSkip: 0, keepLocal: 0, deleted: 0,
+            concurrent: 0, vclockOnlyDrift: 0,
         };
         const concurrent: ConfigConcurrentEntry[] = [];
 
@@ -124,6 +130,7 @@ export class ConfigPullWriter {
             stats.convergedSkip += partition.convergedSkipCount;
             stats.keepLocal += partition.keepLocalCount;
             stats.concurrent += partition.concurrent.length;
+            stats.vclockOnlyDrift += partition.vclockOnlyDriftCount;
             concurrent.push(...partition.concurrent);
 
             // No advance + no docs → server is at our cursor, done.
@@ -141,12 +148,14 @@ export class ConfigPullWriter {
         }
 
         if (stats.accepted + stats.deleted > 0 || stats.convergedSkip > 0
-            || stats.concurrent > 0 || stats.keepLocal > 0) {
+            || stats.concurrent > 0 || stats.keepLocal > 0
+            || stats.vclockOnlyDrift > 0) {
             const parts: string[] = [];
             if (stats.accepted) parts.push(`${stats.accepted} accepted`);
             if (stats.deleted) parts.push(`${stats.deleted} deleted`);
             if (stats.convergedSkip) parts.push(`${stats.convergedSkip} converged`);
             if (stats.keepLocal) parts.push(`${stats.keepLocal} keep-local`);
+            if (stats.vclockOnlyDrift) parts.push(`${stats.vclockOnlyDrift} silent-merge`);
             if (stats.concurrent) parts.push(`${stats.concurrent} concurrent`);
             logInfo(`Config Pull: ${parts.join(", ")}`);
         }
@@ -162,12 +171,14 @@ export class ConfigPullWriter {
         concurrent: ConfigConcurrentEntry[];
         convergedSkipCount: number;
         keepLocalCount: number;
+        vclockOnlyDriftCount: number;
     }> {
         const accepted: ConfigDoc[] = [];
         const deleted: string[] = [];
         const concurrent: ConfigConcurrentEntry[] = [];
         let convergedSkipCount = 0;
         let keepLocalCount = 0;
+        let vclockOnlyDriftCount = 0;
         const resolver = this.deps.getConflictResolver();
 
         for (const row of batch.results) {
@@ -195,23 +206,52 @@ export class ConfigPullWriter {
                 if (resolver) {
                     const verdict = await resolver.resolveOnPull(localDoc, remoteDoc);
                     const path = configPathFromId(remoteDoc._id);
-                    if (verdict === "keep-local") {
-                        logDebug(`  × ${path} (keep-local)`);
-                        keepLocalCount++;
-                        continue;
+                    // **Invariant 5 (PullVerdict 完全網羅).** Every verdict
+                    // must be handled explicitly — fall-through silently
+                    // dropping `silent-merge` was the audit-2026-05-08
+                    // MEDIUM bug shape on the ConfigSync side. The final
+                    // `_exhaustive: never` makes future verdict additions
+                    // a compile error rather than a silent regression.
+                    switch (verdict) {
+                        case "keep-local":
+                            logDebug(`  × ${path} (keep-local)`);
+                            keepLocalCount++;
+                            continue;
+                        case "concurrent":
+                            logDebug(`  ⚡ ${path} (concurrent)`);
+                            concurrent.push({ path, localDoc, remoteDoc });
+                            continue;
+                        case "silent-merge": {
+                            // Same content, drifted vclocks → mergeVC and
+                            // accept. Mirrors vault PullWriter's silent-
+                            // merge handling at pull-writer.ts:217.
+                            const merged = mergeVC(localVC, remoteVC);
+                            const mergedDoc: ConfigDoc = {
+                                ...remoteDoc, vclock: merged,
+                            };
+                            logDebug(`  ⊔ ${path} (silent-merge)`);
+                            vclockOnlyDriftCount++;
+                            accepted.push(mergedDoc);
+                            continue;
+                        }
+                        case "take-remote":
+                            // Fall through to the accepted.push below.
+                            break;
+                        default: {
+                            const _exhaustive: never = verdict;
+                            void _exhaustive;
+                            break;
+                        }
                     }
-                    if (verdict === "concurrent") {
-                        logDebug(`  ⚡ ${path} (concurrent)`);
-                        concurrent.push({ path, localDoc, remoteDoc });
-                        continue;
-                    }
-                    // "take-remote" falls through.
                 }
             }
             accepted.push(remoteDoc);
         }
 
-        return { accepted, deleted, concurrent, convergedSkipCount, keepLocalCount };
+        return {
+            accepted, deleted, concurrent,
+            convergedSkipCount, keepLocalCount, vclockOnlyDriftCount,
+        };
     }
 
     // ── commit ─────────────────────────────────────────

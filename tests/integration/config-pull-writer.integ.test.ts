@@ -153,6 +153,28 @@ describe("ConfigPullWriter — incremental pull", () => {
         expect(Number(cps.getPullSeq())).toBeGreaterThanOrEqual(1);
     });
 
+    it("PR-C: silent-merge when vclocks divergent but data identical (audit MEDIUM, Config side)", async () => {
+        // Pre-PR-C this verdict fell through the if-chain into accepted.push
+        // without merging vclocks → local-only causality info was lost.
+        // Post-PR-C the writer mergeVCs and increments vclockOnlyDrift.
+        const sharedBody = "shared content";
+        const localDoc = makeConfigDoc(".obsidian/shared.json", sharedBody, { "dev-B": 1 });
+        await db.runWriteTx({ docs: [{ doc: localDoc }] });
+        const remoteDoc = makeConfigDoc(".obsidian/shared.json", sharedBody, { "dev-A": 5 });
+        await seedRemote(remote, [remoteDoc]);
+
+        const result = await writer.run();
+
+        expect(result.stats.vclockOnlyDrift).toBe(1);
+        expect(result.stats.concurrent).toBe(0);
+        expect(result.stats.accepted).toBe(1); // mergedDoc landed in accepted
+
+        // Committed doc must carry the merged vclock so future causality
+        // checks see both sides as integrated.
+        const committed = (await db.get(localDoc._id)) as ConfigDoc;
+        expect(committed.vclock).toEqual({ "dev-A": 5, "dev-B": 1 });
+    });
+
     it("keep-local: local dominates remote → skip without surfacing as concurrent", async () => {
         const localDoc = makeConfigDoc(".obsidian/k.json", "v2", { "dev-A": 2 });
         await db.runWriteTx({ docs: [{ doc: localDoc }] });
