@@ -38,6 +38,48 @@
  *   - pull-writer.classify: left = local DB doc; right = incoming remote
  *     doc; `lastSynced` may be omitted (replication is independent of
  *     vault state).
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * Sync-state invariants this codebase upholds (cumulative across the
+ * `feature/sync-classifier` and `feature/sync-classifier-followup` plans;
+ * each failure mode below previously caused a real production silent-loss
+ * or vclock-pollution bug):
+ *
+ * **Invariant 1 — disk-write truth.**
+ *   `lastSynced.chunks/size === disk chunks/size` (always). Enforced by
+ *   `EditorAwareVaultWriter.applyRemoteContent` writing disk before
+ *   reporting `applied: true`. Without this, a stale CM-only path lets
+ *   the classifier read a lying baseline.
+ *
+ * **Invariant 2 — single classifier.**
+ *   This file is the only place the chunks×vclock matrix is interpreted.
+ *   Call sites consume the discriminated union; they do not branch on
+ *   `compareVC` directly.
+ *
+ * **Invariant 3 — vclock-only drift = silent merge.**
+ *   `vclock-only-drift` callers must `mergeVC` and accept; pushing or
+ *   emitting `concurrent` on this state is the false-positive concurrent
+ *   bug shape (audit-2026-05-08).
+ *
+ * **Invariant 4 — pending-edit oracle.**
+ *   "Has the vault been edited but not yet pushed?" is answered by
+ *   `VaultSync.hasUnpushedChanges` via `IPendingProbe.hasPending(path)`
+ *   plus a chunks-vs-`lastSynced` comparison. Vclock-only checks are
+ *   forbidden here — they are kept in lockstep by `fileToDb`/`dbToFile`
+ *   and so always say "no" (= the silent-loss-during-debounce shape).
+ *
+ * **Invariant 5 — PullVerdict exhaustive.**
+ *   Every consumer of `PullVerdict` (vault `PullWriter`, `ConfigPullWriter`,
+ *   future pullers) handles all 4 verdicts explicitly with a trailing
+ *   `_exhaustive: never`. Fall-through on `silent-merge` was the
+ *   audit-2026-05-08 MEDIUM bug shape on the ConfigSync side.
+ *
+ * **Invariant 6 — vclock derivation provenance.**
+ *   A doc whose `vclock` is a placeholder (notably the fake tombstone
+ *   built by `pull-writer.handlePulledDeletion`, which is empty because
+ *   `_changes` doesn't carry deleted-doc bodies) MUST NOT be used as an
+ *   `incrementVC` seed. `ConflictOrchestrator.applyConflictChoice`
+ *   derives deletion-conflict vclocks from `localDoc.vclock` instead.
  */
 
 import { compareVC, type VectorClock } from "./vector-clock.ts";

@@ -31,7 +31,19 @@ import { logDebug, logWarn } from "../ui/log.ts";
 /** A doc that ConflictResolver can process. Both kinds carry a vclock. */
 type ResolvableDoc = FileDoc | ConfigDoc;
 
-/** Result of a pull-time conflict check. */
+/**
+ * Result of a pull-time conflict check.
+ *
+ * **Invariant 5 (PullVerdict 完全網羅).** Every consumer of this type
+ * MUST handle all 4 verdicts explicitly. Trailing
+ * `const _exhaustive: never = verdict;` is required at every call site
+ * so future verdict additions become a compile error rather than a
+ * silent regression. Fall-through dropped `silent-merge` was the
+ * audit-2026-05-08 MEDIUM bug shape on the ConfigSync side.
+ *
+ * Current consumers: `pull-writer.ts:classify`,
+ * `config-pull-writer.ts:classify`.
+ */
 export type PullVerdict = "take-remote" | "keep-local" | "concurrent" | "silent-merge";
 
 /**
