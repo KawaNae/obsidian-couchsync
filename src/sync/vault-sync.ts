@@ -671,14 +671,49 @@ export class VaultSync {
     }
 
     /**
-     * True when the local file has changes not yet synced. Compares the
-     * given vclock against the last-synced snapshot. Returns false when
-     * no record exists (plugin just loaded — assume nothing pending).
+     * **Invariant 4 (Pending-edit oracle).** True iff the vault has
+     * user-driven work that hasn't reached the LocalDB FileDoc yet.
+     *
+     * Two-layer check, both chunks-aware:
+     *   1. `pendingProbe.hasPending(path)` — ChangeTracker has a debounced
+     *      or min-interval-deferred `fileToDb` scheduled for `path`.
+     *      Catches the in-flight window between user keystroke and
+     *      LocalDB commit (= the pull-delete-vs-debounce silent-loss
+     *      race this primitive closes).
+     *   2. Disk vs `lastSynced.{chunks,size}` — defense in depth. If the
+     *      probe is missing (test harness, race during construction)
+     *      OR returns false but the actual disk content differs from
+     *      the last integration baseline, still report pending. Catches
+     *      the rare crash window where invariant 1 is broken.
+     *
+     * The legacy `localVclock` parameter is gone — vclock comparison was
+     * always `compareVC(local, lastSynced) === "equal"` because the two
+     * are kept in lockstep by `fileToDb`/`dbToFile`, so the function was
+     * effectively a no-op (always returned false). The new signature is
+     * `(path) => Promise<boolean>` and the only caller in `main.ts` was
+     * updated to await it.
      */
-    hasUnpushedChanges(path: string, localVclock: VectorClock): boolean {
-        const lastSynced = this.lastSynced.get(toPathKey(path));
-        if (!lastSynced) return false;
-        return compareVC(localVclock, lastSynced.vclock) !== "equal";
+    async hasUnpushedChanges(path: string): Promise<boolean> {
+        if (this.pendingProbe?.hasPending(path)) return true;
+        const ls = this.lastSynced.get(toPathKey(path));
+        if (!ls || ls.chunks === undefined || ls.size === undefined) {
+            // No integration baseline (or legacy entry pre-extension):
+            // we can't tell whether the disk has unpushed work without
+            // the chunks/size baseline. Conservative: report no pending
+            // (matches pre-PR-B behaviour for legacy entries; PR5 of
+            // the prior plan upgrades these on the next "identical"
+            // reconcile pass).
+            return false;
+        }
+        const stat = await this.vault.stat(path);
+        if (!stat) {
+            // File gone from vault. The user-driven deletion is handled
+            // by the `delete` event path, not here.
+            return false;
+        }
+        if (stat.size !== ls.size) return true;
+        const diskChunks = await this.localChunkIds(path);
+        return !chunkListsEqual(diskChunks, ls.chunks);
     }
 
     async handleRename(newPath: string, oldPath: string): Promise<void> {

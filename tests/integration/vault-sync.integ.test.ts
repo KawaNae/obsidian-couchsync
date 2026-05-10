@@ -312,27 +312,59 @@ describe("VaultSync", () => {
         });
     });
 
-    // ── hasUnpushedChanges ──────────────────────────────
+    // ── hasUnpushedChanges (PR-B: chunks-aware, invariant 4) ─
 
     describe("hasUnpushedChanges", () => {
-        it("returns false when no synced vclock exists", async () => {
-            expect(vs.hasUnpushedChanges("a.md", { A: 1 })).toBe(false);
+        it("returns false when no integration baseline exists", async () => {
+            expect(await vs.hasUnpushedChanges("a.md")).toBe(false);
         });
 
-        it("returns false when vclock matches", async () => {
+        it("returns false when vault matches the integration baseline", async () => {
             vault.addFile("a.md", "content");
             await vs.fileToDb("a.md");
 
-            const doc = await db.get(makeFileId("a.md")) as FileDoc;
-            expect(vs.hasUnpushedChanges("a.md", doc.vclock)).toBe(false);
+            expect(await vs.hasUnpushedChanges("a.md")).toBe(false);
         });
 
-        it("returns true when vclock differs", async () => {
+        it("returns true when vault disk drifts from baseline (size differs)", async () => {
             vault.addFile("a.md", "v1");
             await vs.fileToDb("a.md");
 
-            // Simulate a second local edit (vclock incremented)
-            expect(vs.hasUnpushedChanges("a.md", { "dev-A": 2 })).toBe(true);
+            // Simulate a user edit landing on disk before fileToDb fires.
+            vault.addFile("a.md", "v2-local-edit-much-longer", { size: 999 });
+            expect(await vs.hasUnpushedChanges("a.md")).toBe(true);
+        });
+
+        it("returns true when vault drifts but size is unchanged (chunks differ)", async () => {
+            vault.addFile("a.md", "abcde");
+            await vs.fileToDb("a.md");
+            const ls1 = vs.getLastSynced("a.md")!;
+
+            // Same byte length, different content → different chunks.
+            vault.addFile("a.md", "vwxyz", { size: ls1.size });
+            expect(await vs.hasUnpushedChanges("a.md")).toBe(true);
+        });
+
+        it("returns true when ChangeTracker has a debounced sync pending", async () => {
+            vault.addFile("a.md", "content");
+            await vs.fileToDb("a.md");
+            // Vault disk equals baseline — chunks check would say false.
+            expect(await vs.hasUnpushedChanges("a.md")).toBe(false);
+
+            // Wire a fake probe to simulate ChangeTracker reporting pending.
+            vs.setPendingProbe({
+                hasPending: (p: string) => p === "a.md",
+            });
+            expect(await vs.hasUnpushedChanges("a.md")).toBe(true);
+            expect(await vs.hasUnpushedChanges("other.md")).toBe(false);
+        });
+
+        it("returns false when vault file is missing (deletion path handles it)", async () => {
+            vault.addFile("a.md", "content");
+            await vs.fileToDb("a.md");
+            await vault.delete("a.md");
+
+            expect(await vs.hasUnpushedChanges("a.md")).toBe(false);
         });
     });
 });

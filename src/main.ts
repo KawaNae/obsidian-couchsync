@@ -217,8 +217,13 @@ export default class CouchSyncPlugin extends Plugin {
 
         // Pull-driven deletions: if the remote deleted a file, apply
         // locally unless there are unpushed local edits (→ concurrent).
-        this.replicator.events.onQuery("pull-delete", async ({ path, localDoc }) => {
-            if (this.vaultSync.hasUnpushedChanges(path, localDoc.vclock)) {
+        // PR-B: hasUnpushedChanges is now chunks-aware (invariant 4)
+        // and looks at the actual vault disk + ChangeTracker pending
+        // state, not the in-lockstep vclock pair. Catches the silent
+        // loss race where a remote tombstone arrives during the
+        // ChangeTracker debounce window for a fresh user edit.
+        this.replicator.events.onQuery("pull-delete", async ({ path }) => {
+            if (await this.vaultSync.hasUnpushedChanges(path)) {
                 return true; // → concurrent conflict
             }
             await this.vaultSync.applyRemoteDeletion(path);
