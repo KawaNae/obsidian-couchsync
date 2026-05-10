@@ -5,6 +5,7 @@ import type { CouchSyncSettings } from "../settings.ts";
 import type { FileDoc } from "../types.ts";
 import type { ConflictOrchestrator } from "../conflict/conflict-orchestrator.ts";
 import { compareVC, latestDevice } from "./vector-clock.ts";
+import { chunkListsEqual } from "./chunk-equality.ts";
 import { filePathFromId } from "../types/doc-id.ts";
 import { toPathKey, type PathKey } from "../utils/path.ts";
 import { logDebug, logInfo, logWarn, logError } from "../ui/log.ts";
@@ -458,11 +459,5 @@ export class Reconciler {
 function setEquals<T>(a: Set<T>, b: Set<T>): boolean {
     if (a.size !== b.size) return false;
     for (const v of a) if (!b.has(v)) return false;
-    return true;
-}
-
-function chunkListsEqual(a: string[], b: string[]): boolean {
-    if (a.length !== b.length) return false;
-    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
     return true;
 }
