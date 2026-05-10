@@ -306,6 +306,15 @@ export class Reconciler {
                 switch (relation) {
                     case "identical":
                         report.inSync++;
+                        // PR5: align lastSynced to the FileDoc's content
+                        // fingerprint. No-op when already aligned; upgrades
+                        // legacy entries and recovers from stale-bookkeeping
+                        // when invariant 1 has been violated.
+                        await this.tryStep(displayPath, "align",
+                            async (): Promise<void> => {
+                                await this.vaultSync.alignLastSyncedToDoc(file.path, doc);
+                            },
+                            mode);
                         break;
                     case "vclock-only-drift":
                         // Same content, different causality — silent merge.

@@ -78,6 +78,7 @@ interface FakeVaultSync {
     dbToFileCalls: string[];
     markDeletedCalls: string[];
     silentMergeCalls: string[];
+    alignCalls: string[];
     /** Per-path classifier override. Tests must set this explicitly. */
     compareResults: Map<string, ClassifyResult>;
     fileToDb(path: string): Promise<void>;
@@ -85,6 +86,7 @@ interface FakeVaultSync {
     markDeleted(path: string): Promise<void>;
     classifyFileVsDoc(doc: FileDoc, path: string, size: number): Promise<ClassifyResult>;
     silentReconvergeVclock(path: string, doc: FileDoc): Promise<void>;
+    alignLastSyncedToDoc(path: string, doc: FileDoc): Promise<"already-aligned" | "upgraded-legacy" | "recovered-stale">;
     getLastSynced(path: string): undefined;
     computeVaultChunks(path: string): Promise<string[]>;
 }
@@ -95,6 +97,7 @@ function makeVaultSync(): FakeVaultSync {
         dbToFileCalls: [],
         markDeletedCalls: [],
         silentMergeCalls: [],
+        alignCalls: [],
         compareResults: new Map(),
         async fileToDb(path) { this.fileToDbCalls.push(path); },
         // Record the bare vault path (not the prefixed _id) so tests can
@@ -113,6 +116,10 @@ function makeVaultSync(): FakeVaultSync {
         },
         async silentReconvergeVclock(path, _doc) {
             this.silentMergeCalls.push(path);
+        },
+        async alignLastSyncedToDoc(path, _doc) {
+            this.alignCalls.push(path);
+            return "already-aligned" as const;
         },
         // Tests in this file don't exercise the divergent-edit / divergent-
         // delete routing (no ConflictOrchestrator wired); always report no

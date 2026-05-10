@@ -359,6 +359,98 @@ export class VaultSync {
         logDebug(`silentReconvergeVclock: ${path} ${JSON.stringify(baseVC)} ⊔ ${JSON.stringify(fileDoc.vclock ?? {})} = ${JSON.stringify(merged)}`);
     }
 
+    /**
+     * PR5 — align `lastSynced.{chunks,size}` to the FileDoc's actual content
+     * fingerprint when the reconciler observes them as identical.
+     *
+     * Two scenarios this handles:
+     *
+     *   - **Legacy upgrade**: pre-`{chunks,size}` entries (`chunks: undefined`)
+     *     are written by older versions of the plugin. PR5's startup sweep
+     *     piggybacks on the first reconcile to upgrade them in-place by
+     *     reading fileDoc.chunks/size. After one full session every entry
+     *     is in the new shape.
+     *
+     *   - **Stale-bookkeeping recovery**: defensive — if PR1's disk-write
+     *     invariant ever breaks (crash window, external tool), `lastSynced`
+     *     can drift from disk. When classifier returns `identical`, we know
+     *     disk chunks == fileDoc.chunks; if lastSynced disagrees, align it.
+     *
+     * Returns the action taken so callers / tests can observe.
+     */
+    async alignLastSyncedToDoc(
+        path: string,
+        fileDoc: FileDoc,
+    ): Promise<"already-aligned" | "upgraded-legacy" | "recovered-stale"> {
+        const key = toPathKey(path);
+        const existing = this.lastSynced.get(key);
+        const docVC = fileDoc.vclock ?? {};
+
+        if (!existing) {
+            // No baseline at all — establish one from the FileDoc.
+            await this.db.runWriteTx({
+                vclocks: [{
+                    path, op: "set", clock: docVC,
+                    chunks: fileDoc.chunks, size: fileDoc.size,
+                }],
+            });
+            this.lastSynced.set(key, {
+                vclock: docVC,
+                chunks: fileDoc.chunks,
+                size: fileDoc.size,
+            });
+            return "upgraded-legacy";
+        }
+
+        const isLegacy =
+            existing.chunks === undefined || existing.size === undefined;
+        if (isLegacy) {
+            const upgraded: LastSynced = {
+                vclock: existing.vclock,
+                chunks: fileDoc.chunks,
+                size: fileDoc.size,
+            };
+            await this.db.runWriteTx({
+                vclocks: [{
+                    path, op: "set", clock: upgraded.vclock,
+                    chunks: fileDoc.chunks, size: fileDoc.size,
+                }],
+            });
+            this.lastSynced.set(key, upgraded);
+            logDebug(
+                `alignLastSyncedToDoc: ${path} legacy entry upgraded to ${fileDoc.chunks.length} chunks / ${fileDoc.size} bytes`,
+            );
+            return "upgraded-legacy";
+        }
+
+        const aligned =
+            existing.size === fileDoc.size &&
+            chunkListsEqual(existing.chunks!, fileDoc.chunks);
+        if (aligned) return "already-aligned";
+
+        // Stale-bookkeeping: lastSynced drifted from the integrated content.
+        // The classifier has just confirmed disk == fileDoc, so it's safe
+        // to overwrite the bookkeeping with the doc's fingerprint.
+        const realigned: LastSynced = {
+            vclock: existing.vclock,
+            chunks: fileDoc.chunks,
+            size: fileDoc.size,
+        };
+        await this.db.runWriteTx({
+            vclocks: [{
+                path, op: "set", clock: realigned.vclock,
+                chunks: fileDoc.chunks, size: fileDoc.size,
+            }],
+        });
+        this.lastSynced.set(key, realigned);
+        logWarn(
+            `alignLastSyncedToDoc: ${path} stale-bookkeeping recovered ` +
+            `(was ${existing.size} bytes / ${existing.chunks!.length} chunks → ` +
+            `now ${fileDoc.size} bytes / ${fileDoc.chunks.length} chunks)`,
+        );
+        return "recovered-stale";
+    }
+
     async markDeleted(path: string): Promise<void> {
         const fileId = makeFileId(path);
         const deviceId = this.getSettings().deviceId;
