@@ -266,6 +266,15 @@ export class PullWriter {
             path, localDoc,
         });
         if (hasUnpushed) {
+            // **Invariant 6 (vclock 派生の出所制限).** This tombstone is a
+            // flag carrier for the conflict modal — a placeholder so the
+            // orchestrator can decide between "apply deletion" and "keep
+            // edit". `vclock: {}` is intentional: CouchDB `_changes` does
+            // NOT include deleted-doc bodies, so we cannot reconstruct the
+            // deleting device's true vclock. **Downstream code must not
+            // use this tombstone's `vclock` as an `incrementVC` seed** —
+            // see `ConflictOrchestrator.applyConflictChoice` for the
+            // localDoc-derived seed used on take-remote.
             const tombstone: FileDoc = {
                 _id: docId, type: "file", chunks: [],
                 mtime: localDoc.mtime, ctime: localDoc.ctime,

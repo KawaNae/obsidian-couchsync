@@ -269,6 +269,24 @@ export class ConflictOrchestrator {
      * `concurrent` event. Merges vclocks and writes to localDB so the
      * push loop carries the result to remote.
      */
+    /**
+     * Apply the user's conflict-modal choice. The take-remote branch
+     * has a special-case for **fake tombstones** produced by
+     * `pull-writer.handlePulledDeletion` for the remote-deleted vs
+     * local-edit shape: those tombstones carry `vclock: {}` because
+     * CouchDB's `_changes` doesn't expose deleted-doc bodies, so the
+     * pull side cannot reconstruct the deleting device's vclock.
+     *
+     * **Invariant 6 (vclock 派生の出所制限).** A fake tombstone is a
+     * flag carrier — never a causality source. When we promote one to
+     * a real LocalDB tombstone via take-remote, the seed vclock comes
+     * from `localDoc.vclock` (the only place this device has observed
+     * causal history for `path`), merged with whatever `remoteDoc.vclock`
+     * happens to carry (= empty for fake tombstones). The resulting
+     * `incrementVC(merged, deviceId)` strictly dominates `localDoc`,
+     * so peer devices accept the deletion as a normal update instead
+     * of treating the empty-seeded `{deviceId:1}` as a concurrent rev.
+     */
     private async applyConflictChoice(
         choice: ConflictChoice,
         filePath: string,
@@ -281,9 +299,17 @@ export class ConflictOrchestrator {
 
         if (choice === "take-remote") {
             logInfo(`Conflict resolved: take-remote for ${fileName}`);
+            // Invariant 6: deletion conflicts seed from localDoc because
+            // the fake tombstone's vclock is empty by construction.
+            // Non-deletion concurrent edits keep the existing behaviour
+            // (remoteDoc.vclock is real causality from the remote rev).
+            const isDeletionConflict = remoteDoc.deleted === true;
+            const seedVC = isDeletionConflict
+                ? mergeVC(localDoc.vclock ?? {}, remoteDoc.vclock ?? {})
+                : (remoteDoc.vclock ?? {});
             const updated = {
                 ...remoteDoc,
-                vclock: incrementVC(remoteDoc.vclock ?? {}, deviceId),
+                vclock: incrementVC(seedVC, deviceId),
             };
             await localDb.runWriteTx({
                 docs: [{ doc: stripRev(updated) as CouchSyncDoc }],
