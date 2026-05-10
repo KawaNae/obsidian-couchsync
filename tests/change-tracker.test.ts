@@ -130,6 +130,66 @@ describe("ChangeTracker", () => {
         });
     });
 
+    // ── hasPending (PR-A: pending-edit oracle, invariant 4) ─
+
+    describe("hasPending", () => {
+        it("returns true while a debounced fileToDb is scheduled", async () => {
+            tracker.start();
+            expect(tracker.hasPending("a.md")).toBe(false);
+
+            events.emit("modify", "a.md", stat);
+            expect(tracker.hasPending("a.md")).toBe(true);
+
+            // After the debounce fires, the pending timer is cleared and
+            // hasPending returns false again. The actual fileToDb work
+            // happens asynchronously; the probe answers "is the timer
+            // armed", not "is the work in flight".
+            vi.advanceTimersByTime(200);
+            await vi.runAllTimersAsync();
+            expect(tracker.hasPending("a.md")).toBe(false);
+            expect(vaultSync.calls.fileToDb).toEqual(["a.md"]);
+        });
+
+        it("returns true while min-interval is deferring a sync", async () => {
+            // Configure a long min-interval so the second emit is deferred
+            // through pendingMinInterval after the first sync completes.
+            settings = makeSettings({ syncDebounceMs: 50, syncMinIntervalMs: 5000 });
+            tracker = new ChangeTracker(events, vaultSync as any, () => settings);
+            tracker.start();
+
+            // First edit goes through cleanly.
+            events.emit("modify", "a.md", stat);
+            vi.advanceTimersByTime(60);
+            await vi.runAllTimersAsync();
+            expect(vaultSync.calls.fileToDb).toEqual(["a.md"]);
+            expect(tracker.hasPending("a.md")).toBe(false);
+
+            // Second edit lands inside the min-interval window — debounce
+            // fires, runSync defers via pendingMinInterval. hasPending
+            // must still report true throughout the deferred window.
+            events.emit("modify", "a.md", stat);
+            expect(tracker.hasPending("a.md")).toBe(true);
+            vi.advanceTimersByTime(60); // debounce fires, defers to pendingMinInterval
+            expect(tracker.hasPending("a.md")).toBe(true);
+        });
+
+        it("does NOT return true for sync-driven echo suppressors", async () => {
+            tracker.start();
+            // ignoreNextModify / ignoreDelete arm echo suppressors which
+            // are not user edits — hasPending must remain false.
+            tracker.ignoreNextModify("a.md");
+            tracker.ignoreDelete("a.md");
+            expect(tracker.hasPending("a.md")).toBe(false);
+        });
+
+        it("does not affect other paths", async () => {
+            tracker.start();
+            events.emit("modify", "a.md", stat);
+            expect(tracker.hasPending("a.md")).toBe(true);
+            expect(tracker.hasPending("b.md")).toBe(false);
+        });
+    });
+
     // ── debounce ────────────────────────────────────────
 
     describe("debounce", () => {

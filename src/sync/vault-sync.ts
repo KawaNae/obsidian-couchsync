@@ -33,6 +33,29 @@ export interface IWriteIgnore {
     ignoreNextModify(path: string): void;
 }
 
+/**
+ * Read-only probe for "is a fileToDb pass pending for this path?" — the
+ * pending-edit oracle (invariant 4).
+ *
+ * **Invariant 4** (Pending-edit oracle): "Has the vault been edited but
+ * not yet pushed?" must be answered through this primitive plus a
+ * chunks-vs-`lastSynced.chunks` comparison, never through vclock-only
+ * lookups (which are kept in lockstep by `fileToDb`/`dbToFile` and so
+ * always say "no" — the bug shape this primitive closes). The single
+ * call site is `VaultSync.hasUnpushedChanges`.
+ *
+ * Implemented by `ChangeTracker`. Wired via late-binding setter from
+ * `main.ts` to break the construction-time cycle (`ChangeTracker` itself
+ * depends on `VaultSync`).
+ *
+ * Returns `true` iff the path has a debounced or min-interval-deferred
+ * `fileToDb` scheduled. Modify/delete echo suppressors do **not** count
+ * — those are sync-driven, not user-driven.
+ */
+export interface IPendingProbe {
+    hasPending(path: string): boolean;
+}
+
 /** Max snapshot→commit retries inside runWrite when a concurrent pull lands
  *  between our read and our CAS check. Realistic worst case is 1. */
 const CAS_MAX_ATTEMPTS = 4;
@@ -67,12 +90,32 @@ export class VaultSync {
      */
     private skippedPaths: Set<PathKey> | null = null;
 
+    /**
+     * Late-bound probe for "is the user editing this path right now"
+     * (invariant 4). Construction-cycle-broken via `setPendingProbe`
+     * because `ChangeTracker` itself depends on `VaultSync`. Null until
+     * `main.ts` wires it up post-construction.
+     */
+    private pendingProbe: IPendingProbe | null = null;
+
     constructor(
         private vault: IVaultIO,
         private db: LocalDB,
         private getSettings: () => CouchSyncSettings,
         private vaultWriter: VaultWriter,
     ) {}
+
+    /**
+     * Wire the pending-edit probe (invariant 4). Called from `main.ts`
+     * after both `VaultSync` and `ChangeTracker` are constructed.
+     * Tests / harness code that don't need the probe leave it null;
+     * `hasUnpushedChanges` then falls back to chunks-only comparison
+     * (which still catches the most common silent-loss shape — the
+     * probe is the second layer for the in-flight debounce window).
+     */
+    setPendingProbe(probe: IPendingProbe): void {
+        this.pendingProbe = probe;
+    }
 
     /**
      * Load persisted lastSyncedVclock entries. Called once during plugin

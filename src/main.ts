@@ -128,6 +128,10 @@ export default class CouchSyncPlugin extends Plugin {
         // used by VaultWriter only on the deletion path (the modify
         // path now relies on chunksEqual idempotency in fileToDb).
         this.vaultWriter.setWriteIgnore(this.changeTracker);
+        // Late-bind the pending-edit probe (invariant 4). VaultSync uses
+        // it from `hasUnpushedChanges` to detect debounced user edits
+        // before applying a remote deletion.
+        this.vaultSync.setPendingProbe(this.changeTracker);
         // SyncEngine constructed AFTER vaultSync so the pull-writer can
         // call vaultSync.dbToFile directly via constructor DI (replaces
         // the former events.onAsync("pull-write", ...) bus, whose catch-

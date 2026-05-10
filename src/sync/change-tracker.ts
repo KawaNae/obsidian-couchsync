@@ -1,9 +1,9 @@
 import type { IVaultEvents, VaultEventRef } from "../types/vault-events.ts";
-import type { VaultSync, IWriteIgnore } from "./vault-sync.ts";
+import type { VaultSync, IWriteIgnore, IPendingProbe } from "./vault-sync.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import { logError } from "../ui/log.ts";
 
-export class ChangeTracker implements IWriteIgnore {
+export class ChangeTracker implements IWriteIgnore, IPendingProbe {
     private timers = new Map<string, ReturnType<typeof setTimeout>>();
     private pendingMinInterval = new Map<string, ReturnType<typeof setTimeout>>();
     private lastSyncTime = new Map<string, number>();
@@ -73,6 +73,20 @@ export class ChangeTracker implements IWriteIgnore {
     /** Register that the next `modify` event on `path` is sync-driven. */
     ignoreNextModify(path: string): void {
         this.pendingModifyIgnores.add(path);
+    }
+
+    /**
+     * **Invariant 4 (Pending-edit oracle).** True iff a debounced or
+     * min-interval-deferred `fileToDb` is scheduled for `path`. Echo
+     * suppressors (`pendingDeleteIgnores` / `pendingModifyIgnores`) do
+     * NOT count — those mark sync-driven events, not user edits.
+     *
+     * Used by `VaultSync.hasUnpushedChanges` to decide whether the
+     * `pull-delete` query handler should defer a remote deletion (= the
+     * user has work in flight that hasn't reached LocalDB yet).
+     */
+    hasPending(path: string): boolean {
+        return this.timers.has(path) || this.pendingMinInterval.has(path);
     }
 
     private scheduleSync(path: string): void {
