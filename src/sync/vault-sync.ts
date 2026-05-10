@@ -8,19 +8,12 @@ import { notify } from "../ui/log.ts";
 import { compareVC, incrementVC, mergeVC } from "./vector-clock.ts";
 import type { VectorClock } from "./vector-clock.ts";
 import type { LastSynced } from "./last-synced.ts";
+import { classifySyncRelation, type SyncRelation } from "./classify-sync-relation.ts";
+import { chunkListsEqual } from "./chunk-equality.ts";
 import { makeFileId, filePathFromId } from "../types/doc-id.ts";
 import { toPathKey, type PathKey } from "../utils/path.ts";
 import { logDebug, logWarn } from "../ui/log.ts";
 import { DbError } from "../db/write-transaction.ts";
-
-/**
- * Result of comparing a vault file against its local DB record.
- *
- * Answers *local drift* ("has the vault diverged from the DB?"), not
- * cross-device ordering. Cross-device ordering lives in Vector Clocks
- * and is decided by ConflictResolver via resolveOnPull().
- */
-export type CompareResult = "identical" | "local-unpushed" | "remote-pending";
 
 /**
  * Subset of ChangeTracker that EditorAwareVaultWriter needs.
@@ -288,23 +281,55 @@ export class VaultSync {
     }
 
     /**
-     * Compare a vault file against its local DB record to detect drift.
-     * Step 1 — chunk equality.
-     * Step 2 — vclock comparison against `lastSyncedVclock[path]`.
+     * Classify the sync relation between a vault file and its DB record.
+     *
+     * **CLASSIFIER:** routes through `classifySyncRelation` (the single
+     * source of truth). Do not duplicate the chunks/vclock matrix logic
+     * here — extend the classifier instead.
+     *
+     * Step 1 — read disk chunks/size.
+     * Step 2 — call `classifySyncRelation` with vault as left (using
+     *          `lastSynced.vclock` as the disk's attributed vclock) and
+     *          FileDoc as right.
      */
-    async compareFileToDoc(fileDoc: FileDoc, filePath: string, fileSize: number): Promise<CompareResult> {
-        if (fileSize === fileDoc.size) {
-            const ids = await this.localChunkIds(filePath);
-            if (VaultSync.chunksEqual(ids, fileDoc.chunks)) {
-                return "identical";
-            }
-        }
+    async classifyFileVsDoc(fileDoc: FileDoc, filePath: string, fileSize: number): Promise<SyncRelation> {
         const lastSynced = this.lastSynced.get(toPathKey(filePathFromId(fileDoc._id)));
-        if (lastSynced) {
-            const rel = compareVC(fileDoc.vclock ?? {}, lastSynced.vclock);
-            return rel === "equal" ? "local-unpushed" : "remote-pending";
-        }
-        return "remote-pending";
+        const diskChunks = await this.localChunkIds(filePath);
+        return classifySyncRelation({
+            leftVC: lastSynced?.vclock ?? {},
+            leftChunks: diskChunks,
+            leftSize: fileSize,
+            rightVC: fileDoc.vclock ?? {},
+            rightChunks: fileDoc.chunks,
+            rightSize: fileDoc.size,
+            lastSynced,
+        });
+    }
+
+    /**
+     * Reconverge `lastSynced.vclock` with a FileDoc whose content matches
+     * the vault but whose vclock has drifted (= `vclock-only-drift` from the
+     * classifier). Pure meta write — no chunk/file write needed because
+     * content is already aligned. The merged vclock dominates both sides
+     * so future scans see them as equal.
+     */
+    async silentReconvergeVclock(path: string, fileDoc: FileDoc): Promise<void> {
+        const key = toPathKey(path);
+        const lastSynced = this.lastSynced.get(key);
+        const baseVC = lastSynced?.vclock ?? {};
+        const merged = mergeVC(baseVC, fileDoc.vclock ?? {});
+        await this.db.runWriteTx({
+            vclocks: [{
+                path, op: "set", clock: merged,
+                chunks: fileDoc.chunks, size: fileDoc.size,
+            }],
+        });
+        this.lastSynced.set(key, {
+            vclock: merged,
+            chunks: fileDoc.chunks,
+            size: fileDoc.size,
+        });
+        logDebug(`silentReconvergeVclock: ${path} ${JSON.stringify(baseVC)} ⊔ ${JSON.stringify(fileDoc.vclock ?? {})} = ${JSON.stringify(merged)}`);
     }
 
     async markDeleted(path: string): Promise<void> {

@@ -194,20 +194,20 @@ describe("VaultSync", () => {
         });
     });
 
-    // ── compareFileToDoc ────────────────────────────────
+    // ── classifyFileVsDoc (PR3 — replaces legacy compareFileToDoc) ─
 
-    describe("compareFileToDoc", () => {
+    describe("classifyFileVsDoc", () => {
         it("returns identical when content matches", async () => {
             vault.addFile("a.md", "same");
             await vs.fileToDb("a.md");
 
             const doc = await db.get(makeFileId("a.md")) as FileDoc;
             const stat = (await vault.stat("a.md"))!;
-            const result = await vs.compareFileToDoc(doc, "a.md", stat.size);
+            const result = await vs.classifyFileVsDoc(doc, "a.md", stat.size);
             expect(result).toBe("identical");
         });
 
-        it("returns local-unpushed when vault has changed", async () => {
+        it("returns local-edit when vault has changed", async () => {
             vault.addFile("a.md", "v1");
             await vs.fileToDb("a.md");
             await vs.loadLastSyncedVclocks();
@@ -216,11 +216,11 @@ describe("VaultSync", () => {
             vault.addFile("a.md", "v2-local-edit", { size: 999 });
 
             const doc = await db.get(makeFileId("a.md")) as FileDoc;
-            const result = await vs.compareFileToDoc(doc, "a.md", 999);
-            expect(result).toBe("local-unpushed");
+            const result = await vs.classifyFileVsDoc(doc, "a.md", 999);
+            expect(result).toBe("local-edit");
         });
 
-        it("returns remote-pending when db has newer vclock", async () => {
+        it("returns true-divergent when db has newer vclock and vault drifted", async () => {
             vault.addFile("a.md", "v1");
             await vs.fileToDb("a.md");
             await vs.loadLastSyncedVclocks();
@@ -230,9 +230,13 @@ describe("VaultSync", () => {
             const updated = { ...doc, vclock: { "dev-A": 1, "dev-B": 1 }, size: 888 };
             await db.runWriteTx({ docs: [{ doc: updated as any }] });
 
-            vault.addFile("a.md", "v1-unchanged", { size: 777 });
-            const result = await vs.compareFileToDoc(updated as FileDoc, "a.md", 777);
-            expect(result).toBe("remote-pending");
+            // Vault has different content from both lastSynced and remote.
+            vault.addFile("a.md", "v1-but-different", { size: 777 });
+            const result = await vs.classifyFileVsDoc(updated as FileDoc, "a.md", 777);
+            // PR3 classifier detects "right dominates AND left drifted from
+            // baseline" → true-divergent (instead of legacy remote-pending
+            // which had a separate divergent-edit guard).
+            expect(result).toBe("true-divergent");
         });
     });
 

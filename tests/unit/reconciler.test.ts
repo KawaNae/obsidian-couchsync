@@ -63,18 +63,28 @@ class FakeLocalDb {
     async info() { return { updateSeq: this.updateSeq }; }
 }
 
-type CompareResult = "identical" | "local-unpushed" | "remote-pending";
+// PR3: classifier returns 6 states; the legacy 3-state alias is kept
+// as a typedef so tests reading old fixture names stay obvious.
+type ClassifyResult =
+    | "identical"
+    | "vclock-only-drift"
+    | "remote-edit"
+    | "local-edit"
+    | "true-divergent"
+    | "legacy-skip";
 
 interface FakeVaultSync {
     fileToDbCalls: string[];
     dbToFileCalls: string[];
     markDeletedCalls: string[];
-    /** Per-path comparison override. Tests must set this explicitly. */
-    compareResults: Map<string, CompareResult>;
+    silentMergeCalls: string[];
+    /** Per-path classifier override. Tests must set this explicitly. */
+    compareResults: Map<string, ClassifyResult>;
     fileToDb(path: string): Promise<void>;
     dbToFile(doc: FileDoc): Promise<void>;
     markDeleted(path: string): Promise<void>;
-    compareFileToDoc(doc: FileDoc, path: string, size: number): Promise<CompareResult>;
+    classifyFileVsDoc(doc: FileDoc, path: string, size: number): Promise<ClassifyResult>;
+    silentReconvergeVclock(path: string, doc: FileDoc): Promise<void>;
     getLastSynced(path: string): undefined;
     computeVaultChunks(path: string): Promise<string[]>;
 }
@@ -84,13 +94,14 @@ function makeVaultSync(): FakeVaultSync {
         fileToDbCalls: [],
         dbToFileCalls: [],
         markDeletedCalls: [],
+        silentMergeCalls: [],
         compareResults: new Map(),
         async fileToDb(path) { this.fileToDbCalls.push(path); },
         // Record the bare vault path (not the prefixed _id) so tests can
         // keep asserting `expect(dbToFileCalls).toEqual(["a.md"])`.
         async dbToFile(doc) { this.dbToFileCalls.push(filePathFromId(doc._id)); },
         async markDeleted(path) { this.markDeletedCalls.push(path); },
-        async compareFileToDoc(doc, _path, _size) {
+        async classifyFileVsDoc(doc, _path, _size) {
             // Fake honours compareResults keyed by vault path — extract
             // from the prefixed _id to match how tests register overrides.
             const key = filePathFromId(doc._id);
@@ -99,6 +110,9 @@ function makeVaultSync(): FakeVaultSync {
                 throw new Error(`test missing compareResults for ${key}`);
             }
             return override;
+        },
+        async silentReconvergeVclock(path, _doc) {
+            this.silentMergeCalls.push(path);
         },
         // Tests in this file don't exercise the divergent-edit / divergent-
         // delete routing (no ConflictOrchestrator wired); always report no
@@ -144,7 +158,7 @@ describe("Reconciler", () => {
             const h = setup([makeFile("a.md", 5000)]);
             h.db.fileDocs.set("a.md", makeDoc("a.md", { mtime: 3000 }));
             h.db.manifest = { paths: ["a.md"], updatedAt: 0 };
-            h.vaultSync.compareResults.set("a.md", "local-unpushed");
+            h.vaultSync.compareResults.set("a.md", "local-edit");
 
             const r = await h.reconciler.reconcile("manual");
             expect(r.localWins).toEqual(["a.md"]);
@@ -155,7 +169,7 @@ describe("Reconciler", () => {
             const h = setup([makeFile("a.md", 1000)]);
             h.db.fileDocs.set("a.md", makeDoc("a.md", { mtime: 5000 }));
             h.db.manifest = { paths: ["a.md"], updatedAt: 0 };
-            h.vaultSync.compareResults.set("a.md", "remote-pending");
+            h.vaultSync.compareResults.set("a.md", "remote-edit");
 
             const r = await h.reconciler.reconcile("manual");
             expect(r.remoteWins).toEqual(["a.md"]);
@@ -170,7 +184,7 @@ describe("Reconciler", () => {
             const h = setup([makeFile("note.md", 9999)]);
             h.db.fileDocs.set("note.md", makeDoc("note.md", { mtime: 1000, lastWriter: SELF }));
             h.db.manifest = { paths: ["note.md"], updatedAt: 0 };
-            h.vaultSync.compareResults.set("note.md", "local-unpushed");
+            h.vaultSync.compareResults.set("note.md", "local-edit");
 
             const r = await h.reconciler.reconcile("reconnect");
             expect(r.localWins).toEqual(["note.md"]);
@@ -461,7 +475,7 @@ describe("Reconciler", () => {
             h.db.fileDocs.set("readme.md", makeDoc("readme.md", { mtime: 1000 }));
             h.db.manifest = { paths: ["README.md"], updatedAt: 0 };
             // Fake compareFileToDoc keys by the DB doc's stored path.
-            h.vaultSync.compareResults.set("readme.md", "local-unpushed");
+            h.vaultSync.compareResults.set("readme.md", "local-edit");
 
             const r = await h.reconciler.reconcile("manual");
 

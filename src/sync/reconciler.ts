@@ -1,11 +1,11 @@
 import type { IVaultIO, VaultFile } from "../types/vault-io.ts";
 import type { LocalDB, VaultManifest } from "../db/local-db.ts";
-import type { VaultSync, CompareResult } from "./vault-sync.ts";
+import type { VaultSync } from "./vault-sync.ts";
+import type { SyncRelation } from "./classify-sync-relation.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { FileDoc } from "../types.ts";
 import type { ConflictOrchestrator } from "../conflict/conflict-orchestrator.ts";
 import { compareVC, latestDevice } from "./vector-clock.ts";
-import { chunkListsEqual } from "./chunk-equality.ts";
 import { filePathFromId } from "../types/doc-id.ts";
 import { toPathKey, type PathKey } from "../utils/path.ts";
 import { logDebug, logInfo, logWarn, logError } from "../ui/log.ts";
@@ -292,50 +292,67 @@ export class Reconciler {
                 continue;
             }
 
-            // Case A/B: both vault and DB have an alive entry
+            // Case A/B: both vault and DB have an alive entry.
+            // CLASSIFIER: do not duplicate inline — route through
+            // classifyFileVsDoc which delegates to classifySyncRelation.
             if (file && doc && !doc.deleted) {
-                let cmp: CompareResult;
+                let relation: SyncRelation;
                 try {
-                    cmp = await this.vaultSync.compareFileToDoc(doc, file.path, file.stat.size);
+                    relation = await this.vaultSync.classifyFileVsDoc(doc, file.path, file.stat.size);
                 } catch (e) {
-                    logError(`CouchSync: reconcile compare failed for ${displayPath}: ${e?.message ?? e}`);
+                    logError(`CouchSync: reconcile classify failed for ${displayPath}: ${e?.message ?? e}`);
                     continue;
                 }
-                if (cmp === "identical") {
-                    report.inSync++;
-                } else if (cmp === "local-unpushed") {
-                    if (await this.tryStep(displayPath, "push", () => this.vaultSync.fileToDb(file.path), mode)) {
-                        report.localWins.push(displayPath);
-                    }
-                } else {
-                    // Divergent-edit guard: if vault drifted from the last
-                    // integration baseline, the user edited stale content
-                    // during a pull-decline window. Route to conflict
-                    // orchestrator instead of overwriting.
-                    let divergent = false;
-                    const lastSynced = this.vaultSync.getLastSynced(displayPath);
-                    if (lastSynced?.chunks !== undefined && lastSynced.size !== undefined
-                        && this.conflictOrchestrator) {
-                        // Size fast-path: differing size guarantees content
-                        // divergence (skips chunk computation).
-                        if (file.stat.size !== lastSynced.size) {
-                            divergent = true;
-                        } else {
-                            const currentChunks = await this.vaultSync.computeVaultChunks(file.path);
-                            divergent = !chunkListsEqual(currentChunks, lastSynced.chunks);
+                switch (relation) {
+                    case "identical":
+                        report.inSync++;
+                        break;
+                    case "vclock-only-drift":
+                        // Same content, different causality — silent merge.
+                        // Closes audit-2026-05-08 MEDIUM (false-positive
+                        // concurrent on initial-sync devices) when reached
+                        // through the vault scan path.
+                        if (await this.tryStep(displayPath, "vclock-merge",
+                            () => this.vaultSync.silentReconvergeVclock(file.path, doc), mode)) {
+                            report.inSync++;
                         }
-                    }
-                    if (divergent) {
-                        if (await this.tryStep(displayPath, "conflict-edit",
-                            () => this.conflictOrchestrator!.handleDivergentLocalEdit(file.path, doc),
-                            mode)) {
-                            report.remoteWins.push(displayPath);
+                        break;
+                    case "local-edit":
+                        // CLASSIFIER FIX (PR3): the previous "local-unpushed"
+                        // branch had no divergent guard. The classifier now
+                        // returns true-divergent when local has drifted from
+                        // baseline AND remote dominates, so the local-edit
+                        // case here is genuinely a push.
+                        if (await this.tryStep(displayPath, "push", () => this.vaultSync.fileToDb(file.path), mode)) {
+                            report.localWins.push(displayPath);
                         }
-                    } else {
+                        break;
+                    case "remote-edit":
+                    case "legacy-skip":
+                        // legacy-skip: pre-extension lastSynced — fall back to
+                        // pull (= old behavior when divergent guard couldn't
+                        // run). PR5 startup sweep will upgrade the entries.
                         if (await this.tryStep(displayPath, "pull", async () => { await this.ensureChunks(doc); await this.vaultSync.dbToFile(doc); }, mode)) {
                             report.remoteWins.push(displayPath);
                         }
-                    }
+                        break;
+                    case "true-divergent":
+                        if (this.conflictOrchestrator) {
+                            if (await this.tryStep(displayPath, "conflict-edit",
+                                () => this.conflictOrchestrator!.handleDivergentLocalEdit(file.path, doc),
+                                mode)) {
+                                report.remoteWins.push(displayPath);
+                            }
+                        } else {
+                            // No orchestrator wired (e.g., test harness pre-
+                            // ConflictOrchestrator) — fall back to pull. The
+                            // divergent local edit is lost in this fallback;
+                            // production main.ts always wires the orchestrator.
+                            if (await this.tryStep(displayPath, "pull", async () => { await this.ensureChunks(doc); await this.vaultSync.dbToFile(doc); }, mode)) {
+                                report.remoteWins.push(displayPath);
+                            }
+                        }
+                        break;
                 }
             }
         }
