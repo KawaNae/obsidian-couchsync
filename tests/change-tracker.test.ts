@@ -86,10 +86,10 @@ describe("ChangeTracker", () => {
 
     // ── ignoreDelete ─────────────────────────────────────
     //
-    // ignoreWrite / clearIgnore retired in v0.21.0: the modify-path
-    // echo is now suppressed by `chunksEqual` idempotency in
-    // fileToDb. ignoreDelete remains because deletions have no
-    // chunksEqual analog.
+    // ignoreWrite / clearIgnore was retired in v0.21.0; PR1 of the
+    // sync-classifier plan reintroduced an explicit `ignoreNextModify`
+    // because the new disk-write invariant means every pull-side write
+    // produces a modify event we must drop before it hits the debounce.
 
     describe("ignoreDelete", () => {
         it("suppresses next delete for ignored path", async () => {
@@ -99,6 +99,34 @@ describe("ChangeTracker", () => {
 
             await vi.runAllTimersAsync();
             expect(vaultSync.calls.markDeleted).toHaveLength(0);
+        });
+    });
+
+    describe("ignoreNextModify", () => {
+        it("suppresses next modify for ignored path (single use)", async () => {
+            tracker.start();
+            tracker.ignoreNextModify("a.md");
+            events.emit("modify", "a.md", stat);
+
+            vi.advanceTimersByTime(200);
+            await vi.runAllTimersAsync();
+            expect(vaultSync.calls.fileToDb).toHaveLength(0);
+
+            // Token is consumed — second modify does fire.
+            events.emit("modify", "a.md", stat);
+            vi.advanceTimersByTime(200);
+            await vi.runAllTimersAsync();
+            expect(vaultSync.calls.fileToDb).toEqual(["a.md"]);
+        });
+
+        it("does not affect other paths", async () => {
+            tracker.start();
+            tracker.ignoreNextModify("a.md");
+            events.emit("modify", "b.md", stat);
+
+            vi.advanceTimersByTime(200);
+            await vi.runAllTimersAsync();
+            expect(vaultSync.calls.fileToDb).toEqual(["b.md"]);
         });
     });
 

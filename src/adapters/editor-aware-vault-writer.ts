@@ -2,20 +2,28 @@
  * Production VaultWriter — applies remote content while preserving
  * open-editor session state.
  *
+ * **Postcondition (PR1 invariant — disk-write truth):** when
+ * `applyRemoteContent` returns `applied: true`, the bytes on disk equal
+ * `content`. The CM dispatch is a UX overlay (cursor / scroll preservation),
+ * never the system's persistence. This invariant lets `lastSynced.chunks`
+ * always reflect the true vault state, which the classifier in
+ * `src/sync/classify-sync-relation.ts` relies on.
+ *
  * Strategy:
  *   1. Find every `MarkdownView` leaf with `path` open and grab their
  *      CodeMirror EditorView (`view.editor.cm`).
  *   2. If any has `composing === true`, defer through the
  *      CompositionGate. The deferred op re-runs the strategy on
  *      compositionend (or timeout).
- *   3. With no editors open, fall back to `IVaultIO.writeBinary`. The
- *      resulting modify event is harmless: ChangeTracker schedules a
- *      fileToDb pass which short-circuits via `chunksEqual` against
- *      the FileDoc that PullWriter just committed.
- *   4. With editors open and none composing, dispatch a CodeMirror
- *      transaction on every pane simultaneously. Obsidian's autosave
- *      writes disk ~2 s later and the modify event reload becomes a
- *      no-op for these panes (CM doc already matches disk).
+ *   3. With no editors open, write straight to disk via `IVaultIO.writeBinary`.
+ *      The modify event is suppressed via `ignoreNextModify` so the echo
+ *      doesn't redundantly schedule a fileToDb (which would short-circuit
+ *      anyway via `chunksEqual`, but suppressing saves the debounce timer
+ *      and avoids history double-capture).
+ *   4. With editors open and none composing, write disk first then dispatch
+ *      a CodeMirror transaction on every pane. Disk and editor both end
+ *      with the new content; the suppressed modify event keeps the push
+ *      pipeline quiet.
  *
  * Editor-divergence guard: when an op is deferred, the pre-composition
  * doc is captured. At drain time, if the doc has diverged (user
@@ -70,10 +78,10 @@ export class EditorAwareVaultWriter implements VaultWriter {
         const editors = this.findEditors(path);
 
         if (editors.length === 0) {
-            // No live editor session — write straight to disk. Echo
-            // suppression flows through fileToDb's chunksEqual short-
-            // circuit (PullWriter has already committed the FileDoc
-            // to localDB, so the post-write modify event won't push).
+            // No live editor session — write straight to disk. Suppress
+            // the resulting modify event so the echo doesn't roundtrip
+            // through ChangeTracker.
+            this.writeIgnore?.ignoreNextModify(path);
             await this.io.writeBinary(path, content);
             await this.captureHistoryFromBytes(path, content);
             return { applied: true };
@@ -127,6 +135,7 @@ export class EditorAwareVaultWriter implements VaultWriter {
         if (editors.length === 0) {
             // All editors closed during the defer window — fall back
             // to disk write.
+            this.writeIgnore?.ignoreNextModify(path);
             await this.io.writeBinary(path, content);
             await this.captureHistoryFromBytes(path, content);
             return { applied: true };
@@ -161,10 +170,17 @@ export class EditorAwareVaultWriter implements VaultWriter {
     ): Promise<WriteResult> {
         const text = new TextDecoder("utf-8").decode(content);
 
-        // Dispatch on every pane simultaneously. With both panes
-        // already showing the new content, Obsidian's autosave-driven
-        // reload of the non-source pane becomes a no-op (content
-        // matches disk).
+        // PR1 disk-write invariant: persist to disk BEFORE updating the
+        // editor. Disk is the source of truth; CM dispatch is the UX
+        // overlay that preserves cursor / scroll. The modify event from
+        // writeBinary is suppressed via ignoreNextModify so it doesn't
+        // schedule a redundant fileToDb pass.
+        this.writeIgnore?.ignoreNextModify(path);
+        await this.io.writeBinary(path, content);
+
+        // Dispatch on every pane. With disk already updated, Obsidian's
+        // external-change reload (if it fires before our dispatch lands)
+        // would set CM to the new content too — same end state.
         for (const { cm } of editors) {
             cm.dispatch({
                 changes: { from: 0, to: cm.state.doc.length, insert: text },

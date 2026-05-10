@@ -152,13 +152,18 @@ describe("EditorAwareVaultWriter", () => {
 
     it("falls back to IVaultIO when no editor has the file open", async () => {
         io.addFile("a.md", "old");
-        const writer = makeWriter([]);
+        const ignoreNextModify = vi.fn();
+        const writer = makeWriter([], {
+            writeIgnore: { ignoreDelete: vi.fn(), ignoreNextModify },
+        });
         const result = await writer.applyRemoteContent(
             "a.md",
             new TextEncoder().encode("new").buffer,
         );
         expect(result).toEqual({ applied: true });
         expect(io.readText("a.md")).toBe("new");
+        // PR1 — fallback path also suppresses the echo modify event.
+        expect(ignoreNextModify).toHaveBeenCalledWith("a.md");
     });
 
     it("captures history for fallback writes", async () => {
@@ -174,9 +179,15 @@ describe("EditorAwareVaultWriter", () => {
 
     // ── Single editor, not composing ──────────────────────
 
-    it("dispatches CM transaction when single pane is not composing", async () => {
+    it("dispatches CM transaction AND writes to disk when single pane is not composing", async () => {
+        // PR1 disk-write invariant: disk write happens even with editor
+        // open. CM dispatch is the UX overlay; disk is the truth.
+        io.addFile("a.md", "old");
+        const ignoreNextModify = vi.fn();
         const leaf = makeLeaf("a.md", "old");
-        const writer = makeWriter([leaf]);
+        const writer = makeWriter([leaf], {
+            writeIgnore: { ignoreDelete: vi.fn(), ignoreNextModify },
+        });
         const result = await writer.applyRemoteContent(
             "a.md",
             new TextEncoder().encode("new").buffer,
@@ -184,13 +195,16 @@ describe("EditorAwareVaultWriter", () => {
         expect(result).toEqual({ applied: true });
         expect(leaf.view.editor.cm.dispatchSpy).toHaveBeenCalledTimes(1);
         expect(leaf.view.editor.cm.state.doc.toString()).toBe("new");
-        // No fallback to IVaultIO.
-        expect(io.files.size).toBe(0);
+        // PR1 invariant — disk has the new content too.
+        expect(io.readText("a.md")).toBe("new");
+        // The echo modify event from writeBinary is suppressed.
+        expect(ignoreNextModify).toHaveBeenCalledWith("a.md");
     });
 
     // ── Multi-pane, none composing ────────────────────────
 
-    it("dispatches on every pane simultaneously", async () => {
+    it("dispatches on every pane simultaneously and writes disk once", async () => {
+        io.addFile("file.md", "old");
         const a = makeLeaf("file.md", "old");
         const b = makeLeaf("file.md", "old");
         const writer = makeWriter([a, b]);
@@ -202,11 +216,13 @@ describe("EditorAwareVaultWriter", () => {
         expect(b.view.editor.cm.dispatchSpy).toHaveBeenCalledTimes(1);
         expect(a.view.editor.cm.state.doc.toString()).toBe("new");
         expect(b.view.editor.cm.state.doc.toString()).toBe("new");
+        expect(io.readText("file.md")).toBe("new");
     });
 
     // ── Composing — defer ────────────────────────────────
 
-    it("defers dispatch while editor is composing", async () => {
+    it("defers dispatch while editor is composing, then writes disk on drain", async () => {
+        io.addFile("a.md", "old");
         const leaf = makeLeaf("a.md", "old");
         leaf.view.editor.cm.composing = true;
         tracker.startComposition("a.md");
@@ -218,13 +234,16 @@ describe("EditorAwareVaultWriter", () => {
         );
         await Promise.resolve();
         expect(leaf.view.editor.cm.dispatchSpy).not.toHaveBeenCalled();
+        // PR1 invariant — disk is NOT touched while composing.
+        expect(io.readText("a.md")).toBe("old");
 
-        // End composition → drain → dispatch
+        // End composition → drain → CM dispatch + disk write
         leaf.view.editor.cm.composing = false;
         tracker.endComposition("a.md");
         const result = await promise;
         expect(result).toEqual({ applied: true });
         expect(leaf.view.editor.cm.state.doc.toString()).toBe("new");
+        expect(io.readText("a.md")).toBe("new");
     });
 
     it("skips dispatch when local doc diverges during composition", async () => {

@@ -10,6 +10,9 @@ export class ChangeTracker implements IWriteIgnore {
     private eventRefs: VaultEventRef[] = [];
     /** Paths whose next `delete` event should be treated as sync-driven. */
     private pendingDeleteIgnores = new Set<string>();
+    /** Paths whose next `modify` event should be treated as sync-driven (PR1
+     *  disk-write invariant: pull-side writeBinary echoes back as modify). */
+    private pendingModifyIgnores = new Set<string>();
 
     constructor(
         private events: IVaultEvents,
@@ -19,7 +22,10 @@ export class ChangeTracker implements IWriteIgnore {
 
     start(): void {
         this.eventRefs.push(
-            this.events.on("modify", (path) => this.scheduleSync(path)),
+            this.events.on("modify", (path) => {
+                if (this.pendingModifyIgnores.delete(path)) return;
+                this.scheduleSync(path);
+            }),
         );
 
         this.eventRefs.push(
@@ -62,6 +68,11 @@ export class ChangeTracker implements IWriteIgnore {
     /** Register that the next `delete` event on `path` is sync-driven. */
     ignoreDelete(path: string): void {
         this.pendingDeleteIgnores.add(path);
+    }
+
+    /** Register that the next `modify` event on `path` is sync-driven. */
+    ignoreNextModify(path: string): void {
+        this.pendingModifyIgnores.add(path);
     }
 
     private scheduleSync(path: string): void {

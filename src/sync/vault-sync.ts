@@ -25,14 +25,19 @@ export type CompareResult = "identical" | "local-unpushed" | "remote-pending";
 /**
  * Subset of ChangeTracker that EditorAwareVaultWriter needs.
  *
- * Modify-path echo suppression no longer flows through this token —
- * the `chunksEqual` short-circuit in `fileToDb` provides data-level
- * idempotency. Only the deletion path still needs explicit signalling
- * (deletions have no chunksEqual analog).
+ * `ignoreNextModify` suppresses the modify event that follows a sync-driven
+ * `writeBinary` (PR1 disk-write invariant). The `chunksEqual` short-circuit
+ * in `fileToDb` is still data-level idempotent, but suppressing here saves
+ * the debounce timer and avoids history double-capture through the modify
+ * → fileToDb → captureLocal path.
  */
 export interface IWriteIgnore {
     /** Mark the next `delete` event on `path` as sync-driven. */
     ignoreDelete(path: string): void;
+    /** Mark the next `modify` event on `path` as sync-driven (echo from a
+     *  pull-side writeBinary). Consumed by the modify handler before any
+     *  scheduling work runs. */
+    ignoreNextModify(path: string): void;
 }
 
 /** Max snapshot→commit retries inside runWrite when a concurrent pull lands
