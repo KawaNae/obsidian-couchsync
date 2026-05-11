@@ -293,6 +293,20 @@ export class SyncEngine {
         return this.lastErrorDetail;
     }
 
+    /** Snapshot of replication progress for log/diagnostic exports. Returns
+     *  the current state plus the persisted checkpoint cursors. */
+    getDiagnosticsSnapshot(): {
+        state: SyncState;
+        lastPushedSeq: number | string;
+        remoteSeq: number | string;
+    } {
+        return {
+            state: this.state,
+            lastPushedSeq: this.checkpoints.getLastPushedSeq(),
+            remoteSeq: this.checkpoints.getRemoteSeq(),
+        };
+    }
+
     /** Expose the VisibilityGate so ConfigSync can share gating with the
      *  live sync loops. Both must agree on hidden/visible to avoid
      *  hidden-time fetch failures and dead-tx symptoms on iOS. */

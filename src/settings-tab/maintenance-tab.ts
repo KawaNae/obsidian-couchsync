@@ -5,6 +5,7 @@ import type { ConfigLocalDB } from "../db/config-local-db.ts";
 import type { SyncEngine } from "../db/sync-engine.ts";
 import type { StatusBar } from "../ui/status-bar.ts";
 import type { IModalPresenter } from "../types/modal-presenter.ts";
+import type { LogManager } from "../log/log-manager.ts";
 import { DOC_ID } from "../types/doc-id.ts";
 import { logError } from "../ui/log.ts";
 import { gcOrphanChunks } from "../db/chunk-gc.ts";
@@ -18,6 +19,7 @@ interface MaintenanceTabDeps {
     replicator: SyncEngine;
     statusBar: StatusBar;
     modalPresenter: IModalPresenter;
+    logManager: LogManager;
     onRestart: () => void;
     runChunkConsistencyReport: () => Promise<void>;
 }
@@ -79,6 +81,140 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
             toggle.setValue(settings.verboseNotice).onChange(async (value) => {
                 await deps.updateSettings({ verboseNotice: value });
             })
+        );
+
+    new Setting(el)
+        .setName("Log retention (days)")
+        .setDesc("How many days of log entries to keep in the persistent buffer. Must be at least 1.")
+        .addText((text) =>
+            text.setValue(String(settings.logRetentionDays)).onChange(async (value) => {
+                const num = parseInt(value, 10);
+                if (!isNaN(num) && num >= 1) {
+                    await deps.updateSettings({ logRetentionDays: num });
+                }
+            }),
+        );
+
+    new Setting(el)
+        .setName("Max log storage (MB)")
+        .setDesc("Upper bound on log buffer size in megabytes. Set to 0 for unlimited (only the day-based retention applies).")
+        .addText((text) =>
+            text.setValue(String(settings.logMaxStorageMB)).onChange(async (value) => {
+                const num = parseInt(value, 10);
+                if (!isNaN(num) && num >= 0) {
+                    await deps.updateSettings({ logMaxStorageMB: num });
+                }
+            }),
+        );
+
+    // Live stats + actions
+    const logStatsSetting = new Setting(el)
+        .setName("Log buffer")
+        .setDesc("Loading...");
+
+    const refreshLogStats = async () => {
+        try {
+            const stats = await deps.logManager.getStats();
+            if (stats.count === 0) {
+                logStatsSetting.setDesc("Empty.");
+                return;
+            }
+            const mb = (stats.approxBytes / (1024 * 1024)).toFixed(2);
+            const cap = settings.logMaxStorageMB === 0 ? "unlimited" : `${settings.logMaxStorageMB} MB`;
+            const oldest = stats.oldestTs ? new Date(stats.oldestTs).toISOString().slice(0, 19) : "-";
+            const newest = stats.newestTs ? new Date(stats.newestTs).toISOString().slice(0, 19) : "-";
+            logStatsSetting.setDesc(
+                `${stats.count} entries · ${mb} MB / ${cap} · ${oldest} → ${newest}`,
+            );
+        } catch (e: any) {
+            logStatsSetting.setDesc(`(failed to read stats: ${e?.message ?? e})`);
+        }
+    };
+    void refreshLogStats();
+
+    new Setting(el)
+        .setName("Export logs")
+        .setDesc(
+            "Write a snapshot of the persistent log buffer to the vault root as " +
+                "couchsync_log_<device>_<timestamp>.md. The snapshot is frozen — " +
+                "subsequent log entries do not modify the exported file. " +
+                "Note: this captures more than the Log View shows (the view is in-memory only).",
+        )
+        .addButton((btn) =>
+            btn.setButtonText("Export").onClick(async () => {
+                btn.setDisabled(true);
+                btn.setButtonText("Exporting...");
+                try {
+                    const result = await deps.logManager.exportToVault();
+                    new Notice(
+                        `CouchSync: exported ${result.count} log entries to ${result.path}`,
+                        8000,
+                    );
+                    await refreshLogStats();
+                } catch (e: any) {
+                    new Notice(`Log export failed: ${e?.message ?? e}`, 10000);
+                } finally {
+                    btn.setButtonText("Export");
+                    btn.setDisabled(false);
+                }
+            }),
+        );
+
+    new Setting(el)
+        .setName("Clear stored logs")
+        .setDesc("Delete all entries from the persistent log buffer (does not affect already-exported .md files).")
+        .addButton((btn) =>
+            btn.setButtonText("Clear")
+                .setWarning()
+                .onClick(async () => {
+                    const ok = await deps.modalPresenter.showConfirmModal(
+                        "Clear stored logs",
+                        "Delete all entries from the persistent log buffer? This cannot be undone. " +
+                            "Already-exported .md files in the vault are not affected.",
+                        "Clear",
+                        true,
+                    );
+                    if (!ok) return;
+                    btn.setDisabled(true);
+                    try {
+                        await deps.logManager.clearStoredLogs();
+                        new Notice("CouchSync: log buffer cleared.", 4000);
+                        await refreshLogStats();
+                    } catch (e: any) {
+                        new Notice(`Clear failed: ${e?.message ?? e}`, 10000);
+                    } finally {
+                        btn.setDisabled(false);
+                    }
+                }),
+        );
+
+    new Setting(el)
+        .setName("Delete local log database")
+        .setDesc("Advanced: drop the entire IndexedDB store backing the log buffer. Use only if the database is corrupted.")
+        .addButton((btn) =>
+            btn.setButtonText("Delete database")
+                .setWarning()
+                .onClick(async () => {
+                    const ok = await deps.modalPresenter.showConfirmModal(
+                        "Delete local log database",
+                        "Drop the entire IndexedDB store backing the log buffer? " +
+                            "All persistent log data on this device will be lost. " +
+                            "Only do this if the database is corrupted.",
+                        "Delete",
+                        true,
+                    );
+                    if (!ok) return;
+                    btn.setDisabled(true);
+                    try {
+                        await deps.logManager.deleteLogDatabase();
+                        new Notice("CouchSync: log database deleted.", 4000);
+                        await refreshLogStats();
+                    } catch (e: any) {
+                        new Notice(`Delete failed: ${e?.message ?? e}`, 10000);
+                    } finally {
+                        btn.setDisabled(false);
+                    }
+                }),
         );
 
     // Troubleshooting

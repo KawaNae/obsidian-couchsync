@@ -1,4 +1,4 @@
-import { Notice, Platform, Plugin } from "obsidian";
+import { Notice, Platform, Plugin, apiVersion } from "obsidian";
 import { type CouchSyncSettings, DEFAULT_SETTINGS } from "./settings.ts";
 import { LocalDB } from "./db/local-db.ts";
 import { ConfigLocalDB } from "./db/config-local-db.ts";
@@ -20,6 +20,8 @@ import { ProgressNotice } from "./ui/notices.ts";
 import { HistoryStorage } from "./history/storage.ts";
 import { HistoryCapture } from "./history/history-capture.ts";
 import { HistoryManager } from "./history/history-manager.ts";
+import { LogStorage } from "./log/log-storage.ts";
+import { LogManager } from "./log/log-manager.ts";
 import { DiffHistoryView, VIEW_TYPE_DIFF_HISTORY } from "./ui/history-view.ts";
 import { LogView, VIEW_TYPE_LOG } from "./ui/log-view.ts";
 import { migrateSettings } from "./settings-migration.ts";
@@ -49,6 +51,8 @@ export default class CouchSyncPlugin extends Plugin {
     private historyStorage!: HistoryStorage;
     private historyCapture!: HistoryCapture;
     historyManager!: HistoryManager;
+    logStorage!: LogStorage;
+    logManager!: LogManager;
     statusBar!: StatusBar;
     modalPresenter!: ObsidianModalPresenter;
     private conflictOrchestrator!: ConflictOrchestrator;
@@ -201,6 +205,29 @@ export default class CouchSyncPlugin extends Plugin {
         this.historyManager = new HistoryManager(
             vaultIO, this.historyStorage, this.historyCapture, () => this.settings,
         );
+        this.logStorage = new LogStorage(vaultName);
+        this.logManager = new LogManager({
+            storage: this.logStorage,
+            getSettings: () => this.settings,
+            getPluginVersion: () => this.manifest.version,
+            getObsidianVersion: () => apiVersion,
+            getPlatform: () => ({
+                os: typeof process !== "undefined" && process.platform ? process.platform : "unknown",
+                isMobile: Platform.isMobile,
+            }),
+            getSyncDiagnostics: () => {
+                const snap = this.replicator.getDiagnosticsSnapshot();
+                return {
+                    state: snap.state,
+                    connectionState: this.settings.connectionState,
+                    lastPushedSeq: typeof snap.lastPushedSeq === "number" ? snap.lastPushedSeq : undefined,
+                    remoteSeq: typeof snap.remoteSeq === "string" ? snap.remoteSeq : String(snap.remoteSeq),
+                };
+            },
+            vault: vaultIO,
+            doc: typeof document !== "undefined" ? document : undefined,
+            win: typeof window !== "undefined" ? window : undefined,
+        });
         this.conflictOrchestrator = new ConflictOrchestrator({
             modal: modalPresenter,
             localDb: this.localDb,
@@ -264,6 +291,7 @@ export default class CouchSyncPlugin extends Plugin {
         this.app.workspace.onLayoutReady(async () => {
             this.historyCapture.start();
             this.historyManager.startCleanup();
+            this.logManager.start();
             this.compositionTracker.start();
             this.compositionGate.start();
 
@@ -352,6 +380,7 @@ export default class CouchSyncPlugin extends Plugin {
         this.changeTracker?.stop();
         this.historyCapture?.stop();
         this.historyManager?.stopCleanup();
+        this.logManager?.stop();
         this.vaultWriter?.flushAll();
         this.compositionGate?.stop();
         this.compositionTracker?.stop();
@@ -360,6 +389,7 @@ export default class CouchSyncPlugin extends Plugin {
         this.reconciler?.destroy();
         this.statusBar?.destroy();
         this.historyStorage?.close();
+        this.logStorage?.close();
         await this.localDb?.close();
         if (this.configLocalDb) {
             try {

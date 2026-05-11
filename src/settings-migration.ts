@@ -32,4 +32,10 @@ export function migrateSettings(data: Record<string, any>): void {
         delete data.mobileStatusBottom;
         delete data.mobileStatusOffset;
     }
+
+    // v0.23: persistent log buffer settings. Defaults are picked up from
+    // DEFAULT_SETTINGS, but explicit migration keeps the data file's
+    // schema obvious on inspection.
+    if (data.logRetentionDays === undefined) data.logRetentionDays = 7;
+    if (data.logMaxStorageMB === undefined) data.logMaxStorageMB = 50;
 }

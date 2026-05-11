@@ -52,6 +52,13 @@ export interface CouchSyncSettings {
     // Maintenance
     verboseNotice: boolean;
 
+    // Persistent log buffer (LogManager)
+    /** Days of log history kept in IndexedDB. Required; must be >= 1. */
+    logRetentionDays: number;
+    /** Maximum log storage budget in MB. `0` disables the size cap
+     *  (only the day-based retention applies). */
+    logMaxStorageMB: number;
+
     // Internal
     connectionState: ConnectionState;
     /** Human-readable device name used as the vclock key (e.g. "desktop", "iphone"). */
@@ -90,6 +97,9 @@ export const DEFAULT_SETTINGS: CouchSyncSettings = {
     historyExcludePatterns: [],
 
     verboseNotice: false,
+
+    logRetentionDays: 7,
+    logMaxStorageMB: 50,
 
     connectionState: "editing",
     deviceId: "",
