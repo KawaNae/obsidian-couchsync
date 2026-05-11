@@ -131,7 +131,6 @@ export function createSyncHarness(opts: SyncHarnessOptions = {}): SyncHarness {
             getSettings,
             (doc) => vs.dbToFile(doc),
             /* isMobile */ false,
-            /* isIosApp */ false,
             auth,
             clientFactory,
         );

@@ -157,14 +157,18 @@ export class SyncEngine {
         isMobile: this.isMobile,
     });
 
-    /** Pauses live loops while the page is hidden. The gate exists for
-     *  iOS Safari (WKWebView), which force-aborts in-flight IndexedDB
-     *  transactions on visibilitychange→hidden — without it the push
-     *  loop exhausts HandleGuard's reopen budget. Chromium/Blink (Android
-     *  WebView, Electron on every desktop OS including macOS) has no
-     *  such issue, so we use ALWAYS_VISIBLE there to keep sync alive
-     *  while the window is minimised / occluded / on another workspace.
-     *  Initialised in the constructor body once `isIosApp` is known. */
+    /** Pauses live loops while the page is hidden. Two motivations:
+     *    - iOS Safari (WKWebView) force-aborts in-flight IndexedDB
+     *      transactions on visibilitychange→hidden — pausing dodges
+     *      HandleGuard's reopen budget being exhausted.
+     *    - Android WebView keeps IDB alive but the OS suspends the
+     *      network stack, so the push/pull fetches loop on
+     *      "TypeError: Failed to fetch" until resume. Pausing avoids
+     *      the retry log spam and pointless wakeups.
+     *  Electron desktop has no OS-level suspend; keeping the loops
+     *  running while the window is minimised / occluded is correct,
+     *  so it stays on ALWAYS_VISIBLE.
+     *  Initialised in the constructor body once `isMobile` is known. */
     private readonly visibility: VisibilityGate;
 
     // ── Checkpoints ───────────────────────────────────────
@@ -189,14 +193,13 @@ export class SyncEngine {
          *  schedules a reconciler retry. Throws are caught into
          *  `writeFailCount` so the batch log reflects reality. */
         private applyPullWrite: (doc: FileDoc) => Promise<WriteResult>,
+        /** True on Obsidian mobile (iOS + Android). Selects
+         *  BrowserVisibilityGate so push/pull loops pause on
+         *  visibilitychange→hidden. Desktop Electron keeps the loops
+         *  alive — there is no OS-level suspend to defend against and
+         *  the user expects sync to continue while the window is
+         *  minimised. */
         private isMobile: boolean = false,
-        /** True iff running inside iOS / iPadOS Obsidian (WKWebView).
-         *  Selects BrowserVisibilityGate to dodge WebKit's IDB
-         *  force-abort on visibilitychange→hidden. Every other client
-         *  (Android WebView, Electron desktop on Win/Mac/Linux) uses
-         *  Blink and gets ALWAYS_VISIBLE so sync keeps running while
-         *  hidden. */
-        private isIosApp: boolean = false,
         auth?: AuthGate,
         clientFactory?: (s: CouchSyncSettings) => ICouchClient,
     ) {
@@ -205,7 +208,7 @@ export class SyncEngine {
             makeCouchClient(s.couchdbUri, s.couchdbDbName, s.couchdbUser, s.couchdbPassword)
         );
         this.checkpoints = new Checkpoints(localDb);
-        this.visibility = (isIosApp && typeof document !== "undefined")
+        this.visibility = (isMobile && typeof document !== "undefined")
             ? new BrowserVisibilityGate(document)
             : ALWAYS_VISIBLE;
 

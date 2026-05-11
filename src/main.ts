@@ -141,7 +141,6 @@ export default class CouchSyncPlugin extends Plugin {
             () => this.settings,
             (doc) => this.vaultSync.dbToFile(doc),
             Platform.isMobile,
-            Platform.isIosApp,
             this.auth,
         );
         const reconnectBridge: ReconnectBridge = {
