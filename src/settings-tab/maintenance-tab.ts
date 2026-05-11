@@ -8,7 +8,6 @@ import type { IModalPresenter } from "../types/modal-presenter.ts";
 import type { LogManager } from "../log/log-manager.ts";
 import { DOC_ID } from "../types/doc-id.ts";
 import { logError } from "../ui/log.ts";
-import { gcOrphanChunks } from "../db/chunk-gc.ts";
 
 interface MaintenanceTabDeps {
     getSettings: () => CouchSyncSettings;
@@ -217,10 +216,6 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
                 }),
         );
 
-    // Troubleshooting
-    el.createEl("h3", { text: "Troubleshooting" });
-
-
     // ── Migration: legacy configs in vault DB ───────────────
     // Detect orphan `config:*` docs left in the vault DB after the
     // v0.11.0 split. Show the cleanup button only when there's
@@ -268,17 +263,29 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
     void (async () => {
         try {
             const offending = await deps.localDb.findLegacyVaultDoc();
-            if (offending && offending.startsWith("config:")) {
+            if (!offending) {
+                migrationSetting.setDesc(
+                    "No legacy configs detected in the vault DB.",
+                );
+                return;
+            }
+            if (offending.startsWith("config:")) {
                 migrationSetting.setDesc(
                     `Found legacy config docs in the vault DB (e.g. ${offending}). ` +
                         "Click to remove them after running Config Init in Config Sync.",
                 );
                 migrationBtnComponent?.setDisabled(false);
-            } else {
-                migrationSetting.setDesc(
-                    "No legacy configs detected in the vault DB.",
-                );
+                return;
             }
+            // Non-config offender (non-replicated doc id, or vclock-less
+            // FileDoc). This button can't fix it — direct the user to the
+            // full local rebuild path. Matches the startup notify message
+            // in main.ts.
+            migrationSetting.setDesc(
+                `Non-config legacy doc detected in the vault DB (${offending}). ` +
+                    "This button only handles config:* leftovers; use " +
+                    "\"Delete local vault database\" below to rebuild from remote.",
+            );
         } catch (e) {
             migrationSetting.setDesc("Could not check for legacy configs (see console).");
             logError(`CouchSync: legacy probe failed: ${e?.message ?? e}`);
@@ -291,7 +298,11 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
     new Setting(el)
         .setName("Chunk consistency report")
         .setDesc(
-            "Compare local and remote chunk inventories. Read-only; no changes are made.",
+            "Diagnostic tool — compares local and remote chunk inventories and " +
+                "surfaces drift the normal sync path cannot fix (one-sided orphans, " +
+                "broken references). In healthy operation this returns zero drift. " +
+                "Use after suspected sync issues or large migrations. The result " +
+                "modal exposes an optional repair action.",
         )
         .addButton((btn) =>
             btn.setButtonText("Run check").onClick(async () => {
@@ -299,31 +310,6 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
                 try {
                     await deps.runChunkConsistencyReport();
                 } finally {
-                    btn.setDisabled(false);
-                }
-            }),
-        );
-
-    new Setting(el)
-        .setName("Clean up orphan chunks")
-        .setDesc(
-            "Remove chunks no longer referenced by any note. Safe cleanup.",
-        )
-        .addButton((btn) =>
-            btn.setButtonText("Clean up").onClick(async () => {
-                btn.setDisabled(true);
-                btn.setButtonText("Cleaning...");
-                try {
-                    const result = await gcOrphanChunks(deps.localDb);
-                    new Notice(
-                        result.deletedChunks > 0
-                            ? `Deleted ${result.deletedChunks} orphan chunk(s) out of ${result.scannedChunks} total.`
-                            : `No orphan chunks found (${result.scannedChunks} chunks, all referenced).`,
-                    );
-                } catch (e: any) {
-                    new Notice(`Cleanup failed: ${e?.message ?? e}`, 10000);
-                } finally {
-                    btn.setButtonText("Clean up");
                     btn.setDisabled(false);
                 }
             }),
@@ -358,6 +344,17 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
                 .setButtonText("Delete & Restart")
                 .setWarning()
                 .onClick(async () => {
+                    const ok = await deps.modalPresenter.showConfirmModal(
+                        "Delete local vault database",
+                        "Destroy the entire local vault database on this device and " +
+                            "restart the plugin? Remote data is preserved — sync will " +
+                            "re-download from the remote on next start, which can take " +
+                            "minutes for large vaults. Local-only state (unpushed edits, " +
+                            "checkpoints) will be lost.",
+                        "Delete",
+                        true,
+                    );
+                    if (!ok) return;
                     deps.replicator.stop();
                     await deps.localDb.destroy();
                     new Notice("CouchSync: Local vault database deleted. Restarting...");
@@ -371,14 +368,23 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
             .setName("Delete local config database")
             .setDesc(
                 `Destroy the local config database (${configDbName}) and restart. ` +
-                    "Remote config data is preserved. Use this when switching device pools " +
-                    "(e.g. mobile ↔ desktop) leaves an unused local store behind.",
+                    "Remote config data is preserved. Mostly useful for cleaning up unused " +
+                    "local stores left behind by past device-pool reconfigurations.",
             )
             .addButton((btn) =>
                 btn
                     .setButtonText("Delete & Restart")
                     .setWarning()
                     .onClick(async () => {
+                        const ok = await deps.modalPresenter.showConfirmModal(
+                            "Delete local config database",
+                            `Destroy the local config database (${configDbName}) on this ` +
+                                "device and restart the plugin? Remote config data is " +
+                                "preserved — config will re-download on next start.",
+                            "Delete",
+                            true,
+                        );
+                        if (!ok) return;
                         try {
                             await deps.configLocalDb!.destroy();
                             new Notice(
