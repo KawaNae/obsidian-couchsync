@@ -413,15 +413,19 @@ export class PushPipeline {
             });
         }
 
-        // [8] Bulk push: chunks + classified-proceed files (with revs).
+        // [8] Bulk push: chunks first, then classified-proceed files.
+        //     Chunks must precede files in the bulkDocs array so they
+        //     receive lower update_seq values on the remote. This ensures
+        //     a pull-side _changes reader always sees chunks committed
+        //     before the file doc that references them.
         const toBulk: Array<CouchSyncDoc & { _rev?: string }> = [];
+        for (const c of chunkCandidates) {
+            toBulk.push(stripRev(c) as CouchSyncDoc & { _rev?: string });
+        }
         for (const p of classified.proceed) {
             const stripped = stripRev(p.doc) as CouchSyncDoc & { _rev?: string };
             if (p.remoteRev) stripped._rev = p.remoteRev;
             toBulk.push(stripped);
-        }
-        for (const c of chunkCandidates) {
-            toBulk.push(stripRev(c) as CouchSyncDoc & { _rev?: string });
         }
 
         let pushResult: PushDocsResult = { pushed: [], conflicts: [], denied: 0 };
