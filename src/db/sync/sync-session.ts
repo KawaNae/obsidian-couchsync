@@ -121,6 +121,7 @@ export class SyncSession {
             isCancelled,
             signal: this.signal,
             handleLocalDbError: deps.handleLocalDbError,
+            onTransientError: deps.onTransientError,
             delay,
         });
     }

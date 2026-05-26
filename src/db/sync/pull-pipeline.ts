@@ -24,6 +24,7 @@ import type { PullWriter } from "./pull-writer.ts";
 import type { SyncEvents } from "./sync-events.ts";
 import type { Checkpoints } from "./checkpoints.ts";
 import { classifyError } from "./errors.ts";
+import { EncryptionError } from "../encrypting-couch-client.ts";
 import type { VisibilityGate } from "../visibility-gate.ts";
 
 // Lowered from 200 in v0.20.6: 200-row `_changes?include_docs=true`
@@ -180,6 +181,13 @@ export class PullPipeline {
                     if (e instanceof DbError) {
                         this.deps.handleLocalDbError(e, "pull write");
                         await this.deps.delay(this.retryMs);
+                        continue;
+                    }
+
+                    if (e instanceof EncryptionError) {
+                        this.deps.onTransientError(e);
+                        await this.deps.delay(this.retryMs);
+                        this.retryMs = Math.min(this.retryMs * 2, PULL_RETRY_MAX_MS);
                         continue;
                     }
 

@@ -168,6 +168,9 @@ export default class CouchSyncPlugin extends Plugin {
             this.auth,
             encClientFactory,
             async (_signal) => {
+                if (this.encryptionMismatch) {
+                    throw new Error(`Encryption state mismatch: ${this.encryptionMismatch.status}`);
+                }
                 const raw = makeCouchClient(
                     this.settings.couchdbUri, this.settings.couchdbDbName,
                     this.settings.couchdbUser, this.settings.couchdbPassword,

@@ -49,6 +49,7 @@ import { compareVC, type VectorClock } from "../../sync/vector-clock.ts";
 import type { LocalDB } from "../local-db.ts";
 import type { ICouchClient } from "../interfaces.ts";
 import { DbError } from "../write-transaction.ts";
+import { EncryptionError } from "../encrypting-couch-client.ts";
 import { logDebug, logInfo, logWarn } from "../../ui/log.ts";
 import type { EchoTracker } from "./echo-tracker.ts";
 import type { SyncEvents } from "./sync-events.ts";
@@ -125,6 +126,7 @@ export interface PushPipelineDeps {
      *  teardown rather than consuming its 30s request timeout. */
     signal: AbortSignal;
     handleLocalDbError: (e: unknown, context: string) => void;
+    onTransientError: (err: unknown) => void;
     delay: (ms: number) => Promise<void>;
 }
 
@@ -254,6 +256,10 @@ export class PushPipeline {
                     // Either way: not a real error. Skip log + backoff and
                     // loop back to top — waitVisible will block until resume.
                     if (isAbortError(e) || this.deps.visibility.isHidden()) continue;
+                    if (e instanceof EncryptionError) {
+                        this.deps.onTransientError(e);
+                        continue;
+                    }
                     if (e instanceof DbError) {
                         this.deps.handleLocalDbError(e, `push loop [stage:${stage}]`);
                     } else {

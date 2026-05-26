@@ -21,6 +21,13 @@ import type {
 } from "./interfaces.ts";
 import type { CryptoProvider } from "./crypto-provider.ts";
 
+export class EncryptionError extends Error {
+    constructor(message: string, public readonly cause?: unknown) {
+        super(message);
+        this.name = "EncryptionError";
+    }
+}
+
 type AnyDoc = Record<string, unknown>;
 
 function hasEncryptableData(doc: AnyDoc): boolean {
@@ -68,14 +75,21 @@ export class EncryptingCouchClient implements ICouchClient {
 
     private async decryptDoc<T>(doc: T): Promise<T> {
         let d = doc as AnyDoc;
-        if (hasEncryptableData(d)) {
-            d = { ...d, data: await this.crypto.decrypt(d.data as string) };
-        }
-        if (typeof d.encryptedPath === "string") {
-            const prefix = idPrefix(d._id as string);
-            const path = await this.crypto.decryptPath(d.encryptedPath as string);
-            const { encryptedPath: _, ...rest } = d;
-            d = { ...rest, _id: prefix + path };
+        try {
+            if (hasEncryptableData(d)) {
+                d = { ...d, data: await this.crypto.decrypt(d.data as string) };
+            }
+            if (typeof d.encryptedPath === "string") {
+                const prefix = idPrefix(d._id as string);
+                const path = await this.crypto.decryptPath(d.encryptedPath as string);
+                const { encryptedPath: _, ...rest } = d;
+                d = { ...rest, _id: prefix + path };
+            }
+        } catch (e) {
+            throw new EncryptionError(
+                `Failed to decrypt doc ${d._id}: ${e instanceof Error ? e.message : e}`,
+                e,
+            );
         }
         return d as T;
     }
