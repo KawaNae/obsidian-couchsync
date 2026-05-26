@@ -167,3 +167,19 @@ function arrayBufToHex(buf: ArrayBuffer): string {
     for (let i = 0; i < bytes.length; i++) hex += bytes[i].toString(16).padStart(2, "0");
     return hex;
 }
+
+export async function computeMetaHmac(
+    passphrase: string,
+    salt: string,
+    keyCheck: string,
+    version: number,
+): Promise<string> {
+    const encoder = new TextEncoder();
+    const baseKey = await crypto.subtle.importKey(
+        "raw", encoder.encode(passphrase),
+        { name: "HMAC", hash: "SHA-256" }, false, ["sign"],
+    );
+    const payload = encoder.encode(`${salt}:${keyCheck}:${version}`);
+    const sig = await crypto.subtle.sign("HMAC", baseKey, payload);
+    return arrayBufToHex(sig);
+}

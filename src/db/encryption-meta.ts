@@ -13,6 +13,7 @@ import {
     createKeyCheck,
     verifyKeyCheck,
     createCryptoProvider,
+    computeMetaHmac,
     type EncryptionKeys,
     type CryptoProvider,
 } from "./crypto-provider.ts";
@@ -26,6 +27,7 @@ export interface EncryptionMetaDoc {
     salt: string;
     keyCheck: string;
     version: 1;
+    metaHmac?: string;
 }
 
 function uint8ToBase64(bytes: Uint8Array): string {
@@ -53,12 +55,15 @@ export async function deriveEncryption(
     const salt = generateSalt();
     const keys = await deriveKeys(passphrase, salt);
     const keyCheck = await createKeyCheck(keys);
+    const saltB64 = uint8ToBase64(salt);
+    const metaHmac = await computeMetaHmac(passphrase, saltB64, keyCheck, 1);
     const meta: EncryptionMetaDoc = {
         _id: META_DOC_ID,
         type: "encryption-meta",
-        salt: uint8ToBase64(salt),
+        salt: saltB64,
         keyCheck,
         version: 1,
+        metaHmac,
     };
     return { meta, keys, crypto: createCryptoProvider(keys) };
 }
@@ -75,6 +80,12 @@ export async function unlockWithPassphrase(
     meta: EncryptionMetaDoc,
     passphrase: string,
 ): Promise<{ keys: EncryptionKeys; crypto: CryptoProvider } | null> {
+    if (meta.metaHmac) {
+        const expected = await computeMetaHmac(
+            passphrase, meta.salt, meta.keyCheck, meta.version,
+        );
+        if (expected !== meta.metaHmac) return null;
+    }
     const salt = base64ToUint8(meta.salt);
     const keys = await deriveKeys(passphrase, salt);
     const ok = await verifyKeyCheck(keys, meta.keyCheck);

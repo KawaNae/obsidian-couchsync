@@ -335,6 +335,15 @@ export class SyncEngine {
         await this.openSession();
     }
 
+    async stopAndDrain(): Promise<void> {
+        const s = this.session;
+        this.stop();
+        if (s) {
+            s.dispose();
+            await s.settled;
+        }
+    }
+
     stop(): void {
         this.envListeners.detach();
         if (this.visibility instanceof BrowserVisibilityGate) {

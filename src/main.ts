@@ -597,64 +597,100 @@ export default class CouchSyncPlugin extends Plugin {
         this.changeTracker.stop();
     }
 
-    async enableEncryption(passphrase: string): Promise<void> {
-        this.stopSync();
-        const progress = new ProgressNotice("Encryption");
+    private async stopSyncAndDrain(): Promise<void> {
+        this.changeTracker.stop();
+        await this.replicator.stopAndDrain();
+    }
+
+    private encryptionOpInFlight = false;
+
+    private async withEncryptionOp<T>(
+        label: string,
+        body: (progress: ProgressNotice) => Promise<T>,
+    ): Promise<T> {
+        if (this.encryptionOpInFlight) {
+            throw new Error("Another encryption operation is already in progress.");
+        }
+        this.encryptionOpInFlight = true;
+        const progress = new ProgressNotice(label);
         try {
+            return await body(progress);
+        } catch (e: any) {
+            progress.fail(`${label} failed: ${e?.message ?? e}`);
+            throw e;
+        } finally {
+            this.encryptionOpInFlight = false;
+        }
+    }
+
+    async enableEncryption(passphrase: string): Promise<void> {
+        await this.withEncryptionOp("Encryption", async (progress) => {
+            await this.stopSyncAndDrain();
+
             progress.update("Deriving encryption keys...");
             const { meta, crypto } = await deriveEncryption(passphrase);
+
             this.cryptoProvider = crypto;
             this.remoteOps.setClientWrapper((raw) =>
                 new EncryptingCouchClient(raw, this.cryptoProvider!));
+            try {
+                progress.update("Re-initializing vault with encryption...");
+                await this.setupService.init((msg) => progress.update(msg));
 
-            progress.update("Re-initializing vault with encryption...");
-            await this.setupService.init((msg) => progress.update(msg));
+                progress.update("Writing encryption metadata...");
+                await pushEncryptionMeta(this.remoteOps.makeClient(), meta);
 
-            progress.update("Re-initializing config with encryption...");
-            await this.configSync.reinitForEncryptionChange((msg) => progress.update(msg));
+                progress.update("Re-initializing config with encryption...");
+                await this.configSync.reinitForEncryptionChange((msg) => progress.update(msg));
 
-            progress.update("Writing encryption metadata...");
-            await pushEncryptionMeta(this.remoteOps.makeClient(), meta);
-
-            this.settings.encryptionEnabled = true;
-            this.settings.encryptionPassphrase = passphrase;
-            this.settings.connectionState = "setupDone";
-            await this.saveSettings();
-            progress.done("Encryption enabled!");
-        } catch (e: any) {
-            progress.fail(`Enable encryption failed: ${e?.message ?? e}`);
-            throw e;
-        }
+                this.settings.encryptionEnabled = true;
+                this.settings.encryptionPassphrase = passphrase;
+                this.settings.connectionState = "setupDone";
+                await this.saveSettings();
+                progress.done("Encryption enabled!");
+            } catch (e) {
+                this.cryptoProvider = undefined;
+                this.remoteOps.setClientWrapper(undefined);
+                throw e;
+            }
+        });
     }
 
     async disableEncryption(): Promise<void> {
-        this.stopSync();
-        const progress = new ProgressNotice("Encryption");
-        try {
+        await this.withEncryptionOp("Encryption", async (progress) => {
+            await this.stopSyncAndDrain();
+
+            const prevCrypto = this.cryptoProvider;
+            const prevWrapper = prevCrypto
+                ? (raw: any) => new EncryptingCouchClient(raw, prevCrypto)
+                : undefined;
+
             this.cryptoProvider = undefined;
             this.remoteOps.setClientWrapper(undefined);
+            try {
+                progress.update("Re-initializing vault without encryption...");
+                await this.setupService.init((msg) => progress.update(msg));
 
-            progress.update("Re-initializing vault without encryption...");
-            await this.setupService.init((msg) => progress.update(msg));
+                progress.update("Re-initializing config without encryption...");
+                await this.configSync.reinitForEncryptionChange((msg) => progress.update(msg));
 
-            progress.update("Re-initializing config without encryption...");
-            await this.configSync.reinitForEncryptionChange((msg) => progress.update(msg));
-
-            this.settings.encryptionEnabled = false;
-            this.settings.encryptionPassphrase = "";
-            this.settings.connectionState = "setupDone";
-            await this.saveSettings();
-            progress.done("Encryption disabled!");
-        } catch (e: any) {
-            progress.fail(`Disable encryption failed: ${e?.message ?? e}`);
-            throw e;
-        }
+                this.settings.encryptionEnabled = false;
+                this.settings.encryptionPassphrase = "";
+                this.settings.connectionState = "setupDone";
+                await this.saveSettings();
+                progress.done("Encryption disabled!");
+            } catch (e) {
+                this.cryptoProvider = prevCrypto;
+                this.remoteOps.setClientWrapper(prevWrapper);
+                throw e;
+            }
+        });
     }
 
     async joinEncryptedRemote(passphrase: string): Promise<void> {
-        this.stopSync();
-        const progress = new ProgressNotice("Encryption");
-        try {
+        await this.withEncryptionOp("Encryption", async (progress) => {
+            await this.stopSyncAndDrain();
+
             progress.update("Verifying passphrase...");
             const rawClient = makeCouchClient(
                 this.settings.couchdbUri, this.settings.couchdbDbName,
@@ -664,64 +700,73 @@ export default class CouchSyncPlugin extends Plugin {
             if (!meta) throw new Error("encryption:meta not found on remote");
             const result = await unlockWithPassphrase(meta, passphrase);
             if (!result) throw new Error("Wrong passphrase");
+
             this.cryptoProvider = result.crypto;
             this.remoteOps.setClientWrapper((raw) =>
                 new EncryptingCouchClient(raw, this.cryptoProvider!));
+            try {
+                progress.update("Resetting local databases...");
+                await this.localDb.destroy();
+                this.localDb.open();
+                if (this.configLocalDb) {
+                    await this.configLocalDb.destroy();
+                    this.configLocalDb.open();
+                }
 
-            progress.update("Resetting local databases...");
-            await this.localDb.destroy();
-            this.localDb.open();
-            if (this.configLocalDb) {
-                await this.configLocalDb.destroy();
-                this.configLocalDb.open();
+                this.settings.encryptionEnabled = true;
+                this.settings.encryptionPassphrase = passphrase;
+                this.settings.connectionState = "syncing";
+                this.encryptionMismatch = undefined;
+                await this.saveSettings();
+
+                progress.done("Joined encrypted vault!");
+                await this.vaultSync.loadLastSyncedVclocks();
+                this.replicator.start();
+                this.changeTracker.start();
+            } catch (e) {
+                this.cryptoProvider = undefined;
+                this.remoteOps.setClientWrapper(undefined);
+                throw e;
             }
-
-            this.settings.encryptionEnabled = true;
-            this.settings.encryptionPassphrase = passphrase;
-            this.settings.connectionState = "syncing";
-            this.encryptionMismatch = undefined;
-            await this.saveSettings();
-
-            progress.done("Joined encrypted vault!");
-            await this.vaultSync.loadLastSyncedVclocks();
-            this.replicator.start();
-            this.changeTracker.start();
-        } catch (e: any) {
-            progress.fail(`Join encrypted remote failed: ${e?.message ?? e}`);
-            throw e;
-        }
+        });
     }
 
     async acceptPlaintextRemote(): Promise<void> {
-        this.stopSync();
-        const progress = new ProgressNotice("Encryption");
-        try {
-            progress.update("Disabling encryption...");
+        await this.withEncryptionOp("Encryption", async (progress) => {
+            await this.stopSyncAndDrain();
+
+            const prevCrypto = this.cryptoProvider;
+            const prevWrapper = prevCrypto
+                ? (raw: any) => new EncryptingCouchClient(raw, prevCrypto)
+                : undefined;
+
             this.cryptoProvider = undefined;
             this.remoteOps.setClientWrapper(undefined);
+            try {
+                progress.update("Resetting local databases...");
+                await this.localDb.destroy();
+                this.localDb.open();
+                if (this.configLocalDb) {
+                    await this.configLocalDb.destroy();
+                    this.configLocalDb.open();
+                }
 
-            progress.update("Resetting local databases...");
-            await this.localDb.destroy();
-            this.localDb.open();
-            if (this.configLocalDb) {
-                await this.configLocalDb.destroy();
-                this.configLocalDb.open();
+                this.settings.encryptionEnabled = false;
+                this.settings.encryptionPassphrase = "";
+                this.settings.connectionState = "syncing";
+                this.encryptionMismatch = undefined;
+                await this.saveSettings();
+
+                progress.done("Encryption disabled. Re-syncing...");
+                await this.vaultSync.loadLastSyncedVclocks();
+                this.replicator.start();
+                this.changeTracker.start();
+            } catch (e) {
+                this.cryptoProvider = prevCrypto;
+                this.remoteOps.setClientWrapper(prevWrapper);
+                throw e;
             }
-
-            this.settings.encryptionEnabled = false;
-            this.settings.encryptionPassphrase = "";
-            this.settings.connectionState = "syncing";
-            this.encryptionMismatch = undefined;
-            await this.saveSettings();
-
-            progress.done("Encryption disabled. Re-syncing...");
-            await this.vaultSync.loadLastSyncedVclocks();
-            this.replicator.start();
-            this.changeTracker.start();
-        } catch (e: any) {
-            progress.fail(`Accept plaintext remote failed: ${e?.message ?? e}`);
-            throw e;
-        }
+        });
     }
 
     private fireReconcile(reason: ReconcileReason): void {
