@@ -137,6 +137,11 @@ export class EncryptingCouchClient implements ICouchClient {
             }
             translated.keys = translatedKeys;
         }
+        const needPathRestore = !opts.keys
+            && (opts.startkey?.startsWith("file:") || opts.startkey?.startsWith("config:"));
+        if (needPathRestore && !opts.include_docs) {
+            translated.include_docs = true;
+        }
         const result = await this.inner.allDocs<T>(translated, signal);
         return {
             ...result,
@@ -145,7 +150,12 @@ export class EncryptingCouchClient implements ICouchClient {
                     const restoredId = reverseIdMap.get(row.id) ?? row.id;
                     if (!row.doc) return { ...row, id: restoredId };
                     const dec = await this.decryptDoc(row.doc);
-                    return { ...row, id: restoredId, doc: dec };
+                    const docId = (dec as AnyDoc)._id as string ?? restoredId;
+                    const out = { ...row, id: docId, doc: dec };
+                    if (needPathRestore && !opts.include_docs) {
+                        delete (out as any).doc;
+                    }
+                    return out;
                 }),
             ),
         };
