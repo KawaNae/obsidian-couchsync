@@ -168,9 +168,6 @@ export default class CouchSyncPlugin extends Plugin {
             this.auth,
             encClientFactory,
             async (_signal) => {
-                if (this.encryptionMismatch) {
-                    throw new Error(`Encryption state mismatch: ${this.encryptionMismatch.status}`);
-                }
                 const raw = makeCouchClient(
                     this.settings.couchdbUri, this.settings.couchdbDbName,
                     this.settings.couchdbUser, this.settings.couchdbPassword,
@@ -180,15 +177,18 @@ export default class CouchSyncPlugin extends Plugin {
                 );
                 if (agreement.status === "remote-encrypted"
                     || agreement.status === "remote-plaintext") {
+                    if (!this.encryptionMismatch) {
+                        notify(
+                            agreement.status === "remote-encrypted"
+                                ? "CouchSync: remote vault is encrypted. Open Settings → Vault Sync to enter passphrase."
+                                : "CouchSync: encryption was disabled by another device. Open Settings → Vault Sync to confirm.",
+                            15000,
+                        );
+                    }
                     this.encryptionMismatch = agreement;
-                    notify(
-                        agreement.status === "remote-encrypted"
-                            ? "CouchSync: remote vault is encrypted. Open Settings → Vault Sync to enter passphrase."
-                            : "CouchSync: encryption was disabled by another device. Open Settings → Vault Sync to confirm.",
-                        15000,
-                    );
                     throw new Error(`Encryption state mismatch: ${agreement.status}`);
                 }
+                this.encryptionMismatch = undefined;
             },
         );
         const reconnectBridge: ReconnectBridge = {
