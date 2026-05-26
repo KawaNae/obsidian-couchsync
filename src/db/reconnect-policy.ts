@@ -28,6 +28,7 @@ export type SyncErrorKind =
     | "network"   // unreachable, DNS, connection refused, fetch failed
     | "timeout"   // catchup idle timeout, request timeout
     | "server"    // 5xx
+    | "not-found" // 404 — DB deleted / recreated by another device
     | "unknown";
 
 export interface SyncErrorDetail {

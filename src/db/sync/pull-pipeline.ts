@@ -27,6 +27,12 @@ import { classifyError } from "./errors.ts";
 import { EncryptionError } from "../encrypting-couch-client.ts";
 import type { VisibilityGate } from "../visibility-gate.ts";
 
+function seqNumeric(seq: number | string): number {
+    if (typeof seq === "number") return seq;
+    const n = parseInt(seq, 10);
+    return Number.isNaN(n) ? 0 : n;
+}
+
 // Lowered from 200 in v0.20.6: 200-row `_changes?include_docs=true`
 // payloads can exceed the 30s wall-clock timeout on flaky mobile
 // networks (Android iPad observed in production). 100 is the safe
@@ -101,6 +107,10 @@ export class PullPipeline {
             if (this.deps.isCancelled()) return;
 
             if (result.results.length > 0) {
+                const storedSeq = this.deps.checkpoints.getRemoteSeq();
+                if (seqNumeric(result.last_seq) < seqNumeric(storedSeq)) {
+                    throw new Error("Remote database was recreated (seq regression)");
+                }
                 lastProgressAt = Date.now();
                 await this.applyBatch(result);
                 logDebug(
@@ -147,6 +157,15 @@ export class PullPipeline {
                     if (this.deps.isCancelled()) return;
 
                     if (result.results.length > 0) {
+                        const storedSeq = this.deps.checkpoints.getRemoteSeq();
+                        if (seqNumeric(result.last_seq) < seqNumeric(storedSeq)) {
+                            this.deps.onTransientError(
+                                new Error("Remote database was recreated (seq regression)"),
+                            );
+                            await this.deps.delay(this.retryMs);
+                            this.retryMs = Math.min(this.retryMs * 2, PULL_RETRY_MAX_MS);
+                            continue;
+                        }
                         this.retryMs = PULL_RETRY_MIN_MS;
                         this.lastErrorMsg = null;
                         await this.applyBatch(result);
@@ -193,7 +212,7 @@ export class PullPipeline {
 
                     const detail = classifyError(e);
 
-                    if (detail.kind === "auth" || detail.kind === "server") {
+                    if (detail.kind === "auth" || detail.kind === "server" || detail.kind === "not-found") {
                         this.deps.onTransientError(e);
                     } else {
                         // Deduplicate consecutive identical messages.

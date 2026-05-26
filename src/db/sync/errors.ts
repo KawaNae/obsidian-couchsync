@@ -32,6 +32,13 @@ export function classifyError(err: unknown): SyncErrorDetail {
             message: `Authentication failed (${code}). Check your CouchDB credentials.`,
         };
     }
+    if (code === 404) {
+        return {
+            kind: "not-found",
+            code,
+            message: "Database not found (404). It may have been recreated by another device.",
+        };
+    }
     if (typeof code === "number" && code >= 500) {
         return {
             kind: "server",

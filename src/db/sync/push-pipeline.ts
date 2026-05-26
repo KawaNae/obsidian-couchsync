@@ -50,6 +50,7 @@ import type { LocalDB } from "../local-db.ts";
 import type { ICouchClient } from "../interfaces.ts";
 import { DbError } from "../write-transaction.ts";
 import { EncryptionError } from "../encrypting-couch-client.ts";
+import { classifyError } from "./errors.ts";
 import { logDebug, logInfo, logWarn } from "../../ui/log.ts";
 import type { EchoTracker } from "./echo-tracker.ts";
 import type { SyncEvents } from "./sync-events.ts";
@@ -259,6 +260,13 @@ export class PushPipeline {
                     if (e instanceof EncryptionError) {
                         this.deps.onTransientError(e);
                         continue;
+                    }
+                    {
+                        const detail = classifyError(e);
+                        if (detail.kind === "not-found") {
+                            this.deps.onTransientError(e);
+                            continue;
+                        }
                     }
                     if (e instanceof DbError) {
                         this.deps.handleLocalDbError(e, `push loop [stage:${stage}]`);
