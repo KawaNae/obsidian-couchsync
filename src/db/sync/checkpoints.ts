@@ -57,8 +57,8 @@ export class Checkpoints {
             }
         }
 
-        if (remote !== null) this.remoteSeq = remote;
-        if (push !== null) this.lastPushedSeq = push;
+        this.remoteSeq = remote ?? 0;
+        this.lastPushedSeq = push ?? 0;
         logDebug(`checkpoints loaded: remoteSeq=${this.remoteSeq} pushSeq=${this.lastPushedSeq}`);
     }
 
