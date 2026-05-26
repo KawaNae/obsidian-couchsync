@@ -19,6 +19,7 @@
 import type { CouchSyncDoc } from "../../types.ts";
 import type { LocalDB } from "../local-db.ts";
 import type { CouchSyncSettings } from "../../settings.ts";
+import type { ICouchClient } from "../interfaces.ts";
 import { CouchClient, makeCouchClient } from "../couch-client.ts";
 import * as remoteCouch from "../remote-couch.ts";
 import type { AuthGate } from "./auth-gate.ts";
@@ -26,22 +27,28 @@ import type { AuthGate } from "./auth-gate.ts";
 export type ProgressCallback = (docId: string, count: number) => void;
 
 export class VaultRemoteOps {
+    private clientWrapper?: (raw: CouchClient) => ICouchClient;
+
     constructor(
         private localDb: LocalDB,
         private getSettings: () => CouchSyncSettings,
         private auth: AuthGate,
     ) {}
 
+    setClientWrapper(wrapper: ((raw: CouchClient) => ICouchClient) | undefined): void {
+        this.clientWrapper = wrapper;
+    }
+
     /** One-shot push of the entire vault local DB to the vault remote. */
     async pushAll(onProgress?: ProgressCallback): Promise<number> {
-        return remoteCouch.pushAll(this.localDb, this.makeClient(), onProgress);
+        return remoteCouch.pushAll(this.localDb, this.makeWrappedClient(), onProgress);
     }
 
     /** One-shot pull of the entire vault remote → local. */
     async pullAll(
         onProgress?: ProgressCallback,
     ): Promise<{ written: number; docs: CouchSyncDoc[] }> {
-        return remoteCouch.pullAll(this.localDb, this.makeClient(), onProgress);
+        return remoteCouch.pullAll(this.localDb, this.makeWrappedClient(), onProgress);
     }
 
     /** Destroy the vault remote database (auto-recreated on next push). */
@@ -92,5 +99,10 @@ export class VaultRemoteOps {
         return makeCouchClient(
             s.couchdbUri, s.couchdbDbName, s.couchdbUser, s.couchdbPassword,
         );
+    }
+
+    private makeWrappedClient(): ICouchClient {
+        const raw = this.makeClient();
+        return this.clientWrapper ? this.clientWrapper(raw) : raw;
     }
 }

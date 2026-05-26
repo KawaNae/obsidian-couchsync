@@ -41,7 +41,6 @@ import { makeCouchClient } from "./db/couch-client.ts";
 import { fetchEncryptionMeta, unlockWithPassphrase, initEncryptionMeta } from "./db/encryption-meta.ts";
 import { PassphraseModal } from "./ui/passphrase-modal.ts";
 import type { ICouchClient } from "./db/interfaces.ts";
-import * as remoteCouch from "./db/remote-couch.ts";
 
 export default class CouchSyncPlugin extends Plugin {
     settings!: CouchSyncSettings;
@@ -413,6 +412,8 @@ export default class CouchSyncPlugin extends Plugin {
                         return;
                     }
                     this.cryptoProvider = result.crypto;
+                    this.remoteOps.setClientWrapper((raw) =>
+                        new EncryptingCouchClient(raw, this.cryptoProvider!));
                 } catch (e: any) {
                     logError(`CouchSync: encryption unlock failed: ${e?.message ?? e}`);
                     return;
@@ -542,10 +543,11 @@ export default class CouchSyncPlugin extends Plugin {
             progress.update("Initializing encryption...");
             const { crypto } = await initEncryptionMeta(rawClient, passphrase);
             this.cryptoProvider = crypto;
+            this.remoteOps.setClientWrapper((raw) =>
+                new EncryptingCouchClient(raw, this.cryptoProvider!));
 
             progress.update("Re-pushing with encryption...");
-            const encClient = new EncryptingCouchClient(rawClient, crypto);
-            await remoteCouch.pushAll(this.localDb, encClient, (id, n) => {
+            await this.remoteOps.pushAll((id, n) => {
                 progress.update(`Pushing: ${n} docs`);
             });
 
@@ -582,7 +584,8 @@ export default class CouchSyncPlugin extends Plugin {
 
             progress.update("Re-pushing without encryption...");
             this.cryptoProvider = undefined;
-            await remoteCouch.pushAll(this.localDb, rawClient, (id, n) => {
+            this.remoteOps.setClientWrapper(undefined);
+            await this.remoteOps.pushAll((id, n) => {
                 progress.update(`Pushing: ${n} docs`);
             });
 
