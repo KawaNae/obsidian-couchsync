@@ -386,7 +386,7 @@ export default class CouchSyncPlugin extends Plugin {
                 );
             }
 
-            // E2E encryption: require passphrase before sync starts.
+            // E2E encryption: derive keys from stored passphrase or prompt.
             if (this.settings.encryptionEnabled && !this.cryptoProvider) {
                 try {
                     const rawClient = makeCouchClient(
@@ -400,16 +400,25 @@ export default class CouchSyncPlugin extends Plugin {
                         notify("CouchSync: encryption:meta doc not found on server. Re-enable encryption from Settings.", 10000);
                         return;
                     }
-                    const modal = new PassphraseModal(this.app, false);
-                    const passphrase = await modal.waitForResult();
+                    let passphrase = this.settings.encryptionPassphrase;
                     if (!passphrase) {
-                        notify("CouchSync: passphrase required. Sync paused.", 8000);
-                        return;
+                        const modal = new PassphraseModal(this.app, false);
+                        passphrase = await modal.waitForResult() ?? "";
+                        if (!passphrase) {
+                            notify("CouchSync: passphrase required. Sync paused.", 8000);
+                            return;
+                        }
                     }
                     const result = await unlockWithPassphrase(meta, passphrase);
                     if (!result) {
+                        this.settings.encryptionPassphrase = "";
+                        await this.saveSettings();
                         notify("CouchSync: wrong passphrase. Sync paused.", 8000);
                         return;
+                    }
+                    if (!this.settings.encryptionPassphrase) {
+                        this.settings.encryptionPassphrase = passphrase;
+                        await this.saveSettings();
                     }
                     this.cryptoProvider = result.crypto;
                     this.remoteOps.setClientWrapper((raw) =>
@@ -548,6 +557,7 @@ export default class CouchSyncPlugin extends Plugin {
             await pushEncryptionMeta(this.remoteOps.makeClient(), meta);
 
             this.settings.encryptionEnabled = true;
+            this.settings.encryptionPassphrase = passphrase;
             this.settings.connectionState = "setupDone";
             await this.saveSettings();
             progress.done("Encryption enabled!");
@@ -568,6 +578,7 @@ export default class CouchSyncPlugin extends Plugin {
             await this.setupService.init((msg) => progress.update(msg));
 
             this.settings.encryptionEnabled = false;
+            this.settings.encryptionPassphrase = "";
             this.settings.connectionState = "setupDone";
             await this.saveSettings();
             progress.done("Encryption disabled!");

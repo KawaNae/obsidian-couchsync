@@ -61,6 +61,7 @@ export interface CouchSyncSettings {
 
     // E2E Encryption
     encryptionEnabled: boolean;
+    encryptionPassphrase: string;
 
     // Internal
     connectionState: ConnectionState;
@@ -105,6 +106,7 @@ export const DEFAULT_SETTINGS: CouchSyncSettings = {
     logMaxStorageMB: 50,
 
     encryptionEnabled: false,
+    encryptionPassphrase: "",
 
     connectionState: "editing",
     deviceId: "",
