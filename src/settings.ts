@@ -59,6 +59,9 @@ export interface CouchSyncSettings {
      *  (only the day-based retention applies). */
     logMaxStorageMB: number;
 
+    // E2E Encryption
+    encryptionEnabled: boolean;
+
     // Internal
     connectionState: ConnectionState;
     /** Human-readable device name used as the vclock key (e.g. "desktop", "iphone"). */
@@ -100,6 +103,8 @@ export const DEFAULT_SETTINGS: CouchSyncSettings = {
 
     logRetentionDays: 7,
     logMaxStorageMB: 50,
+
+    encryptionEnabled: false,
 
     connectionState: "editing",
     deviceId: "",

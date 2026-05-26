@@ -1,0 +1,77 @@
+/**
+ * Manages the encryption metadata document stored in the remote vault DB.
+ *
+ * The `encryption:meta` doc holds the PBKDF2 salt and a key-check token
+ * so that new devices can derive the same keys from the passphrase and
+ * verify correctness before attempting to decrypt any content.
+ */
+
+import type { ICouchClient } from "./interfaces.ts";
+import {
+    deriveKeys,
+    generateSalt,
+    createKeyCheck,
+    verifyKeyCheck,
+    createCryptoProvider,
+    type EncryptionKeys,
+    type CryptoProvider,
+} from "./crypto-provider.ts";
+
+const META_DOC_ID = "encryption:meta";
+
+export interface EncryptionMetaDoc {
+    _id: typeof META_DOC_ID;
+    _rev?: string;
+    type: "encryption-meta";
+    salt: string;
+    keyCheck: string;
+    version: 1;
+}
+
+function uint8ToBase64(bytes: Uint8Array): string {
+    let binary = "";
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    return btoa(binary);
+}
+
+function base64ToUint8(b64: string): Uint8Array {
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+}
+
+export async function fetchEncryptionMeta(
+    client: ICouchClient,
+): Promise<EncryptionMetaDoc | null> {
+    return client.getDoc<EncryptionMetaDoc>(META_DOC_ID);
+}
+
+export async function initEncryptionMeta(
+    client: ICouchClient,
+    passphrase: string,
+): Promise<{ meta: EncryptionMetaDoc; keys: EncryptionKeys; crypto: CryptoProvider }> {
+    const salt = generateSalt();
+    const keys = await deriveKeys(passphrase, salt);
+    const keyCheck = await createKeyCheck(keys);
+    const meta: EncryptionMetaDoc = {
+        _id: META_DOC_ID,
+        type: "encryption-meta",
+        salt: uint8ToBase64(salt),
+        keyCheck,
+        version: 1,
+    };
+    await client.bulkDocs([meta]);
+    return { meta, keys, crypto: createCryptoProvider(keys) };
+}
+
+export async function unlockWithPassphrase(
+    meta: EncryptionMetaDoc,
+    passphrase: string,
+): Promise<{ keys: EncryptionKeys; crypto: CryptoProvider } | null> {
+    const salt = base64ToUint8(meta.salt);
+    const keys = await deriveKeys(passphrase, salt);
+    const ok = await verifyKeyCheck(keys, meta.keyCheck);
+    if (!ok) return null;
+    return { keys, crypto: createCryptoProvider(keys) };
+}

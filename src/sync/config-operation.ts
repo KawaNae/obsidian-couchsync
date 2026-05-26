@@ -28,7 +28,7 @@
 
 import type { AuthGate } from "../db/sync/auth-gate.ts";
 import type { VisibilityGate } from "../db/visibility-gate.ts";
-import type { CouchClient } from "../db/couch-client.ts";
+import type { ICouchClient } from "../db/interfaces.ts";
 import { classifyError } from "../db/sync/errors.ts";
 import type { ReconnectBridge } from "./reconnect-bridge.ts";
 
@@ -48,7 +48,7 @@ export const CONFIG_TIMEOUTS = {
 
 export interface ConfigOpContext {
     /** The probe-and-body client (full timeout). Use this for allDocs/bulk. */
-    client: CouchClient;
+    client: ICouchClient;
     /** Cancellation signal — propagate into every fetch / waitable. */
     signal: AbortSignal;
 }
@@ -62,7 +62,7 @@ export interface ConfigOperationDeps {
      * the operation doesn't have to know about settings shape. Returning
      * null means "config sync is not configured" → op is rejected.
      */
-    makeClient: () => CouchClient | null;
+    makeClient: () => ICouchClient | null;
 }
 
 export class ConfigOperationError extends Error {

@@ -75,15 +75,21 @@ function splitBase64(base64: string): string[] {
     return chunks;
 }
 
-export async function splitIntoChunks(content: ArrayBuffer): Promise<ChunkDoc[]> {
+export type ChunkHashFn = (data: string) => Promise<string>;
+
+export async function splitIntoChunks(
+    content: ArrayBuffer,
+    hashFn?: ChunkHashFn,
+): Promise<ChunkDoc[]> {
     const base64 = arrayBufferToBase64(content);
     const pieces = splitBase64(base64);
+    const hash = hashFn ?? computeHash;
 
     const chunks: ChunkDoc[] = [];
     for (const piece of pieces) {
-        const hash = await computeHash(piece);
+        const h = await hash(piece);
         chunks.push({
-            _id: makeChunkId(hash),
+            _id: makeChunkId(h),
             type: "chunk",
             data: piece,
         });

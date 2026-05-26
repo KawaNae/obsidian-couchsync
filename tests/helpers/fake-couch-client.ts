@@ -200,6 +200,10 @@ export class FakeCouchClient implements ICouchClient {
         this.revCounter = 0;
     }
 
+    withTimeout(_ms: number): ICouchClient {
+        return this;
+    }
+
     getLastPullBodyChunkAt(): number | null {
         return this.lastPullBodyChunkAt;
     }

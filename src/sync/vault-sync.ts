@@ -3,7 +3,7 @@ import type { LocalDB } from "../db/local-db.ts";
 import type { FileDoc, ChunkDoc, CouchSyncDoc } from "../types.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { VaultWriter, WriteResult } from "./vault-writer.ts";
-import { splitIntoChunks, joinChunks } from "../db/chunker.ts";
+import { splitIntoChunks, joinChunks, type ChunkHashFn } from "../db/chunker.ts";
 import { notify } from "../ui/log.ts";
 import { compareVC, incrementVC, mergeVC } from "./vector-clock.ts";
 import type { VectorClock } from "./vector-clock.ts";
@@ -98,12 +98,17 @@ export class VaultSync {
      */
     private pendingProbe: IPendingProbe | null = null;
 
+    private readonly hashFn?: ChunkHashFn;
+
     constructor(
         private vault: IVaultIO,
         private db: LocalDB,
         private getSettings: () => CouchSyncSettings,
         private vaultWriter: VaultWriter,
-    ) {}
+        hashFn?: ChunkHashFn,
+    ) {
+        this.hashFn = hashFn;
+    }
 
     /**
      * Wire the pending-edit probe (invariant 4). Called from `main.ts`
@@ -164,7 +169,7 @@ export class VaultSync {
         }
 
         const content = await this.vault.readBinary(path);
-        const chunks = await splitIntoChunks(content);
+        const chunks = await splitIntoChunks(content, this.hashFn);
         const chunkIds = chunks.map((c) => c._id);
 
         const deviceId = settings.deviceId;
@@ -595,7 +600,7 @@ export class VaultSync {
         const fileStat = await this.vault.stat(path);
         if (!fileStat) return;
         const content = await this.vault.readBinary(path);
-        const chunks = await splitIntoChunks(content);
+        const chunks = await splitIntoChunks(content, this.hashFn);
         const chunkIds = chunks.map((c) => c._id);
         const fileId = makeFileId(path);
         const deviceId = settings.deviceId;
@@ -776,7 +781,7 @@ export class VaultSync {
 
     private async localChunkIds(path: string): Promise<string[]> {
         const content = await this.vault.readBinary(path);
-        const chunks = await splitIntoChunks(content);
+        const chunks = await splitIntoChunks(content, this.hashFn);
         return chunks.map((c) => c._id);
     }
 

@@ -13,7 +13,8 @@ import type { CouchSyncSettings } from "../settings.ts";
 import { ProgressNotice } from "../ui/notices.ts";
 import { arrayBufferToBase64, base64ToArrayBuffer } from "../db/chunker.ts";
 import { incrementVC } from "./vector-clock.ts";
-import { CouchClient, makeCouchClient } from "../db/couch-client.ts";
+import type { ICouchClient } from "../db/interfaces.ts";
+import { makeCouchClient } from "../db/couch-client.ts";
 import { logError, logWarn } from "../ui/log.ts";
 import * as remoteCouch from "../db/remote-couch.ts";
 import {
@@ -62,7 +63,7 @@ import { ConfigSetupService } from "./config-setup.ts";
  *     same VC discipline as FileDoc — concurrent edits are detected
  *     and surfaced rather than silently LWW-merged.
  */
-function defaultClientFactory(settings: CouchSyncSettings): CouchClient | null {
+function defaultClientFactory(settings: CouchSyncSettings): ICouchClient | null {
     if (!settings.couchdbConfigDbName) return null;
     return makeCouchClient(
         settings.couchdbUri,
@@ -90,7 +91,7 @@ export class ConfigSync {
      * a real CouchDB. Production code never sets this, so the default
      * `makeCouchClient` factory is used.
      */
-    private readonly clientFactory: (settings: CouchSyncSettings) => CouchClient | null;
+    private readonly clientFactory: (settings: CouchSyncSettings) => ICouchClient | null;
 
     /** Per-path `{vclock, size, dataHash}` cache. Drives the scan()
      *  short-circuit so unchanged files don't get rewritten on every
@@ -115,7 +116,7 @@ export class ConfigSync {
         private visibility: VisibilityGate,
         private reconnectBridge: ReconnectBridge,
         private getSettings: () => CouchSyncSettings,
-        clientFactory?: (settings: CouchSyncSettings) => CouchClient | null,
+        clientFactory?: (settings: CouchSyncSettings) => ICouchClient | null,
     ) {
         this.clientFactory = clientFactory ?? defaultClientFactory;
         this.lastSynced = configDb ? new ConfigLastSynced(configDb) : null;

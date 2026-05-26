@@ -168,4 +168,7 @@ export interface ICouchClient {
      * and probe traffic deliberately do not update this stamp.
      */
     getLastPullBodyChunkAt(): number | null;
+    /** Derive a sibling client with the same credentials but a different
+     *  per-request timeout. */
+    withTimeout(ms: number): ICouchClient;
 }

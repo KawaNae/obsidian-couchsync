@@ -101,7 +101,7 @@ export class CouchClient implements ICouchClient {
      * per-request timeout. Used by ConfigOperation to run a short-timeout
      * reachability probe (`info()`) before committing to a 30s allDocs.
      */
-    withTimeout(ms: number): CouchClient {
+    withTimeout(ms: number): ICouchClient {
         return new CouchClient({
             baseUrl: this.baseUrl,
             auth: this.auth,

@@ -34,6 +34,13 @@ import { ObsidianModalPresenter } from "./adapters/obsidian-modal-presenter.ts";
 import { ObsidianCompositionTracker } from "./adapters/obsidian-composition-tracker.ts";
 import { EditorAwareVaultWriter } from "./adapters/editor-aware-vault-writer.ts";
 import { CompositionGate } from "./sync/composition-gate.ts";
+import type { CryptoProvider } from "./db/crypto-provider.ts";
+import type { ChunkHashFn } from "./db/chunker.ts";
+import { EncryptingCouchClient } from "./db/encrypting-couch-client.ts";
+import { makeCouchClient } from "./db/couch-client.ts";
+import { fetchEncryptionMeta, unlockWithPassphrase, initEncryptionMeta } from "./db/encryption-meta.ts";
+import { PassphraseModal } from "./ui/passphrase-modal.ts";
+import type { ICouchClient } from "./db/interfaces.ts";
 
 export default class CouchSyncPlugin extends Plugin {
     settings!: CouchSyncSettings;
@@ -59,6 +66,7 @@ export default class CouchSyncPlugin extends Plugin {
     private compositionTracker!: ObsidianCompositionTracker;
     private compositionGate!: CompositionGate;
     private vaultWriter!: EditorAwareVaultWriter;
+    private cryptoProvider?: CryptoProvider;
 
     async onload(): Promise<void> {
         await this.loadSettings();
@@ -126,7 +134,10 @@ export default class CouchSyncPlugin extends Plugin {
             this.app, vaultIO, this.compositionGate,
             null, this.historyCapture,
         );
-        this.vaultSync = new VaultSync(vaultIO, this.localDb, () => this.settings, this.vaultWriter);
+        const hashFn: ChunkHashFn | undefined = this.cryptoProvider
+            ? (data) => this.cryptoProvider!.hmacHash(data)
+            : undefined;
+        this.vaultSync = new VaultSync(vaultIO, this.localDb, () => this.settings, this.vaultWriter, hashFn);
         this.changeTracker = new ChangeTracker(vaultEvents, this.vaultSync, () => this.settings);
         // Late-bind the writeIgnore once ChangeTracker exists. It is
         // used by VaultWriter only on the deletion path (the modify
@@ -140,12 +151,20 @@ export default class CouchSyncPlugin extends Plugin {
         // call vaultSync.dbToFile directly via constructor DI (replaces
         // the former events.onAsync("pull-write", ...) bus, whose catch-
         // all swallowed write errors and let `Pull: N written` lie).
+        const encClientFactory: ((s: CouchSyncSettings) => ICouchClient) | undefined =
+            this.cryptoProvider
+                ? (s) => new EncryptingCouchClient(
+                    makeCouchClient(s.couchdbUri, s.couchdbDbName, s.couchdbUser, s.couchdbPassword),
+                    this.cryptoProvider!,
+                )
+                : undefined;
         this.replicator = new SyncEngine(
             this.localDb,
             () => this.settings,
             (doc) => this.vaultSync.dbToFile(doc),
             Platform.isMobile,
             this.auth,
+            encClientFactory,
         );
         const reconnectBridge: ReconnectBridge = {
             notifyTransient: () => {
@@ -158,6 +177,15 @@ export default class CouchSyncPlugin extends Plugin {
                 );
             },
         };
+        const encConfigClientFactory = this.cryptoProvider
+            ? (s: CouchSyncSettings) => {
+                if (!s.couchdbConfigDbName) return null;
+                return new EncryptingCouchClient(
+                    makeCouchClient(s.couchdbUri, s.couchdbConfigDbName, s.couchdbUser, s.couchdbPassword),
+                    this.cryptoProvider!,
+                ) as ICouchClient;
+            }
+            : undefined;
         this.configSync = new ConfigSync(
             adapterIO,
             modalPresenter,
@@ -166,6 +194,7 @@ export default class CouchSyncPlugin extends Plugin {
             this.replicator.getVisibilityGate(),
             reconnectBridge,
             () => this.settings,
+            encConfigClientFactory,
         );
         this.statusBar = new StatusBar(
             this,
