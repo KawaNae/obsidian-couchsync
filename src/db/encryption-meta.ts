@@ -47,8 +47,7 @@ export async function fetchEncryptionMeta(
     return client.getDoc<EncryptionMetaDoc>(META_DOC_ID);
 }
 
-export async function initEncryptionMeta(
-    client: ICouchClient,
+export async function deriveEncryption(
     passphrase: string,
 ): Promise<{ meta: EncryptionMetaDoc; keys: EncryptionKeys; crypto: CryptoProvider }> {
     const salt = generateSalt();
@@ -61,8 +60,15 @@ export async function initEncryptionMeta(
         keyCheck,
         version: 1,
     };
-    await client.bulkDocs([meta]);
     return { meta, keys, crypto: createCryptoProvider(keys) };
+}
+
+export async function pushEncryptionMeta(
+    client: ICouchClient,
+    meta: EncryptionMetaDoc,
+): Promise<void> {
+    const { _rev, ...withoutRev } = meta;
+    await client.bulkDocs([withoutRev]);
 }
 
 export async function unlockWithPassphrase(

@@ -38,7 +38,7 @@ import type { CryptoProvider } from "./db/crypto-provider.ts";
 import { computeHash, type ChunkHashFn } from "./db/chunker.ts";
 import { EncryptingCouchClient } from "./db/encrypting-couch-client.ts";
 import { makeCouchClient } from "./db/couch-client.ts";
-import { fetchEncryptionMeta, unlockWithPassphrase, initEncryptionMeta } from "./db/encryption-meta.ts";
+import { fetchEncryptionMeta, unlockWithPassphrase, deriveEncryption, pushEncryptionMeta } from "./db/encryption-meta.ts";
 import { PassphraseModal } from "./ui/passphrase-modal.ts";
 import type { ICouchClient } from "./db/interfaces.ts";
 
@@ -529,38 +529,22 @@ export default class CouchSyncPlugin extends Plugin {
         this.stopSync();
         const progress = new ProgressNotice("Encryption");
         try {
-            const rawClient = makeCouchClient(
-                this.settings.couchdbUri,
-                this.settings.couchdbDbName,
-                this.settings.couchdbUser,
-                this.settings.couchdbPassword,
-            );
-
-            progress.update("Destroying remote DB...");
-            await rawClient.destroy();
-            await rawClient.ensureDb();
-
-            progress.update("Initializing encryption...");
-            const { crypto } = await initEncryptionMeta(rawClient, passphrase);
+            progress.update("Deriving encryption keys...");
+            const { meta, crypto } = await deriveEncryption(passphrase);
             this.cryptoProvider = crypto;
             this.remoteOps.setClientWrapper((raw) =>
                 new EncryptingCouchClient(raw, this.cryptoProvider!));
 
-            progress.update("Re-pushing with encryption...");
-            await this.remoteOps.pushAll((id, n) => {
-                progress.update(`Pushing: ${n} docs`);
-            });
+            progress.update("Re-initializing vault with encryption...");
+            await this.setupService.init((msg) => progress.update(msg));
 
-            progress.update("Resetting checkpoints...");
-            const checkpoints = this.replicator.getCheckpoints();
-            checkpoints.setRemoteSeq(0);
-            checkpoints.setLastPushedSeq(0);
-            await checkpoints.save();
+            progress.update("Writing encryption metadata...");
+            await pushEncryptionMeta(this.remoteOps.makeClient(), meta);
 
             this.settings.encryptionEnabled = true;
             this.settings.connectionState = "setupDone";
             await this.saveSettings();
-            progress.done("Encryption enabled! Restart the plugin to begin syncing.");
+            progress.done("Encryption enabled!");
         } catch (e: any) {
             progress.fail(`Enable encryption failed: ${e?.message ?? e}`);
             throw e;
@@ -571,34 +555,16 @@ export default class CouchSyncPlugin extends Plugin {
         this.stopSync();
         const progress = new ProgressNotice("Encryption");
         try {
-            const rawClient = makeCouchClient(
-                this.settings.couchdbUri,
-                this.settings.couchdbDbName,
-                this.settings.couchdbUser,
-                this.settings.couchdbPassword,
-            );
-
-            progress.update("Destroying remote DB...");
-            await rawClient.destroy();
-            await rawClient.ensureDb();
-
-            progress.update("Re-pushing without encryption...");
             this.cryptoProvider = undefined;
             this.remoteOps.setClientWrapper(undefined);
-            await this.remoteOps.pushAll((id, n) => {
-                progress.update(`Pushing: ${n} docs`);
-            });
 
-            progress.update("Resetting checkpoints...");
-            const checkpoints = this.replicator.getCheckpoints();
-            checkpoints.setRemoteSeq(0);
-            checkpoints.setLastPushedSeq(0);
-            await checkpoints.save();
+            progress.update("Re-initializing vault without encryption...");
+            await this.setupService.init((msg) => progress.update(msg));
 
             this.settings.encryptionEnabled = false;
             this.settings.connectionState = "setupDone";
             await this.saveSettings();
-            progress.done("Encryption disabled! Restart the plugin to begin syncing.");
+            progress.done("Encryption disabled!");
         } catch (e: any) {
             progress.fail(`Disable encryption failed: ${e?.message ?? e}`);
             throw e;
