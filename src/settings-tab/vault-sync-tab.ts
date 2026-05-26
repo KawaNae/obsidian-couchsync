@@ -60,6 +60,10 @@ export class VaultSyncTab {
         this.draft = this.savedToDraft();
     }
 
+    updateDeps(deps: VaultSyncTabDeps): void {
+        this.deps = deps;
+    }
+
     /** Reset draft to match saved settings (call on settings tab hide) */
     resetDraft(): void {
         this.draft = this.savedToDraft();

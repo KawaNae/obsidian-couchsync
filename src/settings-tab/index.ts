@@ -100,6 +100,8 @@ export class CouchSyncSettingTab extends PluginSettingTab {
         };
         if (!this.vaultSyncTab) {
             this.vaultSyncTab = new VaultSyncTab(vaultSyncDeps);
+        } else {
+            this.vaultSyncTab.updateDeps(vaultSyncDeps);
         }
         const vaultSyncPanel = panels.get("vault-sync");
         if (vaultSyncPanel) {
