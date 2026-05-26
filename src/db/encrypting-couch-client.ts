@@ -1,13 +1,13 @@
 /**
  * ICouchClient decorator that transparently encrypts/decrypts doc payloads.
  *
- * Push path: ChunkDoc.data and ConfigDoc.data are encrypted before bulkDocs.
- * Pull path: The same fields are decrypted after changes/bulkGet/allDocs.
- * FileDoc fields (chunks[], vclock, mtime, etc.) pass through unmodified.
+ * Level 1: ChunkDoc.data and ConfigDoc.data are AES-256-GCM encrypted.
+ * Level 2: Additionally, FileDoc and ConfigDoc _id paths are replaced with
+ *          HMAC-SHA256 hashes, and an `encryptedPath` field stores the
+ *          AES-GCM-encrypted original path for pull-side recovery.
  *
  * The decorator sits between SyncEngine and the real CouchClient, so the
- * entire sync stack (push-pipeline, pull-writer, reconciler) operates on
- * plaintext — encryption is invisible to them.
+ * entire sync stack operates on plaintext — encryption is invisible.
  */
 
 import type {
@@ -28,15 +28,20 @@ function hasEncryptableData(doc: AnyDoc): boolean {
         && typeof doc.data === "string";
 }
 
-async function encryptDoc(doc: AnyDoc, crypto: CryptoProvider): Promise<AnyDoc> {
-    if (!hasEncryptableData(doc)) return doc;
-    return { ...doc, data: await crypto.encrypt(doc.data as string) };
+function hasPathId(doc: AnyDoc): boolean {
+    const id = doc._id as string | undefined;
+    if (!id) return false;
+    return id.startsWith("file:") || id.startsWith("config:");
 }
 
-async function decryptDoc<T>(doc: T, crypto: CryptoProvider): Promise<T> {
-    const d = doc as AnyDoc;
-    if (!hasEncryptableData(d)) return doc;
-    return { ...d, data: await crypto.decrypt(d.data as string) } as T;
+function idPrefix(id: string): string {
+    const colon = id.indexOf(":");
+    return colon >= 0 ? id.slice(0, colon + 1) : "";
+}
+
+function idPayload(id: string): string {
+    const colon = id.indexOf(":");
+    return colon >= 0 ? id.slice(colon + 1) : id;
 }
 
 export class EncryptingCouchClient implements ICouchClient {
@@ -44,6 +49,44 @@ export class EncryptingCouchClient implements ICouchClient {
         private readonly inner: ICouchClient,
         private readonly crypto: CryptoProvider,
     ) {}
+
+    private async encryptDoc(doc: AnyDoc): Promise<AnyDoc> {
+        let out = doc;
+        if (hasEncryptableData(doc)) {
+            out = { ...out, data: await this.crypto.encrypt(doc.data as string) };
+        }
+        if (hasPathId(doc)) {
+            const id = doc._id as string;
+            const prefix = idPrefix(id);
+            const path = idPayload(id);
+            const hmac = await this.crypto.hmacHash(path);
+            const encPath = await this.crypto.encryptPath(path);
+            out = { ...out, _id: prefix + hmac, encryptedPath: encPath };
+        }
+        return out;
+    }
+
+    private async decryptDoc<T>(doc: T): Promise<T> {
+        let d = doc as AnyDoc;
+        if (hasEncryptableData(d)) {
+            d = { ...d, data: await this.crypto.decrypt(d.data as string) };
+        }
+        if (typeof d.encryptedPath === "string") {
+            const prefix = idPrefix(d._id as string);
+            const path = await this.crypto.decryptPath(d.encryptedPath as string);
+            const { encryptedPath: _, ...rest } = d;
+            d = { ...rest, _id: prefix + path };
+        }
+        return d as T;
+    }
+
+    private async translateId(plainId: string): Promise<string> {
+        const prefix = idPrefix(plainId);
+        if (prefix === "file:" || prefix === "config:") {
+            return prefix + await this.crypto.hmacHash(idPayload(plainId));
+        }
+        return plainId;
+    }
 
     info(signal?: AbortSignal): Promise<DbInfo> {
         return this.inner.info(signal);
@@ -54,34 +97,48 @@ export class EncryptingCouchClient implements ICouchClient {
         opts?: { conflicts?: boolean },
         signal?: AbortSignal,
     ): Promise<T | null> {
-        const doc = await this.inner.getDoc<T>(id, opts, signal);
-        return doc ? decryptDoc(doc, this.crypto) : null;
+        const remoteId = await this.translateId(id);
+        const doc = await this.inner.getDoc<T>(remoteId, opts, signal);
+        return doc ? this.decryptDoc(doc) : null;
     }
 
     async bulkGet<T>(ids: string[], signal?: AbortSignal): Promise<T[]> {
-        const docs = await this.inner.bulkGet<T>(ids, signal);
-        return Promise.all(docs.map((d) => decryptDoc(d, this.crypto)));
+        const remoteIds = await Promise.all(ids.map((id) => this.translateId(id)));
+        const docs = await this.inner.bulkGet<T>(remoteIds, signal);
+        return Promise.all(docs.map((d) => this.decryptDoc(d)));
     }
 
     async bulkDocs(docs: any[], signal?: AbortSignal): Promise<BulkDocsResult[]> {
         const encrypted = await Promise.all(
-            docs.map((d) => encryptDoc(d as AnyDoc, this.crypto)),
+            docs.map((d) => this.encryptDoc(d as AnyDoc)),
         );
-        return this.inner.bulkDocs(encrypted, signal);
+        const results = await this.inner.bulkDocs(encrypted, signal);
+        return results.map((r, i) => {
+            const original = docs[i] as AnyDoc;
+            if (r.ok && hasPathId(original)) {
+                return { ...r, id: original._id as string };
+            }
+            return r;
+        });
     }
 
     async allDocs<T>(
         opts: AllDocsOpts,
         signal?: AbortSignal,
     ): Promise<AllDocsResult<T>> {
-        const result = await this.inner.allDocs<T>(opts, signal);
-        if (!opts.include_docs) return result;
+        const translated: AllDocsOpts = { ...opts };
+        if (opts.keys) {
+            translated.keys = await Promise.all(
+                opts.keys.map((k) => this.translateId(k)),
+            );
+        }
+        const result = await this.inner.allDocs<T>(translated, signal);
         return {
             ...result,
             rows: await Promise.all(
                 result.rows.map(async (row) => {
                     if (!row.doc) return row;
-                    return { ...row, doc: await decryptDoc(row.doc, this.crypto) };
+                    return { ...row, doc: await this.decryptDoc(row.doc) };
                 }),
             ),
         };
@@ -98,7 +155,8 @@ export class EncryptingCouchClient implements ICouchClient {
             results: await Promise.all(
                 result.results.map(async (row) => {
                     if (!row.doc) return row;
-                    return { ...row, doc: await decryptDoc(row.doc, this.crypto) };
+                    const dec = await this.decryptDoc(row.doc);
+                    return { ...row, id: (dec as AnyDoc)._id as string, doc: dec };
                 }),
             ),
         };
@@ -115,7 +173,8 @@ export class EncryptingCouchClient implements ICouchClient {
             results: await Promise.all(
                 result.results.map(async (row) => {
                     if (!row.doc) return row;
-                    return { ...row, doc: await decryptDoc(row.doc, this.crypto) };
+                    const dec = await this.decryptDoc(row.doc);
+                    return { ...row, id: (dec as AnyDoc)._id as string, doc: dec };
                 }),
             ),
         };

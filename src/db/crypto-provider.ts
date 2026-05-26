@@ -18,6 +18,8 @@ export interface CryptoProvider {
     encrypt(plainBase64: string): Promise<string>;
     decrypt(envelope: string): Promise<string>;
     hmacHash(data: string): Promise<string>;
+    encryptPath(path: string): Promise<string>;
+    decryptPath(envelope: string): Promise<string>;
 }
 
 export interface EncryptionKeys {
@@ -118,6 +120,30 @@ export function createCryptoProvider(keys: EncryptionKeys): CryptoProvider {
             const encoder = new TextEncoder();
             const sig = await crypto.subtle.sign("HMAC", keys.hmacKey, encoder.encode(data));
             return arrayBufToHex(sig);
+        },
+
+        async encryptPath(path: string): Promise<string> {
+            const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES));
+            const encoder = new TextEncoder();
+            const cipherBuf = await crypto.subtle.encrypt(
+                { name: "AES-GCM", iv },
+                keys.contentKey,
+                encoder.encode(path),
+            );
+            return uint8ToBase64(iv) + ":" + uint8ToBase64(new Uint8Array(cipherBuf));
+        },
+
+        async decryptPath(envelope: string): Promise<string> {
+            const colonIdx = envelope.indexOf(":");
+            if (colonIdx < 0) throw new Error("Invalid encrypted path envelope");
+            const iv = base64ToUint8(envelope.slice(0, colonIdx));
+            const ciphertext = base64ToUint8(envelope.slice(colonIdx + 1));
+            const plainBuf = await crypto.subtle.decrypt(
+                { name: "AES-GCM", iv },
+                keys.contentKey,
+                ciphertext,
+            );
+            return new TextDecoder().decode(plainBuf);
         },
     };
 }
