@@ -127,18 +127,25 @@ export class EncryptingCouchClient implements ICouchClient {
         signal?: AbortSignal,
     ): Promise<AllDocsResult<T>> {
         const translated: AllDocsOpts = { ...opts };
+        const reverseIdMap = new Map<string, string>();
         if (opts.keys) {
-            translated.keys = await Promise.all(
+            const translatedKeys = await Promise.all(
                 opts.keys.map((k) => this.translateId(k)),
             );
+            for (let i = 0; i < opts.keys.length; i++) {
+                reverseIdMap.set(translatedKeys[i], opts.keys[i]);
+            }
+            translated.keys = translatedKeys;
         }
         const result = await this.inner.allDocs<T>(translated, signal);
         return {
             ...result,
             rows: await Promise.all(
                 result.rows.map(async (row) => {
-                    if (!row.doc) return row;
-                    return { ...row, doc: await this.decryptDoc(row.doc) };
+                    const restoredId = reverseIdMap.get(row.id) ?? row.id;
+                    if (!row.doc) return { ...row, id: restoredId };
+                    const dec = await this.decryptDoc(row.doc);
+                    return { ...row, id: restoredId, doc: dec };
                 }),
             ),
         };
