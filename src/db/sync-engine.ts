@@ -202,6 +202,7 @@ export class SyncEngine {
         private isMobile: boolean = false,
         auth?: AuthGate,
         clientFactory?: (s: CouchSyncSettings) => ICouchClient,
+        private preCatchupCheck?: (signal: AbortSignal) => Promise<void>,
     ) {
         this.auth = auth ?? new AuthGate();
         this.clientFactory = clientFactory ?? ((s) =>
@@ -660,6 +661,18 @@ export class SyncEngine {
         }
         if (session.disposed) return;
         logDebug(`${tag}openSession: checkpoints.load done in ${Date.now() - checkpointsStart}ms`);
+
+        if (this.preCatchupCheck) {
+            try {
+                await this.preCatchupCheck(session.signal);
+            } catch (e) {
+                if (session.disposed) return;
+                this.session = null;
+                this.enterError(classifyError(e));
+                return;
+            }
+            if (session.disposed) return;
+        }
 
         // Catchup = actual data transfer → syncing.
         this.setState("syncing");

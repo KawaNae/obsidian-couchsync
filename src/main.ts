@@ -39,6 +39,7 @@ import { computeHash, type ChunkHashFn } from "./db/chunker.ts";
 import { EncryptingCouchClient } from "./db/encrypting-couch-client.ts";
 import { makeCouchClient } from "./db/couch-client.ts";
 import { fetchEncryptionMeta, unlockWithPassphrase, deriveEncryption, pushEncryptionMeta } from "./db/encryption-meta.ts";
+import { checkEncryptionAgreement, type EncryptionAgreement } from "./db/encryption-agreement.ts";
 import { PassphraseModal } from "./ui/passphrase-modal.ts";
 import type { ICouchClient } from "./db/interfaces.ts";
 
@@ -67,6 +68,7 @@ export default class CouchSyncPlugin extends Plugin {
     private compositionGate!: CompositionGate;
     private vaultWriter!: EditorAwareVaultWriter;
     private cryptoProvider?: CryptoProvider;
+    encryptionMismatch?: EncryptionAgreement;
 
     async onload(): Promise<void> {
         await this.loadSettings();
@@ -165,6 +167,26 @@ export default class CouchSyncPlugin extends Plugin {
             Platform.isMobile,
             this.auth,
             encClientFactory,
+            async (_signal) => {
+                const raw = makeCouchClient(
+                    this.settings.couchdbUri, this.settings.couchdbDbName,
+                    this.settings.couchdbUser, this.settings.couchdbPassword,
+                );
+                const agreement = await checkEncryptionAgreement(
+                    raw, this.settings.encryptionEnabled,
+                );
+                if (agreement.status === "remote-encrypted"
+                    || agreement.status === "remote-plaintext") {
+                    this.encryptionMismatch = agreement;
+                    notify(
+                        agreement.status === "remote-encrypted"
+                            ? "CouchSync: remote vault is encrypted. Open Settings → Vault Sync to enter passphrase."
+                            : "CouchSync: encryption was disabled by another device. Open Settings → Vault Sync to confirm.",
+                        15000,
+                    );
+                    throw new Error(`Encryption state mismatch: ${agreement.status}`);
+                }
+            },
         );
         const reconnectBridge: ReconnectBridge = {
             notifyTransient: () => {
@@ -386,8 +408,8 @@ export default class CouchSyncPlugin extends Plugin {
                 );
             }
 
-            // E2E encryption: derive keys from stored passphrase or prompt.
-            if (this.settings.encryptionEnabled && !this.cryptoProvider) {
+            // E2E encryption: reconcile local state with remote.
+            if (this.settings.connectionState === "syncing" && this.settings.deviceId) {
                 try {
                     const rawClient = makeCouchClient(
                         this.settings.couchdbUri,
@@ -395,36 +417,55 @@ export default class CouchSyncPlugin extends Plugin {
                         this.settings.couchdbUser,
                         this.settings.couchdbPassword,
                     );
-                    const meta = await fetchEncryptionMeta(rawClient);
-                    if (!meta) {
-                        notify("CouchSync: encryption:meta doc not found on server. Re-enable encryption from Settings.", 10000);
-                        return;
-                    }
-                    let passphrase = this.settings.encryptionPassphrase;
-                    if (!passphrase) {
-                        const modal = new PassphraseModal(this.app, false);
-                        passphrase = await modal.waitForResult() ?? "";
-                        if (!passphrase) {
-                            notify("CouchSync: passphrase required. Sync paused.", 8000);
-                            return;
+                    const agreement = await checkEncryptionAgreement(
+                        rawClient, this.settings.encryptionEnabled,
+                    );
+                    if (agreement.status === "agreed-encrypted") {
+                        if (!this.cryptoProvider) {
+                            let passphrase = this.settings.encryptionPassphrase;
+                            if (!passphrase) {
+                                const modal = new PassphraseModal(this.app, false);
+                                passphrase = await modal.waitForResult() ?? "";
+                                if (!passphrase) {
+                                    notify("CouchSync: passphrase required. Sync paused.", 8000);
+                                    return;
+                                }
+                            }
+                            const result = await unlockWithPassphrase(agreement.meta, passphrase);
+                            if (!result) {
+                                this.settings.encryptionPassphrase = "";
+                                await this.saveSettings();
+                                notify("CouchSync: wrong passphrase. Sync paused.", 8000);
+                                return;
+                            }
+                            if (!this.settings.encryptionPassphrase) {
+                                this.settings.encryptionPassphrase = passphrase;
+                                await this.saveSettings();
+                            }
+                            this.cryptoProvider = result.crypto;
+                            this.remoteOps.setClientWrapper((raw) =>
+                                new EncryptingCouchClient(raw, this.cryptoProvider!));
                         }
-                    }
-                    const result = await unlockWithPassphrase(meta, passphrase);
-                    if (!result) {
-                        this.settings.encryptionPassphrase = "";
-                        await this.saveSettings();
-                        notify("CouchSync: wrong passphrase. Sync paused.", 8000);
+                    } else if (agreement.status === "remote-encrypted") {
+                        this.encryptionMismatch = agreement;
+                        notify(
+                            "CouchSync: remote vault is encrypted. Open Settings → Vault Sync to enter passphrase.",
+                            15000,
+                        );
+                        this.fireReconcile("onload");
+                        return;
+                    } else if (agreement.status === "remote-plaintext") {
+                        this.encryptionMismatch = agreement;
+                        notify(
+                            "CouchSync: encryption was disabled by another device. Open Settings → Vault Sync to confirm.",
+                            15000,
+                        );
+                        this.fireReconcile("onload");
                         return;
                     }
-                    if (!this.settings.encryptionPassphrase) {
-                        this.settings.encryptionPassphrase = passphrase;
-                        await this.saveSettings();
-                    }
-                    this.cryptoProvider = result.crypto;
-                    this.remoteOps.setClientWrapper((raw) =>
-                        new EncryptingCouchClient(raw, this.cryptoProvider!));
+                    // "agreed-plaintext" — proceed normally
                 } catch (e: any) {
-                    logError(`CouchSync: encryption unlock failed: ${e?.message ?? e}`);
+                    logError(`CouchSync: encryption check failed: ${e?.message ?? e}`);
                     return;
                 }
             }
@@ -508,6 +549,19 @@ export default class CouchSyncPlugin extends Plugin {
         if (this.settings.encryptionEnabled && !this.cryptoProvider) {
             throw new Error("Encryption is enabled but passphrase not entered. Enter passphrase first.");
         }
+        const rawClient = makeCouchClient(
+            this.settings.couchdbUri, this.settings.couchdbDbName,
+            this.settings.couchdbUser, this.settings.couchdbPassword,
+        );
+        const agreement = await checkEncryptionAgreement(
+            rawClient, this.settings.encryptionEnabled,
+        );
+        if (agreement.status === "remote-encrypted") {
+            throw new Error("Remote is encrypted. Enter passphrase in the Encryption section first.");
+        }
+        if (agreement.status === "remote-plaintext") {
+            throw new Error("Remote is not encrypted but local encryption is enabled. Disable encryption first.");
+        }
         this.replicator.stop();
         this.changeTracker.stop();
         const progress = new ProgressNotice("Clone");
@@ -553,6 +607,9 @@ export default class CouchSyncPlugin extends Plugin {
             progress.update("Re-initializing vault with encryption...");
             await this.setupService.init((msg) => progress.update(msg));
 
+            progress.update("Re-initializing config with encryption...");
+            await this.configSync.reinitForEncryptionChange((msg) => progress.update(msg));
+
             progress.update("Writing encryption metadata...");
             await pushEncryptionMeta(this.remoteOps.makeClient(), meta);
 
@@ -577,6 +634,9 @@ export default class CouchSyncPlugin extends Plugin {
             progress.update("Re-initializing vault without encryption...");
             await this.setupService.init((msg) => progress.update(msg));
 
+            progress.update("Re-initializing config without encryption...");
+            await this.configSync.reinitForEncryptionChange((msg) => progress.update(msg));
+
             this.settings.encryptionEnabled = false;
             this.settings.encryptionPassphrase = "";
             this.settings.connectionState = "setupDone";
@@ -584,6 +644,79 @@ export default class CouchSyncPlugin extends Plugin {
             progress.done("Encryption disabled!");
         } catch (e: any) {
             progress.fail(`Disable encryption failed: ${e?.message ?? e}`);
+            throw e;
+        }
+    }
+
+    async joinEncryptedRemote(passphrase: string): Promise<void> {
+        this.stopSync();
+        const progress = new ProgressNotice("Encryption");
+        try {
+            progress.update("Verifying passphrase...");
+            const rawClient = makeCouchClient(
+                this.settings.couchdbUri, this.settings.couchdbDbName,
+                this.settings.couchdbUser, this.settings.couchdbPassword,
+            );
+            const meta = await fetchEncryptionMeta(rawClient);
+            if (!meta) throw new Error("encryption:meta not found on remote");
+            const result = await unlockWithPassphrase(meta, passphrase);
+            if (!result) throw new Error("Wrong passphrase");
+            this.cryptoProvider = result.crypto;
+            this.remoteOps.setClientWrapper((raw) =>
+                new EncryptingCouchClient(raw, this.cryptoProvider!));
+
+            progress.update("Resetting local databases...");
+            await this.localDb.destroy();
+            this.localDb.open();
+            if (this.configLocalDb) {
+                await this.configLocalDb.destroy();
+                this.configLocalDb.open();
+            }
+
+            this.settings.encryptionEnabled = true;
+            this.settings.encryptionPassphrase = passphrase;
+            this.settings.connectionState = "syncing";
+            this.encryptionMismatch = undefined;
+            await this.saveSettings();
+
+            progress.done("Joined encrypted vault!");
+            await this.vaultSync.loadLastSyncedVclocks();
+            this.replicator.start();
+            this.changeTracker.start();
+        } catch (e: any) {
+            progress.fail(`Join encrypted remote failed: ${e?.message ?? e}`);
+            throw e;
+        }
+    }
+
+    async acceptPlaintextRemote(): Promise<void> {
+        this.stopSync();
+        const progress = new ProgressNotice("Encryption");
+        try {
+            progress.update("Disabling encryption...");
+            this.cryptoProvider = undefined;
+            this.remoteOps.setClientWrapper(undefined);
+
+            progress.update("Resetting local databases...");
+            await this.localDb.destroy();
+            this.localDb.open();
+            if (this.configLocalDb) {
+                await this.configLocalDb.destroy();
+                this.configLocalDb.open();
+            }
+
+            this.settings.encryptionEnabled = false;
+            this.settings.encryptionPassphrase = "";
+            this.settings.connectionState = "syncing";
+            this.encryptionMismatch = undefined;
+            await this.saveSettings();
+
+            progress.done("Encryption disabled. Re-syncing...");
+            await this.vaultSync.loadLastSyncedVclocks();
+            this.replicator.start();
+            this.changeTracker.start();
+        } catch (e: any) {
+            progress.fail(`Accept plaintext remote failed: ${e?.message ?? e}`);
             throw e;
         }
     }

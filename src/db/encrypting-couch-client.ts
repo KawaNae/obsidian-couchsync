@@ -165,8 +165,12 @@ export class EncryptingCouchClient implements ICouchClient {
         opts: ChangesOpts,
         signal?: AbortSignal,
     ): Promise<ChangesResult<T>> {
+        if (!opts.include_docs) {
+            throw new Error(
+                "EncryptingCouchClient requires include_docs: true to decrypt path-encrypted IDs.",
+            );
+        }
         const result = await this.inner.changes<T>(opts, signal);
-        if (!opts.include_docs) return result;
         return {
             ...result,
             results: await Promise.all(
@@ -183,8 +187,12 @@ export class EncryptingCouchClient implements ICouchClient {
         opts: ChangesOpts,
         signal?: AbortSignal,
     ): Promise<ChangesResult<T>> {
+        if (!opts.include_docs) {
+            throw new Error(
+                "EncryptingCouchClient requires include_docs: true to decrypt path-encrypted IDs.",
+            );
+        }
         const result = await this.inner.changesLongpoll<T>(opts, signal);
-        if (!opts.include_docs) return result;
         return {
             ...result,
             results: await Promise.all(

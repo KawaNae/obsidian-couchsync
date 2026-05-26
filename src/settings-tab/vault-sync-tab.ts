@@ -35,6 +35,9 @@ export interface VaultSyncTabDeps {
     refresh: () => void;
     enableEncryption?: (passphrase: string) => Promise<void>;
     disableEncryption?: () => Promise<void>;
+    encryptionMismatch?: { status: string };
+    joinEncryptedRemote?: (passphrase: string) => Promise<void>;
+    acceptPlaintextRemote?: () => Promise<void>;
 }
 
 interface Draft {
@@ -452,7 +455,37 @@ export class VaultSyncTab {
             cls: "setting-item-description",
         });
 
-        if (settings.encryptionEnabled) {
+        const mismatch = this.deps.encryptionMismatch;
+
+        if (mismatch?.status === "remote-encrypted") {
+            new Setting(el)
+                .setName("E2E encryption")
+                .setDesc("Remote vault is encrypted by another device. Enter the passphrase to join.")
+                .addButton((btn) =>
+                    btn.setButtonText("Enter passphrase")
+                        .setCta()
+                        .setDisabled(!this.deps.joinEncryptedRemote)
+                        .onClick(async () => {
+                            const { PassphraseModal } = await import("../ui/passphrase-modal.ts");
+                            const modal = new PassphraseModal(this.deps.app, false);
+                            const passphrase = await modal.waitForResult();
+                            if (!passphrase) return;
+                            await this.deps.joinEncryptedRemote?.(passphrase);
+                            this.deps.refresh();
+                        }));
+        } else if (mismatch?.status === "remote-plaintext") {
+            new Setting(el)
+                .setName("E2E encryption")
+                .setDesc("Encryption was disabled by another device. Confirm to re-sync without encryption.")
+                .addButton((btn) =>
+                    btn.setButtonText("Disable encryption & re-sync")
+                        .setWarning()
+                        .setDisabled(!this.deps.acceptPlaintextRemote)
+                        .onClick(async () => {
+                            await this.deps.acceptPlaintextRemote?.();
+                            this.deps.refresh();
+                        }));
+        } else if (settings.encryptionEnabled) {
             new Setting(el)
                 .setName("E2E encryption")
                 .setDesc("Enabled — content is encrypted on the server.")

@@ -234,6 +234,35 @@ export class ConfigSync {
         });
     }
 
+    /**
+     * Re-initialize the config DB as part of an encryption state change.
+     * Called from enableEncryption/disableEncryption in main.ts.
+     *
+     * Bypasses ConfigOperation (no auth/visibility gate) because the
+     * caller is already in a user-triggered Settings flow where those
+     * preconditions are satisfied. The client comes from the caller's
+     * clientFactory, which reflects the current cryptoProvider state.
+     */
+    async reinitForEncryptionChange(
+        onProgress: (msg: string) => void,
+    ): Promise<void> {
+        const db = this.configDb;
+        if (!db) return;
+        const client = this.clientFactory(this.getSettings());
+        if (!client) return;
+        const controller = new AbortController();
+        const setup = new ConfigSetupService(
+            db,
+            this.getSettings,
+            {
+                clearLastSynced: () => this.lastSynced?.clear(),
+                invalidateCheckpoints: () => { this.checkpointsLoaded = false; },
+                scan: (cb) => this.scan(cb),
+            },
+        );
+        await setup.init(client, controller.signal, onProgress);
+    }
+
     /** Push: scan .obsidian/ → enumerate local delta via changes feed →
      *  per-doc remote-rev fetch → bulkDocs.
      *
