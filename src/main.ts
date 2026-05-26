@@ -549,6 +549,12 @@ export default class CouchSyncPlugin extends Plugin {
                 progress.update(`Pushing: ${n} docs`);
             });
 
+            progress.update("Resetting checkpoints...");
+            const checkpoints = this.replicator.getCheckpoints();
+            checkpoints.setRemoteSeq(0);
+            checkpoints.setLastPushedSeq(0);
+            await checkpoints.save();
+
             this.settings.encryptionEnabled = true;
             this.settings.connectionState = "setupDone";
             await this.saveSettings();
@@ -579,6 +585,12 @@ export default class CouchSyncPlugin extends Plugin {
             await remoteCouch.pushAll(this.localDb, rawClient, (id, n) => {
                 progress.update(`Pushing: ${n} docs`);
             });
+
+            progress.update("Resetting checkpoints...");
+            const checkpoints = this.replicator.getCheckpoints();
+            checkpoints.setRemoteSeq(0);
+            checkpoints.setLastPushedSeq(0);
+            await checkpoints.save();
 
             this.settings.encryptionEnabled = false;
             this.settings.connectionState = "setupDone";

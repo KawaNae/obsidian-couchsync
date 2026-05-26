@@ -177,6 +177,8 @@ export class SyncEngine {
      *  Owned by SyncEngine because they survive across sessions. */
     private readonly checkpoints: Checkpoints;
 
+    getCheckpoints(): Checkpoints { return this.checkpoints; }
+
     // ── Constructor ───────────────────────────────────────
 
     private readonly clientFactory: (s: CouchSyncSettings) => ICouchClient;
