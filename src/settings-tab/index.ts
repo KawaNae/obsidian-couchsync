@@ -92,6 +92,8 @@ export class CouchSyncSettingTab extends PluginSettingTab {
             startSync: () => this.plugin.startSync(),
             stopSync: () => this.plugin.stopSync(),
             refresh: () => this.display(),
+            enableEncryption: (p: string) => this.plugin.enableEncryption(p),
+            disableEncryption: () => this.plugin.disableEncryption(),
         };
         if (!this.vaultSyncTab) {
             this.vaultSyncTab = new VaultSyncTab(vaultSyncDeps);

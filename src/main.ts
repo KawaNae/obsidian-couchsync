@@ -41,6 +41,7 @@ import { makeCouchClient } from "./db/couch-client.ts";
 import { fetchEncryptionMeta, unlockWithPassphrase, initEncryptionMeta } from "./db/encryption-meta.ts";
 import { PassphraseModal } from "./ui/passphrase-modal.ts";
 import type { ICouchClient } from "./db/interfaces.ts";
+import * as remoteCouch from "./db/remote-couch.ts";
 
 export default class CouchSyncPlugin extends Plugin {
     settings!: CouchSyncSettings;
@@ -388,6 +389,38 @@ export default class CouchSyncPlugin extends Plugin {
                 );
             }
 
+            // E2E encryption: require passphrase before sync starts.
+            if (this.settings.encryptionEnabled && !this.cryptoProvider) {
+                try {
+                    const rawClient = makeCouchClient(
+                        this.settings.couchdbUri,
+                        this.settings.couchdbDbName,
+                        this.settings.couchdbUser,
+                        this.settings.couchdbPassword,
+                    );
+                    const meta = await fetchEncryptionMeta(rawClient);
+                    if (!meta) {
+                        notify("CouchSync: encryption:meta doc not found on server. Re-enable encryption from Settings.", 10000);
+                        return;
+                    }
+                    const modal = new PassphraseModal(this.app, false);
+                    const passphrase = await modal.waitForResult();
+                    if (!passphrase) {
+                        notify("CouchSync: passphrase required. Sync paused.", 8000);
+                        return;
+                    }
+                    const result = await unlockWithPassphrase(meta, passphrase);
+                    if (!result) {
+                        notify("CouchSync: wrong passphrase. Sync paused.", 8000);
+                        return;
+                    }
+                    this.cryptoProvider = result.crypto;
+                } catch (e: any) {
+                    logError(`CouchSync: encryption unlock failed: ${e?.message ?? e}`);
+                    return;
+                }
+            }
+
             // Load vclock cache BEFORE reconciler or changeTracker run.
             // Without this, compareFileToDoc() misclassifies local edits
             // as "remote-pending" and overwrites them with stale DB content.
@@ -491,6 +524,72 @@ export default class CouchSyncPlugin extends Plugin {
     stopSync(): void {
         this.replicator.stop();
         this.changeTracker.stop();
+    }
+
+    async enableEncryption(passphrase: string): Promise<void> {
+        this.stopSync();
+        const progress = new ProgressNotice("Encryption");
+        try {
+            const rawClient = makeCouchClient(
+                this.settings.couchdbUri,
+                this.settings.couchdbDbName,
+                this.settings.couchdbUser,
+                this.settings.couchdbPassword,
+            );
+
+            progress.update("Destroying remote DB...");
+            await rawClient.destroy();
+            await rawClient.ensureDb();
+
+            progress.update("Initializing encryption...");
+            const { crypto } = await initEncryptionMeta(rawClient, passphrase);
+            this.cryptoProvider = crypto;
+
+            progress.update("Re-pushing with encryption...");
+            const encClient = new EncryptingCouchClient(rawClient, crypto);
+            await remoteCouch.pushAll(this.localDb, encClient, (id, n) => {
+                progress.update(`Pushing: ${n} docs`);
+            });
+
+            this.settings.encryptionEnabled = true;
+            this.settings.connectionState = "setupDone";
+            await this.saveSettings();
+            progress.done("Encryption enabled! Restart the plugin to begin syncing.");
+        } catch (e: any) {
+            progress.fail(`Enable encryption failed: ${e?.message ?? e}`);
+            throw e;
+        }
+    }
+
+    async disableEncryption(): Promise<void> {
+        this.stopSync();
+        const progress = new ProgressNotice("Encryption");
+        try {
+            const rawClient = makeCouchClient(
+                this.settings.couchdbUri,
+                this.settings.couchdbDbName,
+                this.settings.couchdbUser,
+                this.settings.couchdbPassword,
+            );
+
+            progress.update("Destroying remote DB...");
+            await rawClient.destroy();
+            await rawClient.ensureDb();
+
+            progress.update("Re-pushing without encryption...");
+            this.cryptoProvider = undefined;
+            await remoteCouch.pushAll(this.localDb, rawClient, (id, n) => {
+                progress.update(`Pushing: ${n} docs`);
+            });
+
+            this.settings.encryptionEnabled = false;
+            this.settings.connectionState = "setupDone";
+            await this.saveSettings();
+            progress.done("Encryption disabled! Restart the plugin to begin syncing.");
+        } catch (e: any) {
+            progress.fail(`Disable encryption failed: ${e?.message ?? e}`);
+            throw e;
+        }
     }
 
     private fireReconcile(reason: ReconcileReason): void {

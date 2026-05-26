@@ -33,6 +33,8 @@ export interface VaultSyncTabDeps {
     startSync: () => Promise<void>;
     stopSync: () => void;
     refresh: () => void;
+    enableEncryption?: (passphrase: string) => Promise<void>;
+    disableEncryption?: () => Promise<void>;
 }
 
 interface Draft {
@@ -284,6 +286,9 @@ export class VaultSyncTab {
                     })
             );
 
+        // ── Encryption ──────────────────────────────────────────
+        this.renderEncryption(el, locked);
+
         // ── Skipped large files ─────────────────────────────────
         renderSkippedFiles(el, this.deps);
     }
@@ -435,6 +440,46 @@ export class VaultSyncTab {
             const detail = el.createEl("details");
             detail.createEl("summary", { text: "Current auto-generated ID" });
             detail.createEl("code", { text: settings.deviceId });
+        }
+    }
+
+    private renderEncryption(el: HTMLElement, locked: boolean): void {
+        const settings = this.deps.getSettings();
+        el.createEl("h3", { text: "Encryption" });
+        el.createEl("p", {
+            text: "End-to-end encrypt vault content before sending to the server. " +
+                "All devices sharing this vault must use the same passphrase.",
+            cls: "setting-item-description",
+        });
+
+        if (settings.encryptionEnabled) {
+            new Setting(el)
+                .setName("E2E encryption")
+                .setDesc("Enabled — content is encrypted on the server.")
+                .addButton((btn) =>
+                    btn.setButtonText("Disable")
+                        .setWarning()
+                        .setDisabled(locked || !this.deps.disableEncryption)
+                        .onClick(async () => {
+                            await this.deps.disableEncryption?.();
+                            this.deps.refresh();
+                        }));
+        } else {
+            new Setting(el)
+                .setName("E2E encryption")
+                .setDesc("Disabled — data is stored in plaintext on the server.")
+                .addButton((btn) =>
+                    btn.setButtonText("Enable")
+                        .setCta()
+                        .setDisabled(locked || !this.deps.enableEncryption)
+                        .onClick(async () => {
+                            const { PassphraseModal } = await import("../ui/passphrase-modal.ts");
+                            const modal = new PassphraseModal(this.deps.app, true);
+                            const passphrase = await modal.waitForResult();
+                            if (!passphrase) return;
+                            await this.deps.enableEncryption?.(passphrase);
+                            this.deps.refresh();
+                        }));
         }
     }
 }
