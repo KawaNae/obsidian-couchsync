@@ -478,6 +478,9 @@ export default class CouchSyncPlugin extends Plugin {
     }
 
     async initVault(): Promise<void> {
+        if (this.settings.encryptionEnabled && !this.cryptoProvider) {
+            throw new Error("Encryption is enabled but passphrase not entered. Enter passphrase first.");
+        }
         this.replicator.stop();
         this.changeTracker.stop();
         const progress = new ProgressNotice("Init");
@@ -493,6 +496,9 @@ export default class CouchSyncPlugin extends Plugin {
     }
 
     async cloneFromRemote(): Promise<void> {
+        if (this.settings.encryptionEnabled && !this.cryptoProvider) {
+            throw new Error("Encryption is enabled but passphrase not entered. Enter passphrase first.");
+        }
         this.replicator.stop();
         this.changeTracker.stop();
         const progress = new ProgressNotice("Clone");
