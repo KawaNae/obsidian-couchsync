@@ -33,11 +33,7 @@ export interface VaultSyncTabDeps {
     startSync: () => Promise<void>;
     stopSync: () => void;
     refresh: () => void;
-    enableEncryption?: (passphrase: string) => Promise<void>;
-    disableEncryption?: () => Promise<void>;
     encryptionMismatch?: { status: string };
-    joinEncryptedRemote?: (passphrase: string) => Promise<void>;
-    acceptPlaintextRemote?: () => Promise<void>;
 }
 
 interface Draft {
@@ -114,8 +110,11 @@ export class VaultSyncTab {
         // ── Device Identity ────────────────────────────────────
         this.renderDeviceIdentity(el, locked);
 
-        // ── Step 1: Connection ──────────────────────────────────
-        el.createEl("h3", { text: "Step 1: Connection" });
+        // ── Step 1: Encryption ─────────────────────────────────
+        this.renderEncryptionStep(el, locked);
+
+        // ── Step 2: Connection ──────────────────────────────────
+        el.createEl("h3", { text: "Step 2: Connection" });
 
         if (locked) {
             el.createEl("p", {
@@ -126,7 +125,7 @@ export class VaultSyncTab {
 
         this.renderField(el, "Server URI", "uri", "https://localhost:5984", locked);
         this.renderField(el, "Username", "user", "admin", locked);
-        this.renderField(el, "Password", "pass", "password", locked, true);
+        this.renderField(el, "Password", "pass", "password", locked, true, true);
         this.renderField(el, "Vault Database Name", "db", "obsidian", locked);
 
         new Setting(el)
@@ -157,12 +156,12 @@ export class VaultSyncTab {
             ".setting-item-description",
         ) as HTMLElement;
 
-        // ── Step 2: Setup ───────────────────────────────────────
-        el.createEl("h3", { text: "Step 2: Setup" });
+        // ── Step 3: Setup ───────────────────────────────────────
+        el.createEl("h3", { text: "Step 3: Setup" });
 
         const setupDesc =
             state === "editing"
-                ? "Complete Step 1 first."
+                ? "Complete Step 2 first."
                 : state === "tested"
                     ? "Choose how to initialize this vault."
                     : state === "setupDone"
@@ -214,8 +213,8 @@ export class VaultSyncTab {
                     })
             );
 
-        // ── Step 3: Sync ────────────────────────────────────────
-        el.createEl("h3", { text: "Step 3: Sync" });
+        // ── Step 4: Sync ────────────────────────────────────────
+        el.createEl("h3", { text: "Step 4: Sync" });
 
         new Setting(el)
             .setName("Live Sync")
@@ -244,8 +243,8 @@ export class VaultSyncTab {
                     })
             );
 
-        // ── Step 4: Filters (vault file inclusion / exclusion) ─
-        el.createEl("h3", { text: "Step 4: Filters" });
+        // ── Filters (vault file inclusion / exclusion) ──────────
+        el.createEl("h3", { text: "Filters" });
         el.createEl("p", {
             text:
                 "Control which vault files are eligible for sync. " +
@@ -293,9 +292,6 @@ export class VaultSyncTab {
                     })
             );
 
-        // ── Encryption ──────────────────────────────────────────
-        this.renderEncryption(el, locked);
-
         // ── Skipped large files ─────────────────────────────────
         renderSkippedFiles(el, this.deps);
     }
@@ -307,8 +303,10 @@ export class VaultSyncTab {
         placeholder: string,
         locked: boolean,
         isPassword = false,
+        showToggle = false,
     ): void {
         const setting = new Setting(el).setName(name);
+        setting.settingEl.addClass("cs-field-2row");
 
         const nameEl = setting.settingEl.querySelector(".setting-item-name");
         if (nameEl) {
@@ -328,6 +326,7 @@ export class VaultSyncTab {
             if (isPassword) text.inputEl.type = "password";
             text.setDisabled(locked);
         });
+        if (showToggle) addPasswordToggle(setting);
     }
 
     private async handleTest(btn: ButtonComponent): Promise<void> {
@@ -450,73 +449,67 @@ export class VaultSyncTab {
         }
     }
 
-    private renderEncryption(el: HTMLElement, locked: boolean): void {
+    private renderEncryptionStep(el: HTMLElement, _locked: boolean): void {
         const settings = this.deps.getSettings();
-        el.createEl("h3", { text: "Encryption" });
+        const state = settings.connectionState;
+        const editable = state !== "syncing";
+
+        el.createEl("h3", { text: "Step 1: Encryption" });
         el.createEl("p", {
             text: "End-to-end encrypt vault content before sending to the server. " +
                 "All devices sharing this vault must use the same passphrase.",
             cls: "setting-item-description",
         });
 
-        const mismatch = this.deps.encryptionMismatch;
+        if (this.deps.encryptionMismatch) {
+            const warn = el.createEl("p", {
+                text: "Encryption state was changed by another device. " +
+                    "Adjust settings here, then re-run Init or Clone in Step 3.",
+                cls: "setting-item-description mod-warning",
+            });
+            warn.style.color = "var(--text-error)";
+        }
 
-        if (mismatch?.status === "remote-encrypted") {
-            new Setting(el)
-                .setName("E2E encryption")
-                .setDesc("Remote vault is encrypted by another device. Enter the passphrase to join.")
-                .addButton((btn) =>
-                    btn.setButtonText("Enter passphrase")
-                        .setCta()
-                        .setDisabled(!this.deps.joinEncryptedRemote)
-                        .onClick(async () => {
-                            const { PassphraseModal } = await import("../ui/passphrase-modal.ts");
-                            const modal = new PassphraseModal(this.deps.app, false);
-                            const passphrase = await modal.waitForResult();
-                            if (!passphrase) return;
-                            await this.deps.joinEncryptedRemote?.(passphrase);
-                            this.deps.refresh();
-                        }));
-        } else if (mismatch?.status === "remote-plaintext") {
-            new Setting(el)
-                .setName("E2E encryption")
-                .setDesc("Encryption was disabled by another device. Confirm to re-sync without encryption.")
-                .addButton((btn) =>
-                    btn.setButtonText("Disable encryption & re-sync")
-                        .setWarning()
-                        .setDisabled(!this.deps.acceptPlaintextRemote)
-                        .onClick(async () => {
-                            await this.deps.acceptPlaintextRemote?.();
-                            this.deps.refresh();
-                        }));
-        } else if (settings.encryptionEnabled) {
-            new Setting(el)
-                .setName("E2E encryption")
-                .setDesc("Enabled — content is encrypted on the server.")
-                .addButton((btn) =>
-                    btn.setButtonText("Disable")
-                        .setWarning()
-                        .setDisabled(locked || !this.deps.disableEncryption)
-                        .onClick(async () => {
-                            await this.deps.disableEncryption?.();
-                            this.deps.refresh();
-                        }));
-        } else {
-            new Setting(el)
-                .setName("E2E encryption")
-                .setDesc("Disabled — data is stored in plaintext on the server.")
-                .addButton((btn) =>
-                    btn.setButtonText("Enable")
-                        .setCta()
-                        .setDisabled(locked || !this.deps.enableEncryption)
-                        .onClick(async () => {
-                            const { PassphraseModal } = await import("../ui/passphrase-modal.ts");
-                            const modal = new PassphraseModal(this.deps.app, true);
-                            const passphrase = await modal.waitForResult();
-                            if (!passphrase) return;
-                            await this.deps.enableEncryption?.(passphrase);
-                            this.deps.refresh();
-                        }));
+        new Setting(el)
+            .setName("E2E encryption")
+            .setDesc(
+                editable
+                    ? "For Init: choose a new passphrase. For Clone: the remote state is auto-detected."
+                    : settings.encryptionEnabled
+                        ? "Enabled — to change, disable sync first."
+                        : "Disabled — to change, disable sync first."
+            )
+            .addToggle((toggle) =>
+                toggle
+                    .setValue(settings.encryptionEnabled)
+                    .setDisabled(!editable)
+                    .onChange(async (value) => {
+                        const patch: Partial<CouchSyncSettings> = { encryptionEnabled: value };
+                        if (!value) patch.encryptionPassphrase = "";
+                        if (state === "setupDone") patch.connectionState = "tested";
+                        await this.deps.updateSettings(patch);
+                        this.deps.refresh();
+                    })
+            );
+
+        if (settings.encryptionEnabled) {
+            const passphraseSetting = new Setting(el)
+                .setName("Passphrase")
+                .setDesc(
+                    editable
+                        ? "Required for Init. For Clone, you will be prompted if needed."
+                        : "Stored passphrase for this vault."
+                )
+                .addText((text) => {
+                    text.setPlaceholder("Enter passphrase")
+                        .setValue(settings.encryptionPassphrase)
+                        .onChange(async (value) => {
+                            await this.deps.updateSettings({ encryptionPassphrase: value });
+                        });
+                    text.inputEl.type = "password";
+                    text.setDisabled(!editable);
+                });
+            addPasswordToggle(passphraseSetting);
         }
     }
 }
@@ -579,4 +572,23 @@ function formatAge(timestamp: number): string {
     if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m ago`;
     if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h ago`;
     return `${Math.floor(diffSec / 86400)}d ago`;
+}
+
+function addPasswordToggle(setting: Setting): void {
+    const input = setting.controlEl.querySelector(
+        'input[type="password"], input[type="text"]',
+    ) as HTMLInputElement | null;
+    if (!input) return;
+    const btn = createEl("button", {
+        cls: "cs-password-toggle clickable-icon",
+        attr: { "aria-label": "Toggle visibility", tabindex: "-1" },
+    });
+    btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>`;
+    btn.addEventListener("click", (e) => {
+        e.preventDefault();
+        const isHidden = input.type === "password";
+        input.type = isHidden ? "text" : "password";
+        btn.toggleClass("is-active", isHidden);
+    });
+    setting.controlEl.insertBefore(btn, input);
 }

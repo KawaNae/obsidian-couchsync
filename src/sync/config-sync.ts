@@ -236,7 +236,7 @@ export class ConfigSync {
 
     /**
      * Re-initialize the config DB as part of an encryption state change.
-     * Called from enableEncryption/disableEncryption in main.ts.
+     * Called from initVault/cloneFromRemote in main.ts.
      *
      * Bypasses ConfigOperation (no auth/visibility gate) because the
      * caller is already in a user-triggered Settings flow where those

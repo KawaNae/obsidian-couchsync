@@ -3,6 +3,55 @@
  * BEM naming: cs-settings
  */
 
+/* ─── Disabled Toggle ────────────────────────────────────── */
+
+.cs-settings .checkbox-container.is-disabled {
+    opacity: 0.4;
+}
+
+/* ─── Two-row field layout (name/desc above, control below) ─ */
+
+.cs-settings .cs-field-2row {
+    flex-wrap: wrap;
+}
+.cs-settings .cs-field-2row .setting-item-info {
+    flex-basis: 100%;
+    max-width: 100%;
+}
+.cs-settings .cs-field-2row .setting-item-control {
+    flex-basis: 100%;
+    padding-top: 4px;
+}
+.cs-settings .cs-field-2row .setting-item-control input[type="text"],
+.cs-settings .cs-field-2row .setting-item-control input[type="password"] {
+    width: 100%;
+}
+
+/* Inherited value shown as text (not input), right-aligned like inputs */
+.cs-settings .cs-inherited-value {
+    display: block;
+    text-align: left;
+    font-family: var(--font-monospace);
+    font-size: var(--font-ui-small);
+    color: var(--text-muted);
+    word-break: break-all;
+}
+
+/* ─── Password visibility toggle ─────────────────────────── */
+
+.cs-password-toggle {
+    background: none;
+    border: none;
+    padding: 4px;
+    cursor: pointer;
+    color: var(--text-muted);
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+}
+.cs-password-toggle:hover { color: var(--text-normal); }
+.cs-password-toggle.is-active { color: var(--text-accent); }
+
 /* ─── Unsaved Field Indicator ────────────────────────────── */
 
 .cs-pencil {

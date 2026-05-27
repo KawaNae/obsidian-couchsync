@@ -118,46 +118,64 @@ export class ConfigSyncTab {
         this.applyBtn = null;
         this.applyDesc = null;
 
+        // ── Device Name (inherited) ────────────────────────
+        el.createEl("h3", { text: "Device Name" });
+        const deviceSetting = new Setting(el).setName("Device name");
+        deviceSetting.settingEl.addClass("cs-field-2row");
+        deviceSetting.descEl.createEl("span", {
+            text: settings.deviceId || "(not set)",
+            cls: "cs-inherited-value",
+        });
+
+        // ── Step 1: Encryption (inherited) ──────────────────
+        el.createEl("h3", { text: "Step 1: Encryption" });
+        new Setting(el)
+            .setName("E2E encryption")
+            .setDesc(
+                settings.encryptionEnabled
+                    ? "Enabled — shared with Vault Sync. Change in the Vault Sync tab."
+                    : "Disabled — shared with Vault Sync. Change in the Vault Sync tab.",
+            )
+            .addToggle((toggle) =>
+                toggle
+                    .setValue(settings.encryptionEnabled)
+                    .setDisabled(true)
+            );
+
         // ── Gate: vault sync must be at least Tested ────────
         if (!vaultReady) {
+            el.createEl("h3", { text: "Step 2: Connection" });
             el.createEl("p", {
-                text: "Configure Vault Sync (Step 1) before setting up Config Sync.",
+                text: "Complete Vault Sync Step 2 (Connection) first.",
                 cls: "setting-item-description",
             });
             return;
         }
 
-        // ── Step 1: Connection ──────────────────────────────
-        el.createEl("h3", { text: "Step 1: Connection" });
+        // ── Step 2: Connection ──────────────────────────────
+        el.createEl("h3", { text: "Step 2: Connection" });
 
         el.createEl("p", {
             text:
                 "Config sync uses a separate database on the same CouchDB server. " +
-                "URI, username, and password are inherited from Vault Sync. " +
-                "Use distinct names like obsidian-config-mobile vs obsidian-config-desktop " +
-                "to keep device pools' .obsidian/ configurations independent. " +
                 "Leave empty to disable config sync.",
             cls: "setting-item-description",
         });
 
-        // Read-only display of inherited credentials
-        new Setting(el)
-            .setName("Server")
-            .setDesc("Inherited from Vault Sync")
-            .addText((text) => {
-                text.setValue(settings.couchdbUri || "(not set)");
-                text.setDisabled(true);
-            });
+        const serverSetting = new Setting(el).setName("Server");
+        serverSetting.settingEl.addClass("cs-field-2row");
+        serverSetting.descEl.createEl("span", {
+            text: settings.couchdbUri || "(not set)",
+            cls: "cs-inherited-value",
+        });
 
-        new Setting(el)
-            .setName("Username")
-            .setDesc("Inherited from Vault Sync")
-            .addText((text) => {
-                text.setValue(settings.couchdbUser || "(not set)");
-                text.setDisabled(true);
-            });
+        const userSetting = new Setting(el).setName("Username");
+        userSetting.settingEl.addClass("cs-field-2row");
+        userSetting.descEl.createEl("span", {
+            text: settings.couchdbUser || "(not set)",
+            cls: "cs-inherited-value",
+        });
 
-        // Editable: config DB name
         this.renderField(el, "Config Database Name", "db", "obsidian-config");
 
         new Setting(el)
@@ -184,29 +202,21 @@ export class ConfigSyncTab {
             ".setting-item-description",
         ) as HTMLElement;
 
-        // ── Step 2: Operations ──────────────────────────────
-        // Always rendered so the user can see the available actions even
-        // before Step 1 has been applied. Buttons are disabled until
-        // `couchdbConfigDbName` is set in saved settings.
-        el.createEl("h3", { text: "Step 2: Operations" });
+        // ── Step 3: Setup ───────────────────────────────────
+        el.createEl("h3", { text: "Step 3: Setup" });
 
         const configEnabled = settings.couchdbConfigDbName.trim() !== "";
 
         if (!configEnabled) {
             el.createEl("p", {
-                text: "Apply a config database name in Step 1 to enable these actions.",
-                cls: "setting-item-description",
-            });
-        } else {
-            el.createEl("p", {
-                text: `Active: ${settings.couchdbConfigDbName}`,
+                text: "Apply a config database name in Step 2 to enable setup.",
                 cls: "setting-item-description",
             });
         }
 
         new Setting(el)
             .setName("Init & Push")
-            .setDesc("Delete old config, re-scan .obsidian/, push to remote.")
+            .setDesc("Delete remote config DB, re-scan .obsidian/, push all to remote. Run once per device pool.")
             .addButton((btn) =>
                 btn.setButtonText("Init & Push").setWarning()
                     .setDisabled(!configEnabled)
@@ -227,6 +237,21 @@ export class ConfigSyncTab {
                     })
             );
 
+        // ── Step 4: Sync ────────────────────────────────────
+        el.createEl("h3", { text: "Step 4: Sync" });
+
+        if (!configEnabled) {
+            el.createEl("p", {
+                text: "Complete Step 2 and Step 3 first.",
+                cls: "setting-item-description",
+            });
+        } else {
+            el.createEl("p", {
+                text: `Active: ${settings.couchdbConfigDbName}`,
+                cls: "setting-item-description",
+            });
+        }
+
         new Setting(el)
             .setName("Push")
             .setDesc("Scan .obsidian/ and push changes to remote.")
@@ -242,8 +267,8 @@ export class ConfigSyncTab {
                     })
             );
 
-        // ── Receive: configSyncPaths editor + Pull & Reload ──
-        el.createEl("h4", { text: "Receive filter" });
+        // ── Filter (configSyncPaths) ────────────────────────
+        el.createEl("h4", { text: "Filter" });
         el.createEl("p", {
             text: "Pull writes only the paths below to this device.",
             cls: "setting-item-description",
@@ -339,6 +364,7 @@ export class ConfigSyncTab {
         placeholder: string,
     ): void {
         const setting = new Setting(el).setName(name);
+        setting.settingEl.addClass("cs-field-2row");
 
         const nameEl = setting.settingEl.querySelector(".setting-item-name");
         if (nameEl) {

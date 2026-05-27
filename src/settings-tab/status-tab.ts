@@ -194,7 +194,9 @@ export function renderStatusTab(el: HTMLElement, deps: StatusTabDeps): void {
     const dbSection = el.createDiv();
     dbSection.createEl("p", { text: "Loading...", cls: "setting-item-description" });
 
-    const { couchdbUser: user, couchdbPassword: pass, couchdbDbName } = settings;
+    const { couchdbUser: user, couchdbPassword: pass, couchdbDbName, couchdbConfigDbName } = settings;
+    const connectedDbs = new Set<string>([couchdbDbName]);
+    if (couchdbConfigDbName) connectedDbs.add(couchdbConfigDbName);
 
     // Serialize: server info first. If auth fails there, abort before
     // triggering loadDatabases' N-way fetch burst.
@@ -208,7 +210,7 @@ export function renderStatusTab(el: HTMLElement, deps: StatusTabDeps): void {
             });
             return;
         }
-        await loadDatabases(dbSection, baseUri, user, pass, couchdbDbName, deps);
+        await loadDatabases(dbSection, baseUri, user, pass, connectedDbs, deps);
     })();
 }
 
@@ -266,7 +268,7 @@ async function loadServerInfo(
 
 async function loadDatabases(
     el: HTMLElement, baseUri: string, user: string, pass: string,
-    currentDb: string, deps: StatusTabDeps,
+    connectedDbs: Set<string>, deps: StatusTabDeps,
 ): Promise<void> {
     try {
         const allDbs: string[] = await fetchJson(`${baseUri}/_all_dbs`, user, pass);
@@ -325,7 +327,7 @@ async function loadDatabases(
         for (let idx = 0; idx < userDbs.length; idx++) {
             const name = userDbs[idx];
             const info = infos[idx];
-            const isCurrent = name === currentDb;
+            const isCurrent = connectedDbs.has(name);
             const label = isCurrent ? `${name} (connected)` : name;
 
             const lastUpdate = lastUpdates[idx];
