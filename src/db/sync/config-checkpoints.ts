@@ -82,7 +82,9 @@ export class ConfigCheckpoints {
      * cursor change to disk.
      */
     async saveEmptyPullBatch(nextPullSeq: number | string): Promise<void> {
-        this.pullSeq = nextPullSeq;
-        await this.save();
+        await this.db.runWriteTx({
+            meta: [{ op: "put", key: META_CONFIG_PULL_SEQ, value: nextPullSeq }],
+            onCommit: () => { this.pullSeq = nextPullSeq; },
+        });
     }
 }

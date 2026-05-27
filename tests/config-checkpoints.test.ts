@@ -123,14 +123,35 @@ describe("ConfigCheckpoints", () => {
     });
 
     describe("saveEmptyPullBatch", () => {
-        it("advances pullSeq and persists both seqs", async () => {
+        it("advances pullSeq and persists only META_CONFIG_PULL_SEQ", async () => {
+            const calls: any[] = [];
             const db = makeConfigDb({ [META_CONFIG_PUSH_SEQ]: 5 });
+            const origRunWriteTx = db.runWriteTx;
+            db.runWriteTx = vi.fn(async (tx: any) => {
+                calls.push(tx);
+                return origRunWriteTx(tx);
+            });
             const cp = new ConfigCheckpoints(db);
             await cp.load();
             await cp.saveEmptyPullBatch("301");
             expect(cp.getPullSeq()).toBe("301");
             expect(db._meta[META_CONFIG_PULL_SEQ]).toBe("301");
-            expect(db._meta[META_CONFIG_PUSH_SEQ]).toBe(5);
+            expect(calls).toHaveLength(1);
+            expect(calls[0].meta).toEqual([
+                { op: "put", key: META_CONFIG_PULL_SEQ, value: "301" },
+            ]);
+        });
+
+        it("does not advance pullSeq when runWriteTx throws", async () => {
+            const db = makeConfigDb();
+            db.runWriteTx = vi.fn(async () => {
+                throw new Error("simulated commit failure");
+            });
+            const cp = new ConfigCheckpoints(db);
+            cp.setPullSeq(10);
+
+            await expect(cp.saveEmptyPullBatch("301")).rejects.toThrow(/simulated/);
+            expect(cp.getPullSeq()).toBe(10);
         });
     });
 

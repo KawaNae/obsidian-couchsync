@@ -1,5 +1,11 @@
+const regexCache = new Map<string, RegExp>();
+
 export function minimatch(filePath: string, pattern: string): boolean {
-    const regex = globToRegex(pattern);
+    let regex = regexCache.get(pattern);
+    if (!regex) {
+        regex = globToRegex(pattern);
+        regexCache.set(pattern, regex);
+    }
     return regex.test(filePath);
 }
 
@@ -22,8 +28,8 @@ function globToRegex(glob: string): RegExp {
             regex += "[^/]*";
         } else if (c === "?") {
             regex += "[^/]";
-        } else if (c === ".") {
-            regex += "\\.";
+        } else if ("\\^$.|+()[]{}".includes(c)) {
+            regex += "\\" + c;
         } else {
             regex += c;
         }

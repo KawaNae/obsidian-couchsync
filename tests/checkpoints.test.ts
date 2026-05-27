@@ -133,14 +133,35 @@ describe("Checkpoints", () => {
     });
 
     describe("saveEmptyPullBatch", () => {
-        it("advances remoteSeq and persists via save()", async () => {
+        it("advances remoteSeq and persists only META_REMOTE_SEQ", async () => {
+            const calls: any[] = [];
             const localDb = makeLocalDb();
+            const origRunWriteTx = localDb.runWriteTx;
+            localDb.runWriteTx = vi.fn(async (tx: any) => {
+                calls.push(tx);
+                return origRunWriteTx(tx);
+            });
             const cp = new Checkpoints(localDb);
             cp.setLastPushedSeq(5);
             await cp.saveEmptyPullBatch("77");
             expect(cp.getRemoteSeq()).toBe("77");
             expect(localDb._meta["_sync/remote-seq"]).toBe("77");
-            expect(localDb._meta["_sync/push-seq"]).toBe(5);
+            expect(calls).toHaveLength(1);
+            expect(calls[0].meta).toEqual([
+                { op: "put", key: "_sync/remote-seq", value: "77" },
+            ]);
+        });
+
+        it("does not advance remoteSeq when runWriteTx throws", async () => {
+            const localDb = makeLocalDb();
+            localDb.runWriteTx = vi.fn(async () => {
+                throw new Error("simulated commit failure");
+            });
+            const cp = new Checkpoints(localDb);
+            cp.setRemoteSeq(10);
+
+            await expect(cp.saveEmptyPullBatch("77")).rejects.toThrow(/simulated/);
+            expect(cp.getRemoteSeq()).toBe(10);
         });
     });
 

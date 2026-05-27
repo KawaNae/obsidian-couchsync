@@ -90,6 +90,9 @@ export class VaultSync {
      */
     private skippedPaths: Set<PathKey> | null = null;
 
+    private syncFilterCache: { pattern: string; re: RegExp } | null = null;
+    private syncIgnoreCache: { pattern: string; re: RegExp } | null = null;
+
     /**
      * Late-bound probe for "is the user editing this path right now"
      * (invariant 4). Construction-cycle-broken via `setPendingProbe`
@@ -794,18 +797,34 @@ export class VaultSync {
         if (path.startsWith(".")) return false;
 
         if (settings.syncFilter) {
-            try {
-                const re = new RegExp(settings.syncFilter);
-                if (!re.test(path)) return false;
-            } catch { logWarn(`syncFilter is not a valid regex: ${settings.syncFilter}`); }
+            const re = this.compileSyncRegex("syncFilter", settings.syncFilter);
+            if (re && !re.test(path)) return false;
         }
         if (settings.syncIgnore) {
-            try {
-                const re = new RegExp(settings.syncIgnore);
-                if (re.test(path)) return false;
-            } catch { logWarn(`syncIgnore is not a valid regex: ${settings.syncIgnore}`); }
+            const re = this.compileSyncRegex("syncIgnore", settings.syncIgnore);
+            if (re && re.test(path)) return false;
         }
         return true;
+    }
+
+    private compileSyncRegex(
+        which: "syncFilter" | "syncIgnore",
+        pattern: string,
+    ): RegExp | null {
+        const cache = which === "syncFilter" ? this.syncFilterCache : this.syncIgnoreCache;
+        if (cache && cache.pattern === pattern) return cache.re;
+        try {
+            const re = new RegExp(pattern);
+            if (which === "syncFilter") {
+                this.syncFilterCache = { pattern, re };
+            } else {
+                this.syncIgnoreCache = { pattern, re };
+            }
+            return re;
+        } catch {
+            logWarn(`${which} is not a valid regex: ${pattern}`);
+            return null;
+        }
     }
 
     private async ensureParentDir(filePath: string): Promise<void> {

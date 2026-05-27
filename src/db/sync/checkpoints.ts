@@ -98,8 +98,10 @@ export class Checkpoints {
      * both seqs so the on-disk cursor matches in-memory state.
      */
     async saveEmptyPullBatch(nextRemoteSeq: number | string): Promise<void> {
-        this.remoteSeq = nextRemoteSeq;
-        await this.save();
+        await this.localDb.runWriteTx({
+            meta: [{ op: "put", key: META_REMOTE_SEQ, value: nextRemoteSeq }],
+            onCommit: () => { this.remoteSeq = nextRemoteSeq; },
+        });
     }
 
     /**
