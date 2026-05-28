@@ -64,16 +64,26 @@ export interface FileDoc extends CouchSyncDocBase {
 
 /** A content chunk — fragment of a file.
  *
- *  `_id` is `"chunk:" + xxhash64(content)` — always constructed via
+ *  `_id` is `"chunk:" + hash(plainBytes)` — always constructed via
  *  `makeChunkId`. Chunks are content-addressed and shared across files.
+ *  In v2 the hash input is the plain binary content (Uint8Array), not the
+ *  base64 string of it — see `chunker.ts`.
  *
- *  In v2 the chunk payload moves to a CouchDB attachment (field `_attachments.c`).
- *  The `data` string is retained on the type for the in-flight migration
- *  phases (Phase 1-6) and will be removed once attachment plumbing lands.
+ *  Phase 2 keeps `data: string` (base64) and adds the parallel `content: Uint8Array`.
+ *  Phase 6 (attachment plumbing) moves the canonical payload into a
+ *  CouchDB attachment (`_attachments.c`) and removes `data`.
  */
 export interface ChunkDoc extends CouchSyncDocBase {
     type: "chunk";
-    data: string; // base64-encoded content (v1; removed by Phase 6)
+    /** Base64-encoded content. Legacy v1 storage carrier, retained for
+     *  back-compat during phases 2-5. Phase 6 removes this in favour of
+     *  the binary attachment.
+     *  @deprecated Use `content` (Uint8Array) for new code paths. */
+    data: string;
+    /** Plain binary content. v2 canonical representation. Optional on
+     *  the type so docs read from legacy storage (data-only) remain
+     *  valid; the chunker always sets it on newly-produced chunks. */
+    content?: Uint8Array;
 }
 
 /** A config file (`.obsidian/` settings, plugin data.json, theme CSS, etc).

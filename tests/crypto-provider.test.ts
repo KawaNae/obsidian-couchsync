@@ -28,7 +28,8 @@ describe("deriveKeys", () => {
         const k2 = await deriveKeys("pass", salt);
         const p1 = createCryptoProvider(k1);
         const p2 = createCryptoProvider(k2);
-        expect(await p1.hmacHash("test")).toBe(await p2.hmacHash("test"));
+        const probe = new TextEncoder().encode("test");
+        expect(await p1.hmacHash(probe)).toBe(await p2.hmacHash(probe));
     });
 
     it("different passphrase → different keys", async () => {
@@ -37,7 +38,8 @@ describe("deriveKeys", () => {
         const k2 = await deriveKeys("beta", salt);
         const p1 = createCryptoProvider(k1);
         const p2 = createCryptoProvider(k2);
-        expect(await p1.hmacHash("test")).not.toBe(await p2.hmacHash("test"));
+        const probe = new TextEncoder().encode("test");
+        expect(await p1.hmacHash(probe)).not.toBe(await p2.hmacHash(probe));
     });
 
     it("different salt → different keys", async () => {
@@ -45,7 +47,8 @@ describe("deriveKeys", () => {
         const k2 = await deriveKeys("same", generateSalt());
         const p1 = createCryptoProvider(k1);
         const p2 = createCryptoProvider(k2);
-        expect(await p1.hmacHash("test")).not.toBe(await p2.hmacHash("test"));
+        const probe = new TextEncoder().encode("test");
+        expect(await p1.hmacHash(probe)).not.toBe(await p2.hmacHash(probe));
     });
 });
 
@@ -95,23 +98,30 @@ describe("CryptoProvider encrypt/decrypt", () => {
 
 describe("CryptoProvider hmacHash", () => {
     let provider: CryptoProvider;
+    const enc = new TextEncoder();
     beforeAll(async () => { provider = createCryptoProvider(await makeTestKeys()); });
 
     it("returns 64-char hex string", async () => {
-        const hash = await provider.hmacHash("test data");
+        const hash = await provider.hmacHash(enc.encode("test data"));
         expect(hash).toMatch(/^[0-9a-f]{64}$/);
     });
 
     it("is deterministic (same input → same hash)", async () => {
-        const h1 = await provider.hmacHash("same input");
-        const h2 = await provider.hmacHash("same input");
+        const h1 = await provider.hmacHash(enc.encode("same input"));
+        const h2 = await provider.hmacHash(enc.encode("same input"));
         expect(h1).toBe(h2);
     });
 
     it("different input → different hash", async () => {
-        const h1 = await provider.hmacHash("input A");
-        const h2 = await provider.hmacHash("input B");
+        const h1 = await provider.hmacHash(enc.encode("input A"));
+        const h2 = await provider.hmacHash(enc.encode("input B"));
         expect(h1).not.toBe(h2);
+    });
+
+    it("accepts arbitrary binary content (not just utf-8)", async () => {
+        const bytes = new Uint8Array([0x00, 0xff, 0x7f, 0x80]);
+        const hash = await provider.hmacHash(bytes);
+        expect(hash).toMatch(/^[0-9a-f]{64}$/);
     });
 });
 

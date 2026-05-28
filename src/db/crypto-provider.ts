@@ -17,7 +17,10 @@ const KEY_CHECK_PLAINTEXT = "couchsync-e2e-v1";
 export interface CryptoProvider {
     encrypt(plainBase64: string): Promise<string>;
     decrypt(envelope: string): Promise<string>;
-    hmacHash(data: string): Promise<string>;
+    /** HMAC-SHA256 over binary input. Returns hex-encoded MAC. Callers
+     *  hashing a string (e.g. vault path) must `TextEncoder.encode` it
+     *  themselves — this method does not infer encoding. */
+    hmacHash(data: Uint8Array): Promise<string>;
     encryptPath(path: string): Promise<string>;
     decryptPath(envelope: string): Promise<string>;
 }
@@ -116,9 +119,8 @@ export function createCryptoProvider(keys: EncryptionKeys): CryptoProvider {
             return new TextDecoder().decode(plainBuf);
         },
 
-        async hmacHash(data: string): Promise<string> {
-            const encoder = new TextEncoder();
-            const sig = await crypto.subtle.sign("HMAC", keys.hmacKey, encoder.encode(data));
+        async hmacHash(data: Uint8Array): Promise<string> {
+            const sig = await crypto.subtle.sign("HMAC", keys.hmacKey, data);
             return arrayBufToHex(sig);
         },
 

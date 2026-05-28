@@ -2,6 +2,13 @@ import type { IVaultIO } from "../types/vault-io.ts";
 import type { IVaultEvents, VaultEventRef } from "../types/vault-events.ts";
 import type { HistoryStorage } from "./storage.ts";
 import { DiffEngine, computeHash } from "./diff-engine.ts";
+
+const HISTORY_TEXT_ENCODER = new TextEncoder();
+/** History layer hashes string snapshots; the underlying `computeHash`
+ *  is binary-input only (v2). This adapter encodes UTF-8 once per call. */
+function hashString(s: string): Promise<string> {
+    return computeHash(HISTORY_TEXT_ENCODER.encode(s));
+}
 import type { CouchSyncSettings } from "../settings.ts";
 import type { HistorySource } from "./types.ts";
 import { minimatch } from "../utils/minimatch.ts";
@@ -89,7 +96,7 @@ export class HistoryCapture {
         const winnerContent = winner === "local" ? localContent : remoteContent;
         const loserContent = winner === "local" ? remoteContent : localContent;
         const patch = this.diffEngine.computePatch(winnerContent, loserContent);
-        const hash = await computeHash(winnerContent);
+        const hash = await hashString(winnerContent);
         const { added, removed } = this.diffEngine.computeLineDiff(winnerContent, loserContent);
         await this.storage.saveDiff(filePath, patch, hash, added, removed, true);
         // Update snapshot to winner content so subsequent diffs have correct baseline.
@@ -191,7 +198,7 @@ export class HistoryCapture {
             if (prevContent === currentContent) return;
 
             const patches = this.diffEngine.computePatch(prevContent, currentContent);
-            const baseHash = await computeHash(prevContent);
+            const baseHash = await hashString(prevContent);
             const { added, removed } = this.diffEngine.computeLineDiff(prevContent, currentContent);
             await this.storage.saveDiff(path, patches, baseHash, added, removed, false, source);
 

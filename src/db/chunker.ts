@@ -1,9 +1,17 @@
 import type { ChunkDoc } from "../types.ts";
+import { CURRENT_SCHEMA_VERSION } from "../types.ts";
 import { makeChunkId } from "../types/doc-id.ts";
 
-const MAX_CHUNK_SIZE = 100 * 1024; // 100KB in base64 characters
+/** Maximum bytes per binary chunk. Matches the previous era's effective
+ *  binary boundary (100 KiB base64 → 75 KiB binary) so chunk granularity
+ *  stays roughly the same across the v1 → v2 transition.
+ *
+ *  CouchDB's per-attachment ceiling is configurable but defaults to ~64 MiB;
+ *  the choice here is content-dedup granularity, not transport. Larger
+ *  chunks reduce per-chunk overhead at the cost of finer dedup. */
+const MAX_CHUNK_BYTES = 75 * 1024;
 
-let xxhash: { h64ToString: (input: string) => string } | null = null;
+let xxhash: { h64Raw: (input: Uint8Array, seed?: bigint) => bigint } | null = null;
 
 async function getXXHash() {
     if (xxhash) return xxhash;
@@ -13,9 +21,14 @@ async function getXXHash() {
     return xxhash;
 }
 
-export async function computeHash(data: string): Promise<string> {
+/** xxhash64 of plain binary content, hex-encoded with leading-zero padding
+ *  to a stable 16-character output. Padding matters: chunk IDs are
+ *  lexicographic keys in CouchDB, and a variable-length hash would change
+ *  range-query semantics across hash values. */
+export async function computeHash(data: Uint8Array): Promise<string> {
     const h = await getXXHash();
-    return h.h64ToString(data);
+    const result = h.h64Raw(data);
+    return result.toString(16).padStart(16, "0");
 }
 
 // Feature detection for the ES2024 base64 APIs. Obsidian Electron (desktop)
@@ -24,8 +37,8 @@ const HAS_NATIVE_BASE64 =
     typeof (Uint8Array.prototype as unknown as { toBase64?: () => string }).toBase64 === "function" &&
     typeof (Uint8Array as unknown as { fromBase64?: (s: string) => Uint8Array }).fromBase64 === "function";
 
-export function arrayBufferToBase64(buffer: ArrayBuffer): string {
-    const bytes = new Uint8Array(buffer);
+export function arrayBufferToBase64(buffer: ArrayBuffer | Uint8Array): string {
+    const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
     if (HAS_NATIVE_BASE64) {
         return (bytes as unknown as { toBase64: () => string }).toBase64();
     }
@@ -64,25 +77,39 @@ export function base64ToArrayBufferFallback(base64: string): ArrayBuffer {
     return bytes.buffer;
 }
 
-function splitBase64(base64: string): string[] {
-    if (base64.length <= MAX_CHUNK_SIZE) {
-        return [base64];
+function splitBinary(bytes: Uint8Array): Uint8Array[] {
+    if (bytes.length === 0) {
+        // Empty file → exactly one zero-length chunk. This matches the
+        // v1 chunker's behaviour (which produced one chunk with empty
+        // base64 data) so file→chunks→file round-trips through the
+        // zero-byte path stay deterministic.
+        return [new Uint8Array(0)];
     }
-    const chunks: string[] = [];
-    for (let i = 0; i < base64.length; i += MAX_CHUNK_SIZE) {
-        chunks.push(base64.slice(i, i + MAX_CHUNK_SIZE));
+    if (bytes.length <= MAX_CHUNK_BYTES) {
+        return [bytes];
     }
-    return chunks;
+    const pieces: Uint8Array[] = [];
+    for (let i = 0; i < bytes.length; i += MAX_CHUNK_BYTES) {
+        pieces.push(bytes.slice(i, i + MAX_CHUNK_BYTES));
+    }
+    return pieces;
 }
 
-export type ChunkHashFn = (data: string) => Promise<string>;
+export type ChunkHashFn = (data: Uint8Array) => Promise<string>;
 
+/** Split a file's binary content into ChunkDocs. Each chunk carries both
+ *  the binary `content` (v2 canonical) and a base64 `data` field (v1
+ *  back-compat retained until Phase 6 removes it).
+ *
+ *  The hash is computed over the binary `content` — never over the
+ *  base64 string. Same plaintext → same chunk ID, regardless of how
+ *  the storage layer chooses to encode it. */
 export async function splitIntoChunks(
     content: ArrayBuffer,
     hashFn?: ChunkHashFn,
 ): Promise<ChunkDoc[]> {
-    const base64 = arrayBufferToBase64(content);
-    const pieces = splitBase64(base64);
+    const bytes = new Uint8Array(content);
+    const pieces = splitBinary(bytes);
     const hash = hashFn ?? computeHash;
 
     const chunks: ChunkDoc[] = [];
@@ -91,13 +118,29 @@ export async function splitIntoChunks(
         chunks.push({
             _id: makeChunkId(h),
             type: "chunk",
-            data: piece,
+            schemaVersion: CURRENT_SCHEMA_VERSION,
+            data: arrayBufferToBase64(piece),
+            content: piece,
         });
     }
     return chunks;
 }
 
 export function joinChunks(chunks: ChunkDoc[]): ArrayBuffer {
-    const base64 = chunks.map((c) => c.data).join("");
-    return base64ToArrayBuffer(base64);
+    // Prefer the v2 binary representation when present. Fall back to
+    // decoding the base64 string for chunks that came in via legacy
+    // storage paths (read from the local DB pre-Phase 4 migration, etc.).
+    const binaries: Uint8Array[] = chunks.map((c) => {
+        if (c.content) return c.content;
+        return new Uint8Array(base64ToArrayBuffer(c.data));
+    });
+    let totalLen = 0;
+    for (const b of binaries) totalLen += b.length;
+    const out = new Uint8Array(totalLen);
+    let off = 0;
+    for (const b of binaries) {
+        out.set(b, off);
+        off += b.length;
+    }
+    return out.buffer;
 }

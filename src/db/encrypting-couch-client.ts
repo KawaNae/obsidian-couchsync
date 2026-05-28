@@ -51,6 +51,11 @@ function idPayload(id: string): string {
     return colon >= 0 ? id.slice(colon + 1) : id;
 }
 
+const PATH_ENCODER = new TextEncoder();
+function encodePathForHmac(path: string): Uint8Array {
+    return PATH_ENCODER.encode(path);
+}
+
 export class EncryptingCouchClient implements ICouchClient {
     constructor(
         private readonly inner: ICouchClient,
@@ -66,7 +71,7 @@ export class EncryptingCouchClient implements ICouchClient {
             const id = doc._id as string;
             const prefix = idPrefix(id);
             const path = idPayload(id);
-            const hmac = await this.crypto.hmacHash(path);
+            const hmac = await this.crypto.hmacHash(encodePathForHmac(path));
             const encPath = await this.crypto.encryptPath(path);
             out = { ...out, _id: prefix + hmac, encryptedPath: encPath };
         }
@@ -97,7 +102,7 @@ export class EncryptingCouchClient implements ICouchClient {
     private async translateId(plainId: string): Promise<string> {
         const prefix = idPrefix(plainId);
         if (prefix === "file:" || prefix === "config:") {
-            return prefix + await this.crypto.hmacHash(idPayload(plainId));
+            return prefix + await this.crypto.hmacHash(encodePathForHmac(idPayload(plainId)));
         }
         return plainId;
     }
