@@ -511,6 +511,30 @@ export class VaultSyncTab {
                 });
             addPasswordToggle(passphraseSetting);
         }
+
+        new Setting(el)
+            .setName("Compress chunks (gzip)")
+            .setDesc(
+                editable
+                    ? "Recommended. Gzip attachment bodies before transport. " +
+                      "Cuts wire bytes substantially on text-heavy vaults. Disabling can " +
+                      "reduce CPU on tiny vaults or for theoretical-best safety under " +
+                      "exotic threat models."
+                    : settings.compressionEnabled
+                        ? "Enabled — to change, disable sync first."
+                        : "Disabled — to change, disable sync first."
+            )
+            .addToggle((toggle) =>
+                toggle
+                    .setValue(settings.compressionEnabled)
+                    .setDisabled(!editable)
+                    .onChange(async (value) => {
+                        const patch: Partial<CouchSyncSettings> = { compressionEnabled: value };
+                        if (state === "setupDone") patch.connectionState = "tested";
+                        await this.deps.updateSettings(patch);
+                        this.deps.refresh();
+                    })
+            );
     }
 }
 

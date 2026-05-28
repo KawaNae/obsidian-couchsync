@@ -62,6 +62,13 @@ export interface CouchSyncSettings {
     // E2E Encryption
     encryptionEnabled: boolean;
     encryptionPassphrase: string;
+    /** v2: enable gzip compression of attachment bodies. Outermost
+     *  decorator in the client stack; transparent to the sync layer.
+     *  Recorded in `vault:meta` at Init time and read by Clone — local
+     *  toggling after the vault is initialised is allowed but the new
+     *  value only takes effect for *future* chunk pushes (existing
+     *  chunks keep whatever encoding they were stored with). */
+    compressionEnabled: boolean;
 
     // Internal
     connectionState: ConnectionState;
@@ -107,6 +114,7 @@ export const DEFAULT_SETTINGS: CouchSyncSettings = {
 
     encryptionEnabled: false,
     encryptionPassphrase: "",
+    compressionEnabled: true,
 
     connectionState: "editing",
     deviceId: "",

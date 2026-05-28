@@ -37,8 +37,15 @@ import { CompositionGate } from "./sync/composition-gate.ts";
 import type { CryptoProvider } from "./db/crypto-provider.ts";
 import { computeHash, type ChunkHashFn } from "./db/chunker.ts";
 import { EncryptingCouchClient } from "./db/encrypting-couch-client.ts";
+import { CompressingCouchClient } from "./db/compressing-couch-client.ts";
 import { makeCouchClient } from "./db/couch-client.ts";
-import { fetchEncryptionMeta, unlockWithPassphrase, deriveEncryption, pushEncryptionMeta } from "./db/encryption-meta.ts";
+import {
+    fetchVaultMeta,
+    buildInitialVaultMeta,
+    pushVaultMeta,
+    unlockVaultMeta,
+    type VaultMetaDoc,
+} from "./db/vault-meta.ts";
 import { checkEncryptionAgreement, type EncryptionAgreement } from "./db/encryption-agreement.ts";
 import { PassphraseModal } from "./ui/passphrase-modal.ts";
 import type { ICouchClient } from "./db/interfaces.ts";
@@ -156,9 +163,17 @@ export default class CouchSyncPlugin extends Plugin {
         // all swallowed write errors and let `Pull: N written` lie).
         const encClientFactory: (s: CouchSyncSettings) => ICouchClient = (s) => {
             const raw = makeCouchClient(s.couchdbUri, s.couchdbDbName, s.couchdbUser, s.couchdbPassword);
-            return this.cryptoProvider
-                ? new EncryptingCouchClient(raw, this.cryptoProvider)
-                : raw;
+            // v2 decorator stack: compress(encrypt(raw)). Compression is
+            // the outermost layer so the plain-text payload reaches gzip
+            // before the cipher renders the stream incompressible.
+            let client: ICouchClient = raw;
+            if (this.cryptoProvider) {
+                client = new EncryptingCouchClient(client, this.cryptoProvider);
+            }
+            if (s.compressionEnabled) {
+                client = new CompressingCouchClient(client);
+            }
+            return client;
         };
         this.replicator = new SyncEngine(
             this.localDb,
@@ -204,9 +219,14 @@ export default class CouchSyncPlugin extends Plugin {
         const encConfigClientFactory = (s: CouchSyncSettings): ICouchClient | null => {
             if (!s.couchdbConfigDbName) return null;
             const raw = makeCouchClient(s.couchdbUri, s.couchdbConfigDbName, s.couchdbUser, s.couchdbPassword);
-            return this.cryptoProvider
-                ? new EncryptingCouchClient(raw, this.cryptoProvider)
-                : raw;
+            let client: ICouchClient = raw;
+            if (this.cryptoProvider) {
+                client = new EncryptingCouchClient(client, this.cryptoProvider);
+            }
+            if (s.compressionEnabled) {
+                client = new CompressingCouchClient(client);
+            }
+            return client;
         };
         this.configSync = new ConfigSync(
             adapterIO,
@@ -433,7 +453,7 @@ export default class CouchSyncPlugin extends Plugin {
                                     return;
                                 }
                             }
-                            const result = await unlockWithPassphrase(agreement.meta, passphrase);
+                            const result = await unlockVaultMeta(agreement.meta, passphrase);
                             if (!result) {
                                 this.settings.encryptionPassphrase = "";
                                 await this.saveSettings();
@@ -460,8 +480,32 @@ export default class CouchSyncPlugin extends Plugin {
                         );
                         this.fireReconcile("onload");
                         return;
+                    } else if (agreement.status === "legacy-meta-only") {
+                        // Pre-v2 `encryption:meta` doc found but no v2
+                        // `vault:meta`. The user must re-run Init/Clone
+                        // following the v2 migration procedure.
+                        this.settings.connectionState = "tested";
+                        await this.saveSettings();
+                        notify(
+                            "CouchSync: this vault was set up with a pre-v2 build. " +
+                            "Open Settings → Vault Sync and re-run Init or Clone to migrate.",
+                            15000,
+                        );
+                        this.fireReconcile("onload");
+                        return;
                     }
-                    // "agreed-plaintext" — proceed normally
+                    // Compression flag is server-of-record. Reconcile the
+                    // local setting with whatever vault:meta says so the
+                    // decorator stack is identical across devices.
+                    const remoteMeta = (agreement.status === "agreed-encrypted"
+                        || agreement.status === "agreed-plaintext")
+                        ? agreement.meta : null;
+                    if (remoteMeta
+                        && this.settings.compressionEnabled !== remoteMeta.compression.enabled) {
+                        this.settings.compressionEnabled = remoteMeta.compression.enabled;
+                        await this.saveSettings();
+                    }
+                    // "agreed-plaintext" / "agreed-encrypted" — proceed normally
                 } catch (e: any) {
                     logError(`CouchSync: encryption check failed: ${e?.message ?? e}`);
                     return;
@@ -530,54 +574,67 @@ export default class CouchSyncPlugin extends Plugin {
         this.changeTracker.stop();
         const progress = new ProgressNotice("Init");
         try {
-            if (this.settings.encryptionEnabled) {
-                if (!this.settings.encryptionPassphrase) {
-                    throw new Error("Encryption is enabled but no passphrase set. Enter a passphrase in Step 1.");
+            const enc = this.settings.encryptionEnabled;
+            const compress = this.settings.compressionEnabled;
+
+            if (enc && !this.settings.encryptionPassphrase) {
+                throw new Error("Encryption is enabled but no passphrase set. Enter a passphrase in Step 1.");
+            }
+
+            let meta: VaultMetaDoc;
+
+            if (enc && this.cryptoProvider) {
+                // Re-init with existing keys: preserve salt + keyCheck
+                // so other devices can still decrypt with the same
+                // passphrase. Compression flag may change between inits.
+                const rawClient = makeCouchClient(
+                    this.settings.couchdbUri, this.settings.couchdbDbName,
+                    this.settings.couchdbUser, this.settings.couchdbPassword,
+                );
+                const existing = await fetchVaultMeta(rawClient);
+                if (!existing || !existing.encryption.enabled) {
+                    throw new Error("vault:meta with encryption not found on remote");
                 }
-
-                let meta: Awaited<ReturnType<typeof deriveEncryption>>["meta"];
-
-                if (this.cryptoProvider) {
-                    // Re-init with existing keys: preserve salt so other
-                    // devices can still decrypt with the same passphrase.
-                    const rawClient = makeCouchClient(
-                        this.settings.couchdbUri, this.settings.couchdbDbName,
-                        this.settings.couchdbUser, this.settings.couchdbPassword,
-                    );
-                    const existing = await fetchEncryptionMeta(rawClient);
-                    if (!existing) throw new Error("encryption:meta not found on remote");
-                    meta = existing;
-                } else {
-                    // First-time encryption: derive new salt + keys.
-                    progress.update("Deriving encryption keys...");
-                    const derived = await deriveEncryption(this.settings.encryptionPassphrase);
-                    meta = derived.meta;
+                meta = {
+                    ...existing,
+                    compression: compress
+                        ? { enabled: true, algorithm: "gzip", version: 1 }
+                        : { enabled: false },
+                };
+            } else {
+                progress.update(enc ? "Deriving encryption keys..." : "Preparing vault metadata...");
+                const derived = await buildInitialVaultMeta({
+                    encryption: enc,
+                    passphrase: enc ? this.settings.encryptionPassphrase : undefined,
+                    compression: compress,
+                });
+                meta = derived.meta;
+                if (derived.crypto) {
                     this.cryptoProvider = derived.crypto;
                     this.remoteOps.setClientWrapper((raw) =>
                         new EncryptingCouchClient(raw, this.cryptoProvider!));
+                } else {
+                    this.cryptoProvider = undefined;
+                    this.remoteOps.setClientWrapper(undefined);
                 }
-
-                const result = await this.setupService.init((msg) => progress.update(msg));
-
-                progress.update("Writing encryption metadata...");
-                await pushEncryptionMeta(this.remoteOps.makeClient(), meta);
-
-                this.settings.connectionState = "setupDone";
-                this.encryptionMismatch = undefined;
-                await this.saveSettings();
-                progress.done(`Init complete! ${result.vaultFiles} files, ${result.totalDocs} docs pushed (encrypted).`);
-            } else {
-                this.cryptoProvider = undefined;
-                this.remoteOps.setClientWrapper(undefined);
-
-                const result = await this.setupService.init((msg) => progress.update(msg));
-
-                this.settings.encryptionPassphrase = "";
-                this.settings.connectionState = "setupDone";
-                this.encryptionMismatch = undefined;
-                await this.saveSettings();
-                progress.done(`Init complete! ${result.vaultFiles} files, ${result.totalDocs} docs pushed.`);
             }
+
+            const result = await this.setupService.init((msg) => progress.update(msg));
+
+            progress.update("Writing vault metadata...");
+            await pushVaultMeta(this.remoteOps.makeClient(), meta);
+
+            if (!enc) {
+                this.settings.encryptionPassphrase = "";
+            }
+            this.settings.connectionState = "setupDone";
+            this.encryptionMismatch = undefined;
+            await this.saveSettings();
+            const modes: string[] = [];
+            if (enc) modes.push("encrypted");
+            if (compress) modes.push("compressed");
+            const tag = modes.length ? ` (${modes.join(", ")})` : "";
+            progress.done(`Init complete! ${result.vaultFiles} files, ${result.totalDocs} docs pushed${tag}.`);
         } catch (e: any) {
             if (this.settings.encryptionEnabled) {
                 this.cryptoProvider = undefined;
@@ -593,9 +650,9 @@ export default class CouchSyncPlugin extends Plugin {
             this.settings.couchdbUri, this.settings.couchdbDbName,
             this.settings.couchdbUser, this.settings.couchdbPassword,
         );
-        const meta = await fetchEncryptionMeta(rawClient);
+        const meta = await fetchVaultMeta(rawClient);
 
-        if (meta) {
+        if (meta && meta.encryption.enabled) {
             let passphrase = this.settings.encryptionPassphrase;
             if (!passphrase) {
                 const modal = new PassphraseModal(this.app, false);
@@ -604,7 +661,7 @@ export default class CouchSyncPlugin extends Plugin {
                     throw new Error("Passphrase required to clone encrypted vault.");
                 }
             }
-            const unlockResult = await unlockWithPassphrase(meta, passphrase);
+            const unlockResult = await unlockVaultMeta(meta, passphrase);
             if (!unlockResult) throw new Error("Wrong passphrase.");
 
             this.cryptoProvider = unlockResult.crypto;
@@ -617,6 +674,13 @@ export default class CouchSyncPlugin extends Plugin {
             this.remoteOps.setClientWrapper(undefined);
             this.settings.encryptionEnabled = false;
             this.settings.encryptionPassphrase = "";
+        }
+
+        // Clone-side: the server's compression flag wins. The local
+        // setting is overwritten to match so the decorator stack rebuilds
+        // identically across devices in the same vault.
+        if (meta) {
+            this.settings.compressionEnabled = meta.compression.enabled;
         }
 
         this.replicator.stop();
