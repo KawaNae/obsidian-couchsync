@@ -198,26 +198,63 @@ export class FakeCouchClient implements ICouchClient {
         signal?: AbortSignal,
     ): Promise<BulkDocsResult[]> {
         throwIfAborted(signal);
-        // Defer to bulkDocs for the doc body, then stash attachments
-        // separately on the same StoredDoc entry.
-        const results = await this.bulkDocs(items.map((i) => i.doc), signal);
-        for (let i = 0; i < items.length; i++) {
-            const res = results[i];
-            if (!res?.ok) continue;
-            const stored = this.docs.get(res.id);
-            if (!stored) continue;
-            // Clone the attachment buffers so tests can mutate inputs
-            // without surprising the fake's storage state.
+        // Independent storage path — does NOT delegate to `bulkDocs` so
+        // tests that spy on `bulkDocs` to count file-doc pushes are not
+        // double-counted by attachment-bearing chunk pushes. Mirrors the
+        // production split where v2 chunks ride a separate code path
+        // (`_bulk_docs` with inline `_attachments.data` base64 in real
+        // CouchDB; we just stash the binary directly here).
+        const results: BulkDocsResult[] = [];
+        for (const { doc, attachments } of items) {
+            const id = doc._id;
+            if (!id) {
+                results.push({ id: "", error: "missing_id", reason: "no _id" });
+                continue;
+            }
+            const existing = this.docs.get(id);
+            const newRev = `${++this.revCounter}-r`;
+            const newSeq = ++this.seqCounter;
+            // Clone attachment buffers so input mutation is isolated.
             const cloned: Record<string, AttachmentBlob> = {};
-            for (const [name, blob] of Object.entries(items[i].attachments)) {
+            for (const [name, blob] of Object.entries(attachments)) {
                 cloned[name] = {
                     contentType: blob.contentType,
                     data: new Uint8Array(blob.data),
                     contentEncoding: blob.contentEncoding,
                 };
             }
-            stored.attachments = cloned;
+            // Chunk pushes (id starts with chunk:) are content-addressed.
+            // A second push of the same id with the same content is a
+            // no-op in spirit; CouchDB returns conflict if the rev is
+            // missing/wrong. Match that: existing doc → conflict unless
+            // caller threaded a _rev (chunks shouldn't, but we treat
+            // the input as ok if it matches existing rev).
+            if (existing && !existing.deleted) {
+                const inputRev = (doc as any)._rev as string | undefined;
+                if (inputRev && inputRev !== existing.rev) {
+                    results.push({
+                        id,
+                        error: "conflict",
+                        reason: "Document update conflict.",
+                    });
+                    continue;
+                }
+                // Idempotent re-put: update body, preserve doc identity.
+                existing.doc = { ...doc, _rev: newRev };
+                existing.rev = newRev;
+                existing.seq = newSeq;
+                existing.attachments = cloned;
+            } else {
+                this.docs.set(id, {
+                    doc: { ...doc, _rev: newRev },
+                    rev: newRev,
+                    seq: newSeq,
+                    attachments: cloned,
+                });
+            }
+            results.push({ id, ok: true, rev: newRev });
         }
+        this.bumpTick();
         return results;
     }
 
