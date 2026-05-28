@@ -12,10 +12,94 @@
  * in-flight HTTP work when the user cancels or session is disposed.
  */
 
-import type { ICouchClient, IDocStore } from "./interfaces.ts";
-import type { CouchSyncDoc } from "../types.ts";
+import type { ICouchClient, IDocStore, DocWithAttachments, BulkDocsResult } from "./interfaces.ts";
+import type { CouchSyncDoc, ChunkDoc } from "../types.ts";
 import { stripRev } from "../utils/doc.ts";
+import { isChunkDocId } from "../types/doc-id.ts";
+import { base64ToArrayBuffer } from "./chunker.ts";
 import { paginateAllDocs, DEFAULT_BATCH_SIZE } from "./sync/pagination.ts";
+
+/** Strip the v2 binary `content` (and legacy `data`) from a chunk doc
+ *  body before sending it to the remote. The attachment carries the
+ *  canonical payload; these fields would either serialise as junk
+ *  (Uint8Array → giant numeric JSON) or duplicate the storage. */
+function stripChunkBody(c: ChunkDoc & { _rev?: string }) {
+    const { data: _data, content: _content, ...rest } = c;
+    void _data; void _content;
+    return rest;
+}
+
+function chunkAttachmentBytes(c: ChunkDoc): Uint8Array | null {
+    if (c.content) return c.content;
+    if (typeof c.data === "string") {
+        if (c.data.length === 0) return new Uint8Array(0);
+        return new Uint8Array(base64ToArrayBuffer(c.data));
+    }
+    return null;
+}
+
+/** Partition a doc list into chunk attachments vs everything else,
+ *  matching the v2 push-pipeline split. Used by setup-time bulk push
+ *  paths (`pushAll`, `pushDocs`) so the chunk body never travels in
+ *  the JSON of `_bulk_docs`. */
+function splitForPush(docs: Array<CouchSyncDoc & { _rev?: string }>): {
+    chunks: DocWithAttachments[];
+    chunkPositions: number[];
+    rest: Array<CouchSyncDoc & { _rev?: string }>;
+    restPositions: number[];
+} {
+    const chunks: DocWithAttachments[] = [];
+    const chunkPositions: number[] = [];
+    const rest: Array<CouchSyncDoc & { _rev?: string }> = [];
+    const restPositions: number[] = [];
+    for (let i = 0; i < docs.length; i++) {
+        const d = docs[i];
+        if (isChunkDocId(d._id)) {
+            const c = d as ChunkDoc & { _rev?: string };
+            const body = chunkAttachmentBytes(c) ?? new Uint8Array(0);
+            chunkPositions.push(i);
+            chunks.push({
+                doc: stripChunkBody(c),
+                attachments: {
+                    c: {
+                        contentType: "application/octet-stream",
+                        data: body,
+                    },
+                },
+            });
+        } else {
+            restPositions.push(i);
+            rest.push(d);
+        }
+    }
+    return { chunks, chunkPositions, rest, restPositions };
+}
+
+async function pushSplit(
+    remote: ICouchClient,
+    docs: Array<CouchSyncDoc & { _rev?: string }>,
+    signal?: AbortSignal,
+): Promise<BulkDocsResult[]> {
+    const split = splitForPush(docs);
+    const results: BulkDocsResult[] = new Array(docs.length);
+    const work: Promise<unknown>[] = [];
+    if (split.rest.length > 0) {
+        work.push(remote.bulkDocs(split.rest, signal).then((res) => {
+            for (let i = 0; i < res.length; i++) {
+                results[split.restPositions[i]] = res[i];
+            }
+        }));
+    }
+    if (split.chunks.length > 0) {
+        work.push(remote.bulkDocsWithAttachments(split.chunks, signal).then((res) => {
+            for (let i = 0; i < res.length; i++) {
+                results[split.chunkPositions[i]] = res[i];
+            }
+        }));
+    }
+    await Promise.all(work);
+    return results;
+}
 
 export type ProgressCallback = (docId: string, count: number) => void;
 
@@ -62,10 +146,10 @@ export async function pushDocs(
         if (remoteRev) doc._rev = remoteRev;
     }
 
-    const results = await remote.bulkDocs(docs, signal);
+    const results = await pushSplit(remote, docs as Array<CouchSyncDoc & { _rev?: string }>, signal);
     let total = 0;
     for (const res of results) {
-        if (res.ok) {
+        if (res?.ok) {
             total++;
             onProgress?.(res.id, total);
         }
@@ -262,10 +346,10 @@ export async function pushAll(
         if (remoteRev) doc._rev = remoteRev;
     }
 
-    const results = await remote.bulkDocs(docs, signal);
+    const results = await pushSplit(remote, docs, signal);
     let total = 0;
     for (const res of results) {
-        if (res.ok) {
+        if (res?.ok) {
             total++;
             onProgress?.(res.id, total);
         }
@@ -295,6 +379,34 @@ export async function pullAll(
         }
     }
     if (docs.length === 0) return { written: 0, docs: [] };
+
+    // v2: chunk bodies live in attachments, not in the doc body. Fetch
+    // the binary content for every chunk before committing locally.
+    // Bounded-concurrency parallel fetch (mirrors `ensureChunks`) so a
+    // fresh-clone pullAll completes in reasonable time over modern
+    // HTTP/2 connections.
+    const CONCURRENCY = 4;
+    const chunkIndices: number[] = [];
+    for (let i = 0; i < docs.length; i++) {
+        if (isChunkDocId(docs[i]._id)) chunkIndices.push(i);
+    }
+    if (chunkIndices.length > 0) {
+        const queue = [...chunkIndices];
+        const workers: Promise<void>[] = [];
+        for (let w = 0; w < CONCURRENCY; w++) {
+            workers.push((async () => {
+                while (queue.length > 0) {
+                    const i = queue.shift();
+                    if (i === undefined) return;
+                    const blob = await remote.getAttachment(docs[i]._id, "c", signal);
+                    const c = docs[i] as ChunkDoc;
+                    c.data = "";
+                    c.content = blob ?? new Uint8Array(0);
+                }
+            })());
+        }
+        await Promise.all(workers);
+    }
 
     // Strip remote _rev before writing to local.
     const localDocs = docs.map((d) => stripRev(d) as CouchSyncDoc);

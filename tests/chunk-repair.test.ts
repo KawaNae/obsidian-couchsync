@@ -261,12 +261,18 @@ describe("repairChunkDrift", () => {
         await putLocal(db, pushC);
         await remote.bulkDocs([pullC]);
 
+        // v2: chunk push routes through bulkDocsWithAttachments. Mock
+        // both endpoints to fail on push paths so the test still
+        // exercises the failure-collection branch regardless of which
+        // codec path the chunk actually takes.
         const originalBulkDocs = remote.bulkDocs.bind(remote);
+        const originalBulkAtt = remote.bulkDocsWithAttachments.bind(remote);
         remote.bulkDocs = async (docs: any[]) => {
-            // Fail only on push (new writes). Tombstone deletes would use
-            // _deleted flag; we don't need those here.
             if (docs.some((d) => !d._deleted)) throw new Error("boom");
             return originalBulkDocs(docs);
+        };
+        remote.bulkDocsWithAttachments = async () => {
+            throw new Error("boom");
         };
 
         const result = await repairChunkDrift(
@@ -284,6 +290,7 @@ describe("repairChunkDrift", () => {
         expect(result.failed[0].direction).toBe("push");
 
         remote.bulkDocs = originalBulkDocs;
+        remote.bulkDocsWithAttachments = originalBulkAtt;
     });
 
     it("records elapsedMs", async () => {
