@@ -17,6 +17,13 @@ const KEY_CHECK_PLAINTEXT = "couchsync-e2e-v1";
 export interface CryptoProvider {
     encrypt(plainBase64: string): Promise<string>;
     decrypt(envelope: string): Promise<string>;
+    /** v2 binary encrypt: returns `IV(12B) || AES-GCM(plain)` as a single
+     *  contiguous Uint8Array. Used by attachment encryption — no base64,
+     *  no envelope string. */
+    encryptBytes(plain: Uint8Array): Promise<Uint8Array>;
+    /** v2 binary decrypt — inverse of encryptBytes. Input must start with
+     *  the 12-byte IV; the rest is the AES-GCM ciphertext+tag. */
+    decryptBytes(blob: Uint8Array): Promise<Uint8Array>;
     /** HMAC-SHA256 over binary input. Returns hex-encoded MAC. Callers
      *  hashing a string (e.g. vault path) must `TextEncoder.encode` it
      *  themselves — this method does not infer encoding. */
@@ -117,6 +124,34 @@ export function createCryptoProvider(keys: EncryptionKeys): CryptoProvider {
                 ciphertext,
             );
             return new TextDecoder().decode(plainBuf);
+        },
+
+        async encryptBytes(plain: Uint8Array): Promise<Uint8Array> {
+            const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES));
+            const cipherBuf = await crypto.subtle.encrypt(
+                { name: "AES-GCM", iv },
+                keys.contentKey,
+                plain,
+            );
+            const cipher = new Uint8Array(cipherBuf);
+            const out = new Uint8Array(iv.length + cipher.length);
+            out.set(iv, 0);
+            out.set(cipher, iv.length);
+            return out;
+        },
+
+        async decryptBytes(blob: Uint8Array): Promise<Uint8Array> {
+            if (blob.length < IV_BYTES) {
+                throw new Error("decryptBytes: input shorter than IV length");
+            }
+            const iv = blob.subarray(0, IV_BYTES);
+            const cipher = blob.subarray(IV_BYTES);
+            const plainBuf = await crypto.subtle.decrypt(
+                { name: "AES-GCM", iv },
+                keys.contentKey,
+                cipher,
+            );
+            return new Uint8Array(plainBuf);
         },
 
         async hmacHash(data: Uint8Array): Promise<string> {

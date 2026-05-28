@@ -229,17 +229,32 @@ export class EncryptingCouchClient implements ICouchClient {
         items: DocWithAttachments[],
         signal?: AbortSignal,
     ): Promise<BulkDocsResult[]> {
-        // Phase 3 pass-through: encryption of attachment bodies and
-        // path-ID translation for attachment-bearing docs lands in Phase 7.
-        // Until then we forward to the base client untouched. The base
-        // sync layer does not push via this method yet (Phase 6 wires
-        // it in), so leaking unencrypted attachments here is impossible
-        // in normal flow.
-        const translated = await Promise.all(items.map(async ({ doc, attachments }) => ({
-            doc: await this.encryptDoc(doc as AnyDoc),
-            attachments,
-        })));
-        return this.inner.bulkDocsWithAttachments(translated, signal);
+        // Encrypt both the doc body (path ID → HMAC, encryptedPath field
+        // populated when applicable) and each attachment body. The
+        // attachment binary becomes `IV || AES-GCM(plain)`. The
+        // inner-side ID returned by bulkDocsWithAttachments will be the
+        // HMAC form for file:/config: ids; we re-map back to the plain
+        // ID before returning so callers stay in plain-id space.
+        const translated = await Promise.all(items.map(async ({ doc, attachments }) => {
+            const encDoc = await this.encryptDoc(doc as AnyDoc);
+            const encAttachments: Record<string, any> = {};
+            for (const [name, blob] of Object.entries(attachments)) {
+                encAttachments[name] = {
+                    contentType: blob.contentType,
+                    data: await this.crypto.encryptBytes(blob.data),
+                    contentEncoding: blob.contentEncoding,
+                };
+            }
+            return { doc: encDoc, attachments: encAttachments };
+        }));
+        const results = await this.inner.bulkDocsWithAttachments(translated, signal);
+        return results.map((r, i) => {
+            const original = items[i].doc as AnyDoc;
+            if (r.ok && hasPathId(original)) {
+                return { ...r, id: original._id as string };
+            }
+            return r;
+        });
     }
 
     async getAttachment(
@@ -248,8 +263,18 @@ export class EncryptingCouchClient implements ICouchClient {
         signal?: AbortSignal,
     ): Promise<Uint8Array | null> {
         const remoteId = await this.translateId(docId);
-        // Phase 3 pass-through: attachment-body decryption lands in Phase 7.
-        return this.inner.getAttachment(remoteId, name, signal);
+        const encrypted = await this.inner.getAttachment(remoteId, name, signal);
+        if (encrypted === null) return null;
+        try {
+            return await this.crypto.decryptBytes(encrypted);
+        } catch (e) {
+            throw new EncryptionError(
+                `Failed to decrypt attachment ${docId}/${name}: ${
+                    e instanceof Error ? e.message : e
+                }`,
+                e,
+            );
+        }
     }
 
     ensureDb(signal?: AbortSignal): Promise<void> {
