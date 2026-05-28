@@ -248,6 +248,13 @@ export class SyncEngine {
      * Ensure every chunk referenced by FileDoc exists in localDB. Any missing
      * chunks are fetched via `client` and persisted locally. When `client`
      * is null, this is a no-op (offline callers rely on existing error paths).
+     *
+     * v2 fetch path: each chunk is pulled as an attachment via
+     * `getAttachment(id, "c")`. The chunk doc body itself is small (just
+     * type/schemaVersion) and is reconstructed locally; the binary content
+     * lives in `ChunkDoc.content`. Fetches run with bounded concurrency
+     * so a fresh-clone catchup overlaps round-trips against modern
+     * HTTP/2-multiplexed transports.
      */
     private async ensureChunksInternal(
         client: ICouchClient | null,
@@ -268,7 +275,44 @@ export class SyncEngine {
         logDebug(
             `  fetching ${missing.length} missing chunk(s) from remote for ${filePathFromId(fileDoc._id)}`,
         );
-        const fetched = await client.bulkGet<ChunkDoc>(missing);
+
+        const CONCURRENCY = 4;
+        const fetched: ChunkDoc[] = [];
+        const queue = [...missing];
+        const notFound: string[] = [];
+        const workers: Promise<void>[] = [];
+        for (let w = 0; w < CONCURRENCY; w++) {
+            workers.push((async () => {
+                while (queue.length > 0) {
+                    const id = queue.shift();
+                    if (!id) return;
+                    const blob = await client.getAttachment(id, "c");
+                    if (blob === null) {
+                        notFound.push(id);
+                        continue;
+                    }
+                    fetched.push({
+                        _id: id,
+                        type: "chunk",
+                        schemaVersion: 2,
+                        data: "",
+                        content: blob,
+                    });
+                }
+            })());
+        }
+        await Promise.all(workers);
+        if (notFound.length > 0) {
+            // A missing-on-server chunk for a file we just committed
+            // indicates an inconsistent push (chunk pushed without
+            // attachment, or attachment expired). chunk-repair handles
+            // recovery; here we surface a warning rather than failing
+            // the whole pull batch (which would block all subsequent
+            // files for one broken chunk).
+            logWarn(
+                `ensureChunks: ${notFound.length} chunk(s) returned 404 for ${filePathFromId(fileDoc._id)}: ${notFound.slice(0, 3).join(", ")}${notFound.length > 3 ? "…" : ""}`,
+            );
+        }
         if (fetched.length > 0) {
             await this.localDb.runWriteTx({ chunks: fetched });
         }

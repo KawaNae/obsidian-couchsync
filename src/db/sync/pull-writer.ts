@@ -155,20 +155,15 @@ export class PullWriter {
             if (!row.doc) continue;
             const remoteDoc = stripRev(row.doc) as CouchSyncDoc;
 
-            // ChunkDocs have no vclock and are content-addressed (id =
-            // hash of payload). If the chunk already exists locally, the
-            // re-put is a no-op — short-circuit to avoid pointless I/O
-            // when a session-boundary catchup re-delivers self-pushed
-            // chunks. R1b path: the old recordPushEcho/consumePushEcho
-            // pair gated this; with that gone, content-addressing is
-            // the durable check.
+            // v2 (data-layer-v2 Phase 5): chunks no longer flow through
+            // `_changes`. Their bodies are tiny attachment metadata and
+            // the canonical binary lives in `_attachments.c`, fetched
+            // lazily via `ensureChunks` when the referencing file lands.
+            // Drop the row from this batch and let `ensureChunks` pull
+            // the attachment on demand. The classify counter stays for
+            // observability so a session log still reports how many
+            // chunk rows the feed produced.
             if (!isFileDoc(remoteDoc) && !isConfigDoc(remoteDoc)) {
-                const existing = await this.deps.localDb.get(remoteDoc._id);
-                if (existing) {
-                    stats.convergedSkipCount++;
-                    continue;
-                }
-                accepted.push(remoteDoc);
                 stats.chunkCount++;
                 continue;
             }

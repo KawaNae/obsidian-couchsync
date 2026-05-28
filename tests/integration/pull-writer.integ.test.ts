@@ -209,20 +209,25 @@ describe("PullWriter integration", () => {
             expect(fired).toEqual([]);
         });
 
-        it("chunk docs bypass the vclock guard (no resolver call)", async () => {
+        it("chunk rows from _changes are dropped (v2: chunks land via attachment fetch, not feed)", async () => {
             h = createSyncHarness();
             const b = h.addDevice("dev-B");
             const rig = attachPullWriter({ device: b, withResolver: true });
 
-            const chunkId = makeChunkId("abc123");
+            const chunkId = makeChunkId("abc1234567890def");
             const chunkDoc = { _id: chunkId, type: "chunk", data: "base64..." };
 
             await rig.writer.apply(makeChangesResult(
                 [{ id: chunkId, seq: "1", doc: chunkDoc }], "1",
             ));
 
+            // v2 semantics: chunks no longer flow through pull-writer.
+            // The row is observed (chunkCount stats) but its body is
+            // discarded; the canonical content arrives via ensureChunks
+            // when the referencing FileDoc lands. The local DB therefore
+            // stays empty for this chunk after a chunk-only batch.
             const stored = await b.db.get(chunkId);
-            expect(stored).not.toBeNull();
+            expect(stored).toBeNull();
         });
 
         it("new doc (no local version): accepted without resolver consultation", async () => {
@@ -249,10 +254,12 @@ describe("PullWriter integration", () => {
             const rig = attachPullWriter({ device: b });
 
             const spy = vi.spyOn(b.db, "runWriteTx");
-            const chunkId = makeChunkId("a");
+            // v2: pull-writer commits file (and config) docs; chunks bypass
+            // this path entirely. Use a FileDoc to exercise the commit tx.
+            const fileDoc = makeRemoteFileDoc("bundle.md", { A: 1 });
 
             await rig.writer.apply(makeChangesResult(
-                [{ id: chunkId, seq: "1", doc: { _id: chunkId, type: "chunk", data: "x" } }],
+                [{ id: fileDoc._id, seq: "1", doc: fileDoc }],
                 "7",
             ));
 
@@ -273,10 +280,12 @@ describe("PullWriter integration", () => {
             const rig = attachPullWriter({ device: b });
 
             const spy = vi.spyOn(b.db, "runWriteTx").mockRejectedValue(new Error("quota"));
-            const chunkId = makeChunkId("a");
+            // v2: drive the commit path with a FileDoc, since chunk rows
+            // are now discarded before reaching `commit()`.
+            const fileDoc = makeRemoteFileDoc("fail.md", { A: 1 });
 
             await expect(rig.writer.apply(makeChangesResult(
-                [{ id: chunkId, seq: "1", doc: { _id: chunkId, type: "chunk", data: "x" } }],
+                [{ id: fileDoc._id, seq: "1", doc: fileDoc }],
                 "3",
             ))).rejects.toThrow("quota");
 
@@ -309,16 +318,19 @@ describe("PullWriter integration", () => {
             const b = h.addDevice("dev-B");
             const rig = attachPullWriter({ device: b });
 
-            const chunkId = makeChunkId("a");
+            // v2: chunks bypass pull-writer entirely (no echo entry needed
+            // because they never reach the pull-echo guard). FileDoc echo
+            // recording remains the load-bearing case for this test.
+            const fileDoc = makeRemoteFileDoc("echo.md", { A: 1 });
             await rig.writer.apply(makeChangesResult(
-                [{ id: chunkId, seq: "1", doc: { _id: chunkId, type: "chunk", data: "x" } }],
+                [{ id: fileDoc._id, seq: "1", doc: fileDoc }],
                 "1",
             ));
 
             // updateSeq comes from the real LocalDB after the write.
             const seq = (await b.db.info()).updateSeq as number;
-            expect(rig.echoes.isPullEcho(chunkId, seq)).toBe(true);
-            expect(rig.echoes.isPullEcho(chunkId, seq + 1)).toBe(false);
+            expect(rig.echoes.isPullEcho(fileDoc._id, seq)).toBe(true);
+            expect(rig.echoes.isPullEcho(fileDoc._id, seq + 1)).toBe(false);
         });
 
         it("R1b: session-boundary self-pushed file doc is silently skipped (vclock equal)", async () => {
