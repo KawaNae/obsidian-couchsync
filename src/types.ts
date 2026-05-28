@@ -22,10 +22,26 @@ export {
 } from "./types/doc-id.ts";
 export type { DocKind, ParsedDocId } from "./types/doc-id.ts";
 
+/** Current doc schema version. Bumped when the on-disk / on-wire shape
+ *  of replicated docs changes in a way that requires the reader to know
+ *  which interpretation to apply. The current value is 2 — the
+ *  attachment-based data layer redesigned in `plans/2026-05-28-data-layer-v2.md`.
+ *
+ *  Writers always stamp this value on every new doc. Readers tolerate
+ *  missing values (legacy / pre-v2 docs) and treat them as the previous
+ *  version. Future bumps should add new variants here and route via
+ *  explicit version checks at the decoder boundary.
+ */
+export const CURRENT_SCHEMA_VERSION = 2 as const;
+export type SchemaVersion = typeof CURRENT_SCHEMA_VERSION;
+
 /** Base fields shared by all CouchSync documents */
 interface CouchSyncDocBase {
     _id: string;
     _rev?: string;
+    /** Doc schema version. Optional in the type system so legacy docs
+     *  (without the field) remain valid; writers always set it. */
+    schemaVersion?: SchemaVersion;
 }
 
 /** A vault file (note, image, attachment) stored as chunks.
@@ -50,10 +66,14 @@ export interface FileDoc extends CouchSyncDocBase {
  *
  *  `_id` is `"chunk:" + xxhash64(content)` — always constructed via
  *  `makeChunkId`. Chunks are content-addressed and shared across files.
+ *
+ *  In v2 the chunk payload moves to a CouchDB attachment (field `_attachments.c`).
+ *  The `data` string is retained on the type for the in-flight migration
+ *  phases (Phase 1-6) and will be removed once attachment plumbing lands.
  */
 export interface ChunkDoc extends CouchSyncDocBase {
     type: "chunk";
-    data: string; // base64-encoded content
+    data: string; // base64-encoded content (v1; removed by Phase 6)
 }
 
 /** A config file (`.obsidian/` settings, plugin data.json, theme CSS, etc).
