@@ -19,6 +19,8 @@
 # Allow top-level project metadata and config files.
 !/LICENSE
 !/README.md
+!/SECURITY.md
+!/CHANGELOG.md
 !/package.json
 !/package-lock.json
 !/tsconfig.json
