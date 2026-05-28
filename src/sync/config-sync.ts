@@ -468,6 +468,7 @@ export class ConfigSync {
                     const newVclock = incrementVC(existing?.vclock, deviceId);
                     const doc: ConfigDoc = {
                         _id: configId,
+                        schemaVersion: 2,
                         type: "config",
                         data,
                         mtime: stat.mtime,

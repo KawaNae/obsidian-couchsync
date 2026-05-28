@@ -241,6 +241,7 @@ export class VaultSync {
                     const newVclock = incrementVC(existing?.vclock, deviceId);
                     const newDoc: FileDoc = {
                         _id: fileId,
+                        schemaVersion: 2,
                         type: "file",
                         chunks: chunkIds,
                         mtime: fileStat.mtime,
@@ -615,6 +616,7 @@ export class VaultSync {
                     const newVclock = incrementVC(merged, deviceId);
                     const newDoc: FileDoc = {
                         _id: fileId,
+                        schemaVersion: 2,
                         type: "file",
                         chunks: chunkIds,
                         mtime: fileStat.mtime,
