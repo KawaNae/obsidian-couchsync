@@ -138,6 +138,25 @@ export interface BulkDocsResult {
     reason?: string;
 }
 
+/** A single attachment alongside a doc.
+ *
+ *  v2 chunk storage carries content here under the well-known name `"c"`.
+ *  `contentEncoding: "gzip"` tells CouchDB the body is already gzip-compressed
+ *  and to serve it with `Content-Encoding: gzip` on retrieval (so the HTTP
+ *  client auto-decompresses).
+ */
+export interface AttachmentBlob {
+    contentType: string;
+    data: Uint8Array;
+    contentEncoding?: "gzip";
+}
+
+/** Doc + its named attachments, used for bulk push/pull with attachments. */
+export interface DocWithAttachments<T = any> {
+    doc: T;
+    attachments: Record<string, AttachmentBlob>;
+}
+
 /**
  * Abstraction over the remote CouchDB HTTP API (backed by CouchClient).
  *
@@ -152,6 +171,24 @@ export interface ICouchClient {
     getDoc<T>(id: string, opts?: { conflicts?: boolean }, signal?: AbortSignal): Promise<T | null>;
     bulkGet<T>(ids: string[], signal?: AbortSignal): Promise<T[]>;
     bulkDocs(docs: any[], signal?: AbortSignal): Promise<BulkDocsResult[]>;
+    /** Push docs with associated attachments. Attachments ride along
+     *  in-band in the `_bulk_docs` JSON body (`_attachments.<name>.data`
+     *  base64). CouchDB decodes and stores them as native binary
+     *  attachments. Wire is base64-inflated on push; pull-side
+     *  `getAttachment` returns the canonical binary form.
+     *
+     *  Use for chunk push in v2 (each chunk carries one attachment "c"). */
+    bulkDocsWithAttachments(
+        items: DocWithAttachments[],
+        signal?: AbortSignal,
+    ): Promise<BulkDocsResult[]>;
+    /** Fetch one attachment as raw binary. Returns null on 404 (doc or
+     *  attachment missing). Used for chunk pulls. */
+    getAttachment(
+        docId: string,
+        name: string,
+        signal?: AbortSignal,
+    ): Promise<Uint8Array | null>;
     allDocs<T>(opts: AllDocsOpts, signal?: AbortSignal): Promise<AllDocsResult<T>>;
     changes<T>(opts: ChangesOpts, signal?: AbortSignal): Promise<ChangesResult<T>>;
     changesLongpoll<T>(opts: ChangesOpts, signal?: AbortSignal): Promise<ChangesResult<T>>;

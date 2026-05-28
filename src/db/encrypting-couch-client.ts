@@ -18,6 +18,7 @@ import type {
     BulkDocsResult,
     ChangesOpts,
     ChangesResult,
+    DocWithAttachments,
 } from "./interfaces.ts";
 import type { CryptoProvider } from "./crypto-provider.ts";
 
@@ -222,6 +223,33 @@ export class EncryptingCouchClient implements ICouchClient {
                 }),
             ),
         };
+    }
+
+    async bulkDocsWithAttachments(
+        items: DocWithAttachments[],
+        signal?: AbortSignal,
+    ): Promise<BulkDocsResult[]> {
+        // Phase 3 pass-through: encryption of attachment bodies and
+        // path-ID translation for attachment-bearing docs lands in Phase 7.
+        // Until then we forward to the base client untouched. The base
+        // sync layer does not push via this method yet (Phase 6 wires
+        // it in), so leaking unencrypted attachments here is impossible
+        // in normal flow.
+        const translated = await Promise.all(items.map(async ({ doc, attachments }) => ({
+            doc: await this.encryptDoc(doc as AnyDoc),
+            attachments,
+        })));
+        return this.inner.bulkDocsWithAttachments(translated, signal);
+    }
+
+    async getAttachment(
+        docId: string,
+        name: string,
+        signal?: AbortSignal,
+    ): Promise<Uint8Array | null> {
+        const remoteId = await this.translateId(docId);
+        // Phase 3 pass-through: attachment-body decryption lands in Phase 7.
+        return this.inner.getAttachment(remoteId, name, signal);
     }
 
     ensureDb(signal?: AbortSignal): Promise<void> {

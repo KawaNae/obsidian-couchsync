@@ -17,6 +17,8 @@ import type {
     BulkDocsResult,
     AllDocsOpts,
     AllDocsResult,
+    DocWithAttachments,
+    AttachmentBlob,
 } from "../../src/db/interfaces.ts";
 
 interface StoredDoc {
@@ -24,6 +26,10 @@ interface StoredDoc {
     rev: string;
     seq: number;
     deleted?: boolean;
+    /** v2: attachments stored alongside the doc, keyed by attachment name.
+     *  Mirrors CouchDB's native attachment storage so tests can exercise
+     *  the attachment APIs without spinning up a real Couch instance. */
+    attachments?: Record<string, AttachmentBlob>;
 }
 
 interface Tick {
@@ -185,6 +191,47 @@ export class FakeCouchClient implements ICouchClient {
             throwIfAborted(signal);
         }
         return { results: [], last_seq: this.seqCounter };
+    }
+
+    async bulkDocsWithAttachments(
+        items: DocWithAttachments[],
+        signal?: AbortSignal,
+    ): Promise<BulkDocsResult[]> {
+        throwIfAborted(signal);
+        // Defer to bulkDocs for the doc body, then stash attachments
+        // separately on the same StoredDoc entry.
+        const results = await this.bulkDocs(items.map((i) => i.doc), signal);
+        for (let i = 0; i < items.length; i++) {
+            const res = results[i];
+            if (!res?.ok) continue;
+            const stored = this.docs.get(res.id);
+            if (!stored) continue;
+            // Clone the attachment buffers so tests can mutate inputs
+            // without surprising the fake's storage state.
+            const cloned: Record<string, AttachmentBlob> = {};
+            for (const [name, blob] of Object.entries(items[i].attachments)) {
+                cloned[name] = {
+                    contentType: blob.contentType,
+                    data: new Uint8Array(blob.data),
+                    contentEncoding: blob.contentEncoding,
+                };
+            }
+            stored.attachments = cloned;
+        }
+        return results;
+    }
+
+    async getAttachment(
+        docId: string,
+        name: string,
+        signal?: AbortSignal,
+    ): Promise<Uint8Array | null> {
+        throwIfAborted(signal);
+        const stored = this.docs.get(docId);
+        if (!stored || stored.deleted) return null;
+        const blob = stored.attachments?.[name];
+        if (!blob) return null;
+        return new Uint8Array(blob.data);
     }
 
     async ensureDb(_signal?: AbortSignal): Promise<void> {

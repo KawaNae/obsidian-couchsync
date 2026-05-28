@@ -18,7 +18,10 @@ import type {
     ChangesOpts,
     ChangesResult,
     ChangeRow,
+    DocWithAttachments,
+    AttachmentBlob,
 } from "./interfaces.ts";
+import { arrayBufferToBase64 } from "./chunker.ts";
 
 /** Default per-request timeout (ms). Longpoll has its own. */
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -52,6 +55,12 @@ const LONGPOLL_MAX_WAIT_MS = 60_000;
 /** Maximum docs per `_bulk_docs` POST. Keeps memory and network
  *  pressure bounded on large push/pull operations. */
 const BULK_BATCH_SIZE = 100;
+
+/** Maximum docs per `_bulk_docs` POST when attachments ride along.
+ *  Lower than `BULK_BATCH_SIZE` because each row carries an inline
+ *  base64 body (~100 KiB / chunk in v2). 25 attachments × 100 KiB =
+ *  ~2.5 MiB JSON body, comfortably under default CouchDB request caps. */
+const BULK_ATTACH_BATCH_SIZE = 25;
 
 export interface CouchClientOpts {
     /** Base URL including database path, e.g. `https://couch.example/mydb` */
@@ -336,6 +345,149 @@ export class CouchClient implements ICouchClient {
             allResults.push(...res);
         }
         return allResults;
+    }
+
+    async bulkDocsWithAttachments(
+        items: DocWithAttachments[],
+        signal?: AbortSignal,
+    ): Promise<BulkDocsResult[]> {
+        if (items.length === 0) return [];
+        if (signal?.aborted) throw makeAbortError();
+
+        const allResults: BulkDocsResult[] = [];
+        for (let i = 0; i < items.length; i += BULK_ATTACH_BATCH_SIZE) {
+            const batch = items.slice(i, i + BULK_ATTACH_BATCH_SIZE);
+            // Render each doc with inline `_attachments.<name>.data` (base64).
+            // CouchDB consumes this and stores the body as a native binary
+            // attachment, so the wire is base64-inflated on push but storage
+            // and pull-side fetches are binary. Phase 14 / post-v1.0 may swap
+            // this for individual multipart PUTs to recover the push wire
+            // bytes — for now JSON-inline keeps the implementation simple and
+            // batched.
+            const docs = batch.map(({ doc, attachments }) => {
+                const _attachments: Record<string, any> = {};
+                for (const [name, blob] of Object.entries(attachments)) {
+                    _attachments[name] = {
+                        content_type: blob.contentType,
+                        data: arrayBufferToBase64(blob.data),
+                    };
+                    if (blob.contentEncoding) {
+                        _attachments[name].encoding = blob.contentEncoding;
+                    }
+                }
+                return { ...doc, _attachments };
+            });
+            const res = await this.request<BulkDocsResult[]>(
+                "/_bulk_docs",
+                { method: "POST", body: JSON.stringify({ docs }) },
+                { externalSignal: signal, streamed: true },
+            );
+            allResults.push(...res);
+        }
+        return allResults;
+    }
+
+    async getAttachment(
+        docId: string,
+        name: string,
+        signal?: AbortSignal,
+    ): Promise<Uint8Array | null> {
+        if (signal?.aborted) throw makeAbortError();
+        const path = `/${encodeURIComponent(docId)}/${encodeURIComponent(name)}`;
+        try {
+            return await this.requestBinary(path, signal);
+        } catch (e: any) {
+            if (e?.status === 404) return null;
+            throw e;
+        }
+    }
+
+    /** Binary GET — reads the response body straight into a Uint8Array
+     *  instead of parsing it as JSON. Shares the streamed-body / stale-timer
+     *  semantics with `request<T>` so a slow attachment download still
+     *  exits cleanly on inactivity. Pull-side, so updates
+     *  `lastPullBodyChunkAt` like other streamed reads. */
+    private async requestBinary(
+        path: string,
+        externalSignal?: AbortSignal,
+    ): Promise<Uint8Array> {
+        if (externalSignal?.aborted) throw makeAbortError();
+
+        const url = `${this.baseUrl}${path}`;
+        const controller = new AbortController();
+        const headerTimeout = this.timeoutMs;
+        let externalAborted = false;
+        let staleFired = false;
+
+        let headerTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
+            controller.abort();
+        }, headerTimeout);
+        let staleTimer: ReturnType<typeof setTimeout> | null = null;
+        const armStale = () => {
+            if (staleTimer) clearTimeout(staleTimer);
+            staleTimer = setTimeout(() => {
+                staleFired = true;
+                controller.abort();
+            }, BODY_STALE_MS);
+        };
+        const onExternalAbort = () => {
+            externalAborted = true;
+            controller.abort();
+        };
+        externalSignal?.addEventListener("abort", onExternalAbort, { once: true });
+
+        try {
+            const res = await fetch(url, {
+                headers: this.headers,
+                signal: controller.signal,
+            });
+            if (headerTimer) { clearTimeout(headerTimer); headerTimer = null; }
+            if (!res.ok) {
+                const body = await res.text().catch(() => "");
+                const err: any = new Error(
+                    `CouchDB ${res.status}: ${body || res.statusText}`,
+                );
+                err.status = res.status;
+                throw err;
+            }
+
+            const reader = res.body!.getReader();
+            const parts: Uint8Array[] = [];
+            let totalLen = 0;
+            armStale();
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                parts.push(value);
+                totalLen += value.length;
+                armStale();
+                this.lastPullBodyChunkAt = Date.now();
+            }
+            if (staleTimer) { clearTimeout(staleTimer); staleTimer = null; }
+            const merged = new Uint8Array(totalLen);
+            let off = 0;
+            for (const p of parts) { merged.set(p, off); off += p.length; }
+            return merged;
+        } catch (e: any) {
+            if (e?.name === "AbortError") {
+                if (externalAborted) throw makeAbortError();
+                if (staleFired) {
+                    const err: any = new Error(
+                        `CouchDB body stale (no data for ${BODY_STALE_MS}ms)`,
+                    );
+                    err.status = 0;
+                    throw err;
+                }
+                const err: any = new Error(`CouchDB request timed out after ${headerTimeout}ms`);
+                err.status = 0;
+                throw err;
+            }
+            throw e;
+        } finally {
+            if (headerTimer) clearTimeout(headerTimer);
+            if (staleTimer) clearTimeout(staleTimer);
+            externalSignal?.removeEventListener("abort", onExternalAbort);
+        }
     }
 
     async allDocs<T>(opts: AllDocsOpts, signal?: AbortSignal): Promise<AllDocsResult<T>> {
