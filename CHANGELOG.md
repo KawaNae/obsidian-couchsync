@@ -2,12 +2,16 @@
 
 All notable changes to obsidian-couchsync.
 
-## 1.0.0 — data-layer-v2
+## 0.25.0 — data-layer-v2
 
-First publication-ready release. Comprehensive rewrite of the data
-layer: chunk content moves into CouchDB attachments, the codec axes
-(encryption, compression) become independent toggles, and four named
-modes are first-class.
+Comprehensive rewrite of the data layer: chunk content moves into
+CouchDB attachments, the codec axes (encryption, compression) become
+independent toggles, and four named modes are first-class.
+
+This release is the technical foundation for a future v1.0 publication.
+The version line stays in the 0.x family until the project is opened
+publicly; the breaking changes below still apply (destructive migration
+required from any earlier 0.x build).
 
 ### Breaking
 
