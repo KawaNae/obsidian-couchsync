@@ -123,42 +123,32 @@ export class CompressingCouchClient implements ICouchClient {
 }
 
 /** Gzip a binary buffer using the Web Streams `CompressionStream` API.
+ *
  *  Available in Node 18+, all modern browsers, and Electron — the
- *  runtimes Obsidian / vitest deploy on. Empty input round-trips
- *  through the standard gzip empty-stream encoding. */
+ *  runtimes Obsidian / vitest deploy on.
+ *
+ *  Implementation note: we *do not* `await writer.write` / `writer.close`
+ *  before starting to read the output, because in Chromium-based runtimes
+ *  (including Electron / Obsidian) the writer's promise only resolves
+ *  once the consumer drains the stream. Awaiting first would deadlock —
+ *  the writer waits for the (not-yet-started) reader, and the reader is
+ *  never started. We use `new Response(stream).arrayBuffer()` which
+ *  consumes the readable side, and let the writer's promises settle
+ *  asynchronously in the background. */
 async function gzipCompress(data: Uint8Array): Promise<Uint8Array> {
     const cs = new CompressionStream("gzip");
     const writer = cs.writable.getWriter();
-    // Web Streams writers expect BufferSource. Uint8Array satisfies that
-    // but TypeScript's lib.dom signature is narrower than the runtime.
-    await writer.write(data);
-    await writer.close();
-    return readStreamToUint8Array(cs.readable);
+    void writer.write(data).catch(() => undefined);
+    void writer.close().catch(() => undefined);
+    const buf = await new Response(cs.readable).arrayBuffer();
+    return new Uint8Array(buf);
 }
 
 async function gzipDecompress(data: Uint8Array): Promise<Uint8Array> {
     const ds = new DecompressionStream("gzip");
     const writer = ds.writable.getWriter();
-    await writer.write(data);
-    await writer.close();
-    return readStreamToUint8Array(ds.readable);
-}
-
-async function readStreamToUint8Array(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
-    const reader = stream.getReader();
-    const parts: Uint8Array[] = [];
-    let totalLen = 0;
-    while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        parts.push(value);
-        totalLen += value.length;
-    }
-    const merged = new Uint8Array(totalLen);
-    let off = 0;
-    for (const p of parts) {
-        merged.set(p, off);
-        off += p.length;
-    }
-    return merged;
+    void writer.write(data).catch(() => undefined);
+    void writer.close().catch(() => undefined);
+    const buf = await new Response(ds.readable).arrayBuffer();
+    return new Uint8Array(buf);
 }
