@@ -21,7 +21,7 @@ required from any earlier 0.x build).
   Uint8Array.** Doc identity (`chunk:<alg>:<hash>`) differs from any
   v0.x vault. There is no automated dual-reader path; migration is
   destructive (recreate the remote DB and re-Init from one device,
-  Clone from the rest). See `docs/migration-v2.md`.
+  Clone from the rest — see Migration below).
 - **Chunk ids carry an explicit hash-algorithm tag** —
   `chunk:x64:<16-hex>` instead of `chunk:<16-hex>`. The default
   algorithm (`x64`, xxhash64 over plain bytes) is unchanged; a future
@@ -191,8 +191,12 @@ canonical binary `content` only.
 
 ### Migration
 
-Destructive — see `docs/migration-v2.md`. No automated upgrade from
-v0.x.
+**Destructive — no automated upgrade from v0.x.** Doc identity changed
+(binary chunk hashes), so old and new vaults cannot interoperate. To
+migrate: stop sync on every device, recreate the remote DB, run **Init**
+on one device (choosing the codec mode — encryption/compression are set
+at Init), then **Clone** on the rest. Encrypted vaults require the same
+passphrase on every device. See `SECURITY.md` for mode selection.
 
 ---
 
