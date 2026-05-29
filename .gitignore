@@ -16,6 +16,14 @@
 !/tests/
 !/scripts/
 
+# Publish ONLY specific docs files. `!/docs/` lets git descend into the
+# tree, `/docs/*` re-ignores everything in it, then each `!/docs/<file>`
+# opts a single file back in. The rest of docs/ (internal design notes,
+# private runbooks) stays unpublished. Do NOT add a broad `!/docs/**`.
+!/docs/
+/docs/*
+!/docs/SETTINGS.md
+
 # Allow top-level project metadata and config files.
 !/LICENSE
 !/README.md
