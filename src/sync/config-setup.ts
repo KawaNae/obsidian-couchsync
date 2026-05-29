@@ -30,12 +30,36 @@ import type { ICouchClient } from "../db/interfaces.ts";
 import type { ConfigLocalDB } from "../db/config-local-db.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import * as remoteCouch from "../db/remote-couch.ts";
+import { makeCouchClient } from "../db/couch-client.ts";
+import {
+    buildInitialConfigMeta, pushConfigMeta, type ConfigMetaDoc,
+} from "../db/vault-meta.ts";
+import type { CryptoProvider } from "../db/crypto-provider.ts";
+import { logWarn } from "../ui/log.ts";
 import { ConfigCheckpoints } from "../db/sync/config-checkpoints.ts";
 import { ConfigPushPipeline } from "../db/sync/config-push-pipeline.ts";
 
 export interface ConfigSetupResult {
     scanned: number;
     pushed: number;
+    /** The freshly-built config:meta. Returned so the host can store
+     *  the doc reference for diagnostics / future re-Init paths. */
+    meta: ConfigMetaDoc;
+    /** New `CryptoProvider` derived from the freshly-generated salt.
+     *  Null when `opts.encryption === false`. The host (main.ts)
+     *  installs this onto `configCryptoProvider` so subsequent
+     *  `wrapConfigClient` calls pick it up (invariant 18). */
+    crypto: CryptoProvider | null;
+}
+
+/** Phase 2 init options: an explicit codec policy passed to
+ *  ConfigSetupService.init. Phase 1 cloned silently from vault:meta;
+ *  Phase 2 makes the choice explicit at the call site (ConfigSync.init
+ *  forwards user settings here). */
+export interface ConfigSetupInitOpts {
+    encryption: boolean;
+    passphrase?: string;
+    compression: boolean;
 }
 
 /** Local-state callbacks the host ConfigSync exposes. After local DB
@@ -51,6 +75,19 @@ export interface ConfigSetupHostHooks {
     scan: (
         onProgress: (path: string, index: number, total: number) => void,
     ) => Promise<number>;
+    /** Hand the freshly-built cryptoProvider back to the host so it
+     *  takes effect for downstream `wrapConfigClient` / chunk hasher
+     *  calls. Called from inside the init flow once `buildInitialMeta`
+     *  resolves. Null = encryption disabled. */
+    onCryptoProviderReady: (crypto: CryptoProvider | null) => void;
+    /** Build a RAW config-DB client (no codec wrapping) for pushing
+     *  the meta doc, which is itself never encrypted or compressed.
+     *  Production wires this to `makeCouchClient`; tests can inject a
+     *  FakeCouchClient so the meta push runs against the same in-memory
+     *  remote as the rest of the test fixture. Optional — when absent,
+     *  the meta push falls back to `makeCouchClient(settings)` which
+     *  hits the real network. */
+    makeRawConfigClient?: () => ICouchClient;
 }
 
 export class ConfigSetupService {
@@ -64,6 +101,7 @@ export class ConfigSetupService {
         client: ICouchClient,
         signal: AbortSignal,
         onProgress: (msg: string) => void,
+        opts: ConfigSetupInitOpts,
     ): Promise<ConfigSetupResult> {
         // 1. Wipe local DB completely (meta + docs in one go).
         onProgress("Wiping local config database...");
@@ -79,6 +117,16 @@ export class ConfigSetupService {
         await remoteCouch.destroyRemote(client, signal);
         onProgress("Recreating remote config database...");
         await client.ensureDb(signal);
+
+        // 2b. Build the config:meta as a SELF-CONTAINED crypto root
+        //     (Phase 2: invariants 17 + 18). Fresh salt + own keyCheck
+        //     means this config DB is verifiable on any device that
+        //     holds `opts.passphrase` — vault DB sharing is no longer
+        //     required. The new cryptoProvider is fed back to the host
+        //     so subsequent `wrapConfigClient` / chunk hasher calls in
+        //     this same Init flow use the correct keys.
+        const { meta, crypto } = await this.buildAndPushConfigMeta(opts);
+        this.host.onCryptoProviderReady(crypto);
 
         // 3. Scan vault → local DB. lastSynced is empty so nothing
         //    short-circuits; every file gets a fresh write with vclock={device:1}.
@@ -100,6 +148,37 @@ export class ConfigSetupService {
         });
         const pushResult = await pipeline.run((msg) => onProgress(msg));
 
-        return { scanned, pushed: pushResult.stats.pushed };
+        return { scanned, pushed: pushResult.stats.pushed, meta, crypto };
+    }
+
+    /** Build a fresh self-contained config:meta (own salt, own keyCheck)
+     *  and push it via a RAW client so the meta itself bypasses the
+     *  envelope codec stack. Network errors surface up — unlike Phase 1
+     *  this write is **load-bearing** (it pins the crypto root) and
+     *  must succeed before the Init can return. */
+    private async buildAndPushConfigMeta(
+        opts: ConfigSetupInitOpts,
+    ): Promise<{ meta: ConfigMetaDoc; crypto: CryptoProvider | null }> {
+        const settings = this.getSettings();
+        if (!settings.couchdbConfigDbName) {
+            throw new Error("ConfigSetup: couchdbConfigDbName not configured");
+        }
+        const rawConfigClient = this.host.makeRawConfigClient?.()
+            ?? makeCouchClient(
+                settings.couchdbUri, settings.couchdbConfigDbName,
+                settings.couchdbUser, settings.couchdbPassword,
+            );
+        const { meta, crypto } = await buildInitialConfigMeta(opts);
+        try {
+            await pushConfigMeta(rawConfigClient, meta);
+        } catch (e: any) {
+            // Network errors here are visible — the meta is the crypto
+            // root and a failed write would leave the config DB without
+            // an authoritative descriptor. Re-throw so the user sees
+            // the Init failure rather than a silent corrupt state.
+            logWarn(`ConfigSetup: config:meta push failed: ${e?.message ?? e}`);
+            throw e;
+        }
+        return { meta, crypto };
     }
 }

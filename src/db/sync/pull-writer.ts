@@ -22,7 +22,8 @@
  */
 
 import type { CouchSyncDoc, FileDoc } from "../../types.ts";
-import { isFileDoc, isConfigDoc } from "../../types.ts";
+import { isFileDoc, isConfigDoc, FILE_SCHEMA_VERSION, CONFIG_SCHEMA_VERSION } from "../../types.ts";
+import { assertSchemaVersion } from "./schema-gate.ts";
 import {
     filePathFromId, configPathFromId, isFileDocId,
 } from "../../types/doc-id.ts";
@@ -168,6 +169,18 @@ export class PullWriter {
                 continue;
             }
 
+            // Schema-version gate, symmetric with the config pull path
+            // (schema-gate.ts). A doc whose shape this build can't read
+            // would corrupt the vault on write, so abort loudly and route
+            // the host to re-init rather than best-effort decoding. Throws
+            // SchemaVersionMismatchError (nonRetriable) → classifyError
+            // maps it to a terminal state instead of a retry storm.
+            if (isFileDoc(remoteDoc)) {
+                assertSchemaVersion(remoteDoc, FILE_SCHEMA_VERSION, "file");
+            } else {
+                assertSchemaVersion(remoteDoc, CONFIG_SCHEMA_VERSION, "config");
+            }
+
             // vclock guard: compare with local.
             if (resolver) {
                 const localDoc = await this.deps.localDb.get(remoteDoc._id);
@@ -271,8 +284,8 @@ export class PullWriter {
             // see `ConflictOrchestrator.applyConflictChoice` for the
             // localDoc-derived seed used on take-remote.
             const tombstone: FileDoc = {
-                _id: docId, type: "file", chunks: [],
-                mtime: localDoc.mtime, ctime: localDoc.ctime,
+                _id: docId, type: "file", schemaVersion: FILE_SCHEMA_VERSION,
+                chunks: [], mtime: localDoc.mtime, ctime: localDoc.ctime,
                 size: 0, deleted: true, vclock: {},
             };
             concurrent.push({ filePath: path, localDoc, remoteDoc: tombstone });

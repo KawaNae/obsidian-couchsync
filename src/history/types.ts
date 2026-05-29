@@ -9,8 +9,11 @@ export interface DiffRecord {
     added?: number;
     removed?: number;
     conflict?: boolean;
-    /** Origin of this entry. Undefined is treated as "local" for backward compat. */
-    source?: HistorySource;
+    /** Origin of this entry. Required — writers always stamp it
+     *  explicitly. The `_meta.schemaVersion` row in the history DB
+     *  reflects this guarantee (invariant 15); v0.25.0 is the first
+     *  format that mandates the field. */
+    source: HistorySource;
 }
 
 export interface FileSnapshot {

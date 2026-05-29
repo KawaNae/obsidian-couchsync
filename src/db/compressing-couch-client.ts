@@ -12,12 +12,20 @@
  * Push direction: app plain bytes → gzip → encrypt → wire
  * Pull direction: wire → decrypt → gunzip → app plain bytes
  *
- * The compression is self-managed: we gzip the attachment body before
- * forwarding to the inner client, and we ungzip on read. The wire-level
- * `Content-Encoding: gzip` header (CouchDB's native attachment encoding
- * support) is intentionally NOT used — keeping the encoding inside our
- * binary blob makes the contract identical against real CouchDB and
- * `FakeCouchClient` in tests.
+ * ## Envelope contract
+ *
+ * Every attachment body passing through this decorator is envelope-
+ * formatted bytes (see `envelope.ts`). On push, this layer:
+ *   1. decodes the incoming envelope (typically `0x00` plain from the
+ *      caller, but may already carry no bits set yet)
+ *   2. gzips the body
+ *   3. sets `bits.compressed = true`
+ *   4. re-encodes the envelope and forwards
+ *
+ * On pull it does the inverse: decode, if compressed bit set then
+ * gunzip and clear the bit, re-encode. This keeps invariant 12
+ * (universality of attachment envelope) intact at every decorator
+ * boundary.
  *
  * Only attachment bodies are touched. Doc bodies (JSON) and other
  * methods (info, getDoc, bulkGet, bulkDocs, allDocs, changes,
@@ -36,6 +44,7 @@ import type {
     DocWithAttachments,
     AttachmentBlob,
 } from "./interfaces.ts";
+import { decodeEnvelope, encodeEnvelope } from "./envelope.ts";
 
 export class CompressingCouchClient implements ICouchClient {
     constructor(private readonly inner: ICouchClient) {}
@@ -67,15 +76,29 @@ export class CompressingCouchClient implements ICouchClient {
         const compressed = await Promise.all(items.map(async ({ doc, attachments }) => {
             const out: Record<string, AttachmentBlob> = {};
             for (const [name, blob] of Object.entries(attachments)) {
+                const env = decodeEnvelope(blob.data);
+                if (env.bits.compressed) {
+                    // Already compressed by a peer (or the same decorator
+                    // applied twice). Pass through unchanged — double-
+                    // compressing would corrupt the round-trip.
+                    out[name] = blob;
+                    continue;
+                }
+                if (env.bits.encrypted) {
+                    // Compress must happen before encrypt (invariant 10).
+                    // If we ever see encrypt-without-compress here it means
+                    // the stack is wired in the wrong order.
+                    throw new Error(
+                        "CompressingCouchClient: cannot compress already-encrypted body",
+                    );
+                }
+                const gzipped = await gzipCompress(env.body);
                 out[name] = {
                     contentType: blob.contentType,
-                    data: await gzipCompress(blob.data),
-                    // Do NOT propagate `contentEncoding: "gzip"` to the
-                    // inner client. The encoding is implicit in our wire
-                    // contract (decorator round-trips it); surfacing it
-                    // to CouchDB would cause double-decompression on
-                    // real HTTP clients (Electron / browser fetch
-                    // auto-decompresses on Content-Encoding: gzip).
+                    data: encodeEnvelope({
+                        bits: { encrypted: false, compressed: true },
+                        body: gzipped,
+                    }),
                 };
             }
             return { doc, attachments: out };
@@ -88,9 +111,21 @@ export class CompressingCouchClient implements ICouchClient {
         name: string,
         signal?: AbortSignal,
     ): Promise<Uint8Array | null> {
-        const compressed = await this.inner.getAttachment(docId, name, signal);
-        if (compressed === null) return null;
-        return gzipDecompress(compressed);
+        const blob = await this.inner.getAttachment(docId, name, signal);
+        if (blob === null) return null;
+        const env = decodeEnvelope(blob);
+        if (!env.bits.compressed) return blob;
+        if (env.bits.encrypted) {
+            // Symmetric to push: decrypt must precede decompress.
+            throw new Error(
+                "CompressingCouchClient: cannot decompress still-encrypted body",
+            );
+        }
+        const inflated = await gzipDecompress(env.body);
+        return encodeEnvelope({
+            bits: { encrypted: false, compressed: false },
+            body: inflated,
+        });
     }
 
     allDocs<T>(opts: AllDocsOpts, signal?: AbortSignal): Promise<AllDocsResult<T>> {
@@ -138,8 +173,11 @@ export class CompressingCouchClient implements ICouchClient {
 async function gzipCompress(data: Uint8Array): Promise<Uint8Array> {
     const cs = new CompressionStream("gzip");
     const writer = cs.writable.getWriter();
-    void writer.write(data).catch(() => undefined);
-    void writer.close().catch(() => undefined);
+    // TS 5.7+ types a bare Uint8Array as Uint8Array<ArrayBufferLike>, which the
+    // stream writer's BufferSource chunk type rejects; the buffer is always
+    // ArrayBuffer-backed at runtime, so the assertion is sound.
+    void writer.write(data as unknown as BufferSource).catch((): void => undefined);
+    void writer.close().catch((): void => undefined);
     const buf = await new Response(cs.readable).arrayBuffer();
     return new Uint8Array(buf);
 }
@@ -147,8 +185,11 @@ async function gzipCompress(data: Uint8Array): Promise<Uint8Array> {
 async function gzipDecompress(data: Uint8Array): Promise<Uint8Array> {
     const ds = new DecompressionStream("gzip");
     const writer = ds.writable.getWriter();
-    void writer.write(data).catch(() => undefined);
-    void writer.close().catch(() => undefined);
+    // TS 5.7+ types a bare Uint8Array as Uint8Array<ArrayBufferLike>, which the
+    // stream writer's BufferSource chunk type rejects; the buffer is always
+    // ArrayBuffer-backed at runtime, so the assertion is sound.
+    void writer.write(data as unknown as BufferSource).catch((): void => undefined);
+    void writer.close().catch((): void => undefined);
     const buf = await new Response(ds.readable).arrayBuffer();
     return new Uint8Array(buf);
 }

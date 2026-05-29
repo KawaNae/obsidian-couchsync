@@ -20,7 +20,7 @@ import type { LocalDB } from "../db/local-db.ts";
 import type { ICouchClient, AllDocsRow } from "../db/interfaces.ts";
 import type { FileDoc } from "../types.ts";
 import { ID_RANGE } from "../types/doc-id.ts";
-import { collectReferencedChunks } from "../db/chunk-refs.ts";
+import { collectFileChunkRefs } from "../db/chunk-refs.ts";
 import { compareVC, type VCRelation, type VectorClock } from "./vector-clock.ts";
 
 export interface ChunkRef {
@@ -157,7 +157,7 @@ export async function analyzeChunkConsistency(
     // Past the gate the two sides are identical by id and vclock. Pick
     // either to build the reference map; `referencedBy` paths are the
     // same whichever we choose.
-    const referenced = collectReferencedChunks(localFiles);
+    const referenced = collectFileChunkRefs(localFiles);
 
     // ── Phase 2 + 3: sort-merge chunk ids ───────────────────────────
 

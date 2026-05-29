@@ -1,13 +1,21 @@
 /**
- * ICouchClient decorator that transparently encrypts/decrypts doc payloads.
+ * ICouchClient decorator that transparently encrypts/decrypts doc
+ * payloads and attachment bodies.
  *
- * Level 1: ChunkDoc.data and ConfigDoc.data are AES-256-GCM encrypted.
- * Level 2: Additionally, FileDoc and ConfigDoc _id paths are replaced with
- *          HMAC-SHA256 hashes, and an `encryptedPath` field stores the
- *          AES-GCM-encrypted original path for pull-side recovery.
+ *  - ConfigDoc.data (string) is encrypted via the unified envelope
+ *    helper (`envelope.ts:encryptString`) and stored as a base64-wrapped
+ *    envelope. The same helper handles decrypt on read.
+ *  - FileDoc and ConfigDoc `_id` paths are replaced with HMAC-SHA256
+ *    hashes; the original path lives in `encryptedPath` (also a
+ *    base64-wrapped envelope produced by `encryptString`).
+ *  - Attachment bodies (ChunkDoc `c`) are decoded as envelopes, the
+ *    body is encrypted via the crypto-provider primitive, and the
+ *    envelope is re-encoded with `bits.encrypted = true` plus the IV
+ *    in the standard slot. The next layer (or the wire) never sees
+ *    raw cipher bytes — they always ride inside the envelope.
  *
- * The decorator sits between SyncEngine and the real CouchClient, so the
- * entire sync stack operates on plaintext — encryption is invisible.
+ * The decorator sits between SyncEngine and the inner couch client, so
+ * the sync stack always operates on plaintext — encryption is invisible.
  */
 
 import type {
@@ -19,8 +27,25 @@ import type {
     ChangesOpts,
     ChangesResult,
     DocWithAttachments,
+    AttachmentBlob,
 } from "./interfaces.ts";
 import type { CryptoProvider } from "./crypto-provider.ts";
+import {
+    decodeEnvelope,
+    encodeEnvelope,
+    encryptString,
+    decryptString,
+} from "./envelope.ts";
+import { VAULT_META_DOC_ID, CONFIG_META_DOC_ID } from "./vault-meta.ts";
+
+/** Reserved meta doc ids that must NEVER be path-encrypted. `config:meta`
+ *  in particular starts with the `config:` prefix that `hasPathId` matches,
+ *  so without this guard a meta doc accidentally routed through the
+ *  encrypting client would be rewritten to `config:<hmac>` + encryptedPath
+ *  and become undiscoverable by `fetchConfigMeta` (which reads the fixed
+ *  id) — silently corrupting the crypto root. Production always reads/writes
+ *  meta via a raw client; this makes that invariant defense-in-depth. */
+const RESERVED_META_IDS = new Set<string>([VAULT_META_DOC_ID, CONFIG_META_DOC_ID]);
 
 export class EncryptionError extends Error {
     constructor(message: string, public readonly cause?: unknown) {
@@ -32,13 +57,13 @@ export class EncryptionError extends Error {
 type AnyDoc = Record<string, unknown>;
 
 function hasEncryptableData(doc: AnyDoc): boolean {
-    return (doc.type === "chunk" || doc.type === "config")
-        && typeof doc.data === "string";
+    return doc.type === "config" && typeof doc.data === "string";
 }
 
 function hasPathId(doc: AnyDoc): boolean {
     const id = doc._id as string | undefined;
     if (!id) return false;
+    if (RESERVED_META_IDS.has(id)) return false;
     return id.startsWith("file:") || id.startsWith("config:");
 }
 
@@ -66,14 +91,14 @@ export class EncryptingCouchClient implements ICouchClient {
     private async encryptDoc(doc: AnyDoc): Promise<AnyDoc> {
         let out = doc;
         if (hasEncryptableData(doc)) {
-            out = { ...out, data: await this.crypto.encrypt(doc.data as string) };
+            out = { ...out, data: await encryptString(doc.data as string, this.crypto) };
         }
         if (hasPathId(doc)) {
             const id = doc._id as string;
             const prefix = idPrefix(id);
             const path = idPayload(id);
             const hmac = await this.crypto.hmacHash(encodePathForHmac(path));
-            const encPath = await this.crypto.encryptPath(path);
+            const encPath = await encryptString(path, this.crypto);
             out = { ...out, _id: prefix + hmac, encryptedPath: encPath };
         }
         return out;
@@ -83,11 +108,11 @@ export class EncryptingCouchClient implements ICouchClient {
         let d = doc as AnyDoc;
         try {
             if (hasEncryptableData(d)) {
-                d = { ...d, data: await this.crypto.decrypt(d.data as string) };
+                d = { ...d, data: await decryptString(d.data as string, this.crypto) };
             }
             if (typeof d.encryptedPath === "string") {
                 const prefix = idPrefix(d._id as string);
-                const path = await this.crypto.decryptPath(d.encryptedPath as string);
+                const path = await decryptString(d.encryptedPath as string, this.crypto);
                 const { encryptedPath: _, ...rest } = d;
                 d = { ...rest, _id: prefix + path };
             }
@@ -106,6 +131,39 @@ export class EncryptingCouchClient implements ICouchClient {
             return prefix + await this.crypto.hmacHash(encodePathForHmac(idPayload(plainId)));
         }
         return plainId;
+    }
+
+    private async encryptAttachment(blob: AttachmentBlob): Promise<AttachmentBlob> {
+        const env = decodeEnvelope(blob.data);
+        if (env.bits.encrypted) {
+            // Double-encryption would corrupt the round-trip. Pass through
+            // when the body is already encrypted (idempotent semantics).
+            return blob;
+        }
+        const { iv, cipher } = await this.crypto.encryptBytesIv(env.body);
+        return {
+            contentType: blob.contentType,
+            data: encodeEnvelope({
+                bits: { encrypted: true, compressed: env.bits.compressed },
+                iv,
+                body: cipher,
+            }),
+        };
+    }
+
+    private async decryptAttachment(blob: Uint8Array): Promise<Uint8Array> {
+        const env = decodeEnvelope(blob);
+        if (!env.bits.encrypted) return blob;
+        if (!env.iv) {
+            throw new EncryptionError(
+                "decryptAttachment: encrypted envelope missing IV",
+            );
+        }
+        const plain = await this.crypto.decryptBytesIv(env.iv, env.body);
+        return encodeEnvelope({
+            bits: { encrypted: false, compressed: env.bits.compressed },
+            body: plain,
+        });
     }
 
     info(signal?: AbortSignal): Promise<DbInfo> {
@@ -229,21 +287,11 @@ export class EncryptingCouchClient implements ICouchClient {
         items: DocWithAttachments[],
         signal?: AbortSignal,
     ): Promise<BulkDocsResult[]> {
-        // Encrypt both the doc body (path ID → HMAC, encryptedPath field
-        // populated when applicable) and each attachment body. The
-        // attachment binary becomes `IV || AES-GCM(plain)`. The
-        // inner-side ID returned by bulkDocsWithAttachments will be the
-        // HMAC form for file:/config: ids; we re-map back to the plain
-        // ID before returning so callers stay in plain-id space.
         const translated = await Promise.all(items.map(async ({ doc, attachments }) => {
             const encDoc = await this.encryptDoc(doc as AnyDoc);
-            const encAttachments: Record<string, any> = {};
+            const encAttachments: Record<string, AttachmentBlob> = {};
             for (const [name, blob] of Object.entries(attachments)) {
-                encAttachments[name] = {
-                    contentType: blob.contentType,
-                    data: await this.crypto.encryptBytes(blob.data),
-                    contentEncoding: blob.contentEncoding,
-                };
+                encAttachments[name] = await this.encryptAttachment(blob);
             }
             return { doc: encDoc, attachments: encAttachments };
         }));
@@ -263,10 +311,10 @@ export class EncryptingCouchClient implements ICouchClient {
         signal?: AbortSignal,
     ): Promise<Uint8Array | null> {
         const remoteId = await this.translateId(docId);
-        const encrypted = await this.inner.getAttachment(remoteId, name, signal);
-        if (encrypted === null) return null;
+        const blob = await this.inner.getAttachment(remoteId, name, signal);
+        if (blob === null) return null;
         try {
-            return await this.crypto.decryptBytes(encrypted);
+            return await this.decryptAttachment(blob);
         } catch (e) {
             throw new EncryptionError(
                 `Failed to decrypt attachment ${docId}/${name}: ${

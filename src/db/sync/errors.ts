@@ -25,6 +25,17 @@ export function classifyError(err: unknown): SyncErrorDetail {
     const code: number | undefined = typeof e?.status === "number" ? e.status : undefined;
     const rawMessage: string = (e?.message ?? (e && String(e)) ?? "unknown").toString();
 
+    // Terminal doc-shape mismatch (SchemaVersionMismatchError). Retrying a
+    // pull this build can't decode never succeeds, so it must NOT enter the
+    // backoff/retry loop — map to a terminal kind the engine halts on. The
+    // `userMessage`, when present, is the migration instruction to surface.
+    if (e?.nonRetriable === true) {
+        return {
+            kind: "schema-mismatch",
+            message: typeof e?.userMessage === "string" ? e.userMessage : rawMessage,
+        };
+    }
+
     if (code === 401 || code === 403) {
         return {
             kind: "auth",

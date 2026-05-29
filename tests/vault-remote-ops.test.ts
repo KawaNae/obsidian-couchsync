@@ -17,7 +17,7 @@ describe("VaultRemoteOps.testConnectionWith", () => {
     it("returns error string on unreachable server", async () => {
         const localDb = {} as any;
         const auth = new AuthGate();
-        const ops = new VaultRemoteOps(localDb, makeSettings, auth);
+        const ops = new VaultRemoteOps(localDb, makeSettings, auth, (r) => r);
 
         const result = await ops.testConnectionWith(
             "http://test.invalid.local", "user", "pass", "db",
@@ -28,7 +28,7 @@ describe("VaultRemoteOps.testConnectionWith", () => {
     it("raises the auth gate on 401 response", async () => {
         const localDb = {} as any;
         const auth = new AuthGate();
-        const ops = new VaultRemoteOps(localDb, makeSettings, auth);
+        const ops = new VaultRemoteOps(localDb, makeSettings, auth, (r) => r);
 
         // Replace makeClient via monkey-patch: provide a client that throws 401.
         (ops as any).makeClient = undefined; // not used by testConnectionWith (uses makeCouchClient directly)
@@ -45,7 +45,7 @@ describe("VaultRemoteOps.testConnection", () => {
     it("returns error string on unreachable server (using saved settings)", async () => {
         const localDb = {} as any;
         const auth = new AuthGate();
-        const ops = new VaultRemoteOps(localDb, makeSettings, auth);
+        const ops = new VaultRemoteOps(localDb, makeSettings, auth, (r) => r);
 
         const result = await ops.testConnection();
         expect(typeof result).toBe("string");

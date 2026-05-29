@@ -86,23 +86,20 @@ describe("chunker roundtrip (text via binary path)", () => {
 });
 
 describe("chunker v2 binary representation", () => {
-    it("each chunk carries both binary `content` and base64 `data`", async () => {
+    it("each chunk carries only the binary `content` field (v0.25.0 dropped base64 `data`)", async () => {
         const original = "hello v2";
         const chunks = await splitIntoChunks(textToBuffer(original));
         expect(chunks.length).toBe(1);
         const c = chunks[0];
         expect(c.content).toBeInstanceOf(Uint8Array);
-        expect(typeof c.data).toBe("string");
-        // The binary form matches the input; the base64 form is the
-        // encoded binary.
-        expect(new Uint8Array(c.content!)).toEqual(enc.encode(original));
-        expect(c.data).toBe(arrayBufferToBase64(enc.encode(original).buffer));
+        expect(new Uint8Array(c.content)).toEqual(enc.encode(original));
+        // No legacy base64 carrier on the ChunkDoc shape any more.
+        expect((c as Record<string, unknown>).data).toBeUndefined();
     });
 
-    it("chunk IDs are hex (xxhash64 over binary), padded to 16 chars", async () => {
+    it("chunk IDs carry the algorithm tag (chunk:x64:<hex>)", async () => {
         const chunks = await splitIntoChunks(textToBuffer("v2 id format"));
-        const hash = chunks[0]._id.replace(/^chunk:/, "");
-        expect(hash).toMatch(/^[0-9a-f]{16}$/);
+        expect(chunks[0]._id).toMatch(/^chunk:x64:[0-9a-f]{16}$/);
     });
 
     it("schemaVersion is stamped on output", async () => {
@@ -110,30 +107,25 @@ describe("chunker v2 binary representation", () => {
         expect(chunks[0].schemaVersion).toBe(2);
     });
 
-    it("custom hashFn receives binary input", async () => {
+    it("custom hasher receives binary input and stamps its alg on the id", async () => {
         const seen: Uint8Array[] = [];
-        const hashFn = async (data: Uint8Array) => {
-            seen.push(new Uint8Array(data));
-            return "deterministic";
+        const hasher = {
+            alg: "hmac" as const,
+            hash: async (data: Uint8Array) => {
+                seen.push(new Uint8Array(data));
+                return "deterministic";
+            },
         };
-        await splitIntoChunks(textToBuffer("inject"), hashFn);
+        const chunks = await splitIntoChunks(textToBuffer("inject"), hasher);
         expect(seen.length).toBe(1);
         expect(seen[0]).toEqual(enc.encode("inject"));
+        // Algorithm tag matches the hasher's declared identity (invariant 14).
+        expect(chunks[0]._id).toBe("chunk:hmac:deterministic");
     });
 
-    it("joinChunks prefers binary `content` over base64 `data` when both present", async () => {
+    it("joinChunks concatenates `content` bytes in order", async () => {
         const chunks = await splitIntoChunks(textToBuffer("prefer-binary"));
-        // Tamper with `data` to ensure joinChunks does NOT read it when
-        // `content` is present (v2 path).
-        for (const c of chunks) c.data = "ZZZZ-corrupted-base64";
         expect(bufferToText(joinChunks(chunks))).toBe("prefer-binary");
-    });
-
-    it("joinChunks falls back to base64 `data` when `content` is missing", async () => {
-        const chunks = await splitIntoChunks(textToBuffer("legacy-fallback"));
-        // Strip the v2 binary field; emulates a doc read from legacy storage.
-        for (const c of chunks) c.content = undefined;
-        expect(bufferToText(joinChunks(chunks))).toBe("legacy-fallback");
     });
 });
 

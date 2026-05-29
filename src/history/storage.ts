@@ -1,15 +1,32 @@
 import Dexie, { type Table } from "dexie";
 import type { DiffRecord, FileSnapshot, HistorySource } from "./types.ts";
 
+/** Local content schema version stamped into `_meta` on first open.
+ *  Bumped when the shape of a DiffRecord / FileSnapshot row changes
+ *  in a way that requires a one-shot migration. Independent of the
+ *  Dexie DB-level version (which tracks table-shape evolution). */
+const HISTORY_SCHEMA_VERSION = 1 as const;
+
+interface MetaRow { key: string; value: number }
+
 class HistoryDB extends Dexie {
     diffs!: Table<DiffRecord, string>;
     snapshots!: Table<FileSnapshot, string>;
+    _meta!: Table<MetaRow, string>;
 
     constructor(vaultName: string) {
         super(`couchsync-history-${vaultName}`);
         this.version(1).stores({
             diffs: "++id, [filePath+timestamp], filePath, timestamp",
             snapshots: "filePath",
+        });
+        // v2: add `_meta` table for application-level schema versioning.
+        // Invariant 15 — every local Dexie DB carries its own format
+        // version row independent of the DB-level Dexie migration chain.
+        this.version(2).stores({
+            diffs: "++id, [filePath+timestamp], filePath, timestamp",
+            snapshots: "filePath",
+            _meta: "&key",
         });
     }
 }
@@ -19,6 +36,21 @@ export class HistoryStorage {
 
     constructor(vaultName: string) {
         this.db = new HistoryDB(vaultName);
+    }
+
+    /** Stamp `_meta.schemaVersion` on first open, or assert the stored
+     *  value matches `HISTORY_SCHEMA_VERSION`. Idempotent. */
+    async ensureSchemaVersion(): Promise<void> {
+        const existing = await this.db._meta.get("schemaVersion");
+        if (existing === undefined) {
+            await this.db._meta.put({ key: "schemaVersion", value: HISTORY_SCHEMA_VERSION });
+            return;
+        }
+        if (existing.value !== HISTORY_SCHEMA_VERSION) {
+            throw new Error(
+                `HistoryStorage schema version mismatch (stored=${existing.value}, expected=${HISTORY_SCHEMA_VERSION})`,
+            );
+        }
     }
 
     async saveDiff(
@@ -38,8 +70,7 @@ export class HistoryStorage {
             added,
             removed,
             conflict: conflict || undefined,
-            // Omit "local" to keep legacy rows and new local rows shape-identical.
-            source: source === "local" ? undefined : source,
+            source,
         });
     }
 

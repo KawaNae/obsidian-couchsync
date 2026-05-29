@@ -136,11 +136,69 @@ recreates the remote database).
 | Content encryption | AES-256-GCM | 12 B random IV per encryption, 16 B authentication tag. |
 | Chunk ID (encrypted vault) | HMAC-SHA-256 | Over plain chunk bytes, hex-encoded. |
 | Chunk ID (plaintext vault) | xxhash64 | Over plain chunk bytes, hex-encoded, 16 chars. |
-| Path encryption | AES-256-GCM | Same key as content. Original path stored in `encryptedPath` field. |
-| Metadata integrity | HMAC-SHA-256 | `metaHmac` over `salt || keyCheck || version`. |
+| Path encryption | AES-256-GCM | Same key as content. Original path stored in `encryptedPath` field as a base64-wrapped envelope. |
+| Passphrase verification | AES-256-GCM | `keyCheck`: a known-plaintext token encrypted under the derived key. Unlock decrypts it and matches the constant. Verifying a passphrase guess costs a full PBKDF2 derivation (the GCM auth tag is the verifier); there is no separate, cheaper verification token. |
 
 All primitives use the Web Crypto API (`crypto.subtle`). No custom
 crypto is implemented.
+
+## Envelope format
+
+Every byte sequence the plugin persists to the server — attachment
+bodies and encrypted string fields — carries a 1-byte codec header so a
+reader handed the raw bytes can decode them without consulting
+`vault:meta` or any other external context.
+
+```
+byte 0     : codec flags
+  bit 0    (0x01)  encrypted (AES-GCM v1; IV(12B) follows)
+  bit 1    (0x02)  compressed (gzip v1)
+  bit 2-6  reserved, must be 0 (reader rejects on non-zero)
+  bit 7    (0x80)  extension flag, must be 0 in v1 (reserved escape
+                   for a future extended descriptor at byte 1)
+byte 1+    : [IV(12B) — present only when bit 0 is set] [payload]
+```
+
+The order of operations is fixed: on push the body is gzipped before
+it is encrypted (compress → encrypt), so on pull the inverse order
+applies (decrypt → decompress). The header records what was applied,
+not the order, which is implicit and tested as an architectural
+invariant.
+
+### Where the envelope appears
+
+| Site | Form | Notes |
+|---|---|---|
+| Chunk attachment (`_attachments.c`) | binary envelope | Plaintext + uncompressed still carries the `0x00` header — universality is required, not optional. |
+| `ConfigDoc.data` when encrypted | base64(envelope) | Plaintext vaults skip the envelope (the field is just `base64(bytes)`); the format is unambiguous either way because `vault:meta.encryption.enabled` declares which case applies and the encrypted form's base64 has no colon separator (legacy hint). |
+| `encryptedPath` field on FileDoc / ConfigDoc | base64(envelope) | Only present in encrypted vaults. Always carries `encrypted=1`. |
+| `vault:meta.encryption.keyCheck` | base64(envelope) | Same shape; the well-known plaintext `"couchsync-e2e-v1"` confirms a passphrase derives the correct contentKey. |
+
+### Why the envelope matters
+
+Without per-blob version markers, every future change to the cipher,
+KDF, compression algorithm, or any other on-wire detail would require a
+synchronous migration of every existing byte sequence (or a dual-reader
+that consults `vault:meta` for every decode and assumes the entire
+vault is on one version). The envelope makes the format per-blob
+identifiable, so the project can roll new algorithms in alongside the
+old ones without requiring every device to upgrade in lockstep.
+
+This is the primary structural reason v0.25.0 must land before the
+plugin is published — after publication, every byte sequence that ever
+shipped is something every future version has to be able to decode.
+
+## Local-only schema versioning
+
+Each local Dexie database (`couchsync-<vault>`,
+`couchsync-<vault>-meta`, the per-config-pool variants,
+`couchsync-history-<vault>`, `couchsync-logs-<vault>`) carries a
+`_meta.schemaVersion = 1` row stamped on first open. A future build
+that bumps the local row layout will increment the value and migrate
+on open; a stale build encountering a higher version throws a
+`degraded` error so the user is prompted to update rather than the
+plugin silently mis-reading rows. This is local-only state and never
+travels to the server.
 
 ## Reporting security issues
 

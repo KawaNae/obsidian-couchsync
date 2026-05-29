@@ -3,11 +3,11 @@ import {
     deriveKeys,
     generateSalt,
     createCryptoProvider,
-    createKeyCheck,
-    verifyKeyCheck,
     type CryptoProvider,
     type EncryptionKeys,
 } from "../src/db/crypto-provider.ts";
+import { encryptString, decryptString } from "../src/db/envelope.ts";
+import { createKeyCheck, verifyKeyCheck } from "../src/db/vault-meta.ts";
 
 async function makeTestKeys(): Promise<EncryptionKeys> {
     return deriveKeys("test-passphrase", generateSalt());
@@ -52,47 +52,47 @@ describe("deriveKeys", () => {
     });
 });
 
-describe("CryptoProvider encrypt/decrypt", () => {
+describe("envelope.encryptString / decryptString", () => {
     let provider: CryptoProvider;
     beforeAll(async () => { provider = createCryptoProvider(await makeTestKeys()); });
 
     it("roundtrip preserves content", async () => {
-        const original = btoa("Hello, World!");
-        const encrypted = await provider.encrypt(original);
+        const original = "Hello, World!";
+        const encrypted = await encryptString(original, provider);
         expect(encrypted).not.toBe(original);
-        expect(await provider.decrypt(encrypted)).toBe(original);
+        expect(await decryptString(encrypted, provider)).toBe(original);
     });
 
-    it("encrypts to iv:ciphertext format", async () => {
-        const encrypted = await provider.encrypt(btoa("data"));
-        expect(encrypted).toContain(":");
-        const [iv, ct] = encrypted.split(":");
-        expect(iv.length).toBeGreaterThan(0);
-        expect(ct.length).toBeGreaterThan(0);
+    it("output is base64-wrapped envelope (not legacy iv:cipher format)", async () => {
+        const encrypted = await encryptString("data", provider);
+        // No colon separator from the old `base64(iv):base64(cipher)` shape.
+        expect(encrypted).not.toContain(":");
+        // base64 chars only.
+        expect(encrypted).toMatch(/^[A-Za-z0-9+/=]+$/);
     });
 
     it("same plaintext produces different ciphertexts (random IV)", async () => {
-        const plain = btoa("determinism test");
-        const e1 = await provider.encrypt(plain);
-        const e2 = await provider.encrypt(plain);
+        const plain = "determinism test";
+        const e1 = await encryptString(plain, provider);
+        const e2 = await encryptString(plain, provider);
         expect(e1).not.toBe(e2);
     });
 
     it("decryption with wrong key throws", async () => {
         const other = createCryptoProvider(await makeTestKeys());
-        const encrypted = await provider.encrypt(btoa("secret"));
-        await expect(other.decrypt(encrypted)).rejects.toThrow();
+        const encrypted = await encryptString("secret", provider);
+        await expect(decryptString(encrypted, other)).rejects.toThrow();
     });
 
     it("handles empty string", async () => {
-        const encrypted = await provider.encrypt("");
-        expect(await provider.decrypt(encrypted)).toBe("");
+        const encrypted = await encryptString("", provider);
+        expect(await decryptString(encrypted, provider)).toBe("");
     });
 
     it("handles large data (100KB+)", async () => {
-        const large = btoa("x".repeat(100_000));
-        const encrypted = await provider.encrypt(large);
-        expect(await provider.decrypt(encrypted)).toBe(large);
+        const large = "x".repeat(100_000);
+        const encrypted = await encryptString(large, provider);
+        expect(await decryptString(encrypted, provider)).toBe(large);
     });
 });
 
@@ -141,7 +141,7 @@ describe("keyCheck", () => {
 
     it("verify fails with corrupted keyCheck", async () => {
         const keys = await makeTestKeys();
-        expect(await verifyKeyCheck(keys, "garbage:data")).toBe(false);
+        expect(await verifyKeyCheck(keys, "garbage-not-an-envelope")).toBe(false);
     });
 });
 

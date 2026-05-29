@@ -16,27 +16,9 @@ import type { ICouchClient, IDocStore, DocWithAttachments, BulkDocsResult } from
 import type { CouchSyncDoc, ChunkDoc } from "../types.ts";
 import { stripRev } from "../utils/doc.ts";
 import { isChunkDocId } from "../types/doc-id.ts";
-import { base64ToArrayBuffer } from "./chunker.ts";
 import { paginateAllDocs, DEFAULT_BATCH_SIZE } from "./sync/pagination.ts";
-
-/** Strip the v2 binary `content` (and legacy `data`) from a chunk doc
- *  body before sending it to the remote. The attachment carries the
- *  canonical payload; these fields would either serialise as junk
- *  (Uint8Array → giant numeric JSON) or duplicate the storage. */
-function stripChunkBody(c: ChunkDoc & { _rev?: string }) {
-    const { data: _data, content: _content, ...rest } = c;
-    void _data; void _content;
-    return rest;
-}
-
-function chunkAttachmentBytes(c: ChunkDoc): Uint8Array | null {
-    if (c.content) return c.content;
-    if (typeof c.data === "string") {
-        if (c.data.length === 0) return new Uint8Array(0);
-        return new Uint8Array(base64ToArrayBuffer(c.data));
-    }
-    return null;
-}
+import { buildChunkAttachment, chunkFromAttachment } from "./chunk-attachment.ts";
+import { logWarn } from "../ui/log.ts";
 
 /** Partition a doc list into chunk attachments vs everything else,
  *  matching the v2 push-pipeline split. Used by setup-time bulk push
@@ -56,17 +38,8 @@ function splitForPush(docs: Array<CouchSyncDoc & { _rev?: string }>): {
         const d = docs[i];
         if (isChunkDocId(d._id)) {
             const c = d as ChunkDoc & { _rev?: string };
-            const body = chunkAttachmentBytes(c) ?? new Uint8Array(0);
             chunkPositions.push(i);
-            chunks.push({
-                doc: stripChunkBody(c),
-                attachments: {
-                    c: {
-                        contentType: "application/octet-stream",
-                        data: body,
-                    },
-                },
-            });
+            chunks.push(buildChunkAttachment(c));
         } else {
             restPositions.push(i);
             rest.push(d);
@@ -390,6 +363,7 @@ export async function pullAll(
     for (let i = 0; i < docs.length; i++) {
         if (isChunkDocId(docs[i]._id)) chunkIndices.push(i);
     }
+    const notFound = new Set<string>();
     if (chunkIndices.length > 0) {
         const queue = [...chunkIndices];
         const workers: Promise<void>[] = [];
@@ -398,18 +372,40 @@ export async function pullAll(
                 while (queue.length > 0) {
                     const i = queue.shift();
                     if (i === undefined) return;
-                    const blob = await remote.getAttachment(docs[i]._id, "c", signal);
-                    const c = docs[i] as ChunkDoc;
-                    c.data = "";
-                    c.content = blob ?? new Uint8Array(0);
+                    const id = docs[i]._id;
+                    const blob = await remote.getAttachment(id, "c", signal);
+                    if (blob === null) {
+                        // Attachment missing on the server. Do NOT fabricate
+                        // an empty chunk — that would pass every id-based
+                        // consistency gate and silently truncate the file.
+                        // Drop it; the file's chunks stay incomplete and a
+                        // later assemble fails loud / routes to repair.
+                        notFound.add(id);
+                        continue;
+                    }
+                    // Decorator stack returned the `[codec][body]` envelope
+                    // (encryption + compression already stripped). Decode to
+                    // the canonical ChunkDoc (no hasher here — Clone runs
+                    // before a stable hmac hasher is available).
+                    docs[i] = await chunkFromAttachment(id, blob);
                 }
             })());
         }
         await Promise.all(workers);
     }
 
-    // Strip remote _rev before writing to local.
-    const localDocs = docs.map((d) => stripRev(d) as CouchSyncDoc);
+    if (notFound.size > 0) {
+        logWarn(
+            `pullAll: ${notFound.size} chunk attachment(s) missing on remote; ` +
+            `skipped (not written as empty): ` +
+            `${[...notFound].slice(0, 3).join(", ")}${notFound.size > 3 ? "…" : ""}`,
+        );
+    }
+
+    // Exclude chunks whose attachment 404'd, then strip remote _rev.
+    const localDocs = docs
+        .filter((d) => !notFound.has(d._id))
+        .map((d) => stripRev(d) as CouchSyncDoc);
 
     await local.runWriteTx({
         docs: localDocs.map((doc) => ({ doc })),
@@ -419,5 +415,5 @@ export async function pullAll(
         total++;
         onProgress?.(doc._id, total);
     }
-    return { written: total, docs };
+    return { written: total, docs: docs.filter((d) => !notFound.has(d._id)) };
 }

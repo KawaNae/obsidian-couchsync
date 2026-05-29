@@ -25,7 +25,7 @@
  * then re-runs the pipeline. The cursor only advances on a clean run.
  */
 
-import type { ConfigDoc, CouchSyncDoc } from "../../types.ts";
+import type { ConfigDoc, CouchSyncDoc, ChunkDoc } from "../../types.ts";
 import { isConfigDoc } from "../../types.ts";
 import {
     configPathFromId, isConfigDocId,
@@ -33,8 +33,13 @@ import {
 import { stripRev } from "../../utils/doc.ts";
 import { compareVC, mergeVC, incrementVC, type VectorClock }
     from "../../sync/vector-clock.ts";
-import type { ICouchClient } from "../interfaces.ts";
+import type {
+    BulkDocsResult,
+    DocWithAttachments,
+    ICouchClient,
+} from "../interfaces.ts";
 import type { ConfigLocalDB } from "../config-local-db.ts";
+import { buildChunkAttachment } from "../chunk-attachment.ts";
 import { logDebug, logInfo } from "../../ui/log.ts";
 import type { ConfigCheckpoints } from "./config-checkpoints.ts";
 
@@ -50,6 +55,10 @@ export interface ConfigPushStats {
     skipped: number;
     conflicts: number;
     divergent: number;
+    /** Number of chunk docs pushed alongside ConfigDocs. Content-
+     *  addressed; conflicts on chunks are benign (same hash = same
+     *  content) and not counted as failures. */
+    chunksPushed: number;
 }
 
 export interface ConfigPushResult {
@@ -101,7 +110,7 @@ export class ConfigPushPipeline {
             // Leaving the cursor at `since` means re-running run() is a
             // cheap no-op (same since, same empty result).
             return {
-                stats: { pushed: 0, skipped: 0, conflicts: 0, divergent: 0 },
+                stats: ConfigPushPipeline.emptyStats(),
                 divergent: [],
                 cursorAdvanced: false,
             };
@@ -176,7 +185,8 @@ export class ConfigPushPipeline {
             // decides via modal whether to forcePush. Cursor stays put.
             return {
                 stats: {
-                    pushed: 0, skipped, conflicts: 0,
+                    ...ConfigPushPipeline.emptyStats(),
+                    skipped,
                     divergent: divergent.length,
                 },
                 divergent,
@@ -192,18 +202,38 @@ export class ConfigPushPipeline {
                 await this.deps.checkpoints.save();
             }
             return {
-                stats: { pushed: 0, skipped, conflicts: 0, divergent: 0 },
+                stats: { ...ConfigPushPipeline.emptyStats(), skipped },
                 divergent: [],
                 cursorAdvanced: localChanges.last_seq !== since,
             };
         }
 
-        onProgress?.(`Pushing ${proceed.length} doc(s)...`);
-        const results = await this.deps.client.bulkDocs(proceed, this.deps.signal);
+        // Resolve chunks referenced by proceed[]. Chunks ride as
+        // separate docs with envelope-formatted attachment "c" so the
+        // wrapped client (compress + encrypt) sees one unified bytes
+        // path for both push and pull. Content-addressed: pushing the
+        // same chunk id twice across devices is a 409 conflict the
+        // remote silently absorbs — no follow-up needed.
+        const chunkAttachments = await this.buildChunkAttachments(proceed);
+
+        onProgress?.(
+            `Pushing ${proceed.length} doc(s)` +
+            (chunkAttachments.length > 0
+                ? ` + ${chunkAttachments.length} chunk(s)...`
+                : `...`),
+        );
+        const [docResults, chunkResults] = await Promise.all([
+            this.deps.client.bulkDocs(proceed, this.deps.signal),
+            chunkAttachments.length > 0
+                ? this.deps.client.bulkDocsWithAttachments(
+                      chunkAttachments, this.deps.signal,
+                  )
+                : Promise.resolve([] as BulkDocsResult[]),
+        ]);
 
         let conflicts = 0;
         let pushed = 0;
-        for (const r of results) {
+        for (const r of docResults) {
             if (r.error === "conflict") {
                 conflicts++;
                 logDebug(`  → ${r.id} (conflict, will retry next push)`);
@@ -214,6 +244,13 @@ export class ConfigPushPipeline {
             }
         }
 
+        let chunksPushed = 0;
+        for (const r of chunkResults) {
+            // Chunk conflicts are benign (content-addressed); only count
+            // successful new writes for diagnostics.
+            if (!r.error) chunksPushed++;
+        }
+
         const cursorAdvanced = conflicts === 0;
         if (cursorAdvanced) {
             this.deps.checkpoints.setPushSeq(localChanges.last_seq);
@@ -222,19 +259,52 @@ export class ConfigPushPipeline {
         // else: leave cursor alone — next run() re-enumerates the same
         // delta and retries. All-or-nothing.
 
-        if (pushed + conflicts > 0) {
+        if (pushed + conflicts + chunksPushed > 0) {
             const parts: string[] = [];
             if (pushed > 0) parts.push(`${pushed} pushed`);
+            if (chunksPushed > 0) parts.push(`${chunksPushed} chunks`);
             if (skipped > 0) parts.push(`${skipped} skipped`);
             if (conflicts > 0) parts.push(`${conflicts} conflicts`);
             logInfo(`Config Push: ${parts.join(", ")}`);
         }
 
         return {
-            stats: { pushed, skipped, conflicts, divergent: 0 },
+            stats: { pushed, skipped, conflicts, divergent: 0, chunksPushed },
             divergent: [],
             cursorAdvanced,
         };
+    }
+
+    /** Empty-stats helper so the various "nothing to push" returns share
+     *  a single source of truth for which counters exist. */
+    private static emptyStats(): ConfigPushStats {
+        return {
+            pushed: 0, skipped: 0, conflicts: 0, divergent: 0, chunksPushed: 0,
+        };
+    }
+
+    /** Read referenced ChunkDocs for the proceed[] ConfigDocs from the
+     *  local DB, build envelope-formatted attachment items ready for
+     *  `bulkDocsWithAttachments`. De-duped by chunk id so the same
+     *  chunk referenced by multiple configs ships once. */
+    private async buildChunkAttachments(
+        proceed: ConfigDoc[],
+    ): Promise<DocWithAttachments[]> {
+        const allChunkIds = new Set<string>();
+        for (const doc of proceed) {
+            for (const cid of doc.chunks) allChunkIds.add(cid);
+        }
+        if (allChunkIds.size === 0) return [];
+
+        const chunks = await this.deps.db.getChunks([...allChunkIds]);
+        // `keepRev: false`: local Dexie tracks revisions on its own store;
+        // CouchDB's /_bulk_docs rejects a doc that already claims a rev when
+        // the destination has no prior version (silent forbidden/conflict
+        // per row). Vault's push pipeline keeps the rev because it has
+        // back-filled the remote rev first — see buildChunkAttachment.
+        return chunks.map((chunk) =>
+            buildChunkAttachment(chunk as ChunkDoc & { _rev?: string }, { keepRev: false }),
+        );
     }
 
     /**

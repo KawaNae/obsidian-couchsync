@@ -29,6 +29,7 @@ export type SyncErrorKind =
     | "timeout"   // catchup idle timeout, request timeout
     | "server"    // 5xx
     | "not-found" // 404 — DB deleted / recreated by another device
+    | "schema-mismatch" // remote doc shape this build can't read — terminal, no retry
     | "unknown";
 
 export interface SyncErrorDetail {

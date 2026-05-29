@@ -36,6 +36,7 @@ import { makeSettings } from "../helpers/settings-factory.ts";
 import { makeFileId } from "../../src/types/doc-id.ts";
 import { toPathKey } from "../../src/utils/path.ts";
 import type { FileDoc, CouchSyncDoc } from "../../src/types.ts";
+import { FILE_SCHEMA_VERSION } from "../../src/types.ts";
 
 let counter = 0;
 function uniqueDbName() { return `phantom-test-${Date.now()}-${counter++}`; }
@@ -263,6 +264,7 @@ describe("regression: pull-skipped event triggers reconcile schedule", () => {
         const remoteDoc: FileDoc = {
             _id: fileId,
             type: "file",
+            schemaVersion: FILE_SCHEMA_VERSION,
             chunks: ["chunk:abc"],
             vclock: { "dev-A": 1 },
             mtime: 1, ctime: 1, size: 3,
@@ -307,6 +309,7 @@ describe("regression: pull-skipped event triggers reconcile schedule", () => {
         const remoteDoc: FileDoc = {
             _id: fileId,
             type: "file",
+            schemaVersion: FILE_SCHEMA_VERSION,
             chunks: ["chunk:abc"],
             vclock: { "dev-A": 1 },
             mtime: 1, ctime: 1, size: 3,

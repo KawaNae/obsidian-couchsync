@@ -50,7 +50,7 @@ import type { LocalDB } from "../local-db.ts";
 import type {
     ICouchClient, BulkDocsResult, DocWithAttachments,
 } from "../interfaces.ts";
-import { base64ToArrayBuffer } from "../chunker.ts";
+import { buildChunkAttachment } from "../chunk-attachment.ts";
 import { DbError } from "../write-transaction.ts";
 import { EncryptionError } from "../encrypting-couch-client.ts";
 import { classifyError } from "./errors.ts";
@@ -136,32 +136,6 @@ export interface PushPipelineDeps {
 
 function isAbortError(e: unknown): boolean {
     return !!e && typeof e === "object" && (e as any).name === "AbortError";
-}
-
-/** Resolve the binary body for a chunk's attachment. v2 chunks carry
- *  `content: Uint8Array` directly; chunks read from legacy storage
- *  paths (data-only, content undefined) fall back to base64-decoding
- *  `data`. Returns null when neither source is available — the chunker
- *  should never produce such an output, so this branch is a defensive
- *  guard. */
-function chunkAttachmentBytes(c: ChunkDoc): Uint8Array | null {
-    if (c.content && c.content.length > 0) return c.content;
-    if (c.content && c.content.length === 0) return c.content;
-    if (typeof c.data === "string") {
-        if (c.data.length === 0) return new Uint8Array(0);
-        return new Uint8Array(base64ToArrayBuffer(c.data));
-    }
-    return null;
-}
-
-/** Strip fields that must not be sent to CouchDB inside the JSON doc
- *  body: the canonical attachment ride along via the `attachments` map,
- *  not embedded as `data` / `content`. */
-function stripAttachmentFields(doc: ChunkDoc & { _rev?: string }) {
-    const { data: _data, content: _content, ...rest } = doc;
-    void _data;
-    void _content;
-    return rest;
 }
 
 export class PushPipeline {
@@ -634,32 +608,8 @@ export class PushPipeline {
             const doc = prepared[i];
             if (isChunkDocId(doc._id)) {
                 const chunk = doc as unknown as ChunkDoc & { _rev?: string };
-                const body = chunkAttachmentBytes(chunk);
-                if (!body) {
-                    // A chunk without retrievable binary content is a
-                    // programming error in v2 — every chunker output
-                    // carries `content`. Skip rather than crash, mark as
-                    // an error so the caller's accounting reflects it.
-                    chunkPositions.push(i);
-                    chunkItems.push({
-                        // Empty attachment fallback — CouchDB will reject
-                        // duplicates with the same _id, which surfaces as a
-                        // benign conflict in the result loop below.
-                        doc: stripAttachmentFields(chunk),
-                        attachments: {},
-                    });
-                    continue;
-                }
                 chunkPositions.push(i);
-                chunkItems.push({
-                    doc: stripAttachmentFields(chunk),
-                    attachments: {
-                        c: {
-                            contentType: "application/octet-stream",
-                            data: body,
-                        },
-                    },
-                });
+                chunkItems.push(buildChunkAttachment(chunk));
             } else {
                 filePositions.push(i);
                 fileDocs.push(doc);

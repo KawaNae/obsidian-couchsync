@@ -10,17 +10,23 @@
 import { describe, it, expect, vi } from "vitest";
 import { ConflictResolver } from "../src/conflict/conflict-resolver.ts";
 import type { ConfigDoc } from "../src/types.ts";
-import { makeConfigId } from "../src/types/doc-id.ts";
+import { CONFIG_SCHEMA_VERSION } from "../src/types.ts";
+import { makeConfigId, makeChunkId } from "../src/types/doc-id.ts";
 
+/** Build a v3 ConfigDoc fixture. `contentTag` becomes the body of the
+ *  single chunk this doc references — varying it across docs creates
+ *  the same content-differs/content-matches distinction the pre-chunks
+ *  `data` strings did, without needing a real chunker round-trip. */
 function makeConfig(
     path: string,
     vclock: Record<string, number>,
-    data = "YmFzZQ==",
+    contentTag = "base",
 ): ConfigDoc {
     return {
         _id: makeConfigId(path),
         type: "config",
-        data,
+        schemaVersion: CONFIG_SCHEMA_VERSION,
+        chunks: [makeChunkId(`${contentTag}-hash`.padEnd(16, "0").slice(0, 16))],
         mtime: 1000,
         size: 4,
         vclock,

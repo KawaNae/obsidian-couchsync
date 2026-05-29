@@ -32,13 +32,28 @@ export interface LogStorageStats {
     levels?: Record<LogLevel, number>;
 }
 
+/** Local content schema version stamped into `_meta` on first open.
+ *  Independent of the Dexie DB-level version. Bump when the shape of
+ *  a PersistedLogEntry row changes in a way that requires a one-shot
+ *  migration. */
+const LOG_SCHEMA_VERSION = 1 as const;
+
+interface MetaRow { key: string; value: number }
+
 class LogDB extends Dexie {
     entries!: Table<PersistedLogEntry, number>;
+    _meta!: Table<MetaRow, string>;
 
     constructor(vaultName: string) {
         super(`couchsync-logs-${vaultName}`);
         this.version(1).stores({
             entries: "++id, timestamp",
+        });
+        // v2: add `_meta` table for application-level schema versioning
+        // (invariant 15). The log row shape itself is unchanged.
+        this.version(2).stores({
+            entries: "++id, timestamp",
+            _meta: "&key",
         });
     }
 }
@@ -58,6 +73,27 @@ export class LogStorage {
     constructor(vaultName: string) {
         this.dbName = `couchsync-logs-${vaultName}`;
         this.db = new LogDB(vaultName);
+    }
+
+    /** Stamp `_meta.schemaVersion` on first open, or assert the stored
+     *  value matches `LOG_SCHEMA_VERSION`. IDB failures are swallowed
+     *  to console.warn — invoking the logger from here would deadlock
+     *  via `pushEntry` and back into LogStorage. */
+    async ensureSchemaVersion(): Promise<void> {
+        try {
+            const existing = await this.db._meta.get("schemaVersion");
+            if (existing === undefined) {
+                await this.db._meta.put({ key: "schemaVersion", value: LOG_SCHEMA_VERSION });
+                return;
+            }
+            if (existing.value !== LOG_SCHEMA_VERSION) {
+                console.warn(
+                    `[log-storage] schema version mismatch (stored=${existing.value}, expected=${LOG_SCHEMA_VERSION})`,
+                );
+            }
+        } catch (e: any) {
+            console.warn(`[log-storage] ensureSchemaVersion failed: ${e?.message ?? e}`);
+        }
     }
 
     async bulkAppend(entries: PersistedLogEntry[]): Promise<void> {

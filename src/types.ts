@@ -17,31 +17,52 @@ export {
     isReplicatedDocId,
     filePathFromId,
     chunkHashFromId,
+    parseChunkId,
     configPathFromId,
     parseDocId,
 } from "./types/doc-id.ts";
-export type { DocKind, ParsedDocId } from "./types/doc-id.ts";
+export type { DocKind, ParsedDocId, ChunkHashAlg } from "./types/doc-id.ts";
 
-/** Current doc schema version. Bumped when the on-disk / on-wire shape
- *  of replicated docs changes in a way that requires the reader to know
- *  which interpretation to apply. The current value is 2 — the
- *  attachment-based data layer redesigned in `plans/2026-05-28-data-layer-v2.md`.
+/** Per-doc-kind schema version. Each replicated doc kind carries its
+ *  own version literal so the kinds can evolve independently: e.g.
+ *  ConfigDoc moves from v2 to v3 (chunks-based) without forcing FileDoc
+ *  to re-stamp. Writers stamp the constant matching the kind; readers
+ *  rely on the type guarantee (invariant 11) and don't tolerate
+ *  undefined.
  *
- *  Writers always stamp this value on every new doc. Readers tolerate
- *  missing values (legacy / pre-v2 docs) and treat them as the previous
- *  version. Future bumps should add new variants here and route via
- *  explicit version checks at the decoder boundary.
+ *  - `FILE_SCHEMA_VERSION = 2` — attachment-based v2 (data-layer-v2)
+ *  - `CHUNK_SCHEMA_VERSION = 2` — attachment-based v2
+ *  - `CONFIG_SCHEMA_VERSION = 3` — chunks-based, attachment payload
+ *    (ConfigSync chunking, supersedes the `data: string` inline form)
  */
-export const CURRENT_SCHEMA_VERSION = 2 as const;
-export type SchemaVersion = typeof CURRENT_SCHEMA_VERSION;
+export const FILE_SCHEMA_VERSION = 2 as const;
+export const CHUNK_SCHEMA_VERSION = 2 as const;
+export const CONFIG_SCHEMA_VERSION = 3 as const;
 
-/** Base fields shared by all CouchSync documents */
+export type FileSchemaVersion = typeof FILE_SCHEMA_VERSION;
+export type ChunkSchemaVersion = typeof CHUNK_SCHEMA_VERSION;
+export type ConfigSchemaVersion = typeof CONFIG_SCHEMA_VERSION;
+
+/** Aggregate alias kept for legacy call sites that need to mention "the
+ *  schemaVersion field of any replicated doc" without committing to a
+ *  specific kind. Most code should use the per-kind constants. */
+export type SchemaVersion =
+    | FileSchemaVersion
+    | ChunkSchemaVersion
+    | ConfigSchemaVersion;
+
+/** Back-compat alias — equal to `FILE_SCHEMA_VERSION`. Pre-v0.26 the
+ *  three kinds shared a single version; downstream code that still
+ *  imports this constant continues to compile, but new writers should
+ *  reach for the per-kind constant directly. */
+export const CURRENT_SCHEMA_VERSION = FILE_SCHEMA_VERSION;
+
+/** Base fields shared by all CouchSync documents. The `schemaVersion`
+ *  field lives on each concrete interface so the literal type pins to
+ *  the right per-kind version. */
 interface CouchSyncDocBase {
     _id: string;
     _rev?: string;
-    /** Doc schema version. Optional in the type system so legacy docs
-     *  (without the field) remain valid; writers always set it. */
-    schemaVersion?: SchemaVersion;
 }
 
 /** A vault file (note, image, attachment) stored as chunks.
@@ -53,6 +74,7 @@ interface CouchSyncDocBase {
  */
 export interface FileDoc extends CouchSyncDocBase {
     type: "file";
+    schemaVersion: FileSchemaVersion;
     chunks: string[];
     mtime: number;
     ctime: number;
@@ -64,26 +86,24 @@ export interface FileDoc extends CouchSyncDocBase {
 
 /** A content chunk — fragment of a file.
  *
- *  `_id` is `"chunk:" + hash(plainBytes)` — always constructed via
- *  `makeChunkId`. Chunks are content-addressed and shared across files.
- *  In v2 the hash input is the plain binary content (Uint8Array), not the
- *  base64 string of it — see `chunker.ts`.
+ *  `_id` is `"chunk:<alg>:<hash>"` — always constructed via `makeChunkId`.
+ *  Chunks are content-addressed and shared across files. v0.25.0 uses
+ *  the `x64` algorithm tag (xxhash64 of plain binary content) for every
+ *  newly-minted chunk.
  *
- *  Phase 2 keeps `data: string` (base64) and adds the parallel `content: Uint8Array`.
- *  Phase 6 (attachment plumbing) moves the canonical payload into a
- *  CouchDB attachment (`_attachments.c`) and removes `data`.
+ *  The canonical payload rides as a CouchDB attachment named `"c"`
+ *  (envelope-formatted; see `envelope.ts`). The local `content` field
+ *  holds the plain binary so the push pipeline can re-wrap it without
+ *  re-reading from vault — that's the only reason it lives in the doc
+ *  body. There is no legacy base64 `data` field; v0.25.0 dropped it
+ *  along with the multipart-related transport.
  */
 export interface ChunkDoc extends CouchSyncDocBase {
     type: "chunk";
-    /** Base64-encoded content. Legacy v1 storage carrier, retained for
-     *  back-compat during phases 2-5. Phase 6 removes this in favour of
-     *  the binary attachment.
-     *  @deprecated Use `content` (Uint8Array) for new code paths. */
-    data: string;
-    /** Plain binary content. v2 canonical representation. Optional on
-     *  the type so docs read from legacy storage (data-only) remain
-     *  valid; the chunker always sets it on newly-produced chunks. */
-    content?: Uint8Array;
+    schemaVersion: ChunkSchemaVersion;
+    /** Plain binary content. Required — chunker always sets it, and
+     *  push pipeline reads it directly when building the `c` attachment. */
+    content: Uint8Array;
 }
 
 /** A config file (`.obsidian/` settings, plugin data.json, theme CSS, etc).
@@ -98,15 +118,31 @@ export interface ChunkDoc extends CouchSyncDocBase {
  *
  *  Like FileDoc, ordering between concurrent edits within the same
  *  config pool is decided by `vclock` — never by mtime.
+ *
+ *  v3 (ConfigSync chunking) replaces the legacy `data: string` (base64
+ *  inline) field with `chunks: string[]`, mirroring FileDoc. Each chunk
+ *  rides as a `ChunkDoc` in the SAME config DB with an envelope-formatted
+ *  attachment "c" — invariant 12 universality now applies to config DB
+ *  too. Cross-device dedup (identical plugin/theme across N devices →
+ *  one chunk on remote) and wire-level gzip (via CompressingCouchClient)
+ *  are the load-bearing wins.
  */
 export interface ConfigDoc extends CouchSyncDocBase {
     type: "config";
-    /** Base64-encoded raw bytes. Always binary-safe. */
-    data: string;
+    schemaVersion: ConfigSchemaVersion;
+    /** Ordered list of `chunk:<alg>:<hash>` ids that compose this config
+     *  file's binary content. Empty for zero-byte files (one chunk of
+     *  zero length, matching FileDoc semantics). */
+    chunks: string[];
     mtime: number;
     size: number;
     /** Causal order. Required on all writes. */
     vclock: VectorClock;
+    /** Tombstone marker — pull-side write skips when true (symmetric with
+     *  FileDoc.deleted). Currently only used for migration safety; the
+     *  manual scan/push/pull flow does not generate tombstones, but
+     *  future continuous-mode work can. */
+    deleted?: boolean;
 }
 
 /** Union of all document types stored in the local DB */

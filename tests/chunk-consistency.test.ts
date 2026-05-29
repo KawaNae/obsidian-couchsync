@@ -17,7 +17,7 @@ import {
     hasDivergence,
     type ChunkConsistencyReport,
 } from "../src/sync/chunk-consistency.ts";
-import { collectReferencedChunks } from "../src/db/chunk-refs.ts";
+import { collectFileChunkRefs } from "../src/db/chunk-refs.ts";
 import type { FileDoc, ChunkDoc, CouchSyncDoc } from "../src/types.ts";
 import { makeFileId, makeChunkId } from "../src/types/doc-id.ts";
 
@@ -84,25 +84,25 @@ async function runWithDefaults(
     return result.report;
 }
 
-// ── collectReferencedChunks unit ─────────────────────────
+// ── collectFileChunkRefs unit ─────────────────────────
 
-describe("collectReferencedChunks", () => {
+describe("collectFileChunkRefs", () => {
     it("skips deleted FileDocs entirely", () => {
         const alive = makeFile("alive.md", [makeChunkId("a")]);
         const dead = makeFile("dead.md", [makeChunkId("b")], { deleted: true });
-        const refs = collectReferencedChunks([alive, dead]);
+        const refs = collectFileChunkRefs([alive, dead]);
         expect([...refs.keys()].sort()).toEqual([makeChunkId("a")]);
     });
 
     it("accumulates referencedBy paths across multiple files", () => {
         const f1 = makeFile("one.md", [makeChunkId("x")]);
         const f2 = makeFile("two.md", [makeChunkId("x")]);
-        const refs = collectReferencedChunks([f1, f2]);
+        const refs = collectFileChunkRefs([f1, f2]);
         expect(refs.get(makeChunkId("x"))?.sort()).toEqual(["one.md", "two.md"]);
     });
 
     it("empty input yields empty map", () => {
-        expect(collectReferencedChunks([]).size).toBe(0);
+        expect(collectFileChunkRefs([]).size).toBe(0);
     });
 });
 

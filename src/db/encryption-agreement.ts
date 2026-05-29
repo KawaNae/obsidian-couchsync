@@ -1,11 +1,18 @@
 /**
- * Vault codec agreement check — compares local codec settings (encryption,
- * compression) with the remote vault DB's `vault:meta` document.
+ * Codec agreement check — compares local codec settings (encryption,
+ * compression) with a remote DB's self-describing meta doc.
+ *
+ * Generic over the meta kind: `vault:meta` for the vault DB,
+ * `config:meta` for the config DB. Phase 2 (invariant 17/18) treats
+ * each meta as an independent crypto root, so this check runs once
+ * per DB — once at vault startup against vault:meta, once at config
+ * startup against config:meta. Both call paths share this function via
+ * the `metaDocId` parameter.
  *
  * Used at startup (main.ts) and per-session (SyncEngine pre-catchup hook)
  * to ensure no data flows until both sides agree on codec state. Always
  * fetches via a RAW client (not EncryptingCouchClient / CompressingCouchClient)
- * because `vault:meta` is never itself encrypted or compressed.
+ * because the meta doc is never itself encrypted or compressed.
  *
  * Naming note: the file/exports retain "Encryption" prefixes for back-compat
  * with the v1 API surface; v2 generalises the check to both codec axes.
@@ -14,24 +21,41 @@
 import type { ICouchClient } from "./interfaces.ts";
 import {
     fetchVaultMeta,
+    fetchConfigMeta,
     fetchLegacyEncryptionMeta,
+    VAULT_META_DOC_ID,
+    CONFIG_META_DOC_ID,
     type VaultMetaDoc,
+    type ConfigMetaDoc,
+    type DbMetaDoc,
 } from "./vault-meta.ts";
 
 export type EncryptionAgreement =
-    | { status: "agreed-encrypted"; meta: VaultMetaDoc }
-    | { status: "agreed-plaintext"; meta: VaultMetaDoc | null }
-    | { status: "remote-encrypted"; meta: VaultMetaDoc }
-    | { status: "remote-plaintext"; meta: VaultMetaDoc | null }
+    | { status: "agreed-encrypted"; meta: DbMetaDoc }
+    | { status: "agreed-plaintext"; meta: DbMetaDoc | null }
+    | { status: "remote-encrypted"; meta: DbMetaDoc }
+    | { status: "remote-plaintext"; meta: DbMetaDoc | null }
     /** Legacy `encryption:meta` doc found on remote but no `vault:meta`.
-     *  Triggers a migration prompt in main.ts. */
+     *  Triggers a migration prompt in main.ts. Vault-DB-only — config
+     *  DB never carried a legacy meta. */
     | { status: "legacy-meta-only" };
 
+/**
+ * Check codec agreement against a specific meta doc id.
+ *
+ * - `"vault:meta"` (default): vault DB. Legacy `encryption:meta` fallback
+ *   triggers a v1 → v2 migration prompt.
+ * - `"config:meta"`: config DB. No legacy fallback — config:meta was
+ *   introduced in v0.26 alongside chunking.
+ */
 export async function checkEncryptionAgreement(
     rawClient: ICouchClient,
     localEncryptionEnabled: boolean,
+    metaDocId: typeof VAULT_META_DOC_ID | typeof CONFIG_META_DOC_ID = VAULT_META_DOC_ID,
 ): Promise<EncryptionAgreement> {
-    const meta = await fetchVaultMeta(rawClient);
+    const meta = metaDocId === VAULT_META_DOC_ID
+        ? await fetchVaultMeta(rawClient)
+        : await fetchConfigMeta(rawClient);
     if (meta) {
         const remoteEncrypted = meta.encryption.enabled;
         if (remoteEncrypted && localEncryptionEnabled) {
@@ -45,12 +69,15 @@ export async function checkEncryptionAgreement(
         }
         return { status: "remote-plaintext", meta };
     }
-    // No vault:meta on the server — check whether an older v1
-    // `encryption:meta` doc exists so main.ts can route the user to
-    // the v2 migration flow.
-    const legacy = await fetchLegacyEncryptionMeta(rawClient);
-    if (legacy) {
-        return { status: "legacy-meta-only" };
+    // Vault-only legacy check: an older v1 `encryption:meta` doc may
+    // exist on the server, signalling the v2 migration is needed.
+    // Config DB never had a legacy meta — skip the probe there to
+    // avoid a wasted round-trip.
+    if (metaDocId === VAULT_META_DOC_ID) {
+        const legacy = await fetchLegacyEncryptionMeta(rawClient);
+        if (legacy) {
+            return { status: "legacy-meta-only" };
+        }
     }
     // No meta of any kind, no local encryption configured — fresh plaintext.
     if (!localEncryptionEnabled) {

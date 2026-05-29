@@ -12,30 +12,42 @@ import { ConfigLocalDB } from "../../src/db/config-local-db.ts";
 import { ConfigCheckpoints } from "../../src/db/sync/config-checkpoints.ts";
 import { ConfigPushPipeline } from "../../src/db/sync/config-push-pipeline.ts";
 import { FakeCouchClient } from "../helpers/fake-couch-client.ts";
-import { arrayBufferToBase64 } from "../../src/db/chunker.ts";
-import { makeConfigId, configPathFromId } from "../../src/types/doc-id.ts";
 import { compareVC } from "../../src/sync/vector-clock.ts";
-import type { ConfigDoc } from "../../src/types.ts";
+import { makeConfigFixture } from "../helpers/config-fixture.ts";
+import type { ConfigDoc, CouchSyncDoc } from "../../src/types.ts";
 
 let counter = 0;
 function uniqueName(): string {
     return `cfg-push-${Date.now()}-${counter++}`;
 }
 
-function makeConfigDoc(
+/** Build a v3 ConfigDoc fixture and seed both the doc and its chunks
+ *  into the local DB in one tx. Returns the doc so callers can refer
+ *  back to ids / vclock. */
+async function seedLocalConfig(
+    db: ConfigLocalDB,
     path: string,
     body: string,
     vclock: Record<string, number>,
-): ConfigDoc {
-    const data = arrayBufferToBase64(new TextEncoder().encode(body).buffer);
-    return {
-        _id: makeConfigId(path),
-        type: "config",
-        data,
-        mtime: 1_000_000,
-        size: body.length,
-        vclock,
-    };
+): Promise<ConfigDoc> {
+    const { doc, chunks } = await makeConfigFixture(path, body, { vclock });
+    await db.runWriteTx({
+        docs: [{ doc: doc as unknown as CouchSyncDoc }],
+        chunks: chunks as unknown as CouchSyncDoc[],
+    });
+    return doc;
+}
+
+/** Build a ConfigDoc fixture for direct seeding into the remote (no
+ *  chunks needed on the remote-side because pull-side tests use the
+ *  fixture's chunk shape and these push tests only care about the
+ *  ConfigDoc's vclock on remote). */
+async function makeRemoteConfigDoc(
+    path: string,
+    body: string,
+    vclock: Record<string, number>,
+): Promise<ConfigDoc> {
+    return (await makeConfigFixture(path, body, { vclock })).doc;
 }
 
 function makePipeline(
@@ -73,8 +85,7 @@ describe("ConfigPushPipeline — incremental push", () => {
     });
 
     it("pushes new docs to empty remote and advances cursor", async () => {
-        const a = makeConfigDoc(".obsidian/a.json", "1", { "dev-A": 1 });
-        await db.runWriteTx({ docs: [{ doc: a }] });
+        const a = await seedLocalConfig(db, ".obsidian/a.json", "1", { "dev-A": 1 });
 
         const result = await pipeline.run();
 
@@ -83,12 +94,13 @@ describe("ConfigPushPipeline — incremental push", () => {
         expect(result.cursorAdvanced).toBe(true);
         const stored = await remote.getDoc<ConfigDoc>(a._id);
         expect(stored).not.toBeNull();
+        // Chunks rode along on the same push round-trip.
+        expect(result.stats.chunksPushed).toBe(1);
     });
 
     it("no-op when local and remote are converged (vclock equal)", async () => {
-        const a = makeConfigDoc(".obsidian/a.json", "1", { "dev-A": 1 });
-        await db.runWriteTx({ docs: [{ doc: a }] });
-        await remote.bulkDocs([a]);
+        const a = await seedLocalConfig(db, ".obsidian/a.json", "1", { "dev-A": 1 });
+        await remote.bulkDocs([a] as unknown as CouchSyncDoc[]);
 
         const result = await pipeline.run();
 
@@ -98,8 +110,7 @@ describe("ConfigPushPipeline — incremental push", () => {
     });
 
     it("second run is empty when nothing changed since lastPushSeq", async () => {
-        const a = makeConfigDoc(".obsidian/a.json", "1", { "dev-A": 1 });
-        await db.runWriteTx({ docs: [{ doc: a }] });
+        await seedLocalConfig(db, ".obsidian/a.json", "1", { "dev-A": 1 });
         await pipeline.run();
         const seq1 = cps.getPushSeq();
 
@@ -112,10 +123,9 @@ describe("ConfigPushPipeline — incremental push", () => {
 
     it("divergence: concurrent vclocks are surfaced and push is held", async () => {
         // Local says {dev-A:1}, remote says {dev-B:1} → incomparable.
-        const local = makeConfigDoc(".obsidian/h.json", "L", { "dev-A": 1 });
-        const remoteDoc = makeConfigDoc(".obsidian/h.json", "R", { "dev-B": 1 });
-        await db.runWriteTx({ docs: [{ doc: local }] });
-        await remote.bulkDocs([remoteDoc]);
+        const local = await seedLocalConfig(db, ".obsidian/h.json", "L", { "dev-A": 1 });
+        const remoteDoc = await makeRemoteConfigDoc(".obsidian/h.json", "R", { "dev-B": 1 });
+        await remote.bulkDocs([remoteDoc] as unknown as CouchSyncDoc[]);
 
         const result = await pipeline.run();
 
@@ -129,10 +139,9 @@ describe("ConfigPushPipeline — incremental push", () => {
     });
 
     it("divergence: remote dominates → push held (would clobber)", async () => {
-        const local = makeConfigDoc(".obsidian/d.json", "L", { "dev-A": 1 });
-        const remoteDoc = makeConfigDoc(".obsidian/d.json", "R", { "dev-A": 2 });
-        await db.runWriteTx({ docs: [{ doc: local }] });
-        await remote.bulkDocs([remoteDoc]);
+        await seedLocalConfig(db, ".obsidian/d.json", "L", { "dev-A": 1 });
+        const remoteDoc = await makeRemoteConfigDoc(".obsidian/d.json", "R", { "dev-A": 2 });
+        await remote.bulkDocs([remoteDoc] as unknown as CouchSyncDoc[]);
 
         const result = await pipeline.run();
 
@@ -142,10 +151,9 @@ describe("ConfigPushPipeline — incremental push", () => {
     });
 
     it("forcePushAdvanceVclocks bumps local vclock above remote so retry succeeds", async () => {
-        const local = makeConfigDoc(".obsidian/h.json", "L", { "dev-A": 1 });
-        const remoteDoc = makeConfigDoc(".obsidian/h.json", "R", { "dev-B": 1 });
-        await db.runWriteTx({ docs: [{ doc: local }] });
-        await remote.bulkDocs([remoteDoc]);
+        const local = await seedLocalConfig(db, ".obsidian/h.json", "L", { "dev-A": 1 });
+        const remoteDoc = await makeRemoteConfigDoc(".obsidian/h.json", "R", { "dev-B": 1 });
+        await remote.bulkDocs([remoteDoc] as unknown as CouchSyncDoc[]);
 
         const first = await pipeline.run();
         expect(first.divergent).toHaveLength(1);
@@ -166,8 +174,7 @@ describe("ConfigPushPipeline — incremental push", () => {
     });
 
     it("all-or-nothing: bulkDocs conflict blocks cursor advance", async () => {
-        const a = makeConfigDoc(".obsidian/a.json", "1", { "dev-A": 1 });
-        await db.runWriteTx({ docs: [{ doc: a }] });
+        await seedLocalConfig(db, ".obsidian/a.json", "1", { "dev-A": 1 });
 
         // Inject a conflict on the next bulkDocs call.
         const origBulk = remote.bulkDocs.bind(remote);

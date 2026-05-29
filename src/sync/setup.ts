@@ -42,6 +42,7 @@ export class SetupService {
             onProgress("Initializing local database...");
             await this.localDb.destroy();
             this.localDb.open();
+            await this.localDb.ensureSchemaVersion();
 
             onProgress("Initializing remote database...");
             await this.remoteOps.destroyRemote();
@@ -69,6 +70,7 @@ export class SetupService {
             onProgress("Initializing local database...");
             await this.localDb.destroy();
             this.localDb.open();
+            await this.localDb.ensureSchemaVersion();
 
             onProgress("Pulling from remote...");
             const { written: totalDocs } = await this.remoteOps.pullAll((docId, n) => {

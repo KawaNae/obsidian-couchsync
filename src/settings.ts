@@ -59,7 +59,7 @@ export interface CouchSyncSettings {
      *  (only the day-based retention applies). */
     logMaxStorageMB: number;
 
-    // E2E Encryption
+    // E2E Encryption (vault DB)
     encryptionEnabled: boolean;
     encryptionPassphrase: string;
     /** v2: enable gzip compression of attachment bodies. Outermost
@@ -69,6 +69,18 @@ export interface CouchSyncSettings {
      *  value only takes effect for *future* chunk pushes (existing
      *  chunks keep whatever encoding they were stored with). */
     compressionEnabled: boolean;
+
+    /** Phase 2 (v0.26): config-side codec overrides. Each field is
+     *  optional — `undefined` means "inherit from the vault setting
+     *  above". Concrete values let advanced users decouple config
+     *  crypto/compression from vault, e.g. share a plaintext config
+     *  DB across pools while keeping notes encrypted. The settings UI
+     *  surfaces these in a Phase 3 follow-up; the internal code paths
+     *  already honour them today (invariant 18: cryptoProvider is
+     *  per-DB). */
+    configEncryptionEnabled?: boolean;
+    configEncryptionPassphrase?: string;
+    configCompressionEnabled?: boolean;
 
     // Internal
     connectionState: ConnectionState;

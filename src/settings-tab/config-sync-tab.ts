@@ -231,7 +231,21 @@ export class ConfigSyncTab {
                         if (!ok) return;
                         btn.setButtonText("Initializing...");
                         btn.setDisabled(true);
-                        try { await this.deps.configSync.init(); } catch { /* handled */ }
+                        try {
+                            // Phase 2: config crypto is independent.
+                            // Pull encryption/passphrase/compression from
+                            // vault settings as default; Phase 3 will
+                            // surface separate UI for these.
+                            const s = this.deps.getSettings();
+                            await this.deps.configSync.init({
+                                encryption: s.configEncryptionEnabled
+                                    ?? s.encryptionEnabled,
+                                passphrase: s.configEncryptionPassphrase
+                                    ?? s.encryptionPassphrase,
+                                compression: s.configCompressionEnabled
+                                    ?? s.compressionEnabled,
+                            });
+                        } catch { /* handled */ }
                         btn.setButtonText("Init & Push");
                         btn.setDisabled(false);
                     })

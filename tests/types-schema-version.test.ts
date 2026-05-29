@@ -7,7 +7,7 @@ import {
     type ConfigDoc,
 } from "../src/types.ts";
 
-describe("schema version (v2)", () => {
+describe("schema version (v2) — invariant 11 (writer-required schemaVersion)", () => {
     it("exposes CURRENT_SCHEMA_VERSION = 2", () => {
         expect(CURRENT_SCHEMA_VERSION).toBe(2);
     });
@@ -16,7 +16,7 @@ describe("schema version (v2)", () => {
         expectTypeOf<SchemaVersion>().toEqualTypeOf<2>();
     });
 
-    it("FileDoc accepts schemaVersion set to the current version", () => {
+    it("FileDoc requires schemaVersion (type-level enforcement)", () => {
         const doc: FileDoc = {
             _id: "file:notes/hello.md",
             type: "file",
@@ -28,32 +28,27 @@ describe("schema version (v2)", () => {
             schemaVersion: CURRENT_SCHEMA_VERSION,
         };
         expect(doc.schemaVersion).toBe(2);
+        // The build catches omissions at compile time — this assertion
+        // documents that no runtime tolerance for missing schemaVersion
+        // remains (v0.25.0 dropped the legacy `?` modifier).
+        expectTypeOf<FileDoc>().toHaveProperty("schemaVersion").not.toBeNullable();
     });
 
-    it("FileDoc remains valid without schemaVersion (legacy tolerance)", () => {
-        const legacy: FileDoc = {
-            _id: "file:legacy.md",
-            type: "file",
-            chunks: [],
-            mtime: 0,
-            ctime: 0,
-            size: 0,
-            vclock: {},
-        };
-        expect(legacy.schemaVersion).toBeUndefined();
-    });
-
-    it("ChunkDoc accepts schemaVersion", () => {
+    it("ChunkDoc requires schemaVersion and content (Uint8Array), no legacy `data` field", () => {
         const doc: ChunkDoc = {
-            _id: "chunk:abc",
+            _id: "chunk:x64:abc",
             type: "chunk",
-            data: "",
             schemaVersion: CURRENT_SCHEMA_VERSION,
+            content: new Uint8Array([1, 2, 3]),
         };
         expect(doc.schemaVersion).toBe(2);
+        expect(doc.content).toBeInstanceOf(Uint8Array);
+        // `data: string` was the v1 carrier — v0.25.0 removed it entirely.
+        // The type no longer carries the field; runtime probes confirm.
+        expect((doc as Record<string, unknown>).data).toBeUndefined();
     });
 
-    it("ConfigDoc accepts schemaVersion", () => {
+    it("ConfigDoc requires schemaVersion", () => {
         const doc: ConfigDoc = {
             _id: "config:.obsidian/x.json",
             type: "config",

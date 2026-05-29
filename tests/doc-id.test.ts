@@ -40,9 +40,9 @@ describe("make* and *FromId round-trip", () => {
         expect(filePathFromId(id)).toBe("notes/hello.md");
     });
 
-    it("round-trips chunk hashes", () => {
+    it("round-trips chunk hashes with default algorithm tag", () => {
         const id = makeChunkId("a1b2c3d4e5f6");
-        expect(id).toBe("chunk:a1b2c3d4e5f6");
+        expect(id).toBe("chunk:x64:a1b2c3d4e5f6");
         expect(chunkHashFromId(id)).toBe("a1b2c3d4e5f6");
     });
 
@@ -134,8 +134,9 @@ describe("parseDocId", () => {
             kind: "file",
             path: "notes/a.md",
         });
-        expect(parseDocId("chunk:abcd")).toEqual({
+        expect(parseDocId("chunk:x64:abcd")).toEqual({
             kind: "chunk",
+            alg: "x64",
             hash: "abcd",
         });
         expect(parseDocId("config:.obsidian/app.json")).toEqual({

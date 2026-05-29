@@ -48,18 +48,13 @@ export type PullVerdict = "take-remote" | "keep-local" | "concurrent" | "silent-
 
 /**
  * Adapt a doc into the chunks/size fingerprint the classifier expects.
- * FileDoc passes `chunks` directly; ConfigDoc wraps `data` (base64 of the
- * full content) into a 1-element array — content-addressed equality still
- * holds. Tombstones with `chunks:[]` and `size:0` compare correctly:
+ * v0.26 unifies the shape: FileDoc and ConfigDoc both expose
+ * `chunks: string[]` (content-addressed hash list). Pass through
+ * directly. Tombstones with `chunks:[]` and `size:0` compare correctly:
  * deleted-vs-deleted is identical, deleted-vs-alive is content-differing.
  */
 function asContent(doc: ResolvableDoc): { chunks: readonly string[]; size: number } {
-    if (isFileDoc(doc)) {
-        return { chunks: doc.chunks, size: doc.size };
-    }
-    // ConfigDoc.data is base64 of the file. Use the data string itself as
-    // a single-element fingerprint — equal data ⇒ equal content.
-    return { chunks: [doc.data], size: doc.size };
+    return { chunks: doc.chunks, size: doc.size };
 }
 
 /**

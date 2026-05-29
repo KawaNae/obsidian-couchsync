@@ -126,6 +126,14 @@ export class LocalDB implements IDocStore<CouchSyncDoc> {
         await this.metaGuard.ensureHealthy();
     }
 
+    /** Stamp the application-level schema version on both stores (docs
+     *  + meta) on first open, or assert it matches the build's expected
+     *  version on subsequent opens. Invariant 15. */
+    async ensureSchemaVersion(): Promise<void> {
+        await this.runDocsOp((s) => s.ensureSchemaVersion(), "ensureSchemaVersion-docs");
+        await this.runMetaOp((s) => s.ensureSchemaVersion(), "ensureSchemaVersion-meta");
+    }
+
     // ── IDocStore: reads ─────────────────────────────────
 
     async get<T extends CouchSyncDoc>(id: string): Promise<T | null> {

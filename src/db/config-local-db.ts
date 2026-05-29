@@ -12,7 +12,7 @@
  * matching the discipline LocalDB has had since v0.18.
  */
 
-import type { ConfigDoc, CouchSyncDoc } from "../types.ts";
+import type { ChunkDoc, ConfigDoc, CouchSyncDoc } from "../types.ts";
 import type {
     IDocStore,
     AllDocsOpts,
@@ -60,6 +60,13 @@ export class ConfigLocalDB implements IDocStore<CouchSyncDoc> {
     async ensureHealthy(): Promise<void> {
         if (!this.guard) throw new Error("Database not opened");
         await this.guard.ensureHealthy();
+    }
+
+    /** Stamp the application-level schema version on first open, or
+     *  assert it matches the build's expected version on subsequent
+     *  opens. Invariant 15. */
+    async ensureSchemaVersion(): Promise<void> {
+        await this.runOp((s) => s.ensureSchemaVersion(), "ensureSchemaVersion");
     }
 
     // ── Guarded access ──────────────────────────────────
@@ -132,7 +139,32 @@ export class ConfigLocalDB implements IDocStore<CouchSyncDoc> {
     // ── Domain helpers ──────────────────────────────────
 
     /**
+     * Bulk-fetch chunks by id. Mirrors `LocalDB.getChunks` — the config
+     * DB carries its own chunk store now (v0.26+), so config-side
+     * code paths (ConfigPullWriter ensureChunks, ConfigSync.write
+     * joinChunks) read through this method rather than reaching across
+     * to the vault DB. Rows whose body is absent (id not found) are
+     * silently dropped; callers detect missing chunks by comparing the
+     * returned length against the requested ids.
+     */
+    async getChunks(chunkIds: string[]): Promise<ChunkDoc[]> {
+        if (chunkIds.length === 0) return [];
+        const result = await this.allDocs({ keys: chunkIds, include_docs: true });
+        const chunks: ChunkDoc[] = [];
+        for (const row of result.rows) {
+            if (row.doc) {
+                const doc = row.doc as unknown as CouchSyncDoc;
+                if (doc.type === "chunk") chunks.push(doc as ChunkDoc);
+            }
+        }
+        return chunks;
+    }
+
+    /**
      * Return every ConfigDoc in the store. Uses a `config:` range query.
+     * Includes tombstones (`deleted: true`) — callers that care about
+     * live references filter at the next layer (e.g. `chunk-refs.ts`
+     * skips deleted owners explicitly).
      */
     async allConfigDocs(): Promise<ConfigDoc[]> {
         const result = await this.allDocs({
@@ -166,14 +198,28 @@ export class ConfigLocalDB implements IDocStore<CouchSyncDoc> {
     }
 
     /**
-     * Probe for documents that don't conform to the v0.11.0 ConfigDoc
-     * schema. Returns the offending `_id`, or null if the store is
-     * empty / fully current.
+     * Probe for documents that don't conform to the current ConfigDoc
+     * schema (v0.26 = v3 chunks-based). Returns the offending `_id`,
+     * or null if the store is empty / fully current.
+     *
+     * Detects:
+     *   - non-`config:` ids in the config DB (foreign content)
+     *   - ConfigDocs missing `vclock` (pre-v0.11)
+     *   - **v2 ConfigDocs carrying a `data: string` field** (v0.25 and
+     *     older). These cannot be read by the v3 chunker path; main.ts
+     *     uses this signal to halt the ConfigSync replicator and route
+     *     the user to the Config Init flow.
+     *
+     * Chunks (`chunk:*`) in the config DB are valid v3 content and
+     * skipped. The check stops at the first legit v3 ConfigDoc — a
+     * single confirming doc means the schema is current overall.
      */
     async findLegacyConfigDoc(): Promise<string | null> {
         const result = await this.allDocs({ limit: 200 });
         for (const row of result.rows) {
             if (row.id.startsWith("_")) continue;
+            // v3 config DB legitimately contains chunk docs; skip them.
+            if (row.id.startsWith("chunk:")) continue;
             if (!isConfigDocId(row.id)) {
                 return row.id;
             }
@@ -182,7 +228,13 @@ export class ConfigLocalDB implements IDocStore<CouchSyncDoc> {
             if (!doc.vclock || Object.keys(doc.vclock).length === 0) {
                 return row.id;
             }
-            return null; // first valid → schema is current
+            // v3 schema check: must carry chunks[]; the legacy `data`
+            // field is the v2 signature and never coexists with chunks.
+            const legacy = doc as ConfigDoc & { data?: unknown };
+            if (typeof legacy.data === "string" || !Array.isArray(legacy.chunks)) {
+                return row.id;
+            }
+            return null; // first valid v3 doc → schema is current
         }
         return null;
     }

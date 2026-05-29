@@ -17,16 +17,11 @@ import { FakeVaultIO } from "./helpers/fake-vault-io.ts";
 import { FakeModalPresenter } from "./helpers/fake-modal-presenter.ts";
 import { makeSettings } from "./helpers/settings-factory.ts";
 import { makeConfigId } from "../src/types/doc-id.ts";
-import { arrayBufferToBase64 } from "../src/db/chunker.ts";
-import type { ConfigDoc, CouchSyncDoc } from "../src/types.ts";
+import { makeConfigFixture } from "./helpers/config-fixture.ts";
+import type { CouchSyncDoc } from "../src/types.ts";
 
 let counter = 0;
 function uniqueName() { return `config-sync-test-${Date.now()}-${counter++}`; }
-
-/** Encode a UTF-8 string to base64 for fixture ConfigDocs. */
-function b64(s: string): string {
-    return arrayBufferToBase64(new TextEncoder().encode(s).buffer);
-}
 
 describe("ConfigSync", () => {
     let vault: FakeVaultIO;
@@ -223,7 +218,7 @@ describe("ConfigSync", () => {
             // exercised only via integration tests; here we just verify
             // the local clearing→rescan path.)
             try {
-                await cs.init();
+                await cs.init({encryption:false,compression:false});
             } catch {
                 // remote-side phases will fail with no client, but the
                 // local clearing happens first. Tolerate the error.
@@ -241,15 +236,11 @@ describe("ConfigSync", () => {
 
     describe("write", () => {
         async function seedConfigDoc(path: string, content: string): Promise<void> {
-            const doc: ConfigDoc = {
-                _id: makeConfigId(path),
-                type: "config",
-                data: b64(content),
-                mtime: 1000,
-                size: content.length,
-                vclock: { "dev-A": 1 },
-            };
-            await db.runWriteTx({ docs: [{ doc: doc as unknown as CouchSyncDoc }] });
+            const { doc, chunks } = await makeConfigFixture(path, content);
+            await db.runWriteTx({
+                docs: [{ doc: doc as unknown as CouchSyncDoc }],
+                chunks: chunks as unknown as CouchSyncDoc[],
+            });
         }
 
         it("returns 0 when configSyncPaths is empty", async () => {

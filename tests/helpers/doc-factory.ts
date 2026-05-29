@@ -5,6 +5,7 @@
  */
 
 import type { FileDoc, ChunkDoc, ConfigDoc } from "../../src/types.ts";
+import { FILE_SCHEMA_VERSION } from "../../src/types.ts";
 import type { VectorClock } from "../../src/sync/vector-clock.ts";
 import { makeFileId, makeChunkId, makeConfigId } from "../../src/types/doc-id.ts";
 import { splitIntoChunks, arrayBufferToBase64 } from "../../src/db/chunker.ts";
@@ -23,6 +24,7 @@ export function makeFileDoc(
     return {
         _id: makeFileId(path),
         type: "file",
+        schemaVersion: FILE_SCHEMA_VERSION,
         chunks: opts.chunks ?? [],
         mtime: opts.mtime ?? 1000,
         ctime: opts.ctime ?? 1000,
@@ -50,6 +52,7 @@ export async function makeFileDocWithContent(
     const fileDoc: FileDoc = {
         _id: makeFileId(path),
         type: "file",
+        schemaVersion: FILE_SCHEMA_VERSION,
         chunks: chunks.map((c) => c._id),
         mtime: Date.now(),
         ctime: Date.now(),

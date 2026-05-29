@@ -35,16 +35,20 @@ import { ObsidianCompositionTracker } from "./adapters/obsidian-composition-trac
 import { EditorAwareVaultWriter } from "./adapters/editor-aware-vault-writer.ts";
 import { CompositionGate } from "./sync/composition-gate.ts";
 import type { CryptoProvider } from "./db/crypto-provider.ts";
-import { computeHash, type ChunkHashFn } from "./db/chunker.ts";
+import { computeHash, type ChunkHasher } from "./db/chunker.ts";
+import type { ChunkHashAlg } from "./types/doc-id.ts";
 import { EncryptingCouchClient } from "./db/encrypting-couch-client.ts";
 import { CompressingCouchClient } from "./db/compressing-couch-client.ts";
-import { makeCouchClient } from "./db/couch-client.ts";
+import { makeCouchClient, type CouchClient } from "./db/couch-client.ts";
 import {
     fetchVaultMeta,
     buildInitialVaultMeta,
     pushVaultMeta,
     unlockVaultMeta,
+    unlockConfigMeta,
+    CONFIG_META_DOC_ID,
     type VaultMetaDoc,
+    type ConfigMetaDoc,
 } from "./db/vault-meta.ts";
 import { checkEncryptionAgreement, type EncryptionAgreement } from "./db/encryption-agreement.ts";
 import { PassphraseModal } from "./ui/passphrase-modal.ts";
@@ -74,8 +78,57 @@ export default class CouchSyncPlugin extends Plugin {
     private compositionTracker!: ObsidianCompositionTracker;
     private compositionGate!: CompositionGate;
     private vaultWriter!: EditorAwareVaultWriter;
-    private cryptoProvider?: CryptoProvider;
+    /** Phase 2 (v0.26): per-DB crypto principals (invariant 18). Each
+     *  DB is its own crypto root — same passphrase + different salts →
+     *  different keys. vault:meta unlocks `vaultCryptoProvider`;
+     *  config:meta unlocks `configCryptoProvider`. */
+    private vaultCryptoProvider?: CryptoProvider;
+    private configCryptoProvider?: CryptoProvider;
     encryptionMismatch?: EncryptionAgreement;
+    /** Mismatch surfaced from the config:meta agreement check, if any.
+     *  Symmetric to `encryptionMismatch` (vault). */
+    configEncryptionMismatch?: EncryptionAgreement;
+
+    /**
+     * Wrap a raw CouchClient with the vault-DB decorator stack. Reads
+     * `vaultCryptoProvider` + `settings.compressionEnabled` via closure
+     * on every invocation, so Init/Clone state changes propagate to all
+     * vault-side consumers (VaultRemoteOps + SyncEngine) automatically.
+     *
+     * Compose order encodes invariant 10: `compress(encrypt(raw))` on
+     * push so the plain payload reaches gzip before the cipher renders
+     * the stream incompressible. Pull traverses the inverse order.
+     */
+    private wrapVaultClient = (raw: CouchClient): ICouchClient => {
+        let client: ICouchClient = raw;
+        if (this.vaultCryptoProvider) {
+            client = new EncryptingCouchClient(client, this.vaultCryptoProvider);
+        }
+        if (this.settings.compressionEnabled) {
+            client = new CompressingCouchClient(client);
+        }
+        return client;
+    };
+
+    /**
+     * Wrap a raw CouchClient with the config-DB decorator stack. Mirror
+     * of `wrapVaultClient` but reads `configCryptoProvider` and the
+     * config-specific compression flag (`configCompressionEnabled` falls
+     * back to `compressionEnabled` when undefined — Phase 3 will surface
+     * an independent UI toggle).
+     */
+    private wrapConfigClient = (raw: CouchClient): ICouchClient => {
+        let client: ICouchClient = raw;
+        if (this.configCryptoProvider) {
+            client = new EncryptingCouchClient(client, this.configCryptoProvider);
+        }
+        const compress = this.settings.configCompressionEnabled
+            ?? this.settings.compressionEnabled;
+        if (compress) {
+            client = new CompressingCouchClient(client);
+        }
+        return client;
+    };
 
     async onload(): Promise<void> {
         await this.loadSettings();
@@ -105,6 +158,7 @@ export default class CouchSyncPlugin extends Plugin {
         const dbName = `couchsync-${vaultName}`;
         this.localDb = new LocalDB(dbName);
         this.localDb.open();
+        await this.localDb.ensureSchemaVersion();
 
         // Open the config-side local store only when the user has set
         // a config DB name. The local store is keyed by both vault name
@@ -115,6 +169,7 @@ export default class CouchSyncPlugin extends Plugin {
                 `couchsync-${vaultName}-config-${this.settings.couchdbConfigDbName}`;
             this.configLocalDb = new ConfigLocalDB(configLocalName);
             this.configLocalDb.open();
+            await this.configLocalDb.ensureSchemaVersion();
         }
 
         initLog(
@@ -128,8 +183,11 @@ export default class CouchSyncPlugin extends Plugin {
         const modalPresenter = this.modalPresenter;
 
         this.auth = new AuthGate();
-        this.remoteOps = new VaultRemoteOps(this.localDb, () => this.settings, this.auth);
+        this.remoteOps = new VaultRemoteOps(
+            this.localDb, () => this.settings, this.auth, this.wrapVaultClient,
+        );
         this.historyStorage = new HistoryStorage(this.app.vault.getName());
+        await this.historyStorage.ensureSchemaVersion();
         this.historyCapture = new HistoryCapture(vaultIO, vaultEvents, this.historyStorage, () => this.settings);
 
         // Editor-aware write layer: defers vault writes while the
@@ -143,11 +201,30 @@ export default class CouchSyncPlugin extends Plugin {
             this.app, vaultIO, this.compositionGate,
             null, this.historyCapture,
         );
-        const hashFn: ChunkHashFn = (data) =>
-            this.cryptoProvider
-                ? this.cryptoProvider.hmacHash(data)
-                : computeHash(data);
-        this.vaultSync = new VaultSync(vaultIO, this.localDb, () => this.settings, this.vaultWriter, hashFn);
+        // ChunkHasher: bundles the hash function with its own algorithm
+        // identity so the chunk id is stamped with the truly-used tag
+        // (`chunk:x64:<xxhash>` vs `chunk:hmac:<HMAC>`). Phase 2 splits
+        // this into two — vault and config each read their own
+        // cryptoProvider live via closure, so encryption-state changes
+        // propagate without rebuilding the hasher and the two DBs mint
+        // chunk ids in disjoint id spaces (invariant 18).
+        //
+        // Outer `this` is captured via local alias because the object
+        // literal's own `this` would refer to itself (not the plugin).
+        const plugin = this;
+        const vaultChunkHasher: ChunkHasher = {
+            get alg(): ChunkHashAlg { return plugin.vaultCryptoProvider ? "hmac" : "x64"; },
+            hash: (data) => plugin.vaultCryptoProvider
+                ? plugin.vaultCryptoProvider.hmacHash(data)
+                : computeHash(data),
+        };
+        const configChunkHasher: ChunkHasher = {
+            get alg(): ChunkHashAlg { return plugin.configCryptoProvider ? "hmac" : "x64"; },
+            hash: (data) => plugin.configCryptoProvider
+                ? plugin.configCryptoProvider.hmacHash(data)
+                : computeHash(data),
+        };
+        this.vaultSync = new VaultSync(vaultIO, this.localDb, () => this.settings, this.vaultWriter, vaultChunkHasher);
         this.changeTracker = new ChangeTracker(vaultEvents, this.vaultSync, () => this.settings);
         // Late-bind the writeIgnore once ChangeTracker exists. It is
         // used by VaultWriter only on the deletion path (the modify
@@ -161,20 +238,10 @@ export default class CouchSyncPlugin extends Plugin {
         // call vaultSync.dbToFile directly via constructor DI (replaces
         // the former events.onAsync("pull-write", ...) bus, whose catch-
         // all swallowed write errors and let `Pull: N written` lie).
-        const encClientFactory: (s: CouchSyncSettings) => ICouchClient = (s) => {
-            const raw = makeCouchClient(s.couchdbUri, s.couchdbDbName, s.couchdbUser, s.couchdbPassword);
-            // v2 decorator stack: compress(encrypt(raw)). Compression is
-            // the outermost layer so the plain-text payload reaches gzip
-            // before the cipher renders the stream incompressible.
-            let client: ICouchClient = raw;
-            if (this.cryptoProvider) {
-                client = new EncryptingCouchClient(client, this.cryptoProvider);
-            }
-            if (s.compressionEnabled) {
-                client = new CompressingCouchClient(client);
-            }
-            return client;
-        };
+        const encClientFactory: (s: CouchSyncSettings) => ICouchClient = (s) =>
+            this.wrapVaultClient(
+                makeCouchClient(s.couchdbUri, s.couchdbDbName, s.couchdbUser, s.couchdbPassword),
+            );
         this.replicator = new SyncEngine(
             this.localDb,
             () => this.settings,
@@ -205,6 +272,10 @@ export default class CouchSyncPlugin extends Plugin {
                 this.encryptionMismatch = undefined;
             },
         );
+        // Verify pulled chunk bodies hash to their content-addressed id
+        // (the inverse of the mint in splitIntoChunks). Reads the live
+        // crypto provider, so encryption-state changes propagate.
+        this.replicator.setChunkHasher(vaultChunkHasher);
         const reconnectBridge: ReconnectBridge = {
             notifyTransient: () => {
                 // Fire-and-forget: ConfigSync surfaces the original error to
@@ -218,15 +289,9 @@ export default class CouchSyncPlugin extends Plugin {
         };
         const encConfigClientFactory = (s: CouchSyncSettings): ICouchClient | null => {
             if (!s.couchdbConfigDbName) return null;
-            const raw = makeCouchClient(s.couchdbUri, s.couchdbConfigDbName, s.couchdbUser, s.couchdbPassword);
-            let client: ICouchClient = raw;
-            if (this.cryptoProvider) {
-                client = new EncryptingCouchClient(client, this.cryptoProvider);
-            }
-            if (s.compressionEnabled) {
-                client = new CompressingCouchClient(client);
-            }
-            return client;
+            return this.wrapConfigClient(
+                makeCouchClient(s.couchdbUri, s.couchdbConfigDbName, s.couchdbUser, s.couchdbPassword),
+            );
         };
         this.configSync = new ConfigSync(
             adapterIO,
@@ -237,6 +302,11 @@ export default class CouchSyncPlugin extends Plugin {
             reconnectBridge,
             () => this.settings,
             encConfigClientFactory,
+            configChunkHasher,
+            // Phase 2: hand a freshly-derived config CryptoProvider back
+            // so subsequent `wrapConfigClient` calls produce the right
+            // encrypting stack. Null = encryption disabled on config.
+            (crypto) => { this.configCryptoProvider = crypto ?? undefined; },
         );
         this.statusBar = new StatusBar(
             this,
@@ -277,6 +347,7 @@ export default class CouchSyncPlugin extends Plugin {
             vaultIO, this.historyStorage, this.historyCapture, () => this.settings,
         );
         this.logStorage = new LogStorage(vaultName);
+        await this.logStorage.ensureSchemaVersion();
         this.logManager = new LogManager({
             storage: this.logStorage,
             getSettings: () => this.settings,
@@ -366,6 +437,115 @@ export default class CouchSyncPlugin extends Plugin {
             this.compositionTracker.start();
             this.compositionGate.start();
 
+            // E2E encryption: derive **both** cryptoProviders FIRST,
+            // before the legacy guard. The recovery action the legacy
+            // guard tells the user to perform (Config Init / Vault Init)
+            // needs the chunk hasher to flip to HMAC mode — which only
+            // happens once `*CryptoProvider` is set. Without this
+            // early-derive, a user in legacy-blocked state who clicks
+            // "Config Init" would unknowingly mint x64 (plaintext)
+            // chunk ids on an otherwise-encrypted vault.
+            //
+            // Phase 2: vault and config are independent crypto principals
+            // (invariant 18). Each meta is unlocked against its own
+            // passphrase source — vault uses `encryptionPassphrase`;
+            // config uses `configEncryptionPassphrase ?? encryptionPassphrase`
+            // so the common "one passphrase for both" UX stays default
+            // while advanced users can decouple. Errors here fall through
+            // — the legacy guard runs anyway, the user just stays in a
+            // crypto-uninitialised state until they retry.
+            if (this.settings.connectionState === "syncing"
+                && this.settings.deviceId) {
+                try {
+                    const rawClient = makeCouchClient(
+                        this.settings.couchdbUri,
+                        this.settings.couchdbDbName,
+                        this.settings.couchdbUser,
+                        this.settings.couchdbPassword,
+                    );
+                    const agreement = await checkEncryptionAgreement(
+                        rawClient, this.settings.encryptionEnabled,
+                    );
+                    if (agreement.status === "agreed-encrypted"
+                        && !this.vaultCryptoProvider
+                        && this.settings.encryptionPassphrase
+                        && agreement.meta && (agreement.meta as VaultMetaDoc).type === "vault-meta") {
+                        const result = await unlockVaultMeta(
+                            agreement.meta as VaultMetaDoc, this.settings.encryptionPassphrase,
+                        );
+                        if (result) {
+                            this.vaultCryptoProvider = result.crypto;
+                        }
+                    }
+                } catch (e: any) {
+                    logWarn(
+                        `CouchSync: early vault crypto derivation failed (non-fatal): ${e?.message ?? e}`,
+                    );
+                }
+                // Config-side early derive — independent of vault.
+                if (this.settings.couchdbConfigDbName) {
+                    try {
+                        const rawConfigClient = makeCouchClient(
+                            this.settings.couchdbUri,
+                            this.settings.couchdbConfigDbName,
+                            this.settings.couchdbUser,
+                            this.settings.couchdbPassword,
+                        );
+                        const configEncEnabled = this.settings.configEncryptionEnabled
+                            ?? this.settings.encryptionEnabled;
+                        const configPassphrase = this.settings.configEncryptionPassphrase
+                            ?? this.settings.encryptionPassphrase;
+                        const agreement = await checkEncryptionAgreement(
+                            rawConfigClient, configEncEnabled, CONFIG_META_DOC_ID,
+                        );
+                        if (agreement.status === "agreed-encrypted"
+                            && !this.configCryptoProvider
+                            && configPassphrase
+                            && agreement.meta && agreement.meta.type === "config-meta") {
+                            const configMeta = agreement.meta as ConfigMetaDoc;
+                            // Phase 2 migration guard: the Phase 1
+                            // in-progress config:meta (schemaVersion: 1)
+                            // was a clone of vault:meta — not a real
+                            // crypto root. Reject it loudly so the user
+                            // re-runs Config Init and gets a Phase 2
+                            // self-contained meta.
+                            if (configMeta.schemaVersion !== 2) {
+                                notify(
+                                    `CouchSync: Config DB has legacy meta ` +
+                                    `(schemaVersion ${configMeta.schemaVersion}). ` +
+                                    `Open Settings → Config Sync → Init & Push to upgrade.`,
+                                    15000,
+                                );
+                                logWarn(
+                                    `CouchSync: config:meta schemaVersion ${configMeta.schemaVersion} — Phase 2 expects 2. Re-Init required.`,
+                                );
+                            } else {
+                                const result = await unlockConfigMeta(
+                                    configMeta, configPassphrase,
+                                );
+                                if (result) {
+                                    this.configCryptoProvider = result.crypto;
+                                } else {
+                                    logWarn(
+                                        "CouchSync: config:meta unlock failed — passphrase mismatch. " +
+                                        "Re-run Config Init to recover.",
+                                    );
+                                }
+                            }
+                        } else if (
+                            agreement.status === "remote-encrypted"
+                            || agreement.status === "remote-plaintext"
+                        ) {
+                            this.configEncryptionMismatch = agreement;
+                        }
+                    } catch (e: any) {
+                        logWarn(
+                            `CouchSync: early config crypto derivation failed (non-fatal): ${e?.message ?? e}`,
+                        );
+                    }
+                }
+            }
+
             // Schema guard. Two checks:
             //
             //   1. The vault DB must NOT contain bare-path docs, missing
@@ -443,7 +623,7 @@ export default class CouchSyncPlugin extends Plugin {
                         rawClient, this.settings.encryptionEnabled,
                     );
                     if (agreement.status === "agreed-encrypted") {
-                        if (!this.cryptoProvider) {
+                        if (!this.vaultCryptoProvider) {
                             let passphrase = this.settings.encryptionPassphrase;
                             if (!passphrase) {
                                 const modal = new PassphraseModal(this.app, false);
@@ -453,7 +633,9 @@ export default class CouchSyncPlugin extends Plugin {
                                     return;
                                 }
                             }
-                            const result = await unlockVaultMeta(agreement.meta, passphrase);
+                            const result = await unlockVaultMeta(
+                                agreement.meta as VaultMetaDoc, passphrase,
+                            );
                             if (!result) {
                                 this.settings.encryptionPassphrase = "";
                                 await this.saveSettings();
@@ -464,9 +646,9 @@ export default class CouchSyncPlugin extends Plugin {
                                 this.settings.encryptionPassphrase = passphrase;
                                 await this.saveSettings();
                             }
-                            this.cryptoProvider = result.crypto;
-                            this.remoteOps.setClientWrapper((raw) =>
-                                new EncryptingCouchClient(raw, this.cryptoProvider!));
+                            this.vaultCryptoProvider = result.crypto;
+                            // wrapVaultClient picks up the new provider on
+                            // next invocation — no mutable setter needed.
                         }
                     } else if (agreement.status === "remote-encrypted"
                         || agreement.status === "remote-plaintext") {
@@ -583,7 +765,7 @@ export default class CouchSyncPlugin extends Plugin {
 
             let meta: VaultMetaDoc;
 
-            if (enc && this.cryptoProvider) {
+            if (enc && this.vaultCryptoProvider) {
                 // Re-init with existing keys: preserve salt + keyCheck
                 // so other devices can still decrypt with the same
                 // passphrase. Compression flag may change between inits.
@@ -609,14 +791,7 @@ export default class CouchSyncPlugin extends Plugin {
                     compression: compress,
                 });
                 meta = derived.meta;
-                if (derived.crypto) {
-                    this.cryptoProvider = derived.crypto;
-                    this.remoteOps.setClientWrapper((raw) =>
-                        new EncryptingCouchClient(raw, this.cryptoProvider!));
-                } else {
-                    this.cryptoProvider = undefined;
-                    this.remoteOps.setClientWrapper(undefined);
-                }
+                this.vaultCryptoProvider = derived.crypto ?? undefined;
             }
 
             const result = await this.setupService.init((msg) => progress.update(msg));
@@ -637,8 +812,7 @@ export default class CouchSyncPlugin extends Plugin {
             progress.done(`Init complete! ${result.vaultFiles} files, ${result.totalDocs} docs pushed${tag}.`);
         } catch (e: any) {
             if (this.settings.encryptionEnabled) {
-                this.cryptoProvider = undefined;
-                this.remoteOps.setClientWrapper(undefined);
+                this.vaultCryptoProvider = undefined;
             }
             progress.fail(`Init failed: ${e?.message ?? e}`);
             throw e;
@@ -664,14 +838,11 @@ export default class CouchSyncPlugin extends Plugin {
             const unlockResult = await unlockVaultMeta(meta, passphrase);
             if (!unlockResult) throw new Error("Wrong passphrase.");
 
-            this.cryptoProvider = unlockResult.crypto;
-            this.remoteOps.setClientWrapper((raw) =>
-                new EncryptingCouchClient(raw, this.cryptoProvider!));
+            this.vaultCryptoProvider = unlockResult.crypto;
             this.settings.encryptionEnabled = true;
             this.settings.encryptionPassphrase = passphrase;
         } else {
-            this.cryptoProvider = undefined;
-            this.remoteOps.setClientWrapper(undefined);
+            this.vaultCryptoProvider = undefined;
             this.settings.encryptionEnabled = false;
             this.settings.encryptionPassphrase = "";
         }
@@ -695,8 +866,7 @@ export default class CouchSyncPlugin extends Plugin {
             progress.done(`Clone complete! ${result.vaultFiles} files written.`);
         } catch (e: any) {
             if (meta) {
-                this.cryptoProvider = undefined;
-                this.remoteOps.setClientWrapper(undefined);
+                this.vaultCryptoProvider = undefined;
             }
             progress.fail(`Clone failed: ${e?.message ?? e}`);
             throw e;

@@ -24,8 +24,8 @@
  * cursor, with no half-applied state. Mirrors the vault PullWriter.
  */
 
-import type { ConfigDoc, CouchSyncDoc } from "../../types.ts";
-import { isConfigDoc } from "../../types.ts";
+import type { ConfigDoc, CouchSyncDoc, ChunkDoc } from "../../types.ts";
+import { isConfigDoc, CONFIG_SCHEMA_VERSION } from "../../types.ts";
 import { configPathFromId, isConfigDocId } from "../../types/doc-id.ts";
 import { stripRev } from "../../utils/doc.ts";
 import { compareVC, mergeVC } from "../../sync/vector-clock.ts";
@@ -33,11 +33,12 @@ import type { ICouchClient } from "../interfaces.ts";
 import type { ChangesResult } from "../interfaces.ts";
 import type { ConfigLocalDB } from "../config-local-db.ts";
 import type { ConflictResolver } from "../../conflict/conflict-resolver.ts";
-import { base64ToArrayBuffer } from "../chunker.ts";
-import { logDebug, logInfo } from "../../ui/log.ts";
+import { chunkFromAttachment, ChunkIntegrityError } from "../chunk-attachment.ts";
+import type { ChunkHasher } from "../chunker.ts";
+import { assertSchemaVersion } from "./schema-gate.ts";
+import { logDebug, logInfo, logWarn } from "../../ui/log.ts";
 import {
     ConfigLastSynced,
-    computeConfigDataHash,
     configLastSyncedKey,
 } from "./config-last-synced.ts";
 import {
@@ -82,6 +83,10 @@ export interface ConfigPullWriterDeps {
     lastSynced: ConfigLastSynced;
     getConflictResolver: () => ConflictResolver | undefined;
     signal: AbortSignal;
+    /** Optional hasher to verify pulled chunk bodies hash to their id
+     *  (the inverse of the mint in `splitIntoChunks`). When unset, chunks
+     *  are stored without verification. */
+    hasher?: ChunkHasher;
 }
 
 export class ConfigPullWriter {
@@ -182,8 +187,11 @@ export class ConfigPullWriter {
         const resolver = this.deps.getConflictResolver();
 
         for (const row of batch.results) {
-            // Filter to config docs. The config DB shouldn't contain
-            // anything else, but defend against future schema drift.
+            // Filter to config docs. The config DB also carries chunk
+            // docs (v0.26+); their bodies arrive lazily through
+            // `ensureChunks` and are skipped here. Anything else in
+            // the config DB id space is unexpected — defend against
+            // schema drift and drop.
             if (!isConfigDocId(row.id)) continue;
 
             if (row.deleted) {
@@ -193,6 +201,14 @@ export class ConfigPullWriter {
             if (!row.doc) continue;
             const remoteDoc = stripRev(row.doc) as ConfigDoc;
             if (!isConfigDoc(remoteDoc)) continue;
+
+            // Schema-version gate (Plan agent C1, invariant 17). v0.25
+            // shipped ConfigDoc with `data: string` and `schemaVersion: 2`;
+            // v0.26 expects `chunks: string[]` + `schemaVersion: 3`. Mixing
+            // shapes silently corrupts disk writes, so we abort loudly
+            // and route the host to the migration flow. Shared with the
+            // vault pull path via schema-gate.ts.
+            assertSchemaVersion(remoteDoc, CONFIG_SCHEMA_VERSION, "config");
 
             const localDoc = (await this.deps.db.get(row.id)) as ConfigDoc | null;
             if (localDoc) {
@@ -271,22 +287,24 @@ export class ConfigPullWriter {
         deletes: string[],
         nextPullSeq: number | string,
     ): Promise<void> {
-        // Pre-compute lastSynced meta entries for accepted docs. Each
-        // doc carries base64 `data`; we hash it once here so the cache
-        // can short-circuit a subsequent scan() against the same content.
+        // Build per-path lastSynced meta entries. v0.26 stores the
+        // chunk-id list directly — same fingerprint the next scan()
+        // compares against, so the short-circuit and the integration
+        // baseline share one shape (vault symmetry).
         const lastSyncedMeta: Array<{
             op: "put"; key: string;
-            value: { vclock: ConfigDoc["vclock"]; size: number; dataHash: string };
+            value: {
+                vclock: ConfigDoc["vclock"];
+                size: number;
+                chunks: string[];
+            };
         }> = [];
-        const acceptedHashes = new Map<string, string>();
         for (const doc of accepted) {
-            const hash = await computeConfigDataHash(base64ToArrayBuffer(doc.data));
             const path = configPathFromId(doc._id);
-            acceptedHashes.set(doc._id, hash);
             lastSyncedMeta.push({
                 op: "put",
                 key: configLastSyncedKey(path),
-                value: { vclock: doc.vclock, size: doc.size, dataHash: hash },
+                value: { vclock: doc.vclock, size: doc.size, chunks: doc.chunks },
             });
         }
         const lastSyncedDeletes = deletes
@@ -314,11 +332,10 @@ export class ConfigPullWriter {
                 this.deps.checkpoints.setPullSeq(nextPullSeq);
                 for (const doc of accepted) {
                     const path = configPathFromId(doc._id);
-                    const hash = acceptedHashes.get(doc._id)!;
                     this.deps.lastSynced.set(path, {
                         vclock: doc.vclock,
                         size: doc.size,
-                        dataHash: hash,
+                        chunks: doc.chunks,
                     });
                 }
                 for (const id of deletes) {
@@ -328,5 +345,86 @@ export class ConfigPullWriter {
                 }
             },
         });
+
+        // After the batch's docs and tombstones land durably, pull any
+        // referenced chunks that aren't already local. ensureChunks runs
+        // outside the runWriteTx so the per-chunk attachment fetch
+        // round-trips don't keep the IDB write transaction open. A
+        // missing chunk only blocks the eventual `ConfigSync.write()`
+        // for that one path — config-pull stats already advanced.
+        for (const doc of accepted) {
+            try {
+                await this.ensureChunks(doc);
+            } catch (e: any) {
+                logWarn(
+                    `ConfigPullWriter.ensureChunks: ${configPathFromId(doc._id)}: ` +
+                    `${e?.message ?? e}`,
+                );
+            }
+        }
+    }
+
+    /**
+     * Fetch any chunks referenced by `configDoc` that aren't already
+     * present in the local config DB. Mirrors `SyncEngine.ensureChunksInternal`
+     * for vault FileDocs. Bounded concurrency keeps a fresh-clone Init
+     * within reasonable latency over HTTP/2-multiplexed transports.
+     *
+     * Missing-on-server chunks are logged via WARN and left missing —
+     * the next `ConfigSync.write()` will skip that path with a clear
+     * diagnostic rather than blocking the whole pull.
+     */
+    private async ensureChunks(configDoc: ConfigDoc): Promise<void> {
+        const existing = await this.deps.db.getChunks(configDoc.chunks);
+        const existingIds = new Set(existing.map((c) => c._id));
+        const missing = configDoc.chunks.filter((id) => !existingIds.has(id));
+        if (missing.length === 0) return;
+
+        const CONCURRENCY = 4;
+        const fetched: ChunkDoc[] = [];
+        const queue = [...missing];
+        const notFound: string[] = [];
+        const corrupt: string[] = [];
+        const workers: Promise<void>[] = [];
+        for (let w = 0; w < CONCURRENCY; w++) {
+            workers.push((async () => {
+                while (queue.length > 0) {
+                    const id = queue.shift();
+                    if (!id) return;
+                    const blob = await this.deps.client.getAttachment(
+                        id, "c", this.deps.signal,
+                    );
+                    if (blob === null) {
+                        notFound.push(id);
+                        continue;
+                    }
+                    // Decorator stack already decrypted + decompressed.
+                    // chunkFromAttachment decodes the envelope and (when a
+                    // hasher is wired) verifies content hashes to the id; a
+                    // mismatch is treated like a missing chunk.
+                    try {
+                        fetched.push(await chunkFromAttachment(id, blob, this.deps.hasher));
+                    } catch (e) {
+                        if (e instanceof ChunkIntegrityError) {
+                            corrupt.push(id);
+                            continue;
+                        }
+                        throw e;
+                    }
+                }
+            })());
+        }
+        await Promise.all(workers);
+        if (notFound.length > 0 || corrupt.length > 0) {
+            const bad = [...notFound, ...corrupt];
+            logWarn(
+                `ConfigPullWriter: ${notFound.length} missing + ${corrupt.length} corrupt chunk(s) ` +
+                `for ${configPathFromId(configDoc._id)}: ` +
+                `${bad.slice(0, 3).join(", ")}${bad.length > 3 ? "…" : ""}`,
+            );
+        }
+        if (fetched.length > 0) {
+            await this.deps.db.runWriteTx({ chunks: fetched });
+        }
     }
 }

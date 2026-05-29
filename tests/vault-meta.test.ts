@@ -87,4 +87,20 @@ describe("vault:meta v2", () => {
         const r = await unlockVaultMeta(meta as VaultMetaDoc, "any");
         expect(r).toBeNull();
     });
+
+    it("ignores a stale/forged metaHmac field — keyCheck is the sole verifier", async () => {
+        // metaHmac was removed (it was a fast offline-guessing oracle).
+        // A meta doc carrying a leftover/garbage metaHmac from an older
+        // dev build must still unlock purely via keyCheck.
+        const { meta } = await buildInitialVaultMeta({
+            encryption: true, passphrase: "correct", compression: false,
+        });
+        (meta.encryption as Record<string, unknown>).metaHmac = "deadbeef";
+
+        const ok = await unlockVaultMeta(meta, "correct");
+        expect(ok).not.toBeNull();
+
+        const bad = await unlockVaultMeta(meta, "wrong");
+        expect(bad).toBeNull();
+    });
 });

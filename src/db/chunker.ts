@@ -1,15 +1,31 @@
 import type { ChunkDoc } from "../types.ts";
-import { CURRENT_SCHEMA_VERSION } from "../types.ts";
-import { makeChunkId } from "../types/doc-id.ts";
+import { CHUNK_SCHEMA_VERSION } from "../types.ts";
+import { makeChunkId, type ChunkHashAlg } from "../types/doc-id.ts";
 
-/** Maximum bytes per binary chunk. Matches the previous era's effective
- *  binary boundary (100 KiB base64 → 75 KiB binary) so chunk granularity
- *  stays roughly the same across the v1 → v2 transition.
+/** Default per-binary-chunk size for vault FileDocs. Matches the previous
+ *  era's effective binary boundary (100 KiB base64 → 75 KiB binary) so
+ *  chunk granularity stays roughly the same across the v1 → v2 transition.
  *
  *  CouchDB's per-attachment ceiling is configurable but defaults to ~64 MiB;
  *  the choice here is content-dedup granularity, not transport. Larger
  *  chunks reduce per-chunk overhead at the cost of finer dedup. */
-const MAX_CHUNK_BYTES = 75 * 1024;
+export const MAX_CHUNK_BYTES_VAULT = 75 * 1024;
+
+/** Per-binary-chunk size for ConfigSync (`.obsidian/`) payloads.
+ *
+ *  Tuned for the measured config distribution: median 698B–1.4KB, 99%
+ *  of JSON < 4KB, max ~8.6MB (bundled plugin `main.js`). At 256 KiB the
+ *  long tail (plugin/theme bundles) yields ~35 chunks even at 8.6MB,
+ *  small JSON becomes a single chunk regardless, and gzip's dictionary
+ *  window is fully utilised. Cross-version dedup is limited (bundled JS
+ *  usually rewrites entirely on upgrade), so going finer than 256 KiB
+ *  trades real per-doc overhead for marginal dedup gains. */
+export const MAX_CHUNK_BYTES_CONFIG = 256 * 1024;
+
+/** Legacy alias for the default vault chunk size. New callers should
+ *  reach for `MAX_CHUNK_BYTES_VAULT` (or pass an explicit `chunkBytes`
+ *  in `ChunkerConfig`). */
+const MAX_CHUNK_BYTES = MAX_CHUNK_BYTES_VAULT;
 
 let xxhash: { h64Raw: (input: Uint8Array, seed?: bigint) => bigint } | null = null;
 
@@ -77,7 +93,7 @@ export function base64ToArrayBufferFallback(base64: string): ArrayBuffer {
     return bytes.buffer;
 }
 
-function splitBinary(bytes: Uint8Array): Uint8Array[] {
+function splitBinary(bytes: Uint8Array, chunkBytes: number): Uint8Array[] {
     if (bytes.length === 0) {
         // Empty file → exactly one zero-length chunk. This matches the
         // v1 chunker's behaviour (which produced one chunk with empty
@@ -85,62 +101,106 @@ function splitBinary(bytes: Uint8Array): Uint8Array[] {
         // zero-byte path stay deterministic.
         return [new Uint8Array(0)];
     }
-    if (bytes.length <= MAX_CHUNK_BYTES) {
+    if (bytes.length <= chunkBytes) {
         return [bytes];
     }
     const pieces: Uint8Array[] = [];
-    for (let i = 0; i < bytes.length; i += MAX_CHUNK_BYTES) {
-        pieces.push(bytes.slice(i, i + MAX_CHUNK_BYTES));
+    for (let i = 0; i < bytes.length; i += chunkBytes) {
+        pieces.push(bytes.slice(i, i + chunkBytes));
     }
     return pieces;
 }
 
-export type ChunkHashFn = (data: Uint8Array) => Promise<string>;
-
-/** Split a file's binary content into ChunkDocs. Each chunk carries both
- *  the binary `content` (v2 canonical) and a base64 `data` field (v1
- *  back-compat retained until Phase 6 removes it).
+/** A hasher bundles the hash function with its own algorithm identity,
+ *  so the chunk id can be stamped with the truly-used algorithm tag.
  *
- *  The hash is computed over the binary `content` — never over the
- *  base64 string. Same plaintext → same chunk ID, regardless of how
- *  the storage layer chooses to encode it. */
+ *  Required because encrypted vaults swap `computeHash` (xxhash64) for
+ *  `cryptoProvider.hmacHash` — the chunker can't tell from the function
+ *  alone which algorithm produced the bytes, so the algorithm must be
+ *  declared alongside (invariant 14). The `alg` getter is consulted on
+ *  every chunk so live changes to the underlying crypto state propagate
+ *  without re-wiring the hasher. */
+export interface ChunkHasher {
+    readonly alg: ChunkHashAlg;
+    hash(data: Uint8Array): Promise<string>;
+}
+
+const DEFAULT_HASHER: ChunkHasher = {
+    alg: "x64",
+    hash: computeHash,
+};
+
+/** Bundles the hasher with the chunk size, so a single argument carries
+ *  the full chunking policy for a call site. VaultSync passes the
+ *  default (75 KiB + xxhash64 or the encrypted HMAC). ConfigSync passes
+ *  `{hasher, chunkBytes: MAX_CHUNK_BYTES_CONFIG}` to opt into the larger
+ *  256 KiB unit that suits config-file size distributions. */
+export interface ChunkerConfig {
+    hasher: ChunkHasher;
+    /** Bytes per chunk. Default `MAX_CHUNK_BYTES_VAULT` (75 KiB). */
+    chunkBytes?: number;
+}
+
+const DEFAULT_CHUNKER_CONFIG: ChunkerConfig = {
+    hasher: DEFAULT_HASHER,
+    chunkBytes: MAX_CHUNK_BYTES_VAULT,
+};
+
+/** Split a file's binary content into ChunkDocs. The hash is computed
+ *  over the plain binary `content` — same plaintext → same chunk ID
+ *  regardless of how the storage layer chooses to encode it on the wire
+ *  (envelope flags / encryption / compression are downstream concerns).
+ *  v0.25.0 dropped the legacy base64 `data` field; the canonical payload
+ *  is `content` (Uint8Array) and the attachment is built from it at push
+ *  time.
+ *
+ *  The hasher carries its own algorithm identity (`alg`), read once per
+ *  chunk and used as the id tag (`chunk:<alg>:<hash>`). Plaintext-only
+ *  callers can omit the argument and default to xxhash64 (`x64`).
+ *
+ *  Accepts either a `ChunkerConfig` object or a bare `ChunkHasher` for
+ *  back-compat with the pre-v0.26 signature; the bare-hasher overload
+ *  silently uses the default `MAX_CHUNK_BYTES_VAULT` chunk size.
+ */
 export async function splitIntoChunks(
     content: ArrayBuffer,
-    hashFn?: ChunkHashFn,
+    configOrHasher: ChunkerConfig | ChunkHasher = DEFAULT_CHUNKER_CONFIG,
 ): Promise<ChunkDoc[]> {
+    const config: ChunkerConfig = isChunkHasher(configOrHasher)
+        ? { hasher: configOrHasher, chunkBytes: MAX_CHUNK_BYTES_VAULT }
+        : configOrHasher;
+    const hasher = config.hasher;
+    const chunkBytes = config.chunkBytes ?? MAX_CHUNK_BYTES_VAULT;
+
     const bytes = new Uint8Array(content);
-    const pieces = splitBinary(bytes);
-    const hash = hashFn ?? computeHash;
+    const pieces = splitBinary(bytes, chunkBytes);
 
     const chunks: ChunkDoc[] = [];
     for (const piece of pieces) {
-        const h = await hash(piece);
+        const h = await hasher.hash(piece);
         chunks.push({
-            _id: makeChunkId(h),
+            _id: makeChunkId(h, hasher.alg),
             type: "chunk",
-            schemaVersion: CURRENT_SCHEMA_VERSION,
-            data: arrayBufferToBase64(piece),
+            schemaVersion: CHUNK_SCHEMA_VERSION,
             content: piece,
         });
     }
     return chunks;
 }
 
+function isChunkHasher(x: ChunkerConfig | ChunkHasher): x is ChunkHasher {
+    return typeof (x as ChunkHasher).hash === "function"
+        && typeof (x as ChunkHasher).alg === "string";
+}
+
 export function joinChunks(chunks: ChunkDoc[]): ArrayBuffer {
-    // Prefer the v2 binary representation when present. Fall back to
-    // decoding the base64 string for chunks that came in via legacy
-    // storage paths (read from the local DB pre-Phase 4 migration, etc.).
-    const binaries: Uint8Array[] = chunks.map((c) => {
-        if (c.content) return c.content;
-        return new Uint8Array(base64ToArrayBuffer(c.data));
-    });
     let totalLen = 0;
-    for (const b of binaries) totalLen += b.length;
+    for (const c of chunks) totalLen += c.content.length;
     const out = new Uint8Array(totalLen);
     let off = 0;
-    for (const b of binaries) {
-        out.set(b, off);
-        off += b.length;
+    for (const c of chunks) {
+        out.set(c.content, off);
+        off += c.content.length;
     }
     return out.buffer;
 }

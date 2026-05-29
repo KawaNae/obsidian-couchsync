@@ -2,34 +2,44 @@
  * E2E encryption primitives using Web Crypto API.
  *
  * Two purpose-specific keys are derived from a single passphrase:
- *   - contentKey (AES-256-GCM): encrypts ChunkDoc.data and ConfigDoc.data
- *   - hmacKey (HMAC-SHA256): generates content-addressed chunk IDs
+ *   - contentKey (AES-256-GCM): encrypts attachment bytes and string fields
+ *   - hmacKey (HMAC-SHA256): generates path-based content-addressed IDs
  *
  * Deriving separate keys via HKDF ensures that HMAC output (visible as
- * chunk IDs on the server) leaks no information about the AES key.
+ * path-derived IDs on the server) leaks no information about the AES key.
+ *
+ * The provider exposes *primitives only* — IV + ciphertext as separate
+ * Uint8Array values. Envelope framing (the `[codec-byte][IV?][body]`
+ * format that lands on the wire) lives in `envelope.ts`; this module
+ * is unaware of it. That separation keeps invariant 13 (encrypted
+ * string envelope versioning) enforced structurally: there is no way
+ * to call the provider directly and produce a non-versioned string
+ * envelope.
  */
 
 const PBKDF2_ITERATIONS = 600_000;
 const SALT_BYTES = 16;
 const IV_BYTES = 12;
-const KEY_CHECK_PLAINTEXT = "couchsync-e2e-v1";
+
+/** TS 5.7+ types a bare `Uint8Array` as `Uint8Array<ArrayBufferLike>`, which
+ *  the DOM `BufferSource` (WebCrypto args) rejects because it pins to an
+ *  `ArrayBuffer`-backed view. Our buffers are always `ArrayBuffer`-backed at
+ *  runtime, so re-asserting the type is sound. Centralised here so the cast
+ *  is documented once rather than scattered as inline `as` noise. */
+const bs = (u: Uint8Array): BufferSource => u as unknown as BufferSource;
 
 export interface CryptoProvider {
-    encrypt(plainBase64: string): Promise<string>;
-    decrypt(envelope: string): Promise<string>;
-    /** v2 binary encrypt: returns `IV(12B) || AES-GCM(plain)` as a single
-     *  contiguous Uint8Array. Used by attachment encryption — no base64,
-     *  no envelope string. */
-    encryptBytes(plain: Uint8Array): Promise<Uint8Array>;
-    /** v2 binary decrypt — inverse of encryptBytes. Input must start with
-     *  the 12-byte IV; the rest is the AES-GCM ciphertext+tag. */
-    decryptBytes(blob: Uint8Array): Promise<Uint8Array>;
+    /** Encrypt arbitrary plain bytes. Returns the AES-GCM ciphertext
+     *  (which already includes the authentication tag) and the random
+     *  IV used. Callers compose the envelope. */
+    encryptBytesIv(plain: Uint8Array): Promise<{ iv: Uint8Array; cipher: Uint8Array }>;
+    /** Decrypt ciphertext produced by `encryptBytesIv`. The IV must be
+     *  the exact 12-byte value from the corresponding encrypt call. */
+    decryptBytesIv(iv: Uint8Array, cipher: Uint8Array): Promise<Uint8Array>;
     /** HMAC-SHA256 over binary input. Returns hex-encoded MAC. Callers
      *  hashing a string (e.g. vault path) must `TextEncoder.encode` it
      *  themselves — this method does not infer encoding. */
     hmacHash(data: Uint8Array): Promise<string>;
-    encryptPath(path: string): Promise<string>;
-    decryptPath(envelope: string): Promise<string>;
 }
 
 export interface EncryptionKeys {
@@ -54,7 +64,7 @@ export async function deriveKeys(
         ["deriveBits"],
     );
     const masterBits = await crypto.subtle.deriveBits(
-        { name: "PBKDF2", salt, iterations: PBKDF2_ITERATIONS, hash: "SHA-256" },
+        { name: "PBKDF2", salt: bs(salt), iterations: PBKDF2_ITERATIONS, hash: "SHA-256" },
         baseKey,
         256,
     );
@@ -82,120 +92,35 @@ export async function deriveKeys(
     return { contentKey, hmacKey };
 }
 
-export async function createKeyCheck(keys: EncryptionKeys): Promise<string> {
-    const provider = createCryptoProvider(keys);
-    return provider.encrypt(btoa(KEY_CHECK_PLAINTEXT));
-}
-
-export async function verifyKeyCheck(
-    keys: EncryptionKeys,
-    keyCheck: string,
-): Promise<boolean> {
-    try {
-        const provider = createCryptoProvider(keys);
-        const decrypted = await provider.decrypt(keyCheck);
-        return atob(decrypted) === KEY_CHECK_PLAINTEXT;
-    } catch {
-        return false;
-    }
-}
-
 export function createCryptoProvider(keys: EncryptionKeys): CryptoProvider {
     return {
-        async encrypt(plainBase64: string): Promise<string> {
-            const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES));
-            const encoder = new TextEncoder();
-            const cipherBuf = await crypto.subtle.encrypt(
-                { name: "AES-GCM", iv },
-                keys.contentKey,
-                encoder.encode(plainBase64),
-            );
-            return uint8ToBase64(iv) + ":" + uint8ToBase64(new Uint8Array(cipherBuf));
-        },
-
-        async decrypt(envelope: string): Promise<string> {
-            const colonIdx = envelope.indexOf(":");
-            if (colonIdx < 0) throw new Error("Invalid encrypted envelope");
-            const iv = base64ToUint8(envelope.slice(0, colonIdx));
-            const ciphertext = base64ToUint8(envelope.slice(colonIdx + 1));
-            const plainBuf = await crypto.subtle.decrypt(
-                { name: "AES-GCM", iv },
-                keys.contentKey,
-                ciphertext,
-            );
-            return new TextDecoder().decode(plainBuf);
-        },
-
-        async encryptBytes(plain: Uint8Array): Promise<Uint8Array> {
+        async encryptBytesIv(plain: Uint8Array): Promise<{ iv: Uint8Array; cipher: Uint8Array }> {
             const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES));
             const cipherBuf = await crypto.subtle.encrypt(
-                { name: "AES-GCM", iv },
+                { name: "AES-GCM", iv: bs(iv) },
                 keys.contentKey,
-                plain,
+                bs(plain),
             );
-            const cipher = new Uint8Array(cipherBuf);
-            const out = new Uint8Array(iv.length + cipher.length);
-            out.set(iv, 0);
-            out.set(cipher, iv.length);
-            return out;
+            return { iv, cipher: new Uint8Array(cipherBuf) };
         },
 
-        async decryptBytes(blob: Uint8Array): Promise<Uint8Array> {
-            if (blob.length < IV_BYTES) {
-                throw new Error("decryptBytes: input shorter than IV length");
+        async decryptBytesIv(iv: Uint8Array, cipher: Uint8Array): Promise<Uint8Array> {
+            if (iv.length !== IV_BYTES) {
+                throw new Error(`decryptBytesIv: IV must be ${IV_BYTES} bytes`);
             }
-            const iv = blob.subarray(0, IV_BYTES);
-            const cipher = blob.subarray(IV_BYTES);
             const plainBuf = await crypto.subtle.decrypt(
-                { name: "AES-GCM", iv },
+                { name: "AES-GCM", iv: bs(iv) },
                 keys.contentKey,
-                cipher,
+                bs(cipher),
             );
             return new Uint8Array(plainBuf);
         },
 
         async hmacHash(data: Uint8Array): Promise<string> {
-            const sig = await crypto.subtle.sign("HMAC", keys.hmacKey, data);
+            const sig = await crypto.subtle.sign("HMAC", keys.hmacKey, bs(data));
             return arrayBufToHex(sig);
         },
-
-        async encryptPath(path: string): Promise<string> {
-            const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES));
-            const encoder = new TextEncoder();
-            const cipherBuf = await crypto.subtle.encrypt(
-                { name: "AES-GCM", iv },
-                keys.contentKey,
-                encoder.encode(path),
-            );
-            return uint8ToBase64(iv) + ":" + uint8ToBase64(new Uint8Array(cipherBuf));
-        },
-
-        async decryptPath(envelope: string): Promise<string> {
-            const colonIdx = envelope.indexOf(":");
-            if (colonIdx < 0) throw new Error("Invalid encrypted path envelope");
-            const iv = base64ToUint8(envelope.slice(0, colonIdx));
-            const ciphertext = base64ToUint8(envelope.slice(colonIdx + 1));
-            const plainBuf = await crypto.subtle.decrypt(
-                { name: "AES-GCM", iv },
-                keys.contentKey,
-                ciphertext,
-            );
-            return new TextDecoder().decode(plainBuf);
-        },
     };
-}
-
-function uint8ToBase64(bytes: Uint8Array): string {
-    let binary = "";
-    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-    return btoa(binary);
-}
-
-function base64ToUint8(b64: string): Uint8Array {
-    const binary = atob(b64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    return bytes;
 }
 
 function arrayBufToHex(buf: ArrayBuffer): string {
@@ -203,20 +128,4 @@ function arrayBufToHex(buf: ArrayBuffer): string {
     let hex = "";
     for (let i = 0; i < bytes.length; i++) hex += bytes[i].toString(16).padStart(2, "0");
     return hex;
-}
-
-export async function computeMetaHmac(
-    passphrase: string,
-    salt: string,
-    keyCheck: string,
-    version: number,
-): Promise<string> {
-    const encoder = new TextEncoder();
-    const baseKey = await crypto.subtle.importKey(
-        "raw", encoder.encode(passphrase),
-        { name: "HMAC", hash: "SHA-256" }, false, ["sign"],
-    );
-    const payload = encoder.encode(`${salt}:${keyCheck}:${version}`);
-    const sig = await crypto.subtle.sign("HMAC", baseKey, payload);
-    return arrayBufToHex(sig);
 }

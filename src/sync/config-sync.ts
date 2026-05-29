@@ -3,7 +3,8 @@ import type { IModalPresenter } from "../types/modal-presenter.ts";
 import type { ConfigLocalDB } from "../db/config-local-db.ts";
 import type { AuthGate } from "../db/sync/auth-gate.ts";
 import type { VisibilityGate } from "../db/visibility-gate.ts";
-import type { ConfigDoc, CouchSyncDoc } from "../types.ts";
+import type { ConfigDoc, CouchSyncDoc, ChunkDoc } from "../types.ts";
+import { CONFIG_SCHEMA_VERSION } from "../types.ts";
 import {
     DOC_ID,
     makeConfigId,
@@ -11,10 +12,24 @@ import {
 } from "../types/doc-id.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import { ProgressNotice } from "../ui/notices.ts";
-import { arrayBufferToBase64, base64ToArrayBuffer } from "../db/chunker.ts";
+import {
+    splitIntoChunks,
+    joinChunks,
+    computeHash,
+    MAX_CHUNK_BYTES_CONFIG,
+    type ChunkHasher,
+} from "../db/chunker.ts";
+
+/** Plaintext xxhash64 hasher — used by test harnesses that don't wire a
+ *  cryptoProvider through. Production main.ts always injects a hasher
+ *  closure that flips to HMAC when encryption is on. */
+function defaultHasher(): ChunkHasher {
+    return { alg: "x64", hash: computeHash };
+}
 import { incrementVC } from "./vector-clock.ts";
 import type { ICouchClient } from "../db/interfaces.ts";
 import { makeCouchClient } from "../db/couch-client.ts";
+import type { CryptoProvider } from "../db/crypto-provider.ts";
 import { logError, logWarn } from "../ui/log.ts";
 import * as remoteCouch from "../db/remote-couch.ts";
 import {
@@ -25,7 +40,6 @@ import {
 import type { ReconnectBridge } from "./reconnect-bridge.ts";
 import {
     ConfigLastSynced,
-    computeConfigDataHash,
     configLastSyncedKey,
 } from "../db/sync/config-last-synced.ts";
 import { ConfigCheckpoints } from "../db/sync/config-checkpoints.ts";
@@ -33,6 +47,7 @@ import {
     ConfigPullWriter,
     type ConfigConcurrentEntry,
 } from "../db/sync/config-pull-writer.ts";
+import { SchemaVersionMismatchError } from "../db/sync/schema-gate.ts";
 import {
     ConfigPushPipeline,
     type ConfigPushDivergence,
@@ -108,6 +123,32 @@ export class ConfigSync {
      *  shared instance is enough. Same class as vault sync. */
     private readonly conflictResolver: ConflictResolver;
 
+    /** Chunk hasher — bundles algorithm identity with the hash function.
+     *  Same `ChunkHasher` shape vault-side uses, fed from a closure that
+     *  reads the live **config** `cryptoProvider` (Phase 2 invariant 18:
+     *  per-DB hasher) so encryption-state flips propagate without
+     *  rebuilding the hasher. Optional for the older test harnesses
+     *  that didn't pre-thread it; null → fall back to the chunker's
+     *  default xxhash64 (plaintext-only call sites). */
+    private readonly hasher?: ChunkHasher;
+
+    /** Phase 2 callback: hand the host (main.ts) a freshly-built
+     *  `CryptoProvider` after a Config Init / Pull derivation. The
+     *  host stores it on `configCryptoProvider` so subsequent
+     *  `wrapConfigClient` calls produce the right encrypting stack
+     *  for live sync ops. Null = encryption is disabled for config. */
+    private readonly onConfigCryptoChange?: (crypto: CryptoProvider | null) => void;
+
+    /** Phase 2: RAW config-DB client factory (no codec wrapping) used
+     *  by ConfigSetupService for the `config:meta` push. The meta doc
+     *  is never encrypted or compressed — bypassing the codec stack
+     *  keeps it readable by a fresh-Clone device that hasn't unlocked
+     *  the passphrase yet. Optional; falls back to building one from
+     *  settings via `makeCouchClient`. Tests pass the same in-memory
+     *  FakeCouchClient as the wrapped client factory so the meta push
+     *  lands on the same fixture. */
+    private readonly rawClientFactory?: (settings: CouchSyncSettings) => ICouchClient | null;
+
     constructor(
         private vault: IVaultIO,
         private modal: IModalPresenter,
@@ -117,11 +158,17 @@ export class ConfigSync {
         private reconnectBridge: ReconnectBridge,
         private getSettings: () => CouchSyncSettings,
         clientFactory?: (settings: CouchSyncSettings) => ICouchClient | null,
+        hasher?: ChunkHasher,
+        onConfigCryptoChange?: (crypto: CryptoProvider | null) => void,
+        rawClientFactory?: (settings: CouchSyncSettings) => ICouchClient | null,
     ) {
         this.clientFactory = clientFactory ?? defaultClientFactory;
         this.lastSynced = configDb ? new ConfigLastSynced(configDb) : null;
         this.checkpoints = configDb ? new ConfigCheckpoints(configDb) : null;
         this.conflictResolver = new ConflictResolver();
+        this.hasher = hasher;
+        this.onConfigCryptoChange = onConfigCryptoChange;
+        this.rawClientFactory = rawClientFactory;
     }
 
     /** Lazy-load the persisted pull/push cursors. Idempotent — safe to
@@ -140,7 +187,7 @@ export class ConfigSync {
      * inherited from the vault sync settings. Returns null if config
      * sync is not configured.
      */
-    private makeConfigClient(): CouchClient | null {
+    private makeConfigClient(): ICouchClient | null {
         return this.clientFactory(this.getSettings());
     }
 
@@ -203,14 +250,29 @@ export class ConfigSync {
      * 2. Remote: DELETE /<configDb> + PUT /<configDb> via the operation
      *    epoch's CouchClient. True rev-tree reset, not the legacy
      *    "tombstone-only" pseudo-reset that left rev tree intact.
+     * 2b. Build a SELF-CONTAINED `config:meta` (Phase 2 invariant 17):
+     *     fresh salt + own keyCheck derived from `opts.passphrase`.
+     *     The new `CryptoProvider` is propagated to the host via
+     *     `onConfigCryptoChange` so subsequent push round-trips inside
+     *     this same Init flow use the correct keys.
      * 3. Scan vault → seed local from current `.obsidian/` truth.
      * 4. Push to empty remote (no conflicts possible).
      *
      * Symmetric with `SetupService.init()` for vault sync. Resolves the
      * audit-2026-05-08 finding where init() left rev=N+1 with vclock
      * reset to {device:1}, silently destroying peer causality history.
+     *
+     * Phase 2 signature change: takes an explicit `opts` describing the
+     * desired config-side codec policy. The host (main.ts) reads this
+     * from `settings.configEncryptionEnabled ?? settings.encryptionEnabled`
+     * etc., letting Phase 3 surface independent UI without altering this
+     * layer.
      */
-    async init(): Promise<number> {
+    async init(opts: {
+        encryption: boolean;
+        passphrase?: string;
+        compression: boolean;
+    }): Promise<number> {
         const db = this.requireConfigDb();
         return this.runOperation("Config Init", async (ctx, progress) => {
             const setup = new ConfigSetupService(
@@ -220,12 +282,23 @@ export class ConfigSync {
                     clearLastSynced: () => this.lastSynced?.clear(),
                     invalidateCheckpoints: () => { this.checkpointsLoaded = false; },
                     scan: (cb) => this.scan(cb),
+                    onCryptoProviderReady: (crypto) => {
+                        this.onConfigCryptoChange?.(crypto);
+                    },
+                    makeRawConfigClient: this.rawClientFactory
+                        ? () => {
+                            const c = this.rawClientFactory!(this.getSettings());
+                            if (!c) throw new Error("ConfigSync: raw client factory returned null");
+                            return c;
+                        }
+                        : undefined,
                 },
             );
             const result = await setup.init(
                 ctx.client,
                 ctx.signal,
                 (msg) => progress.update(msg),
+                opts,
             );
             progress.done(
                 `Config init: scanned ${result.scanned} file(s), pushed ${result.pushed}.`,
@@ -245,6 +318,11 @@ export class ConfigSync {
      */
     async reinitForEncryptionChange(
         onProgress: (msg: string) => void,
+        opts: {
+            encryption: boolean;
+            passphrase?: string;
+            compression: boolean;
+        },
     ): Promise<void> {
         const db = this.configDb;
         if (!db) return;
@@ -258,9 +336,12 @@ export class ConfigSync {
                 clearLastSynced: () => this.lastSynced?.clear(),
                 invalidateCheckpoints: () => { this.checkpointsLoaded = false; },
                 scan: (cb) => this.scan(cb),
+                onCryptoProviderReady: (crypto) => {
+                    this.onConfigCryptoChange?.(crypto);
+                },
             },
         );
-        await setup.init(client, controller.signal, onProgress);
+        await setup.init(client, controller.signal, onProgress, opts);
     }
 
     /** Push: scan .obsidian/ → enumerate local delta via changes feed →
@@ -331,8 +412,22 @@ export class ConfigSync {
                 lastSynced: this.lastSynced!,
                 getConflictResolver: () => this.conflictResolver,
                 signal: ctx.signal,
+                hasher: this.hasher,
             });
-            const result = await writer.run((msg) => progress.update(msg));
+            let result;
+            try {
+                result = await writer.run((msg) => progress.update(msg));
+            } catch (e: any) {
+                if (e instanceof SchemaVersionMismatchError) {
+                    // Remote ConfigDoc shape this build can't read — re-init
+                    // flow required. Surface the error's own version-accurate
+                    // message via the operation's progress.fail path; the
+                    // host's findLegacyConfigDoc startup guard also catches
+                    // the local-side copy on next reload.
+                    throw new Error(e.userMessage);
+                }
+                throw e;
+            }
 
             if (result.concurrent.length > 0) {
                 this.notifyConcurrentPull(result.concurrent);
@@ -425,12 +520,18 @@ export class ConfigSync {
     /** Scan entire .obsidian/ directory to local DB.
      *
      *  Short-circuit: if the per-path lastSynced cache reports a matching
-     *  `{size, dataHash}`, skip the rewrite entirely. This is the config
-     *  symmetric to VaultSync.fileToDb's `chunksEqual` early-out — without
-     *  it every scan rev-bumps every config doc, which inflates the remote
-     *  rev tree and produces phantom divergence for peers (see audit
-     *  2026-05-08). Hash + size compared, not base64 equality, to avoid
-     *  holding the full 5MB×N base64 in memory. */
+     *  `{size, chunks}`, skip the rewrite entirely. v0.26 symmetric to
+     *  VaultSync.fileToDb's `chunksEqual` early-out — without it every
+     *  scan rev-bumps every config doc, which inflates the remote rev
+     *  tree and produces phantom divergence for peers (audit 2026-05-08).
+     *  Chunk-list comparison is O(N) over chunk ids; the full payload
+     *  is never re-encoded for the equality check.
+     *
+     *  v0.26 chunking: each config file is split into ChunkDocs via
+     *  `splitIntoChunks` (256 KiB chunks). The ConfigDoc carries only
+     *  `chunks: string[]`; chunk bodies live as separate docs with
+     *  envelope-formatted attachment "c" (gzip + encrypt transparently
+     *  applied by the wrapped client). */
     async scan(onProgress?: (path: string, index: number, total: number) => void): Promise<number> {
         const db = this.requireConfigDb();
         const lastSynced = this.lastSynced;
@@ -454,39 +555,50 @@ export class ConfigSync {
                 if (!stat || stat.size > ConfigSync.MAX_CONFIG_SIZE) continue;
 
                 const buf = await this.vault.readBinary(file);
-                const dataHash = await computeConfigDataHash(buf);
+                const chunks = await splitIntoChunks(
+                    buf,
+                    this.hasher
+                        ? { hasher: this.hasher, chunkBytes: MAX_CHUNK_BYTES_CONFIG }
+                        : { hasher: defaultHasher(), chunkBytes: MAX_CHUNK_BYTES_CONFIG },
+                );
+                const chunkIds = chunks.map((c) => c._id);
 
                 const cached = lastSynced.get(file);
-                if (cached && cached.size === stat.size && cached.dataHash === dataHash) {
+                if (cached && cached.size === stat.size
+                    && ConfigSync.chunksEqual(cached.chunks, chunkIds)) {
                     continue; // unchanged since last sync — no rewrite
                 }
 
-                const data = arrayBufferToBase64(buf);
                 const configId = makeConfigId(file);
                 await db.runWriteBuilder(async (snap) => {
                     const existing = (await snap.get(configId)) as ConfigDoc | null;
                     const newVclock = incrementVC(existing?.vclock, deviceId);
                     const doc: ConfigDoc = {
                         _id: configId,
-                        schemaVersion: 2,
+                        schemaVersion: CONFIG_SCHEMA_VERSION,
                         type: "config",
-                        data,
+                        chunks: chunkIds,
                         mtime: stat.mtime,
                         size: stat.size,
                         vclock: newVclock,
                     };
                     return {
-                        docs: [{ doc }],
+                        chunks: chunks as unknown as CouchSyncDoc[],
+                        docs: [{ doc: doc as unknown as CouchSyncDoc }],
                         meta: [{
                             op: "put",
                             key: configLastSyncedKey(file),
-                            value: { vclock: newVclock, size: stat.size, dataHash },
+                            value: {
+                                vclock: newVclock,
+                                size: stat.size,
+                                chunks: chunkIds,
+                            },
                         }],
                         onCommit: () => {
                             lastSynced.set(file, {
                                 vclock: newVclock,
                                 size: stat.size,
-                                dataHash,
+                                chunks: chunkIds,
                             });
                         },
                     };
@@ -499,13 +611,29 @@ export class ConfigSync {
         return count;
     }
 
-    /** Write config docs to filesystem, filtered by configSyncPaths */
+    /** Chunk-list equality. O(N) over ids; chunks are content-addressed,
+     *  so id-equality is byte-equality (invariant 14). Mirrors
+     *  VaultSync.chunksEqual. */
+    private static chunksEqual(a: readonly string[], b: readonly string[]): boolean {
+        return a.length === b.length && a.every((id, i) => id === b[i]);
+    }
+
+
+    /** Write config docs to filesystem, filtered by configSyncPaths.
+     *
+     *  v0.26 chunking: assembles each config file's binary content by
+     *  fetching the referenced ChunkDocs from the config DB and joining
+     *  them. Missing chunks cause a WARN + skip (symmetric with
+     *  VaultSync.dbToFile); the missing chunk is expected to arrive on
+     *  the next pull. Tombstones (`deleted: true`) are silently skipped
+     *  \u2014 config-sync currently has no continuous tombstone-driven flow,
+     *  but the field is honoured for safety. */
     async write(onProgress?: (path: string, index: number, total: number) => void): Promise<number> {
         const db = this.requireConfigDb();
         const paths = this.getSettings().configSyncPaths;
         if (paths.length === 0) return 0;
 
-        const entries: { path: string; data: string }[] = [];
+        const docs: ConfigDoc[] = [];
         for (const p of paths) {
             if (p.endsWith("/")) {
                 // Prefix-range scan for everything under the folder.
@@ -519,26 +647,35 @@ export class ConfigSync {
                     if (!row.doc) continue;
                     const doc = row.doc as unknown as ConfigDoc;
                     if (doc.type !== "config") continue;
-                    entries.push({
-                        path: configPathFromId(doc._id),
-                        data: doc.data,
-                    });
+                    if (doc.deleted) continue;
+                    docs.push(doc);
                 }
             } else {
-                const doc = await db.get(makeConfigId(p));
-                if (doc) entries.push({ path: p, data: doc.data });
+                const doc = await db.get(makeConfigId(p)) as ConfigDoc | null;
+                if (doc && doc.type === "config" && !doc.deleted) docs.push(doc);
             }
         }
 
         let count = 0;
-        for (let i = 0; i < entries.length; i++) {
-            const { path, data } = entries[i];
+        for (let i = 0; i < docs.length; i++) {
+            const doc = docs[i];
+            const path = configPathFromId(doc._id);
             if (ConfigSync.SKIP_PATHS.has(path)) continue;
             try {
-                onProgress?.(path, i + 1, entries.length);
+                onProgress?.(path, i + 1, docs.length);
+                const chunks = await db.getChunks(doc.chunks);
+                if (chunks.length !== doc.chunks.length) {
+                    const missing = doc.chunks.filter(
+                        (id) => !chunks.some((c) => c._id === id),
+                    );
+                    logWarn(
+                        `CouchSync: Skipping config write ${path} \u2014 ` +
+                        `missing ${missing.length} chunk(s): ${missing.slice(0, 3).join(", ")}`,
+                    );
+                    continue;
+                }
+                const buf = ConfigSync.assembleChunks(doc.chunks, chunks);
                 await this.ensureDir(path);
-                // ConfigDoc is always base64-encoded binary; decode verbatim.
-                const buf = base64ToArrayBuffer(data);
                 if (await this.vault.exists(path)) {
                     await this.vault.writeBinary(path, buf);
                 } else {
@@ -550,6 +687,22 @@ export class ConfigSync {
             }
         }
         return count;
+    }
+
+    /** Order the fetched chunks by the ConfigDoc.chunks reference list
+     *  and join into a single ArrayBuffer. The fetch order from
+     *  `getChunks` is not guaranteed (keys-array allDocs returns rows
+     *  in id order, not request order), so we re-order through a map. */
+    private static assembleChunks(
+        order: readonly string[],
+        chunks: readonly ChunkDoc[],
+    ): ArrayBuffer {
+        const byId = new Map<string, ChunkDoc>();
+        for (const c of chunks) byId.set(c._id, c);
+        const ordered = order
+            .map((id) => byId.get(id))
+            .filter((c): c is ChunkDoc => c != null);
+        return joinChunks(ordered as ChunkDoc[]);
     }
 
     // ── Utilities (public for settings UI) ─────────────

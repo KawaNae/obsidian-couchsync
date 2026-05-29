@@ -17,6 +17,12 @@
  *
  *  push path: app → compress → encrypt → wire
  *  pull path: wire → decrypt → ungzip → app
+ *
+ *  Every blob fed into the stack is envelope-formatted bytes
+ *  (`[codec][IV?][body]`) and every blob returned by the stack is the
+ *  same shape with the bits the decorators stripped now cleared.
+ *  Tests wrap raw payloads via `asEnvelope` / `fromEnvelope` (see
+ *  invariant 12).
  */
 
 import { describe, it, expect, beforeAll } from "vitest";
@@ -30,6 +36,7 @@ import {
     type CryptoProvider,
 } from "../src/db/crypto-provider.ts";
 import type { ICouchClient } from "../src/db/interfaces.ts";
+import { asEnvelope, fromEnvelope } from "./helpers/envelope.ts";
 
 let crypto: CryptoProvider;
 beforeAll(async () => {
@@ -71,29 +78,34 @@ describe.each(modes)("sync mode matrix — $name", (mode) => {
         await app.bulkDocsWithAttachments([
             {
                 doc: { _id: "chunk:rt-" + mode.name, type: "chunk", schemaVersion: 2 },
-                attachments: { c: { contentType: "application/octet-stream", data: payload } },
+                attachments: { c: { contentType: "application/octet-stream", data: asEnvelope(payload) } },
             },
         ]);
         const back = await app.getAttachment("chunk:rt-" + mode.name, "c");
-        expect(back).toEqual(payload);
+        expect(fromEnvelope(back!)).toEqual(payload);
     });
 
     it("the inner storage state reflects the codec actually applied", async () => {
         const { app, inner } = buildClient(mode);
         const payload = enc.encode("inner-view-" + mode.name);
         await app.bulkDocsWithAttachments([
-            { doc: { _id: "chunk:iv-" + mode.name }, attachments: { c: { contentType: "x", data: payload } } },
+            { doc: { _id: "chunk:iv-" + mode.name }, attachments: { c: { contentType: "x", data: asEnvelope(payload) } } },
         ]);
 
         const innerBlob = await inner.getAttachment("chunk:iv-" + mode.name, "c");
         expect(innerBlob).not.toBeNull();
+        // Every byte on the wire is envelope-formatted (invariant 12).
+        // The header reflects which codecs were actually applied.
+        const expectedHeader =
+            (mode.encryption ? 0x01 : 0) | (mode.compression ? 0x02 : 0);
+        expect(innerBlob![0]).toBe(expectedHeader);
 
         if (!mode.encryption && !mode.compression) {
-            // raw: inner sees the exact bytes we pushed.
-            expect(innerBlob).toEqual(payload);
+            // raw: stripping the 1-byte envelope yields the exact input.
+            expect(innerBlob!.slice(1)).toEqual(payload);
         } else {
             // Anything else transforms the bytes before storage.
-            expect(innerBlob).not.toEqual(payload);
+            expect(innerBlob!.slice(1)).not.toEqual(payload);
         }
     });
 
@@ -102,7 +114,7 @@ describe.each(modes)("sync mode matrix — $name", (mode) => {
         // 4 KiB of one character — gzip should crush this.
         const payload = enc.encode("a".repeat(4 * 1024));
         await app.bulkDocsWithAttachments([
-            { doc: { _id: "chunk:cmp-" + mode.name }, attachments: { c: { contentType: "x", data: payload } } },
+            { doc: { _id: "chunk:cmp-" + mode.name }, attachments: { c: { contentType: "x", data: asEnvelope(payload) } } },
         ]);
         const innerBlob = await inner.getAttachment("chunk:cmp-" + mode.name, "c");
         if (mode.compression && !mode.encryption) {
@@ -115,12 +127,12 @@ describe.each(modes)("sync mode matrix — $name", (mode) => {
             // compressed plaintext.
             expect(innerBlob!.length).toBeLessThan(payload.length / 3);
         } else if (!mode.compression && mode.encryption) {
-            // encrypt only: cipher ≈ plaintext + 28 B.
+            // encrypt only: cipher ≈ plaintext + 28 B (envelope+IV+tag).
             expect(innerBlob!.length).toBeGreaterThanOrEqual(payload.length);
             expect(innerBlob!.length).toBeLessThan(payload.length + 64);
         } else {
-            // raw: same bytes.
-            expect(innerBlob!.length).toBe(payload.length);
+            // raw: same bytes plus the 1-byte envelope header.
+            expect(innerBlob!.length).toBe(payload.length + 1);
         }
     });
 
@@ -129,23 +141,23 @@ describe.each(modes)("sync mode matrix — $name", (mode) => {
         const items = Array.from({ length: 5 }, (_, i) => ({
             doc: { _id: `chunk:multi-${mode.name}-${i}` },
             attachments: {
-                c: { contentType: "x", data: enc.encode(`item-${i}-` + mode.name.repeat(10)) },
+                c: { contentType: "x", data: asEnvelope(enc.encode(`item-${i}-` + mode.name.repeat(10))) },
             },
         }));
         await app.bulkDocsWithAttachments(items);
         for (let i = 0; i < items.length; i++) {
             const back = await app.getAttachment(items[i].doc._id, "c");
-            expect(dec.decode(back!)).toBe(`item-${i}-` + mode.name.repeat(10));
+            expect(dec.decode(fromEnvelope(back!))).toBe(`item-${i}-` + mode.name.repeat(10));
         }
     });
 
     it("empty attachment round-trips correctly", async () => {
         const { app } = buildClient(mode);
         await app.bulkDocsWithAttachments([
-            { doc: { _id: "chunk:empty-" + mode.name }, attachments: { c: { contentType: "x", data: new Uint8Array(0) } } },
+            { doc: { _id: "chunk:empty-" + mode.name }, attachments: { c: { contentType: "x", data: asEnvelope(new Uint8Array(0)) } } },
         ]);
-        expect(await app.getAttachment("chunk:empty-" + mode.name, "c"))
-            .toEqual(new Uint8Array(0));
+        const back = await app.getAttachment("chunk:empty-" + mode.name, "c");
+        expect(fromEnvelope(back!)).toEqual(new Uint8Array(0));
     });
 
     it("getAttachment on a missing doc returns null", async () => {
@@ -160,9 +172,10 @@ describe("cross-mode independence", () => {
         const b = buildClient(modes[3]);
         const payload = enc.encode("isolation-probe");
         await a.app.bulkDocsWithAttachments([
-            { doc: { _id: "chunk:iso" }, attachments: { c: { contentType: "x", data: payload } } },
+            { doc: { _id: "chunk:iso" }, attachments: { c: { contentType: "x", data: asEnvelope(payload) } } },
         ]);
         expect(await b.app.getAttachment("chunk:iso", "c")).toBeNull();
-        expect(await a.app.getAttachment("chunk:iso", "c")).toEqual(payload);
+        const back = await a.app.getAttachment("chunk:iso", "c");
+        expect(fromEnvelope(back!)).toEqual(payload);
     });
 });

@@ -26,6 +26,8 @@ import type { ICouchClient } from "./interfaces.ts";
 import type { ConflictResolver } from "../conflict/conflict-resolver.ts";
 import { filePathFromId } from "../types/doc-id.ts";
 import { makeCouchClient } from "./couch-client.ts";
+import { chunkFromAttachment, ChunkIntegrityError } from "./chunk-attachment.ts";
+import type { ChunkHasher } from "./chunker.ts";
 import { decideReconnect } from "./reconnect-policy.ts";
 import type {
     ReconnectReason,
@@ -244,6 +246,16 @@ export class SyncEngine {
 
     private conflictResolver?: ConflictResolver;
 
+    /** Optional hasher used to verify pulled chunk bodies hash to their
+     *  content-addressed id (the inverse of how the id was minted). Reads
+     *  the live crypto provider, so a single object tracks encryption
+     *  state. When unset, chunks are stored without verification. */
+    setChunkHasher(hasher: ChunkHasher): void {
+        this.chunkHasher = hasher;
+    }
+
+    private chunkHasher?: ChunkHasher;
+
     /**
      * Ensure every chunk referenced by FileDoc exists in localDB. Any missing
      * chunks are fetched via `client` and persisted locally. When `client`
@@ -280,6 +292,7 @@ export class SyncEngine {
         const fetched: ChunkDoc[] = [];
         const queue = [...missing];
         const notFound: string[] = [];
+        const corrupt: string[] = [];
         const workers: Promise<void>[] = [];
         for (let w = 0; w < CONCURRENCY; w++) {
             workers.push((async () => {
@@ -291,26 +304,34 @@ export class SyncEngine {
                         notFound.push(id);
                         continue;
                     }
-                    fetched.push({
-                        _id: id,
-                        type: "chunk",
-                        schemaVersion: 2,
-                        data: "",
-                        content: blob,
-                    });
+                    // Decorator stack has decrypted + decompressed the body.
+                    // chunkFromAttachment decodes the envelope and (when a
+                    // hasher is wired) verifies content hashes to the id. A
+                    // hash mismatch means the body is corrupt — treat it like
+                    // a missing chunk (skip + warn, route to repair) rather
+                    // than persisting bad bytes or failing the whole batch.
+                    try {
+                        fetched.push(await chunkFromAttachment(id, blob, this.chunkHasher));
+                    } catch (e) {
+                        if (e instanceof ChunkIntegrityError) {
+                            corrupt.push(id);
+                            continue;
+                        }
+                        throw e;
+                    }
                 }
             })());
         }
         await Promise.all(workers);
-        if (notFound.length > 0) {
-            // A missing-on-server chunk for a file we just committed
-            // indicates an inconsistent push (chunk pushed without
-            // attachment, or attachment expired). chunk-repair handles
-            // recovery; here we surface a warning rather than failing
-            // the whole pull batch (which would block all subsequent
-            // files for one broken chunk).
+        if (notFound.length > 0 || corrupt.length > 0) {
+            // A missing/corrupt chunk for a file we just committed indicates
+            // an inconsistent push (chunk pushed without attachment, attachment
+            // expired, or body damaged). chunk-repair handles recovery; here we
+            // surface a warning rather than failing the whole pull batch (which
+            // would block all subsequent files for one broken chunk).
+            const bad = [...notFound, ...corrupt];
             logWarn(
-                `ensureChunks: ${notFound.length} chunk(s) returned 404 for ${filePathFromId(fileDoc._id)}: ${notFound.slice(0, 3).join(", ")}${notFound.length > 3 ? "…" : ""}`,
+                `ensureChunks: ${notFound.length} missing + ${corrupt.length} corrupt chunk(s) for ${filePathFromId(fileDoc._id)}: ${bad.slice(0, 3).join(", ")}${bad.length > 3 ? "…" : ""}`,
             );
         }
         if (fetched.length > 0) {
@@ -494,6 +515,17 @@ export class SyncEngine {
             // Auth is user-gated. Raise the latch, tear down, and leave
             // the retry timer off — only a fresh start() clears this.
             this.auth.raise(detail.code ?? 401, detail.message);
+            this.stopRetryTimer();
+            void this.teardown();
+            return;
+        }
+
+        if (detail.kind === "schema-mismatch") {
+            // Remote carries a doc shape this build can't read. Retrying
+            // the pull would loop forever against the same batch, so this
+            // is terminal: surface the migration instruction, halt retries,
+            // and tear down. A fresh start() (post re-init) clears it.
+            notify(detail.message, 15000);
             this.stopRetryTimer();
             void this.teardown();
             return;

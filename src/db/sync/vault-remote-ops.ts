@@ -27,17 +27,20 @@ import type { AuthGate } from "./auth-gate.ts";
 export type ProgressCallback = (docId: string, count: number) => void;
 
 export class VaultRemoteOps {
-    private clientWrapper?: (raw: CouchClient) => ICouchClient;
-
     constructor(
         private localDb: LocalDB,
         private getSettings: () => CouchSyncSettings,
         private auth: AuthGate,
+        /**
+         * Codec stack wrapper — same closure used by SyncEngine's live
+         * loop. Single source of truth for "how to talk to this vault";
+         * captures the latest `cryptoProvider` / `compressionEnabled`
+         * state on every call. Eliminates the legacy `setClientWrapper`
+         * mutable setter and the Init/Clone vs sync-loop drift that
+         * silently dropped the Compressing layer from Init pushes.
+         */
+        private wrapClient: (raw: CouchClient) => ICouchClient,
     ) {}
-
-    setClientWrapper(wrapper: ((raw: CouchClient) => ICouchClient) | undefined): void {
-        this.clientWrapper = wrapper;
-    }
 
     /** One-shot push of the entire vault local DB to the vault remote. */
     async pushAll(onProgress?: ProgressCallback): Promise<number> {
@@ -102,7 +105,6 @@ export class VaultRemoteOps {
     }
 
     private makeWrappedClient(): ICouchClient {
-        const raw = this.makeClient();
-        return this.clientWrapper ? this.clientWrapper(raw) : raw;
+        return this.wrapClient(this.makeClient());
     }
 }

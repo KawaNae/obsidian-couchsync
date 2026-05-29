@@ -1,9 +1,10 @@
 import type { IVaultIO } from "../types/vault-io.ts";
 import type { LocalDB } from "../db/local-db.ts";
 import type { FileDoc, ChunkDoc, CouchSyncDoc } from "../types.ts";
+import { FILE_SCHEMA_VERSION } from "../types.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { VaultWriter, WriteResult } from "./vault-writer.ts";
-import { splitIntoChunks, joinChunks, type ChunkHashFn } from "../db/chunker.ts";
+import { splitIntoChunks, joinChunks, type ChunkHasher } from "../db/chunker.ts";
 import { notify } from "../ui/log.ts";
 import { compareVC, incrementVC, mergeVC } from "./vector-clock.ts";
 import type { VectorClock } from "./vector-clock.ts";
@@ -101,16 +102,16 @@ export class VaultSync {
      */
     private pendingProbe: IPendingProbe | null = null;
 
-    private readonly hashFn?: ChunkHashFn;
+    private readonly hasher?: ChunkHasher;
 
     constructor(
         private vault: IVaultIO,
         private db: LocalDB,
         private getSettings: () => CouchSyncSettings,
         private vaultWriter: VaultWriter,
-        hashFn?: ChunkHashFn,
+        hasher?: ChunkHasher,
     ) {
-        this.hashFn = hashFn;
+        this.hasher = hasher;
     }
 
     /**
@@ -172,7 +173,7 @@ export class VaultSync {
         }
 
         const content = await this.vault.readBinary(path);
-        const chunks = await splitIntoChunks(content, this.hashFn);
+        const chunks = await splitIntoChunks(content, this.hasher);
         const chunkIds = chunks.map((c) => c._id);
 
         const deviceId = settings.deviceId;
@@ -241,7 +242,7 @@ export class VaultSync {
                     const newVclock = incrementVC(existing?.vclock, deviceId);
                     const newDoc: FileDoc = {
                         _id: fileId,
-                        schemaVersion: 2,
+                        schemaVersion: FILE_SCHEMA_VERSION,
                         type: "file",
                         chunks: chunkIds,
                         mtime: fileStat.mtime,
@@ -604,7 +605,7 @@ export class VaultSync {
         const fileStat = await this.vault.stat(path);
         if (!fileStat) return;
         const content = await this.vault.readBinary(path);
-        const chunks = await splitIntoChunks(content, this.hashFn);
+        const chunks = await splitIntoChunks(content, this.hasher);
         const chunkIds = chunks.map((c) => c._id);
         const fileId = makeFileId(path);
         const deviceId = settings.deviceId;
@@ -616,7 +617,7 @@ export class VaultSync {
                     const newVclock = incrementVC(merged, deviceId);
                     const newDoc: FileDoc = {
                         _id: fileId,
-                        schemaVersion: 2,
+                        schemaVersion: FILE_SCHEMA_VERSION,
                         type: "file",
                         chunks: chunkIds,
                         mtime: fileStat.mtime,
@@ -786,7 +787,7 @@ export class VaultSync {
 
     private async localChunkIds(path: string): Promise<string[]> {
         const content = await this.vault.readBinary(path);
-        const chunks = await splitIntoChunks(content, this.hashFn);
+        const chunks = await splitIntoChunks(content, this.hasher);
         return chunks.map((c) => c._id);
     }
 

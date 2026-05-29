@@ -43,6 +43,7 @@ function file(path: string, chunkIds: string[]): FileDoc {
     return {
         _id: makeFileId(path),
         type: "file",
+        schemaVersion: 2,
         chunks: chunkIds,
         mtime: 1000,
         ctime: 1000,
@@ -55,7 +56,8 @@ function chunk(hash: string): ChunkDoc {
     return {
         _id: makeChunkId(hash),
         type: "chunk",
-        data: "ZGF0YQ==",
+        schemaVersion: 2,
+        content: new TextEncoder().encode("data"),
     };
 }
 

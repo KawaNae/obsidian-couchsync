@@ -1,15 +1,16 @@
 /**
  * ConfigLastSynced — per-config-path integration baseline.
  *
- * Records, for each `.obsidian/...` path, the `{vclock, size, dataHash}` at
+ * Records, for each `.obsidian/...` path, the `{vclock, chunks, size}` at
  * the moment the local DB and vault file were last reconciled. Loaded on
  * first use into an in-memory map keyed by config path; persisted to the
  * ConfigLocalDB meta store under `_local/config-last-synced/<path>`.
  *
- * Mirror of `LastSynced` (`src/sync/last-synced.ts`) for vault FileDocs,
- * but with `dataHash` instead of `chunks`. Configs are single-doc base64
- * payloads, not chunked, so a content-addressed digest is the natural
- * cheap-equality key for the scan() short-circuit.
+ * v0.26 (ConfigSync chunking) aligns this shape with vault's `LastSynced`:
+ * `chunks: string[]` replaces the old `dataHash: string` because ConfigDoc
+ * is now chunked just like FileDoc. The cheap-equality check in
+ * `ConfigSync.scan()` becomes the same `chunksEqual` test the vault scan
+ * uses — a true symmetry rather than a stand-in.
  *
  * Persistence layer: `WriteTransaction.meta` (`{op:"put",key,value}`)
  * lands the meta write atomically with the doc upsert, so the in-memory
@@ -21,10 +22,11 @@ import type { ConfigLocalDB } from "../config-local-db.ts";
 
 export interface ConfigLastSyncedValue {
     vclock: VectorClock;
+    /** Ordered chunk id list at integration. Same fingerprint the vault
+     *  scanner uses; `chunksEqual` against the freshly-chunked disk
+     *  produces the scan() short-circuit. */
+    chunks: string[];
     size: number;
-    /** First 16 hex chars of SHA-256(data). Sufficient for content equality
-     *  in the scan() short-circuit; collision risk at <1e-19 per pair. */
-    dataHash: string;
 }
 
 export const CONFIG_LAST_SYNCED_PREFIX = "_local/config-last-synced/";
@@ -35,17 +37,6 @@ export function configLastSyncedKey(path: string): string {
     return CONFIG_LAST_SYNCED_PREFIX + path;
 }
 
-/** SHA-256(buf) → first 16 hex chars (64 bits). Used by scan() to
- *  detect "vault content unchanged since last sync" without re-encoding
- *  to base64 for string comparison. */
-export async function computeConfigDataHash(buf: ArrayBuffer): Promise<string> {
-    const digest = await crypto.subtle.digest("SHA-256", buf);
-    const arr = new Uint8Array(digest);
-    let out = "";
-    for (let i = 0; i < 8; i++) out += arr[i].toString(16).padStart(2, "0");
-    return out;
-}
-
 export class ConfigLastSynced {
     private cache = new Map<string, ConfigLastSyncedValue>();
     private loaded = false;
@@ -54,16 +45,24 @@ export class ConfigLastSynced {
 
     /** Lazy-load the on-disk meta into the in-memory cache. Idempotent —
      *  subsequent calls are no-ops. Called from ConfigSync.scan() / push()
-     *  / pull() before any read of the cache. */
+     *  / pull() before any read of the cache.
+     *
+     *  v0.25 → v0.26 legacy entries carry a `dataHash: string` field
+     *  instead of `chunks`. Such entries are silently dropped during
+     *  load — the scan() short-circuit will simply re-derive on first
+     *  scan, and the migration guard (`findLegacyConfigDoc`) ensures
+     *  the DB rebuild path runs before live sync resumes anyway. */
     async ensureLoaded(): Promise<void> {
         if (this.loaded) return;
-        const rows = await this.db.getMetaByPrefix<ConfigLastSyncedValue>(
+        const rows = await this.db.getMetaByPrefix<unknown>(
             CONFIG_LAST_SYNCED_PREFIX,
         );
         this.cache.clear();
         for (const { key, value } of rows) {
+            const parsed = parseConfigLastSyncedValue(value);
+            if (!parsed) continue;
             const path = key.slice(CONFIG_LAST_SYNCED_PREFIX.length);
-            this.cache.set(path, value);
+            this.cache.set(path, parsed);
         }
         this.loaded = true;
     }
@@ -94,4 +93,13 @@ export class ConfigLastSynced {
         this.cache.clear();
         this.loaded = false;
     }
+}
+
+function parseConfigLastSyncedValue(value: unknown): ConfigLastSyncedValue | null {
+    if (!value || typeof value !== "object") return null;
+    const v = value as Partial<ConfigLastSyncedValue> & { dataHash?: unknown };
+    if (!Array.isArray(v.chunks)) return null;
+    if (typeof v.size !== "number") return null;
+    if (!v.vclock || typeof v.vclock !== "object") return null;
+    return { vclock: v.vclock as VectorClock, chunks: v.chunks as string[], size: v.size };
 }

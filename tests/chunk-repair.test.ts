@@ -52,7 +52,8 @@ function makeChunk(hash: string): ChunkDoc {
     return {
         _id: makeChunkId(hash),
         type: "chunk",
-        data: "ZGF0YQ==",
+        schemaVersion: 2,
+        content: new TextEncoder().encode("data"),
     };
 }
 

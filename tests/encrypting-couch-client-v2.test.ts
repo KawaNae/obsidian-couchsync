@@ -1,8 +1,9 @@
 /**
- * Phase 8 (data-layer-v2): cover the EncryptingCouchClient attachment
- * path. The decorator must encrypt attachment binaries on push and
- * decrypt on pull, transparently to the caller, alongside the existing
- * path-ID HMAC translation.
+ * data-layer-v2 (envelope-aware): cover the EncryptingCouchClient
+ * attachment path. The decorator must encrypt attachment binaries on
+ * push (setting the envelope's `encrypted` bit and prepending IV) and
+ * decrypt + strip on pull, transparently to the caller, alongside the
+ * existing path-ID HMAC translation.
  */
 
 import { describe, it, expect, beforeAll } from "vitest";
@@ -14,6 +15,7 @@ import {
     generateSalt,
     type CryptoProvider,
 } from "../src/db/crypto-provider.ts";
+import { asEnvelope, fromEnvelope } from "./helpers/envelope.ts";
 
 let crypto1: CryptoProvider;
 let crypto2: CryptoProvider; // different keys, for failure tests
@@ -37,12 +39,12 @@ describe("EncryptingCouchClient v2 attachment encryption", () => {
         await client.bulkDocsWithAttachments([
             {
                 doc: { _id: "chunk:abc", type: "chunk" },
-                attachments: { c: { contentType: "application/octet-stream", data: original } },
+                attachments: { c: { contentType: "application/octet-stream", data: asEnvelope(original) } },
             },
         ]);
 
         const back = await client.getAttachment("chunk:abc", "c");
-        expect(back).toEqual(original);
+        expect(fromEnvelope(back!)).toEqual(original);
     });
 
     it("the inner storage holds ciphertext, not plaintext", async () => {
@@ -51,20 +53,22 @@ describe("EncryptingCouchClient v2 attachment encryption", () => {
 
         const original = bytes("secret chunk content");
         await client.bulkDocsWithAttachments([
-            { doc: { _id: "chunk:secret" }, attachments: { c: { contentType: "x", data: original } } },
+            { doc: { _id: "chunk:secret" }, attachments: { c: { contentType: "x", data: asEnvelope(original) } } },
         ]);
 
         const raw = await inner.getAttachment("chunk:secret", "c");
         expect(raw).not.toBeNull();
-        expect(raw!.length).toBeGreaterThan(original.length); // IV + GCM tag overhead
-        expect(raw).not.toEqual(original);
+        // Envelope (1B) + IV (12B) + cipher (plain + 16B GCM tag).
+        expect(raw!.length).toBeGreaterThan(original.length);
+        expect(raw![0]).toBe(0x01); // encrypted bit set, compressed bit clear
+        expect(raw).not.toEqual(asEnvelope(original));
     });
 
     it("decrypt with wrong key throws EncryptionError", async () => {
         const inner = new FakeCouchClient();
         const writer = new EncryptingCouchClient(inner, crypto1);
         await writer.bulkDocsWithAttachments([
-            { doc: { _id: "chunk:enc" }, attachments: { c: { contentType: "x", data: bytes("data") } } },
+            { doc: { _id: "chunk:enc" }, attachments: { c: { contentType: "x", data: asEnvelope(bytes("data")) } } },
         ]);
 
         const reader = new EncryptingCouchClient(inner, crypto2);
@@ -79,7 +83,7 @@ describe("EncryptingCouchClient v2 attachment encryption", () => {
         const original = bytes("file content as one chunk would be elsewhere");
         const fileId = "file:notes/secret.md";
         await client.bulkDocsWithAttachments([
-            { doc: { _id: fileId, type: "file" }, attachments: { c: { contentType: "x", data: original } } },
+            { doc: { _id: fileId, type: "file" }, attachments: { c: { contentType: "x", data: asEnvelope(original) } } },
         ]);
 
         // Inner storage: the file: id should be HMAC-suffixed, plain id not directly there.
@@ -91,32 +95,34 @@ describe("EncryptingCouchClient v2 attachment encryption", () => {
 
         // Decorator-facing fetch resolves the plain id and decrypts.
         const back = await client.getAttachment(fileId, "c");
-        expect(back).toEqual(original);
+        expect(fromEnvelope(back!)).toEqual(original);
     });
 
     it("chunk: id passes through (content-addressed, not HMAC-translated)", async () => {
         const inner = new FakeCouchClient();
         const client = new EncryptingCouchClient(inner, crypto1);
 
-        // The chunk ID for v2 is hash(plainBytes) computed by chunker —
-        // already content-addressed, the decorator does not translate it.
-        const chunkId = "chunk:abc1234567890def";
+        // The chunk ID for v2 is `chunk:<alg>:<hash>` and the decorator
+        // does not translate it (content-addressed, not path-based).
+        const chunkId = "chunk:x64:abc1234567890def";
         await client.bulkDocsWithAttachments([
-            { doc: { _id: chunkId }, attachments: { c: { contentType: "x", data: bytes("payload") } } },
+            { doc: { _id: chunkId }, attachments: { c: { contentType: "x", data: asEnvelope(bytes("payload")) } } },
         ]);
 
         const stored = (inner as any).docs.get(chunkId);
         expect(stored).toBeTruthy();
-        expect(await client.getAttachment(chunkId, "c")).toEqual(bytes("payload"));
+        const back = await client.getAttachment(chunkId, "c");
+        expect(fromEnvelope(back!)).toEqual(bytes("payload"));
     });
 
     it("empty attachment round-trips", async () => {
         const inner = new FakeCouchClient();
         const client = new EncryptingCouchClient(inner, crypto1);
         await client.bulkDocsWithAttachments([
-            { doc: { _id: "chunk:zero" }, attachments: { c: { contentType: "x", data: new Uint8Array(0) } } },
+            { doc: { _id: "chunk:zero" }, attachments: { c: { contentType: "x", data: asEnvelope(new Uint8Array(0)) } } },
         ]);
-        expect(await client.getAttachment("chunk:zero", "c")).toEqual(new Uint8Array(0));
+        const back = await client.getAttachment("chunk:zero", "c");
+        expect(fromEnvelope(back!)).toEqual(new Uint8Array(0));
     });
 
     it("each push generates a fresh IV (same plaintext → different ciphertext)", async () => {
@@ -127,10 +133,10 @@ describe("EncryptingCouchClient v2 attachment encryption", () => {
 
         const payload = bytes("repeat me");
         await c1.bulkDocsWithAttachments([
-            { doc: { _id: "chunk:repeat" }, attachments: { c: { contentType: "x", data: payload } } },
+            { doc: { _id: "chunk:repeat" }, attachments: { c: { contentType: "x", data: asEnvelope(payload) } } },
         ]);
         await c2.bulkDocsWithAttachments([
-            { doc: { _id: "chunk:repeat" }, attachments: { c: { contentType: "x", data: payload } } },
+            { doc: { _id: "chunk:repeat" }, attachments: { c: { contentType: "x", data: asEnvelope(payload) } } },
         ]);
 
         const raw1 = await inner1.getAttachment("chunk:repeat", "c");
@@ -139,22 +145,24 @@ describe("EncryptingCouchClient v2 attachment encryption", () => {
     });
 });
 
-describe("CryptoProvider encryptBytes / decryptBytes", () => {
+describe("CryptoProvider encryptBytesIv / decryptBytesIv", () => {
     it("round-trips arbitrary binary payloads", async () => {
         const payload = new Uint8Array(256);
         for (let i = 0; i < 256; i++) payload[i] = i;
-        const blob = await crypto1.encryptBytes(payload);
-        const back = await crypto1.decryptBytes(blob);
+        const { iv, cipher } = await crypto1.encryptBytesIv(payload);
+        const back = await crypto1.decryptBytesIv(iv, cipher);
         expect(back).toEqual(payload);
     });
 
-    it("blob = IV(12) || cipher; minimum length is IV_BYTES + tag (16)", async () => {
-        const blob = await crypto1.encryptBytes(new Uint8Array(0));
-        expect(blob.length).toBeGreaterThanOrEqual(12 + 16);
+    it("IV is exactly 12 bytes; cipher carries the GCM auth tag (+16 over plain)", async () => {
+        const { iv, cipher } = await crypto1.encryptBytesIv(new Uint8Array(0));
+        expect(iv.length).toBe(12);
+        expect(cipher.length).toBe(16); // empty plaintext + 16B tag
     });
 
-    it("decryptBytes rejects truncated input", async () => {
-        const tooShort = new Uint8Array(5);
-        await expect(crypto1.decryptBytes(tooShort)).rejects.toThrow(/shorter than IV/);
+    it("decryptBytesIv rejects an IV of the wrong length", async () => {
+        const { cipher } = await crypto1.encryptBytesIv(bytes("payload"));
+        const badIv = new Uint8Array(5);
+        await expect(crypto1.decryptBytesIv(badIv, cipher)).rejects.toThrow(/IV must be/);
     });
 });

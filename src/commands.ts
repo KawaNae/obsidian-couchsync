@@ -3,9 +3,10 @@ import { ProgressNotice } from "./ui/notices.ts";
 import { ConsistencyReportModal } from "./ui/consistency-report-modal.ts";
 import { ChunkConsistencyReportModal } from "./ui/chunk-consistency-report-modal.ts";
 import { totalDiscrepancies } from "./sync/reconciler.ts";
-import { logWarn, notify } from "./ui/log.ts";
+import { logError, logWarn, notify } from "./ui/log.ts";
 import { analyzeChunkConsistency } from "./sync/chunk-consistency.ts";
 import { planFromReport, repairChunkDrift } from "./sync/chunk-repair.ts";
+import { gcOrphanConfigChunks } from "./db/chunk-gc.ts";
 
 /**
  * Register all Command-Palette commands on the plugin.
@@ -58,6 +59,30 @@ export function registerCommands(plugin: CouchSyncPlugin): void {
         id: "couchsync-chunk-consistency-report",
         name: "Chunk consistency report (local ↔ remote)",
         callback: () => runChunkConsistencyReport(plugin),
+    });
+
+    plugin.addCommand({
+        id: "couchsync-config-chunk-gc",
+        name: "Config: garbage-collect orphan chunks",
+        callback: async () => {
+            if (!plugin.configLocalDb) {
+                notify("CouchSync: Config DB is not configured.", 5000);
+                return;
+            }
+            const progress = new ProgressNotice("Config GC");
+            try {
+                progress.update("Sweeping orphan chunks...");
+                const result = await gcOrphanConfigChunks(plugin.configLocalDb);
+                progress.done(
+                    `Config GC: scanned ${result.scannedChunks}, ` +
+                    `referenced ${result.referencedChunks}, ` +
+                    `deleted ${result.deletedChunks} orphan(s).`,
+                );
+            } catch (e: any) {
+                logError(`Config GC failed: ${e?.message ?? e}`);
+                progress.fail(`Config GC failed: ${e?.message ?? e}`);
+            }
+        },
     });
 
     plugin.addCommand({

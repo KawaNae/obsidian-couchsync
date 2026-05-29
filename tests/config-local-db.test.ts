@@ -6,7 +6,8 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import "fake-indexeddb/auto";
 import { ConfigLocalDB } from "../src/db/config-local-db.ts";
 import type { ConfigDoc, CouchSyncDoc } from "../src/types.ts";
-import { makeConfigId, makeFileId } from "../src/types/doc-id.ts";
+import { CONFIG_SCHEMA_VERSION } from "../src/types.ts";
+import { makeConfigId, makeFileId, makeChunkId } from "../src/types/doc-id.ts";
 
 function uniqueName(prefix: string) {
     return `${prefix}-${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
@@ -16,7 +17,8 @@ function makeConfig(path: string, vclock: Record<string, number> = { test: 1 }):
     return {
         _id: makeConfigId(path),
         type: "config",
-        data: "ZGF0YQ==", // "data" base64
+        schemaVersion: CONFIG_SCHEMA_VERSION,
+        chunks: [makeChunkId("0000000000000000")],
         mtime: 1000,
         size: 4,
         vclock,

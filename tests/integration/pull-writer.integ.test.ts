@@ -24,6 +24,7 @@ import type { WriteResult } from "../../src/sync/vault-writer.ts";
 import { makeFileId, makeChunkId } from "../../src/types/doc-id.ts";
 import type { ChangesResult } from "../../src/db/interfaces.ts";
 import type { FileDoc, CouchSyncDoc } from "../../src/types.ts";
+import { FILE_SCHEMA_VERSION } from "../../src/types.ts";
 import * as log from "../../src/ui/log.ts";
 
 interface WriterRig {
@@ -75,6 +76,7 @@ async function seedLocalFileDoc(
     const doc: FileDoc = {
         _id: makeFileId(path),
         type: "file",
+        schemaVersion: FILE_SCHEMA_VERSION,
         chunks,
         vclock,
         mtime: 1,
@@ -93,6 +95,7 @@ function makeRemoteFileDoc(
     return {
         _id: makeFileId(path),
         type: "file",
+        schemaVersion: FILE_SCHEMA_VERSION,
         chunks: [],
         vclock,
         mtime: 2,
@@ -140,6 +143,26 @@ describe("PullWriter integration", () => {
             ));
 
             await expectDb(b.db).toHaveFileDoc("test.md").withVclock({ A: 2 });
+        });
+
+        it("schema gate: aborts on a FileDoc whose schemaVersion this build can't read", async () => {
+            h = createSyncHarness();
+            const b = h.addDevice("dev-B");
+            const rig = attachPullWriter({ device: b, withResolver: true });
+
+            const remote = makeRemoteFileDoc("future.md", { A: 1 }, {
+                schemaVersion: 3 as unknown as FileDoc["schemaVersion"],
+            });
+
+            await expect(
+                rig.writer.apply(makeChangesResult(
+                    [{ id: remote._id, seq: "1", doc: remote }], "1",
+                )),
+            ).rejects.toMatchObject({
+                name: "SchemaVersionMismatchError",
+                kind: "file",
+                nonRetriable: true,
+            });
         });
 
         it("keep-local: skips doc when local vclock dominates remote", async () => {
@@ -540,6 +563,7 @@ describe("PullWriter integration", () => {
             const tombstone: FileDoc = {
                 _id: makeFileId("gone.md"),
                 type: "file",
+                schemaVersion: FILE_SCHEMA_VERSION,
                 chunks: [],
                 vclock: { A: 1 },
                 mtime: 1,

@@ -5,16 +5,24 @@
  * ## Scheme
  *
  * ```
- * file:<vaultPath>      FileDoc    e.g. "file:notes/hello.md"
- * chunk:<xxhash64>      ChunkDoc   e.g. "chunk:a1b2c3d4..."
- * config:<vaultPath>    ConfigDoc  e.g. "config:.obsidian/appearance.json"
- * _local/<name>         CouchDB reserved (not replicated)
+ * file:<vaultPath>              FileDoc    e.g. "file:notes/hello.md"
+ * chunk:<alg>:<hash>            ChunkDoc   e.g. "chunk:x64:a1b2c3d4..."
+ * config:<vaultPath>            ConfigDoc  e.g. "config:.obsidian/appearance.json"
+ * _local/<name>                 CouchDB reserved (not replicated)
  * ```
  *
- * All three replicated prefixes are lexicographically disjoint, so
- * `allDocs({ startkey, endkey })` range queries over `ID_RANGE.<kind>` will
- * never accidentally overlap. See the `prefix disjointness` test block for
- * the exact orderings this module relies on.
+ * The chunk id carries an algorithm tag between the `chunk:` prefix and
+ * the hash payload. v0.25.0 ships with `x64` (xxhash64 / 16 hex chars).
+ * Adding a new hash function (e.g. blake3) introduces a new tag (`b3`,
+ * etc.) that coexists in the same namespace — old `chunk:x64:...` ids
+ * and new `chunk:b3:...` ids can live side-by-side, with the algorithm
+ * trivially derivable from the id alone (invariant 14).
+ *
+ * All three replicated prefixes (`file:`, `chunk:`, `config:`) are
+ * lexicographically disjoint, so `allDocs({ startkey, endkey })` range
+ * queries over `ID_RANGE.<kind>` will never accidentally overlap. See
+ * the `prefix disjointness` test block for the exact orderings this
+ * module relies on.
  *
  * ## Usage rule
  *
@@ -32,6 +40,21 @@ export const DOC_ID = {
 
 export type DocKind = "file" | "chunk" | "config";
 
+/** Hash algorithms allowed in chunk ids.
+ *  - `x64`: xxhash64 (16 hex chars) — plaintext vaults
+ *  - `hmac`: HMAC-SHA256 (64 hex chars) — encrypted vaults
+ *
+ *  Encrypted vaults swap to HMAC so the chunk id derived from plain
+ *  content cannot be linked across vaults by a server that knows the
+ *  public, keyless xxhash64. Both forms can coexist in one vault
+ *  (the tag in the id selects the verifier per chunk). */
+export type ChunkHashAlg = "x64" | "hmac";
+
+/** Default algorithm tag for new chunk ids — used when no hasher is
+ *  supplied (plaintext code paths and unit tests). Real chunker
+ *  callers pass an explicit hasher that carries its own algorithm. */
+export const DEFAULT_CHUNK_ALG: ChunkHashAlg = "x64";
+
 /**
  * Range query bounds per replicated kind. Use with `allDocs`:
  *
@@ -41,13 +64,28 @@ export type DocKind = "file" | "chunk" | "config";
  *     include_docs: true,
  *   })
  *
- * The `\ufff0` upper bound is the largest reasonably-matchable BMP codepoint
+ * The `￰` upper bound is the largest reasonably-matchable BMP codepoint
  * and ensures every `<prefix>:<anything>` entry is included.
+ *
+ * `chunk.x64` narrows the chunk range to a single hash algorithm —
+ * useful when phasing in a new algorithm and needing to enumerate just
+ * one cohort. `chunk.startkey/endkey` cover every algorithm.
  */
 export const ID_RANGE = {
-    file: { startkey: DOC_ID.FILE, endkey: DOC_ID.FILE + "\ufff0" },
-    chunk: { startkey: DOC_ID.CHUNK, endkey: DOC_ID.CHUNK + "\ufff0" },
-    config: { startkey: DOC_ID.CONFIG, endkey: DOC_ID.CONFIG + "\ufff0" },
+    file: { startkey: DOC_ID.FILE, endkey: DOC_ID.FILE + "￰" },
+    chunk: {
+        startkey: DOC_ID.CHUNK,
+        endkey: DOC_ID.CHUNK + "￰",
+        x64: {
+            startkey: DOC_ID.CHUNK + "x64:",
+            endkey: DOC_ID.CHUNK + "x64:￰",
+        },
+        hmac: {
+            startkey: DOC_ID.CHUNK + "hmac:",
+            endkey: DOC_ID.CHUNK + "hmac:￰",
+        },
+    },
+    config: { startkey: DOC_ID.CONFIG, endkey: DOC_ID.CONFIG + "￰" },
 } as const;
 
 // ── Generation ──────────────────────────────────────────────────────────
@@ -56,8 +94,15 @@ export function makeFileId(vaultPath: string): string {
     return DOC_ID.FILE + vaultPath;
 }
 
-export function makeChunkId(hash: string): string {
-    return DOC_ID.CHUNK + hash;
+/** Build a chunk id of the form `chunk:<alg>:<hash>`. The default
+ *  algorithm (`x64`) matches what `chunker.computeHash` produces; pass
+ *  another tag explicitly when minting ids for a different algorithm
+ *  during a rolling migration. */
+export function makeChunkId(
+    hash: string,
+    alg: ChunkHashAlg = DEFAULT_CHUNK_ALG,
+): string {
+    return DOC_ID.CHUNK + alg + ":" + hash;
 }
 
 export function makeConfigId(vaultPath: string): string {
@@ -97,11 +142,30 @@ export function filePathFromId(id: string): string {
     return id.slice(DOC_ID.FILE.length);
 }
 
-export function chunkHashFromId(id: string): string {
+/** Parse a chunk id into its algorithm tag and hash. Throws when the
+ *  id does not match the `chunk:<alg>:<hash>` shape — there is no
+ *  legacy-flat fallback (v0.25.0 mints every chunk with an explicit
+ *  algorithm tag). */
+export function parseChunkId(id: string): { alg: ChunkHashAlg; hash: string } {
     if (!isChunkDocId(id)) {
-        throw new Error(`chunkHashFromId: not a chunk doc id: ${id}`);
+        throw new Error(`parseChunkId: not a chunk doc id: ${id}`);
     }
-    return id.slice(DOC_ID.CHUNK.length);
+    const rest = id.slice(DOC_ID.CHUNK.length);
+    const colon = rest.indexOf(":");
+    if (colon < 0) {
+        throw new Error(`parseChunkId: missing algorithm tag in ${id}`);
+    }
+    const alg = rest.slice(0, colon);
+    const hash = rest.slice(colon + 1);
+    if (alg !== "x64" && alg !== "hmac") {
+        throw new Error(`parseChunkId: unknown algorithm '${alg}' in ${id}`);
+    }
+    return { alg, hash };
+}
+
+/** Returns just the hash payload (delegates to `parseChunkId`). */
+export function chunkHashFromId(id: string): string {
+    return parseChunkId(id).hash;
 }
 
 export function configPathFromId(id: string): string {
@@ -115,14 +179,17 @@ export function configPathFromId(id: string): string {
 
 export type ParsedDocId =
     | { kind: "file"; path: string }
-    | { kind: "chunk"; hash: string }
+    | { kind: "chunk"; alg: ChunkHashAlg; hash: string }
     | { kind: "config"; path: string }
     | { kind: "local"; name: string }
     | { kind: "unknown" };
 
 export function parseDocId(id: string): ParsedDocId {
     if (isConfigDocId(id)) return { kind: "config", path: configPathFromId(id) };
-    if (isChunkDocId(id)) return { kind: "chunk", hash: chunkHashFromId(id) };
+    if (isChunkDocId(id)) {
+        const { alg, hash } = parseChunkId(id);
+        return { kind: "chunk", alg, hash };
+    }
     if (isFileDocId(id)) return { kind: "file", path: filePathFromId(id) };
     if (id.startsWith("_local/")) {
         return { kind: "local", name: id.slice("_local/".length) };

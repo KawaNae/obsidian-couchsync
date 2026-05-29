@@ -84,9 +84,19 @@ function sleep(ms: number): Promise<void> {
 
 // ── Dexie database schema ───────────────────────────────
 
+/** Application-level content schema version stamped into the `_meta`
+ *  table on first open. This is independent of the Dexie DB-level
+ *  version (which tracks table-shape migrations) and tracks the shape
+ *  of the *content* persisted in `docs` / `meta`. Bump when a row
+ *  layout changes in a way that requires a one-shot migration of
+ *  existing data. v0.25.0 ships with version 1 — the first public
+ *  format. */
+export const DEXIE_STORE_SCHEMA_VERSION = 1 as const;
+
 export class SyncDB extends Dexie {
     docs!: Table<StoredDoc, string>;
     meta!: Table<LocalMeta, string>;
+    _meta!: Table<LocalMeta, string>;
 
     constructor(name: string) {
         super(name);
@@ -97,6 +107,16 @@ export class SyncDB extends Dexie {
         this.version(2).stores({
             docs: "_id, type, _localSeq",
             meta: "key",
+        });
+        // v3: add a dedicated `_meta` table for application-level schema
+        // versioning (and any future cross-cutting bookkeeping). Kept
+        // separate from `meta` so the `_local/*`-style domain keys in
+        // `meta` are not confused with format-versioning rows — see
+        // invariant 15.
+        this.version(3).stores({
+            docs: "_id, type, _localSeq",
+            meta: "key",
+            _meta: "&key",
         });
     }
 }
@@ -142,6 +162,34 @@ export class DexieStore<T extends { _id: string; _rev?: string } = any>
     /** Expose the underlying Dexie instance (for migration, testing). */
     getDexie(): SyncDB {
         return this.db;
+    }
+
+    /**
+     * Stamp the application-level schema version on first open, or
+     * verify the stored value matches the build's expected version on
+     * subsequent opens. Throws on mismatch — callers (LocalDB,
+     * ConfigLocalDB) treat that as a build/data desync that requires
+     * explicit migration, not silent advance.
+     *
+     * Idempotent: safe to call on every open. Implementations should
+     * call this from their `open()` / `ensureHealthy()` path so the
+     * invariant 15 check fires before any content read.
+     */
+    async ensureSchemaVersion(
+        expected: number = DEXIE_STORE_SCHEMA_VERSION,
+    ): Promise<void> {
+        const existing = await this.db._meta.get("schemaVersion");
+        if (existing === undefined) {
+            await this.db._meta.put({ key: "schemaVersion", value: expected });
+            return;
+        }
+        if (existing.value !== expected) {
+            throw new DbError(
+                "degraded",
+                null,
+                `DexieStore schema version mismatch (stored=${existing.value}, expected=${expected}) — manual migration required`,
+            );
+        }
     }
 
     // ── Core: single-tx + single-seq + retry/normalise ──

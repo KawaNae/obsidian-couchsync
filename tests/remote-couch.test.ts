@@ -138,6 +138,10 @@ function createRemoteStub(): ICouchClient & { _docs: Map<string, any>, _destroye
         },
         changes: async () => ({ results: [], last_seq: 0 }),
         changesLongpoll: async () => ({ results: [], last_seq: 0 }),
+        // Attachments are not stored by this stub; mirror CouchDB's 404 on
+        // a missing attachment by returning null. Tests that need a present
+        // attachment override this per-instance.
+        getAttachment: async () => null,
         destroy: async function (this: any) { this._destroyed = true; _docs.clear(); },
     };
 }
@@ -365,6 +369,28 @@ describe("remote-couch (IDocStore + ICouchClient)", () => {
             expect(result.written).toBe(2);
             expect(result.docs.length).toBe(2);
             expect(seen.length).toBe(2);
+        });
+
+        it("does NOT fabricate an empty chunk when its attachment is missing on remote", async () => {
+            // Regression: a missing attachment used to be written as an
+            // empty Uint8Array under the real content-addressed id, which
+            // passed every id-based consistency gate and silently truncated
+            // the file. pullAll must instead skip the chunk so a later
+            // assemble fails loud / routes to repair.
+            const file = { ...makeFileDoc("a.md", "1"), _rev: "1-r" };
+            const chunkId = makeChunkId("missing-attachment");
+            remote._docs.set(file._id, file);
+            remote._docs.set(chunkId, { _id: chunkId, type: "chunk", schemaVersion: 2, _rev: "1-r" });
+            // getAttachment returns null (stub default) → attachment missing.
+
+            const result = await pullAll(local, remote);
+
+            // The chunk is NOT persisted at all (neither empty nor present).
+            expect(local._docs.has(chunkId)).toBe(false);
+            // The file doc still lands.
+            expect(local._docs.has(file._id)).toBe(true);
+            // Returned docs exclude the dropped chunk.
+            expect(result.docs.some((d) => d._id === chunkId)).toBe(false);
         });
     });
 });
