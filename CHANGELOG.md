@@ -2,6 +2,50 @@
 
 All notable changes to obsidian-couchsync.
 
+## 0.25.3
+
+Hardens the data layer against the failure modes seen in the v0.25.0–0.25.2
+migration logs, established as three architectural invariants rather than
+point patches. All were reproduced on a real device before fixing, and the
+e2e suite was overhauled to drive the real sync pipeline so these paths are
+guarded going forward.
+
+### Fixed
+
+- **A chunk present but without content no longer crashes reconcile.** A
+  content-less chunk doc used to slip past the "missing chunk" guard and blow
+  up chunk reassembly with an opaque `cannot read 'length' of undefined`,
+  failing every file in a reconcile pass. A chunk is now treated as available
+  only when it has real content; an incomplete one is re-fetched, or surfaces
+  the same clean "Missing N chunk(s)" error as an absent one (vault + config).
+- **Broken files no longer ping-pong forever.** A file whose chunks are gone
+  on both this device and the server (e.g. a synced log file whose chunks were
+  GC'd mid-migration) used to be retried every reconcile — spamming errors and
+  fighting chunk-repair. It is now **quarantined**: retry is suppressed and the
+  file is surfaced once, with no data loss (another device may still hold the
+  chunk), and it **recovers automatically** if the chunk reappears.
+- **An interrupted Clone can no longer bring up a broken sync session.** A
+  Clone that failed mid-way (e.g. a dropped connection) left the codec stack
+  half-built — compression on, encryption off — and a reconnect would open a
+  session on it, failing every chunk fetch with "cannot decompress
+  still-encrypted body". A vault sync session now starts only when the vault is
+  fully provisioned, and the client refuses to build an encrypt-less stack for
+  an encrypted vault.
+- **Quieter, safer shutdown.** Reconcile work no longer runs against a
+  closing database during unload (no more `DatabaseClosedError` noise), and
+  that error class is now correctly recognized.
+
+### Added
+
+- **Startup version banner in the log.** Every session's log now opens with
+  `CouchSync v<version> starting — built <time>, commit <hash>`, so a log
+  attached to a report self-identifies the exact build.
+
+Internal: e2e tests now drive the real push/pull pipeline (attachments, codec,
+catchup/longpoll, Init/Clone) against real CouchDB instead of hand-rolled
+requests; added Init/Clone and at-rest encrypt+gzip verification, a
+broken-file quarantine regression, and a `npm run bench` codec benchmark.
+
 ## 0.25.2
 
 Makes the maintenance/diagnostic tooling work on **encrypted** vaults. The

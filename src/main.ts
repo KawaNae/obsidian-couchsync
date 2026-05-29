@@ -14,7 +14,7 @@ import { Reconciler, type ReconcileReason } from "./sync/reconciler.ts";
 import { ConflictOrchestrator } from "./conflict/conflict-orchestrator.ts";
 import { checkInstallMarker } from "./sync/install-marker.ts";
 import { StatusBar } from "./ui/status-bar.ts";
-import { initLog, logError, logWarn, notify } from "./ui/log.ts";
+import { initLog, logInfo, logError, logWarn, notify } from "./ui/log.ts";
 import { CouchSyncSettingTab } from "./settings-tab/index.ts";
 import { ProgressNotice } from "./ui/notices.ts";
 import { HistoryStorage } from "./history/storage.ts";
@@ -467,6 +467,16 @@ export default class CouchSyncPlugin extends Plugin {
             this.historyCapture.start();
             this.historyManager.startCleanup();
             this.logManager.start();
+            // Startup declaration — first persisted line of every session's log.
+            // Pins exactly which build is running (version, build time, commit)
+            // so a field report's log self-identifies. Logged right after
+            // logManager.start() so it lands in the persistent buffer. typeof
+            // guards keep it safe in the test runtime (build-time defines absent).
+            {
+                const built = typeof __BUILD_TIME__ !== "undefined" ? __BUILD_TIME__ : "unknown";
+                const commit = typeof __COMMIT_HASH__ !== "undefined" ? __COMMIT_HASH__ : "unknown";
+                logInfo(`CouchSync v${this.manifest.version} starting — built ${built}, commit ${commit}`);
+            }
             this.compositionTracker.start();
             this.compositionGate.start();
 

@@ -4,8 +4,25 @@ import process from "process";
 import builtins from "builtin-modules";
 import fs from "node:fs";
 import path from "node:path";
+import { execSync } from "node:child_process";
 
 const prod = process.argv[2] === "production";
+
+// Short commit hash at build time (with `+dirty` for uncommitted work) so the
+// running plugin can declare exactly which build it is. "unknown" off-git.
+const commitHash = (() => {
+    try {
+        const sha = execSync("git rev-parse --short HEAD", { stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
+        let dirty = "";
+        try {
+            const status = execSync("git status --porcelain", { stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
+            if (status) dirty = "+dirty";
+        } catch { /* ignore */ }
+        return sha + dirty;
+    } catch {
+        return "unknown";
+    }
+})();
 
 const pad2 = (v) => String(v).padStart(2, "0");
 const formatBuildTime = (d) => {
@@ -53,6 +70,7 @@ const context = await esbuild.context({
         MANIFEST_VERSION: `"${manifestJson.version}"`,
         PACKAGE_VERSION: `"${packageJson.version}"`,
         __BUILD_TIME__: JSON.stringify(buildTime),
+        __COMMIT_HASH__: JSON.stringify(commitHash),
         global: "window",
     },
     external: [
