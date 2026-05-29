@@ -2,6 +2,41 @@
 
 All notable changes to obsidian-couchsync.
 
+## 0.25.2
+
+Makes the maintenance/diagnostic tooling work on **encrypted** vaults. The
+chunk-consistency report and chunk-repair were written against the pre-v2,
+pre-encryption data model (raw client, chunk content in the doc body,
+plaintext ids) and were never updated for data-layer-v2.
+
+### Fixed
+
+- **Chunk consistency report was permanently stuck on encrypted vaults.**
+  It talked to the remote with a raw (non-decrypting) client, so remote
+  file-doc ids (`file:<hmac>`) never matched local plaintext ids and the
+  convergence gate always reported "not converged" — the report and its
+  repair never ran. It now uses the codec (encryption/compression) data
+  client, so remote docs are seen with their restored plaintext ids.
+- **Chunk-repair could corrupt an encrypted vault or pull empty chunks.**
+  Via the raw client, repair-push wrote *plaintext* chunk bodies into an
+  encrypted vault, and repair-pull fetched only doc bodies — which in v2
+  carry no chunk content (it rides in the `c` attachment). Repair now runs
+  through the codec client (push encrypts, ids translate) and reconstructs
+  pulled chunk content from attachments, reusing the same primitive as
+  clone/live-pull.
+- **Remote enumeration could mis-page on large encrypted vaults.** The
+  report's bespoke pager continued on the decrypted (plaintext) `row.id`;
+  under encryption the remote is ordered by the `file:<hmac>` storage key,
+  so paging jumped to the wrong place after the first batch. It now reuses
+  the canonical `paginateAllDocs` helper, which continues on the raw
+  `row.key`.
+
+Internal: `VaultRemoteOps` now exposes `makeDataClient()` (codec-wrapped)
+for data-plane diagnostics/maintenance; `makeClient()` is documented as
+raw/admin-only (db create/destroy, connection test, `vault:meta`). Other
+maintenance commands (verify-and-repair, chunk GC, log export, DB reset)
+were audited and were already encryption-safe.
+
 ## 0.25.1
 
 Fixes two issues surfaced during v0.24.2 → v0.25.0 migration, each by
