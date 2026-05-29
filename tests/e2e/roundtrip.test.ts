@@ -12,6 +12,12 @@
 import "fake-indexeddb/auto";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { createE2EHarness, waitFor, bytesEqual, type E2EHarness } from "./couch-harness.ts";
+import { makeFileId } from "../../src/types/doc-id.ts";
+import type { FileDoc } from "../../src/types.ts";
+
+// Envelope flag bits (src/db/envelope.ts, byte 0 of every attachment body).
+const FLAG_ENCRYPTED = 0x01;
+const FLAG_COMPRESSED = 0x02;
 
 describe("E2E: roundtrip (real engine + real CouchDB)", () => {
     let h: E2EHarness;
@@ -101,5 +107,47 @@ describe("E2E: roundtrip over the encrypted + compressed codec stack", () => {
         );
         expect(b.vault.readText("secret.md")).toBe("encrypted hello");
         expect(new Uint8Array(await b.vault.readBinary("secret.bin"))).toEqual(bytes);
+    });
+
+    it("at-rest: the chunk really is encrypted + gzipped on the server", async () => {
+        const a = h.addDevice("dev-A");
+
+        // A distinctive plaintext marker we can search for in the raw bytes.
+        const marker = "PLAINTEXT-MARKER-should-never-appear-on-the-wire";
+        a.vault.addFile("atrest.md", marker.repeat(20));
+        await a.vs.fileToDb("atrest.md");
+
+        const fileDoc = (await a.db.get(makeFileId("atrest.md"))) as FileDoc;
+        const chunkId = fileDoc.chunks[0];
+        // Under encryption the chunk id is content-HMAC, not the x64 hash.
+        expect(chunkId.startsWith("chunk:hmac:")).toBe(true);
+
+        await a.engine.start();
+
+        // Wait until the chunk attachment lands on the server, then inspect the
+        // RAW bytes via the admin client (no codec decorators) — this is what
+        // is physically at rest in CouchDB.
+        let raw: Uint8Array | null = null;
+        await waitFor(
+            async () => {
+                raw = await h.adminClient.getAttachment(chunkId, "c");
+                return raw != null;
+            },
+            { label: "chunk attachment lands on server" },
+        );
+        const bytes = raw!;
+
+        // Envelope header byte advertises BOTH transforms.
+        expect((bytes[0] & FLAG_ENCRYPTED) !== 0).toBe(true);
+        expect((bytes[0] & FLAG_COMPRESSED) !== 0).toBe(true);
+
+        // The plaintext marker must NOT survive anywhere in the stored bytes
+        // (proves encryption is genuinely applied, not a no-op).
+        const asLatin1 = Array.from(bytes, (b) => String.fromCharCode(b)).join("");
+        expect(asLatin1.includes(marker)).toBe(false);
+
+        // And the stored body is smaller than the repetitive plaintext (proves
+        // gzip actually compressed the highly-repetitive content).
+        expect(bytes.byteLength).toBeLessThan(marker.length * 20);
     });
 });
