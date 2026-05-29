@@ -2,6 +2,42 @@
 
 All notable changes to obsidian-couchsync.
 
+## 0.25.1
+
+Fixes two issues surfaced during v0.24.2 → v0.25.0 migration, each by
+re-establishing an invariant that the data-layer-v2 rewrite left implicit.
+
+### Fixed
+
+- **Pull-side "Missing N chunk(s)" / permanent ghost files (esp. exported
+  logs).** The v2 push split file docs and chunk attachments into two
+  parallel `bulkDocs` requests, so a file doc could become visible on the
+  remote `_changes` feed before its chunks were durable — a peer then
+  pulled the file, found chunks missing, and (because the pull checkpoint
+  had already advanced) never retried, leaving the file silently absent.
+  Large, write-once files like exported logs were the most exposed.
+  - *Push order contract:* `pushDocs` now uses an ordered two-phase
+    transport — chunks are committed first, then only the files whose
+    chunks all landed; a file referencing a chunk that failed to push is
+    withheld and retried.
+  - *Pull durability:* a missing-chunk apply failure no longer advances
+    the checkpoint past the file unrecorded. The file is recorded in a
+    persistent pending-apply set (mirror of the push-side unpushed set)
+    and re-applied every pull cycle — including on the idle longpoll —
+    until its chunks become durable.
+
+- **Live Sync could be started after a failed Init/Clone, against a
+  half-built database.** Init/Clone destroy the local DB at the start but
+  only advanced state to `setupDone` on success, so a failure during a
+  re-run left the prior `setupDone`/`syncing` state — and an enabled Live
+  Sync toggle. Setup is now atomic: it drops to a non-syncable
+  `settingUp` state (persisted before the destructive step) and only
+  reaches `setupDone` on confirmed success; a failure keeps Init/Clone
+  available to retry but Live Sync disabled. Clone's encryption and
+  compression settings are now committed only on success (compression
+  runs from an in-memory override during the clone), so a failed clone
+  leaves persisted settings untouched.
+
 ## 0.25.0 — data-layer-v2
 
 Comprehensive rewrite of the data layer: chunk content moves into
