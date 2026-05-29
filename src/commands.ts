@@ -121,7 +121,13 @@ export async function runChunkConsistencyReport(
 ): Promise<void> {
     const progress = new ProgressNotice("Chunk consistency");
     try {
-        const remote = plugin.remoteOps.makeClient();
+        // Data-plane client: codec (encryption/compression) decorators
+        // applied. On an encrypted vault this is mandatory — the raw client
+        // would surface `file:<hmac>` ids (never matching local plaintext
+        // ids → permanent needs-convergence) and would push plaintext
+        // chunk bodies during repair (vault corruption). Both analyze and
+        // repairChunkDrift below share this client.
+        const remote = plugin.remoteOps.makeDataClient();
         const analyze = () =>
             analyzeChunkConsistency({
                 localDb: plugin.localDb,

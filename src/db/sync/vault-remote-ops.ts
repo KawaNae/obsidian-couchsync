@@ -43,7 +43,7 @@ export class VaultRemoteOps {
 
     /** One-shot push of the entire vault local DB to the vault remote. */
     async pushAll(onProgress?: ProgressCallback): Promise<number> {
-        return remoteCouch.pushAll(this.localDb, this.makeWrappedClient(), onProgress);
+        return remoteCouch.pushAll(this.localDb, this.makeDataClient(), onProgress);
     }
 
     /** One-shot pull of the entire vault remote → local. Returns the
@@ -51,7 +51,7 @@ export class VaultRemoteOps {
     async pullAll(
         onProgress?: ProgressCallback,
     ): Promise<number> {
-        return remoteCouch.pullAll(this.localDb, this.makeWrappedClient(), onProgress);
+        return remoteCouch.pullAll(this.localDb, this.makeDataClient(), onProgress);
     }
 
     /** Destroy the vault remote database (auto-recreated on next push). */
@@ -92,10 +92,19 @@ export class VaultRemoteOps {
     }
 
     /**
-     * Construct a fresh CouchClient from saved settings. Public so that
-     * other one-shot callers (diagnostic commands, maintenance tooling)
-     * can reuse the exact same factory — settings, auth, URL encoding
-     * all live here in one place.
+     * Construct a fresh RAW CouchClient from saved settings — NO codec
+     * (encryption/compression) decorators.
+     *
+     * Use ONLY for meta/admin operations that must bypass the codec:
+     * database create/destroy, connection test, and `vault:meta` (which
+     * deliberately stays plaintext because it holds the crypto salt /
+     * keyCheck read by a key-less client).
+     *
+     * For any file/chunk/config DATA operation (diagnostics, maintenance,
+     * repair) use {@link makeDataClient} instead — on an encrypted vault
+     * the raw client sees `file:<hmac>` ids and ciphertext attachments, so
+     * comparing against local plaintext ids or pushing local bodies
+     * corrupts the vault.
      */
     makeClient(): CouchClient {
         const s = this.getSettings();
@@ -104,7 +113,16 @@ export class VaultRemoteOps {
         );
     }
 
-    private makeWrappedClient(): ICouchClient {
+    /**
+     * Construct a fresh data-plane client: the raw client wrapped in the
+     * same codec (encryption + compression) decorator stack the live sync
+     * loop uses. Presents a plaintext view of the remote — path-encrypted
+     * ids are restored, chunk attachments are decrypted on read and
+     * encrypted on write. This is the correct client for every file/chunk
+     * diagnostic, repair, and bulk data operation. Transparent (== raw)
+     * when the vault is unencrypted and uncompressed.
+     */
+    makeDataClient(): ICouchClient {
         return this.wrapClient(this.makeClient());
     }
 }

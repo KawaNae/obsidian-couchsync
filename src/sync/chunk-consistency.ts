@@ -17,9 +17,10 @@
  */
 
 import type { LocalDB } from "../db/local-db.ts";
-import type { ICouchClient, AllDocsRow } from "../db/interfaces.ts";
+import type { ICouchClient } from "../db/interfaces.ts";
 import type { FileDoc } from "../types.ts";
 import { ID_RANGE } from "../types/doc-id.ts";
+import { paginateAllDocs } from "../db/sync/pagination.ts";
 import { collectFileChunkRefs } from "../db/chunk-refs.ts";
 import { compareVC, type VCRelation, type VectorClock } from "./vector-clock.ts";
 
@@ -136,7 +137,7 @@ export async function analyzeChunkConsistency(
 
     const remoteFiles: FileDoc[] = [];
     onProgress?.("scan-remote-files", 0);
-    for await (const fd of pagedRemoteFileDocs(remote, pageSize, throwIfAborted)) {
+    for await (const fd of pagedRemoteFileDocs(remote, pageSize, signal)) {
         remoteFiles.push(fd);
         onProgress?.("scan-remote-files", remoteFiles.length);
     }
@@ -162,7 +163,7 @@ export async function analyzeChunkConsistency(
     // ── Phase 2 + 3: sort-merge chunk ids ───────────────────────────
 
     const localIter = pagedLocalChunkIds(localDb, pageSize, throwIfAborted);
-    const remoteIter = pagedRemoteChunkIds(remote, pageSize, throwIfAborted);
+    const remoteIter = pagedRemoteChunkIds(remote, pageSize, signal);
 
     const localOnly: string[] = [];
     const remoteOnly: string[] = [];
@@ -324,29 +325,29 @@ export function hasDivergence(d: FileDocDivergence): boolean {
 async function* pagedRemoteFileDocs(
     remote: ICouchClient,
     pageSize: number,
-    throwIfAborted: () => void,
+    signal?: AbortSignal,
 ): AsyncGenerator<FileDoc> {
-    let startkey = ID_RANGE.file.startkey;
-    const endkey = ID_RANGE.file.endkey;
-    // eslint-disable-next-line no-constant-condition
-    while (true) {
-        throwIfAborted();
-        const page = await remote.allDocs<FileDoc>({
-            startkey,
-            endkey,
+    // Delegate paging to the canonical keyset helper, which continues on
+    // the raw storage `row.key`. This is the load-bearing detail under
+    // encryption: the codec client restores `row.id` to the plaintext
+    // path while leaving `row.key` as the on-disk `file:<hmac>` id, so
+    // paging stays correct in the remote's actual (hmac) ordering. A
+    // hand-rolled `startkey = row.id` loop would jump into the plaintext
+    // keyspace and mis-page after the first batch.
+    for await (const rows of paginateAllDocs<FileDoc>(
+        remote,
+        {
+            startkey: ID_RANGE.file.startkey,
+            endkey: ID_RANGE.file.endkey,
             include_docs: true,
-            limit: pageSize,
-        });
-        if (page.rows.length === 0) return;
-        let lastId = "";
-        for (const row of page.rows) {
-            lastId = row.id;
+        },
+        { batchSize: pageSize, signal },
+    )) {
+        for (const row of rows) {
             const doc = row.doc;
-            if (!doc || (doc as any).type !== "file") continue;
+            if (!doc || (doc as { type?: string }).type !== "file") continue;
             yield doc;
         }
-        if (page.rows.length < pageSize) return;
-        startkey = lastId + "\x00";
     }
 }
 
@@ -371,31 +372,26 @@ async function* pagedLocalChunkIds(
 async function* pagedRemoteChunkIds(
     remote: ICouchClient,
     pageSize: number,
-    throwIfAborted: () => void,
+    signal?: AbortSignal,
 ): AsyncGenerator<string> {
-    let startkey = ID_RANGE.chunk.startkey;
-    const endkey = ID_RANGE.chunk.endkey;
-    // eslint-disable-next-line no-constant-condition
-    while (true) {
-        throwIfAborted();
-        const page = await remote.allDocs<unknown>({
-            startkey,
-            endkey,
-            // include_docs stays false: CouchDB returns only id/key/rev,
-            // a few hundred bytes per row even at 50k chunks.
-            limit: pageSize,
-        });
-        if (page.rows.length === 0) return;
-        let lastId = "";
-        for (const row of page.rows as AllDocsRow<unknown>[]) {
-            // Filter out tombstones (deleted docs surface as rows with
-            // value.deleted=true in CouchDB). Their id still contributes
-            // to paging order so we advance startkey either way.
-            lastId = row.id;
+    // Chunk ids (`chunk:<alg>:<hash>`) are NOT path-encrypted, so they are
+    // identical on local and remote and the codec client passes them
+    // through untouched — no `include_docs` needed (id/key/rev only). Uses
+    // the same canonical keyset paging (continues on `row.key`).
+    for await (const rows of paginateAllDocs<unknown>(
+        remote,
+        {
+            startkey: ID_RANGE.chunk.startkey,
+            endkey: ID_RANGE.chunk.endkey,
+            include_docs: false,
+        },
+        { batchSize: pageSize, signal },
+    )) {
+        for (const row of rows) {
+            // Filter out tombstones (deleted docs surface with
+            // value.deleted=true); they still anchor paging via row.key.
             if (row.value?.deleted) continue;
             yield row.id;
         }
-        if (page.rows.length < pageSize) return;
-        startkey = lastId + "\x00";
     }
 }

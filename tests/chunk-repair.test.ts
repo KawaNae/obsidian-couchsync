@@ -22,6 +22,15 @@ import {
 import type { ChunkConsistencyReport } from "../src/sync/chunk-consistency.ts";
 import type { ChunkDoc, CouchSyncDoc } from "../src/types.ts";
 import { makeChunkId } from "../src/types/doc-id.ts";
+import { buildChunkAttachment } from "../src/db/chunk-attachment.ts";
+
+/** Seed a chunk on the remote the way production does — content in the
+ *  `c` attachment, not the doc body. Repair-pull reconstructs content
+ *  from this attachment (v2), so a body-only seed would pull an empty
+ *  chunk. */
+async function seedRemoteChunk(remote: FakeCouchClient, chunk: ChunkDoc): Promise<void> {
+    await remote.bulkDocsWithAttachments([buildChunkAttachment(chunk)]);
+}
 
 function emptyReport(overrides: Partial<ChunkConsistencyReport> = {}): ChunkConsistencyReport {
     return {
@@ -141,7 +150,7 @@ describe("repairChunkDrift", () => {
 
     it("pulls referenced remoteOnly → local", async () => {
         const chunk = makeChunk("pull");
-        await remote.bulkDocs([chunk]);
+        await seedRemoteChunk(remote, chunk);
 
         const result = await repairChunkDrift(
             { toPush: [], toPull: [chunk._id], toDeleteLocal: [], toDeleteRemote: [] },
@@ -166,7 +175,7 @@ describe("repairChunkDrift", () => {
 
     it("tombstones unreferenced remoteOnly chunks on remote", async () => {
         const chunk = makeChunk("orphan-remote");
-        await remote.bulkDocs([chunk]);
+        await seedRemoteChunk(remote, chunk);
 
         const result = await repairChunkDrift(
             { toPush: [], toPull: [], toDeleteLocal: [], toDeleteRemote: [chunk._id] },
@@ -190,7 +199,7 @@ describe("repairChunkDrift", () => {
         const delR = makeChunk("q-del-remote");
         await putLocal(db, pushC);
         await putLocal(db, delL);
-        await remote.bulkDocs([pullC]);
+        await seedRemoteChunk(remote, pullC);
         await remote.bulkDocs([delR]);
 
         const result = await repairChunkDrift(
@@ -234,7 +243,7 @@ describe("repairChunkDrift", () => {
         const delR = makeChunk("p-del-remote");
         await putLocal(db, pushC);
         await putLocal(db, delL);
-        await remote.bulkDocs([pullC]);
+        await seedRemoteChunk(remote, pullC);
         await remote.bulkDocs([delR]);
 
         const phases = new Set<string>();
@@ -260,7 +269,7 @@ describe("repairChunkDrift", () => {
         const pushC = makeChunk("will-fail");
         const pullC = makeChunk("ok-pull");
         await putLocal(db, pushC);
-        await remote.bulkDocs([pullC]);
+        await seedRemoteChunk(remote, pullC);
 
         // v2: chunk push routes through bulkDocsWithAttachments. Mock
         // both endpoints to fail on push paths so the test still

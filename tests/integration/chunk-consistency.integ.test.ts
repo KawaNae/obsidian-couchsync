@@ -16,8 +16,12 @@ import {
     type ChunkConsistencyReport,
     type ChunkConsistencyDeps,
 } from "../../src/sync/chunk-consistency.ts";
-import { makeFileId, makeChunkId } from "../../src/types/doc-id.ts";
+import { makeFileId, makeChunkId, isChunkDocId } from "../../src/types/doc-id.ts";
 import type { FileDoc, ChunkDoc, CouchSyncDoc } from "../../src/types.ts";
+import type { ICouchClient } from "../../src/db/interfaces.ts";
+import { EncryptingCouchClient } from "../../src/db/encrypting-couch-client.ts";
+import { deriveKeys, generateSalt, createCryptoProvider } from "../../src/db/crypto-provider.ts";
+import { buildChunkAttachment } from "../../src/db/chunk-attachment.ts";
 
 async function analyzeConverged(
     deps: ChunkConsistencyDeps,
@@ -174,5 +178,53 @@ describe("Integration: analyzeChunkConsistency", () => {
         expect(r.orphanRemote).toEqual([remoteOrphan._id]);
         expect(r.missingReferenced).toHaveLength(1);
         expect(r.missingReferenced[0].id).toBe(ghost);
+    });
+
+    // ── Encrypted vault + multi-page paging ──────────────
+    //
+    // Through the codec (Encrypting) client the remote stores `file:<hmac>`
+    // ids; the analyzer must still see plaintext ids (matching local) AND
+    // page correctly across more docs than one page. Regresses two bugs:
+    // (1) raw-client id mismatch → permanent needs-convergence; (2) the
+    // bespoke iterator paging on the restored plaintext `row.id` instead of
+    // the raw storage `row.key`, which mis-pages past batch 1 under
+    // encryption. pageSize:2 over 5 files forces 3 pages.
+    it("encrypted, multi-page: converges and counts every file/chunk", async () => {
+        const inner = new FakeCouchClient();
+        const crypto = createCryptoProvider(await deriveKeys("pw", generateSalt()));
+        const enc = new EncryptingCouchClient(inner, crypto);
+        const db = new LocalDB(`integ-chunk-cons-enc-${Date.now()}-${counter++}`);
+        db.open();
+        cleanups.push(async () => { await db.destroy(); });
+        cleanups.push(async () => { await inner.destroy(); });
+
+        const N = 5;
+        const docs: CouchSyncDoc[] = [];
+        for (let i = 0; i < N; i++) {
+            const c: ChunkDoc = {
+                _id: makeChunkId(`enc-c${i}`), type: "chunk",
+                schemaVersion: 2, content: new TextEncoder().encode(`data${i}`),
+            };
+            docs.push(c, file(`note${i}.md`, [c._id]));
+        }
+        await putLocal(db, docs);
+        // Seed remote through the codec client (chunks → encrypted
+        // attachments, files → hmac ids), mirroring production.
+        const chunks = docs.filter((d) => isChunkDocId(d._id)) as ChunkDoc[];
+        const files = docs.filter((d) => !isChunkDocId(d._id));
+        await enc.bulkDocs(files);
+        await enc.bulkDocsWithAttachments(chunks.map((c) => buildChunkAttachment(c)));
+
+        const report = await analyzeConverged({
+            localDb: db, remote: enc as ICouchClient, pageSize: 2,
+        });
+        expect(report.counts.localChunks).toBe(N);
+        expect(report.counts.remoteChunks).toBe(N);
+        expect(report.counts.referencedIds).toBe(N);
+        expect(report.counts.localOnly).toBe(0);
+        expect(report.counts.remoteOnly).toBe(0);
+        expect(report.counts.missingReferenced).toBe(0);
+        expect(report.counts.orphanLocal).toBe(0);
+        expect(report.counts.orphanRemote).toBe(0);
     });
 });

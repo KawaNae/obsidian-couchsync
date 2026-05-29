@@ -148,12 +148,25 @@ export async function pullDocs(
     if (fetched.length === 0) return 0;
 
     const localDocs = fetched.map((d) => stripRev(d) as CouchSyncDoc);
+    // v2: a chunk's bytes ride in the `c` attachment, not the doc body
+    // (buildChunkAttachment strips `content` on push). `bulkGet` returns
+    // only the body, so a chunk doc arrives as an empty shell. Reconstruct
+    // content from the attachment — the same primitive pullAll/ensureChunks
+    // use — so a repaired chunk lands with its actual bytes. Non-chunk docs
+    // are left untouched; chunks whose attachment is missing are dropped
+    // rather than written content-less.
+    const notFound = await resolveChunkAttachments(localDocs, remote, signal);
+    const toWrite = notFound.size === 0
+        ? localDocs
+        : localDocs.filter((d) => !notFound.has(d._id));
+    if (toWrite.length === 0) return 0;
+
     await local.runWriteTx({
-        docs: localDocs.map((doc) => ({ doc })),
+        docs: toWrite.map((doc) => ({ doc })),
     });
 
     let total = 0;
-    for (const doc of localDocs) {
+    for (const doc of toWrite) {
         total++;
         onProgress?.(doc._id, total);
     }
