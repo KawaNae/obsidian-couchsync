@@ -499,15 +499,26 @@ export class CouchClient implements ICouchClient {
         if (opts.conflicts) params.set("conflicts", "true");
         if (opts.limit !== undefined) params.set("limit", String(opts.limit));
 
-        // If `keys` is provided, POST to _all_docs with a body.
+        // If `keys` is provided, POST to _all_docs with a body. Batch the
+        // keys list to bound the POST body (and the rev-only response) on
+        // the same BULK_BATCH_SIZE boundary as bulkGet/bulkDocs — a single
+        // unbounded keys request would hit the 30s mobile timeout the same
+        // way the now-paginated startkey/endkey path used to.
         if (opts.keys && opts.keys.length > 0) {
+            const keys = opts.keys;
             const qs = params.toString();
             const path = `/_all_docs${qs ? "?" + qs : ""}`;
-            return this.request<AllDocsResult<T>>(
-                path,
-                { method: "POST", body: JSON.stringify({ keys: opts.keys }) },
-                { externalSignal: signal, streamed: true },
-            );
+            const rows: AllDocsRow<T>[] = [];
+            for (let i = 0; i < keys.length; i += BULK_BATCH_SIZE) {
+                const batch = keys.slice(i, i + BULK_BATCH_SIZE);
+                const res = await this.request<AllDocsResult<T>>(
+                    path,
+                    { method: "POST", body: JSON.stringify({ keys: batch }) },
+                    { externalSignal: signal, streamed: true },
+                );
+                rows.push(...res.rows);
+            }
+            return { rows };
         }
 
         const qs = params.toString();

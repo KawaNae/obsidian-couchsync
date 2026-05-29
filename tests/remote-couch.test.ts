@@ -91,6 +91,14 @@ function createLocalStub(): IDocStore<CouchSyncDoc> & { _docs: Map<string, any> 
             }));
             return { rows } as AllDocsResult<CouchSyncDoc>;
         },
+        listIds: async (range: any) => {
+            let ids = Array.from(_docs.keys());
+            if (range?.startkey !== undefined) ids = ids.filter((k) => k >= range.startkey);
+            if (range?.endkey !== undefined) ids = ids.filter((k) => k <= range.endkey);
+            ids.sort();
+            if (range?.limit !== undefined) ids = ids.slice(0, range.limit);
+            return ids;
+        },
         changes: async () => ({ results: [], last_seq: 0 }),
         info: async () => ({ updateSeq: 0 }),
         close: async () => {},
@@ -358,17 +366,18 @@ describe("remote-couch (IDocStore + ICouchClient)", () => {
     });
 
     describe("pullAll", () => {
-        it("pulls every remote doc to local and returns the docs", async () => {
+        it("pulls every remote doc to local and returns the count written", async () => {
             const docA = { ...makeFileDoc("a.md", "1"), _rev: "1-r" };
             const docB = { ...makeFileDoc("b.md", "2"), _rev: "1-r" };
             remote._docs.set(docA._id, docA);
             remote._docs.set(docB._id, docB);
 
             const seen: string[] = [];
-            const result = await pullAll(local, remote, (id) => seen.push(id));
-            expect(result.written).toBe(2);
-            expect(result.docs.length).toBe(2);
+            const written = await pullAll(local, remote, (id) => seen.push(id));
+            expect(written).toBe(2);
             expect(seen.length).toBe(2);
+            expect(local._docs.has(docA._id)).toBe(true);
+            expect(local._docs.has(docB._id)).toBe(true);
         });
 
         it("does NOT fabricate an empty chunk when its attachment is missing on remote", async () => {
@@ -383,14 +392,14 @@ describe("remote-couch (IDocStore + ICouchClient)", () => {
             remote._docs.set(chunkId, { _id: chunkId, type: "chunk", schemaVersion: 2, _rev: "1-r" });
             // getAttachment returns null (stub default) → attachment missing.
 
-            const result = await pullAll(local, remote);
+            const written = await pullAll(local, remote);
 
             // The chunk is NOT persisted at all (neither empty nor present).
             expect(local._docs.has(chunkId)).toBe(false);
             // The file doc still lands.
             expect(local._docs.has(file._id)).toBe(true);
-            // Returned docs exclude the dropped chunk.
-            expect(result.docs.some((d) => d._id === chunkId)).toBe(false);
+            // Only the file was written, not the dropped chunk.
+            expect(written).toBe(1);
         });
     });
 });

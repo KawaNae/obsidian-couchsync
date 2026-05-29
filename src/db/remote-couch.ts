@@ -288,6 +288,12 @@ export async function destroyRemote(
 /**
  * Push every doc in `local` to `remote` as a one-shot. Used by SetupService
  * during Init to seed the remote from a freshly-scanned vault.
+ *
+ * Enumerates ids without loading bodies (`listIds`), then loads + pushes
+ * one `DEFAULT_BATCH_SIZE` page at a time. This keeps peak memory bounded
+ * (a large vault's chunk bodies are never all resident at once) and is
+ * symmetric with the paginated `pullAll`. The per-page remote rev lookup
+ * is itself batched inside `CouchClient.allDocs`.
  */
 export async function pushAll(
     local: IDocStore<CouchSyncDoc>,
@@ -295,125 +301,149 @@ export async function pushAll(
     onProgress?: ProgressCallback,
     signal?: AbortSignal,
 ): Promise<number> {
-    const result = await local.allDocs({ include_docs: true });
-    const docs: Array<CouchSyncDoc & { _rev?: string }> = [];
-    for (const row of result.rows) {
-        if (row.doc && !row.value?.deleted) {
-            docs.push(stripRev(row.doc) as CouchSyncDoc);
-        }
-    }
-    if (docs.length === 0) return 0;
-
-    // Fetch current remote revisions for existing docs.
-    const remoteResult = await remote.allDocs<CouchSyncDoc>({
-        keys: docs.map((d) => d._id),
-    }, signal);
-    const remoteRevMap = new Map<string, string>();
-    for (const row of remoteResult.rows) {
-        if (row.value?.rev && !row.value?.deleted) {
-            remoteRevMap.set(row.id, row.value.rev);
-        }
-    }
-    for (const doc of docs) {
-        const remoteRev = remoteRevMap.get(doc._id);
-        if (remoteRev) doc._rev = remoteRev;
-    }
-
-    const results = await pushSplit(remote, docs, signal);
+    const ids = await local.listIds({ startkey: "", endkey: "\ufff0" });
     let total = 0;
-    for (const res of results) {
-        if (res?.ok) {
-            total++;
-            onProgress?.(res.id, total);
+
+    for (let i = 0; i < ids.length; i += DEFAULT_BATCH_SIZE) {
+        const pageIds = ids.slice(i, i + DEFAULT_BATCH_SIZE);
+        const result = await local.allDocs({ keys: pageIds, include_docs: true });
+        const docs: Array<CouchSyncDoc & { _rev?: string }> = [];
+        for (const row of result.rows) {
+            if (row.doc && !row.value?.deleted) {
+                docs.push(stripRev(row.doc) as CouchSyncDoc);
+            }
+        }
+        if (docs.length === 0) continue;
+
+        // Fetch current remote revisions for existing docs.
+        const remoteResult = await remote.allDocs<CouchSyncDoc>({
+            keys: docs.map((d) => d._id),
+        }, signal);
+        const remoteRevMap = new Map<string, string>();
+        for (const row of remoteResult.rows) {
+            if (row.value?.rev && !row.value?.deleted) {
+                remoteRevMap.set(row.id, row.value.rev);
+            }
+        }
+        for (const doc of docs) {
+            const remoteRev = remoteRevMap.get(doc._id);
+            if (remoteRev) doc._rev = remoteRev;
+        }
+
+        const results = await pushSplit(remote, docs, signal);
+        for (const res of results) {
+            if (res?.ok) {
+                total++;
+                onProgress?.(res.id, total);
+            }
         }
     }
     return total;
 }
 
+/** Concurrency for the per-batch chunk attachment fetch in `pullAll`. */
+const PULL_ATTACHMENT_CONCURRENCY = 4;
+
 /**
- * Pull every doc from `remote` into `local`. Returns both the written
- * count and the array of pulled documents (so callers can react to each,
- * e.g. SetupService writing files to the vault during Clone).
+ * Resolve chunk bodies for one batch of pulled docs in place. v2 chunk
+ * bodies live in attachments, not in the doc body, so each chunk doc
+ * must have its `[codec][body]` envelope fetched and decoded before it
+ * can be committed locally. Bounded-concurrency parallel fetch (mirrors
+ * `ensureChunks`). Returns the set of chunk ids whose attachment 404'd —
+ * those are dropped by the caller (NOT written as empty, which would
+ * pass every id-based consistency gate and silently truncate the file).
+ */
+async function resolveChunkAttachments(
+    docs: CouchSyncDoc[],
+    remote: ICouchClient,
+    signal?: AbortSignal,
+): Promise<Set<string>> {
+    const queue: number[] = [];
+    for (let i = 0; i < docs.length; i++) {
+        if (isChunkDocId(docs[i]._id)) queue.push(i);
+    }
+    const notFound = new Set<string>();
+    if (queue.length === 0) return notFound;
+
+    const workers: Promise<void>[] = [];
+    for (let w = 0; w < PULL_ATTACHMENT_CONCURRENCY; w++) {
+        workers.push((async () => {
+            while (queue.length > 0) {
+                const i = queue.shift();
+                if (i === undefined) return;
+                const id = docs[i]._id;
+                const blob = await remote.getAttachment(id, "c", signal);
+                if (blob === null) {
+                    notFound.add(id);
+                    continue;
+                }
+                // Decoder stack already stripped encryption + compression
+                // (no hasher here — Clone runs before a stable hmac hasher
+                // is available).
+                docs[i] = await chunkFromAttachment(id, blob);
+            }
+        })());
+    }
+    await Promise.all(workers);
+    return notFound;
+}
+
+/**
+ * Pull every doc from `remote` into `local`. Returns the count written.
+ *
+ * Paginated over keyset continuation (`DEFAULT_BATCH_SIZE` rows per
+ * request), with each batch's chunk attachments fetched and the batch
+ * committed in its own `runWriteTx`. This bounds per-request HTTP payload
+ * (so the 30s mobile timeout is survivable) and peak memory (so a
+ * fresh-clone of a large vault never has to hold every chunk body at
+ * once) — mirroring `pullByPrefix`. The single-request `allDocs(
+ * {include_docs:true})` this replaces regressed on exactly the mobile
+ * timeout this project already learned to paginate around for Config Pull.
  */
 export async function pullAll(
     local: IDocStore<CouchSyncDoc>,
     remote: ICouchClient,
     onProgress?: ProgressCallback,
     signal?: AbortSignal,
-): Promise<{ written: number; docs: CouchSyncDoc[] }> {
-    const remoteResult = await remote.allDocs<CouchSyncDoc>({
-        include_docs: true,
-    }, signal);
+): Promise<number> {
+    let written = 0;
+    const notFoundTotal = new Set<string>();
 
-    const docs: CouchSyncDoc[] = [];
-    for (const row of remoteResult.rows) {
-        if (row.doc && !row.value?.deleted) {
-            docs.push(row.doc);
+    for await (const rows of paginateAllDocs<CouchSyncDoc>(
+        remote,
+        { startkey: "", endkey: "\ufff0", include_docs: true },
+        { signal, batchSize: DEFAULT_BATCH_SIZE },
+    )) {
+        const docs: CouchSyncDoc[] = [];
+        for (const row of rows) {
+            if (row.doc && !row.value?.deleted) docs.push(row.doc);
+        }
+        if (docs.length === 0) continue;
+
+        const notFound = await resolveChunkAttachments(docs, remote, signal);
+        for (const id of notFound) notFoundTotal.add(id);
+
+        // Exclude chunks whose attachment 404'd, then strip remote _rev.
+        const localDocs = docs
+            .filter((d) => !notFound.has(d._id))
+            .map((d) => stripRev(d) as CouchSyncDoc);
+        if (localDocs.length === 0) continue;
+
+        await local.runWriteTx({
+            docs: localDocs.map((doc) => ({ doc })),
+        });
+        for (const doc of localDocs) {
+            written++;
+            onProgress?.(doc._id, written);
         }
     }
-    if (docs.length === 0) return { written: 0, docs: [] };
 
-    // v2: chunk bodies live in attachments, not in the doc body. Fetch
-    // the binary content for every chunk before committing locally.
-    // Bounded-concurrency parallel fetch (mirrors `ensureChunks`) so a
-    // fresh-clone pullAll completes in reasonable time over modern
-    // HTTP/2 connections.
-    const CONCURRENCY = 4;
-    const chunkIndices: number[] = [];
-    for (let i = 0; i < docs.length; i++) {
-        if (isChunkDocId(docs[i]._id)) chunkIndices.push(i);
-    }
-    const notFound = new Set<string>();
-    if (chunkIndices.length > 0) {
-        const queue = [...chunkIndices];
-        const workers: Promise<void>[] = [];
-        for (let w = 0; w < CONCURRENCY; w++) {
-            workers.push((async () => {
-                while (queue.length > 0) {
-                    const i = queue.shift();
-                    if (i === undefined) return;
-                    const id = docs[i]._id;
-                    const blob = await remote.getAttachment(id, "c", signal);
-                    if (blob === null) {
-                        // Attachment missing on the server. Do NOT fabricate
-                        // an empty chunk — that would pass every id-based
-                        // consistency gate and silently truncate the file.
-                        // Drop it; the file's chunks stay incomplete and a
-                        // later assemble fails loud / routes to repair.
-                        notFound.add(id);
-                        continue;
-                    }
-                    // Decorator stack returned the `[codec][body]` envelope
-                    // (encryption + compression already stripped). Decode to
-                    // the canonical ChunkDoc (no hasher here — Clone runs
-                    // before a stable hmac hasher is available).
-                    docs[i] = await chunkFromAttachment(id, blob);
-                }
-            })());
-        }
-        await Promise.all(workers);
-    }
-
-    if (notFound.size > 0) {
+    if (notFoundTotal.size > 0) {
         logWarn(
-            `pullAll: ${notFound.size} chunk attachment(s) missing on remote; ` +
+            `pullAll: ${notFoundTotal.size} chunk attachment(s) missing on remote; ` +
             `skipped (not written as empty): ` +
-            `${[...notFound].slice(0, 3).join(", ")}${notFound.size > 3 ? "…" : ""}`,
+            `${[...notFoundTotal].slice(0, 3).join(", ")}${notFoundTotal.size > 3 ? "…" : ""}`,
         );
     }
-
-    // Exclude chunks whose attachment 404'd, then strip remote _rev.
-    const localDocs = docs
-        .filter((d) => !notFound.has(d._id))
-        .map((d) => stripRev(d) as CouchSyncDoc);
-
-    await local.runWriteTx({
-        docs: localDocs.map((doc) => ({ doc })),
-    });
-    let total = 0;
-    for (const doc of localDocs) {
-        total++;
-        onProgress?.(doc._id, total);
-    }
-    return { written: total, docs: docs.filter((d) => !notFound.has(d._id)) };
+    return written;
 }

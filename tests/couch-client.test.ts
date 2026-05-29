@@ -162,6 +162,30 @@ describe("CouchClient", () => {
             const body = JSON.parse(init.body);
             expect(body.keys).toEqual(["a", "b"]);
         });
+
+        it("batches a large keys list into BULK_BATCH_SIZE POSTs and concatenates rows", async () => {
+            // 250 keys → 3 requests (100, 100, 50). Each request must carry
+            // at most 100 keys so an unbounded body never hits the mobile
+            // timeout, and the returned rows are the concatenation of all
+            // batches. Mirrors bulkGet/bulkDocs batching.
+            const keys = Array.from({ length: 250 }, (_, i) => `k${i}`);
+            fetchMock.mockImplementation((_url: string, init: RequestInit) => {
+                const batch: string[] = JSON.parse(init.body as string).keys;
+                const rows = batch.map((id) => ({ id, key: id, value: { rev: "1-x" } }));
+                return Promise.resolve(jsonResponse({ rows }));
+            });
+
+            const result = await client().allDocs<any>({ keys });
+
+            expect(fetchMock).toHaveBeenCalledTimes(3);
+            const batchSizes = fetchMock.mock.calls.map(
+                ([, init]: any) => JSON.parse(init.body).keys.length,
+            );
+            expect(batchSizes).toEqual([100, 100, 50]);
+            expect(result.rows).toHaveLength(250);
+            expect(result.rows[0].id).toBe("k0");
+            expect(result.rows[249].id).toBe("k249");
+        });
     });
 
     describe("changes()", () => {

@@ -16,7 +16,6 @@
  * accordingly on its next iteration.
  */
 
-import type { CouchSyncDoc } from "../../types.ts";
 import type { LocalDB } from "../local-db.ts";
 import type { CouchSyncSettings } from "../../settings.ts";
 import type { ICouchClient } from "../interfaces.ts";
@@ -47,10 +46,11 @@ export class VaultRemoteOps {
         return remoteCouch.pushAll(this.localDb, this.makeWrappedClient(), onProgress);
     }
 
-    /** One-shot pull of the entire vault remote → local. */
+    /** One-shot pull of the entire vault remote → local. Returns the
+     *  count of docs written. */
     async pullAll(
         onProgress?: ProgressCallback,
-    ): Promise<{ written: number; docs: CouchSyncDoc[] }> {
+    ): Promise<number> {
         return remoteCouch.pullAll(this.localDb, this.makeWrappedClient(), onProgress);
     }
 

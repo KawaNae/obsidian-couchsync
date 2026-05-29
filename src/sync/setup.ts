@@ -73,7 +73,7 @@ export class SetupService {
             await this.localDb.ensureSchemaVersion();
 
             onProgress("Pulling from remote...");
-            const { written: totalDocs } = await this.remoteOps.pullAll((docId, n) => {
+            const totalDocs = await this.remoteOps.pullAll((docId, n) => {
                 onProgress(`Pulling: ${formatDocIdForProgress(docId)} (${n})`);
             });
 
