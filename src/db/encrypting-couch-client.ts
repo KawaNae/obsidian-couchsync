@@ -2,12 +2,9 @@
  * ICouchClient decorator that transparently encrypts/decrypts doc
  * payloads and attachment bodies.
  *
- *  - ConfigDoc.data (string) is encrypted via the unified envelope
- *    helper (`envelope.ts:encryptString`) and stored as a base64-wrapped
- *    envelope. The same helper handles decrypt on read.
  *  - FileDoc and ConfigDoc `_id` paths are replaced with HMAC-SHA256
- *    hashes; the original path lives in `encryptedPath` (also a
- *    base64-wrapped envelope produced by `encryptString`).
+ *    hashes; the original path lives in `encryptedPath` (a
+ *    base64-wrapped envelope produced by `envelope.ts:encryptString`).
  *  - Attachment bodies (ChunkDoc `c`) are decoded as envelopes, the
  *    body is encrypted via the crypto-provider primitive, and the
  *    envelope is re-encoded with `bits.encrypted = true` plus the IV
@@ -56,10 +53,6 @@ export class EncryptionError extends Error {
 
 type AnyDoc = Record<string, unknown>;
 
-function hasEncryptableData(doc: AnyDoc): boolean {
-    return doc.type === "config" && typeof doc.data === "string";
-}
-
 function hasPathId(doc: AnyDoc): boolean {
     const id = doc._id as string | undefined;
     if (!id) return false;
@@ -90,9 +83,6 @@ export class EncryptingCouchClient implements ICouchClient {
 
     private async encryptDoc(doc: AnyDoc): Promise<AnyDoc> {
         let out = doc;
-        if (hasEncryptableData(doc)) {
-            out = { ...out, data: await encryptString(doc.data as string, this.crypto) };
-        }
         if (hasPathId(doc)) {
             const id = doc._id as string;
             const prefix = idPrefix(id);
@@ -107,9 +97,6 @@ export class EncryptingCouchClient implements ICouchClient {
     private async decryptDoc<T>(doc: T): Promise<T> {
         let d = doc as AnyDoc;
         try {
-            if (hasEncryptableData(d)) {
-                d = { ...d, data: await decryptString(d.data as string, this.crypto) };
-            }
             if (typeof d.encryptedPath === "string") {
                 const prefix = idPrefix(d._id as string);
                 const path = await decryptString(d.encryptedPath as string, this.crypto);

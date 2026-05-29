@@ -82,11 +82,10 @@ export interface ConfigSetupHostHooks {
     onCryptoProviderReady: (crypto: CryptoProvider | null) => void;
     /** Build a RAW config-DB client (no codec wrapping) for pushing
      *  the meta doc, which is itself never encrypted or compressed.
-     *  Production wires this to `makeCouchClient`; tests can inject a
-     *  FakeCouchClient so the meta push runs against the same in-memory
-     *  remote as the rest of the test fixture. Optional — when absent,
-     *  the meta push falls back to `makeCouchClient(settings)` which
-     *  hits the real network. */
+     *  Production omits this and the meta push falls back to
+     *  `makeCouchClient(settings)`; tests inject a FakeCouchClient so the
+     *  meta push runs against the same in-memory remote as the rest of
+     *  the test fixture. */
     makeRawConfigClient?: () => ICouchClient;
 }
 
@@ -163,6 +162,10 @@ export class ConfigSetupService {
         if (!settings.couchdbConfigDbName) {
             throw new Error("ConfigSetup: couchdbConfigDbName not configured");
         }
+        // The meta doc bypasses the codec stack (never encrypted or
+        // compressed) so a fresh-Clone device can read it before unlocking
+        // the passphrase — push it via a RAW, unwrapped client. Tests inject
+        // one; production builds it from settings.
         const rawConfigClient = this.host.makeRawConfigClient?.()
             ?? makeCouchClient(
                 settings.couchdbUri, settings.couchdbConfigDbName,

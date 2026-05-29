@@ -139,14 +139,15 @@ export class ConfigSync {
      *  for live sync ops. Null = encryption is disabled for config. */
     private readonly onConfigCryptoChange?: (crypto: CryptoProvider | null) => void;
 
-    /** Phase 2: RAW config-DB client factory (no codec wrapping) used
-     *  by ConfigSetupService for the `config:meta` push. The meta doc
-     *  is never encrypted or compressed — bypassing the codec stack
-     *  keeps it readable by a fresh-Clone device that hasn't unlocked
-     *  the passphrase yet. Optional; falls back to building one from
-     *  settings via `makeCouchClient`. Tests pass the same in-memory
-     *  FakeCouchClient as the wrapped client factory so the meta push
-     *  lands on the same fixture. */
+    /** RAW config-DB client factory (no codec wrapping) used by
+     *  ConfigSetupService for the `config:meta` push. The meta doc is
+     *  never encrypted or compressed — bypassing the codec stack keeps it
+     *  readable by a fresh-Clone device that hasn't unlocked the passphrase
+     *  yet. Optional; production omits it and the meta push falls back to
+     *  building a client from settings via `makeCouchClient`. Tests inject
+     *  the same in-memory FakeCouchClient here as the wrapped client factory
+     *  so the meta push lands on the same fixture instead of hitting the
+     *  network. */
     private readonly rawClientFactory?: (settings: CouchSyncSettings) => ICouchClient | null;
 
     constructor(
@@ -736,8 +737,11 @@ export class ConfigSync {
             for (const folder of listing.folders) {
                 folders.push(folder + "/");
             }
-        } catch (e) {
-            // plugins dir might not exist
+        } catch (e: any) {
+            // A missing plugins dir is expected (vault with no plugins).
+            // Anything else is unexpected — surface it rather than silently
+            // returning an empty list, which would look like "no plugins".
+            logWarn(`CouchSync: listPluginFolders failed: ${e?.message ?? e}`);
         }
         return folders.sort();
     }
@@ -797,8 +801,12 @@ export class ConfigSync {
                 if (ConfigSync.SKIP_DIRS.has(folderName)) continue;
                 await this.listFilesRecursive(folder, result);
             }
-        } catch (e) {
-            // skip inaccessible dirs
+        } catch (e: any) {
+            // Skip inaccessible dirs, but log — a dir that was listed by its
+            // parent yet errors on its own listing is unexpected (race or
+            // permission issue), not normal operation, and silently dropping
+            // its files would under-sync config without any trace.
+            logWarn(`CouchSync: listFilesRecursive skipped ${dir}: ${e?.message ?? e}`);
         }
     }
 }

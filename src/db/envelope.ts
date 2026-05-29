@@ -139,15 +139,14 @@ function base64ToUint8(b64: string): Uint8Array {
     return bytes;
 }
 
-// ── String envelope helpers (for ConfigDoc.data / encryptedPath) ──
+// ── String envelope helpers (for encryptedPath) ──
 
 /**
  * Encrypt an arbitrary UTF-8 string into a base64-wrapped envelope.
  * Output format: `base64( [0x01][IV(12B)][AES-GCM(utf8(s))] )`.
  *
  * Symmetric with `decryptString`. Used by the encrypting-couch-client
- * for string fields that cannot ride as attachments (ConfigDoc.data,
- * encryptedPath).
+ * for the `encryptedPath` field, which cannot ride as an attachment.
  */
 export async function encryptString(
     plain: string,

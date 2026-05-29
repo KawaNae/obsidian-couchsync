@@ -21,20 +21,20 @@ function makeClient() {
 }
 
 describe("EncryptingCouchClient push (bulkDocs)", () => {
-    it("encrypts ConfigDoc.data via envelope and translates _id", async () => {
+    it("translates config _id and adds encryptedPath (body rides as chunks)", async () => {
         const { inner, enc } = makeClient();
-        const config = { _id: "config:.obsidian/app.json", type: "config", data: btoa("{}"), vclock: {}, mtime: 0, size: 2, schemaVersion: 2 };
+        // v3 ConfigDoc carries its body as chunk attachments (like FileDoc),
+        // not an in-doc `data` field. The encrypting client only HMAC-
+        // translates the _id and adds encryptedPath; chunk bodies are
+        // encrypted at the attachment layer.
+        const config = { _id: "config:.obsidian/app.json", type: "config", chunks: ["chunk:x64:abc"], vclock: {}, mtime: 0, size: 2, schemaVersion: 3 };
         await enc.bulkDocs([config]);
 
         const allDocs = await inner.allDocs<any>({ startkey: "config:", endkey: "config:￰", include_docs: true });
         const stored = allDocs.rows[0]?.doc;
         expect(stored).toBeDefined();
         expect(stored._id).toMatch(/^config:[0-9a-f]{64}$/);
-        // Encrypted ConfigDoc.data is a base64-wrapped envelope — distinct
-        // from the original plaintext base64 and without the legacy
-        // colon-separated `iv:cipher` form.
-        expect(stored.data).not.toBe(btoa("{}"));
-        expect(stored.data).not.toContain(":");
+        expect(stored.chunks).toEqual(["chunk:x64:abc"]);
         expect(stored.encryptedPath).toBeDefined();
     });
 
@@ -75,41 +75,41 @@ describe("EncryptingCouchClient push (bulkDocs)", () => {
 });
 
 describe("EncryptingCouchClient pull (decrypt)", () => {
-    it("getDoc decrypts ConfigDoc.data and restores _id", async () => {
+    it("getDoc restores config _id and preserves chunks", async () => {
         const { enc } = makeClient();
-        const original = btoa("cfg data");
-        await enc.bulkDocs([{ _id: "config:test", type: "config", data: original, vclock: {}, mtime: 0, size: 0, schemaVersion: 2 }]);
+        await enc.bulkDocs([{ _id: "config:test", type: "config", chunks: ["chunk:x64:t1"], vclock: {}, mtime: 0, size: 0, schemaVersion: 3 }]);
 
         const doc = await enc.getDoc<any>("config:test");
-        expect(doc!.data).toBe(original);
+        expect(doc!.chunks).toEqual(["chunk:x64:t1"]);
         expect(doc!._id).toBe("config:test");
     });
 
-    it("changes decrypts docs when include_docs is true", async () => {
+    it("changes restores docs when include_docs is true", async () => {
         const { enc } = makeClient();
-        await enc.bulkDocs([{ _id: "config:c1", type: "config", data: btoa("cfg-c1"), vclock: {}, mtime: 0, size: 0, schemaVersion: 2 }]);
+        await enc.bulkDocs([{ _id: "config:c1", type: "config", chunks: ["chunk:x64:c1"], vclock: {}, mtime: 0, size: 0, schemaVersion: 3 }]);
 
         const result = await enc.changes<any>({ include_docs: true });
         const row = result.results.find((r) => r.id === "config:c1");
-        expect(row!.doc.data).toBe(btoa("cfg-c1"));
+        expect(row!.doc.chunks).toEqual(["chunk:x64:c1"]);
         expect(row!.doc._id).toBe("config:c1");
     });
 
-    it("allDocs decrypts when include_docs is true", async () => {
+    it("allDocs restores when include_docs is true", async () => {
         const { enc } = makeClient();
-        await enc.bulkDocs([{ _id: "config:a", type: "config", data: btoa("a"), vclock: {}, mtime: 0, size: 0, schemaVersion: 2 }]);
+        await enc.bulkDocs([{ _id: "config:a", type: "config", chunks: ["chunk:x64:a1"], vclock: {}, mtime: 0, size: 0, schemaVersion: 3 }]);
 
         const result = await enc.allDocs<any>({ keys: ["config:a"], include_docs: true });
-        expect(result.rows[0].doc!.data).toBe(btoa("a"));
+        expect(result.rows[0].doc!.chunks).toEqual(["chunk:x64:a1"]);
         expect(result.rows[0].doc!._id).toBe("config:a");
     });
 
     it("rejects ciphertext produced by a different key", async () => {
-        // Realistic 2-vault scenario: writer encrypts under key A and
-        // pushes via its own EncryptingCouchClient; a reader with key B
-        // pulls the same doc and must surface EncryptionError rather
-        // than silently returning garbage. allDocs decrypts inline, so
-        // the rejection bubbles out of the allDocs call itself.
+        // Realistic 2-vault scenario: writer encrypts the path under key A
+        // and pushes via its own EncryptingCouchClient; a reader with key B
+        // pulls the same doc and must surface EncryptionError (the
+        // encryptedPath fails to decrypt under B) rather than silently
+        // returning garbage. allDocs decrypts inline, so the rejection
+        // bubbles out of the allDocs call itself.
         const inner = new FakeCouchClient();
         const keyA = createCryptoProvider(await deriveKeys("alpha", generateSalt()));
         const keyB = createCryptoProvider(await deriveKeys("beta", generateSalt()));
@@ -118,8 +118,8 @@ describe("EncryptingCouchClient pull (decrypt)", () => {
 
         const path = "config:.obsidian/secret.json";
         await writerA.bulkDocs([{
-            _id: path, type: "config", data: btoa("secret"), vclock: {},
-            mtime: 0, size: 6, schemaVersion: 2,
+            _id: path, type: "config", chunks: ["chunk:x64:s1"], vclock: {},
+            mtime: 0, size: 6, schemaVersion: 3,
         }]);
 
         await expect(readerB.allDocs<any>({
@@ -129,26 +129,25 @@ describe("EncryptingCouchClient pull (decrypt)", () => {
 });
 
 describe("EncryptingCouchClient roundtrip", () => {
-    it("push → pull preserves ConfigDoc content and path", async () => {
+    it("push → pull preserves ConfigDoc chunks and path", async () => {
         const { enc } = makeClient();
-        const original = btoa("roundtrip test data ok");
-        await enc.bulkDocs([{ _id: "config:rt.json", type: "config", data: original, vclock: {}, mtime: 0, size: 0, schemaVersion: 2 }]);
+        await enc.bulkDocs([{ _id: "config:rt.json", type: "config", chunks: ["chunk:x64:rt"], vclock: {}, mtime: 0, size: 0, schemaVersion: 3 }]);
 
         const pulled = await enc.getDoc<any>("config:rt.json");
-        expect(pulled!.data).toBe(original);
+        expect(pulled!.chunks).toEqual(["chunk:x64:rt"]);
         expect(pulled!._id).toBe("config:rt.json");
     });
 
     it("mixed doc types in single bulkDocs", async () => {
         const { enc } = makeClient();
         const file = { _id: "file:f.md", type: "file", chunks: ["chunk:x64:m1"], vclock: {}, mtime: 0, ctime: 0, size: 5, schemaVersion: 2 };
-        const config = { _id: "config:app", type: "config", data: btoa("cfg"), vclock: {}, mtime: 0, size: 3, schemaVersion: 2 };
+        const config = { _id: "config:app", type: "config", chunks: ["chunk:x64:m2"], vclock: {}, mtime: 0, size: 3, schemaVersion: 3 };
         await enc.bulkDocs([file, config]);
 
         const f = await enc.getDoc<any>("file:f.md");
         expect(f!.chunks).toEqual(["chunk:x64:m1"]);
         const cfg = await enc.getDoc<any>("config:app");
-        expect(cfg!.data).toBe(btoa("cfg"));
+        expect(cfg!.chunks).toEqual(["chunk:x64:m2"]);
     });
 });
 
@@ -183,7 +182,7 @@ describe("EncryptingCouchClient Level 2 (path encryption)", () => {
 
     it("encrypts config _id on push", async () => {
         const { inner, enc } = makeClient();
-        const cfg = { _id: "config:.obsidian/app.json", type: "config", data: btoa("{}"), vclock: {}, mtime: 0, size: 2, schemaVersion: 2 };
+        const cfg = { _id: "config:.obsidian/app.json", type: "config", chunks: ["chunk:x64:cfg"], vclock: {}, mtime: 0, size: 2, schemaVersion: 3 };
         await enc.bulkDocs([cfg]);
 
         const allDocs = await inner.allDocs<any>({ startkey: "config:", endkey: "config:￰", include_docs: true });
@@ -222,12 +221,12 @@ describe("EncryptingCouchClient Level 2 (path encryption)", () => {
 
     it("roundtrip: push file + config → pull via getDoc", async () => {
         const { enc } = makeClient();
-        const config = { _id: "config:rt", type: "config", data: btoa("content"), vclock: {}, mtime: 0, size: 7, schemaVersion: 2 };
+        const config = { _id: "config:rt", type: "config", chunks: ["chunk:x64:rt2"], vclock: {}, mtime: 0, size: 7, schemaVersion: 3 };
         const file = { _id: "file:doc.md", type: "file", chunks: ["chunk:x64:r1"], vclock: { d: 1 }, mtime: 1, ctime: 1, size: 7, schemaVersion: 2 };
         await enc.bulkDocs([config, file]);
 
         const c = await enc.getDoc<any>("config:rt");
-        expect(c!.data).toBe(btoa("content"));
+        expect(c!.chunks).toEqual(["chunk:x64:rt2"]);
         const f = await enc.getDoc<any>("file:doc.md");
         expect(f!._id).toBe("file:doc.md");
         expect(f!.chunks).toEqual(["chunk:x64:r1"]);
