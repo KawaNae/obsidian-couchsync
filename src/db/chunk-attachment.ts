@@ -54,6 +54,20 @@ export class ChunkIntegrityError extends Error {
     }
 }
 
+/** Thrown when a ChunkDoc reaches reassembly without a usable `content`
+ *  buffer (undefined/null/non-Uint8Array). A chunk is *available* only when
+ *  its doc exists AND carries content; a content-less doc is treated exactly
+ *  like a missing chunk. This converts the previous opaque
+ *  `TypeError: cannot read 'length' of undefined` (joinChunks) into a typed,
+ *  routable signal. Sibling of ChunkIntegrityError — both mean "this chunk is
+ *  not usable, route to repair/quarantine". */
+export class ChunkContentMissingError extends Error {
+    constructor(public readonly chunkId: string) {
+        super(`chunk ${chunkId} has no usable content (content-less doc)`);
+        this.name = "ChunkContentMissingError";
+    }
+}
+
 /**
  * Forward step: turn a ChunkDoc into the `{ doc, attachments: { c } }`
  * item consumed by `bulkDocsWithAttachments`. The `content` field is

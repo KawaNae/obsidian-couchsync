@@ -7,6 +7,8 @@ import {
     arrayBufferToBase64Fallback,
     base64ToArrayBufferFallback,
 } from "../src/db/chunker.ts";
+import { ChunkContentMissingError } from "../src/db/chunk-attachment.ts";
+import type { ChunkDoc } from "../src/types.ts";
 
 const enc = new TextEncoder();
 const dec = new TextDecoder("utf-8");
@@ -69,6 +71,20 @@ describe("chunker roundtrip (text via binary path)", () => {
         const bytes = new Uint8Array([0, 1, 2, 127, 128, 255, 0, 42]);
         const chunks = await splitIntoChunks(bytes.buffer);
         expect(new Uint8Array(joinChunks(chunks))).toEqual(bytes);
+    });
+
+    // Invariant I (G1): a content-less ChunkDoc must raise a typed, routable
+    // error — NOT the opaque `TypeError: cannot read 'length' of undefined`
+    // that crashed reconcile in the field (reproduced on real device).
+    it("content-less chunk → ChunkContentMissingError (not opaque TypeError)", () => {
+        const good = { _id: "chunk:x64:aaaa", type: "chunk", schemaVersion: 2, content: new Uint8Array([1, 2]) } as ChunkDoc;
+        const broken = { _id: "chunk:x64:bbbb", type: "chunk", schemaVersion: 2 } as unknown as ChunkDoc;
+        expect(() => joinChunks([good, broken])).toThrow(ChunkContentMissingError);
+        try {
+            joinChunks([good, broken]);
+        } catch (e) {
+            expect((e as ChunkContentMissingError).chunkId).toBe("chunk:x64:bbbb");
+        }
     });
 
     it("same content produces same chunk IDs (content-addressed)", async () => {

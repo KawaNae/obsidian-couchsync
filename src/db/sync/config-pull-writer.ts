@@ -376,8 +376,13 @@ export class ConfigPullWriter {
      */
     private async ensureChunks(configDoc: ConfigDoc): Promise<void> {
         const existing = await this.deps.db.getChunks(configDoc.chunks);
-        const existingIds = new Set(existing.map((c) => c._id));
-        const missing = configDoc.chunks.filter((id) => !existingIds.has(id));
+        // Availability (Invariant I): content-less doc counts as missing so it
+        // is re-fetched rather than trusted by id. Symmetric with the vault
+        // side (SyncEngine.ensureChunksInternal).
+        const usableIds = new Set(
+            existing.filter((c) => c.content instanceof Uint8Array).map((c) => c._id),
+        );
+        const missing = configDoc.chunks.filter((id) => !usableIds.has(id));
         if (missing.length === 0) return;
 
         const CONCURRENCY = 4;

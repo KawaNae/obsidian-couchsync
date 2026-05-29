@@ -45,6 +45,17 @@ import { BackoffSchedule } from "./sync/backoff.ts";
 import { classifyError } from "./sync/errors.ts";
 import { BrowserVisibilityGate, ALWAYS_VISIBLE, type VisibilityGate } from "./visibility-gate.ts";
 
+// ── Types ────────────────────────────────────────────────
+
+/** Residual availability after an ensure-chunks attempt (Invariant I/II).
+ *  `stillMissing` lists chunk ids unavailable after the attempt; when
+ *  `remoteConsulted` is true those are missing on the server too = broken
+ *  (reconciler quarantines), when false the device was offline = transient. */
+export interface EnsureChunksResult {
+    stillMissing: string[];
+    remoteConsulted: boolean;
+}
+
 // ── Constants ────────────────────────────────────────────
 
 const HEALTH_CHECK_INTERVAL = 30000; // 30s
@@ -271,17 +282,25 @@ export class SyncEngine {
     private async ensureChunksInternal(
         client: ICouchClient | null,
         fileDoc: FileDoc,
-    ): Promise<void> {
+    ): Promise<EnsureChunksResult> {
         const existing = await this.localDb.getChunks(fileDoc.chunks);
-        const existingIds = new Set(existing.map((c) => c._id));
-        const missing = fileDoc.chunks.filter((id) => !existingIds.has(id));
-        if (missing.length === 0) return;
+        // Availability (Invariant I): a chunk doc that exists but carries no
+        // content buffer is NOT usable — treat it as missing so it gets
+        // re-fetched (the remote attachment re-materialises content) instead
+        // of being trusted by id alone and later crashing reassembly.
+        const usableIds = new Set(
+            existing.filter((c) => c.content instanceof Uint8Array).map((c) => c._id),
+        );
+        const missing = fileDoc.chunks.filter((id) => !usableIds.has(id));
+        if (missing.length === 0) return { stillMissing: [], remoteConsulted: client != null };
 
         if (!client) {
             logWarn(
                 `missing ${missing.length} chunk(s) for ${filePathFromId(fileDoc._id)} but no remote client`,
             );
-            return;
+            // No remote consulted → caller treats as transient (offline), not
+            // as broken (Invariant II): do not quarantine, retry when online.
+            return { stillMissing: missing, remoteConsulted: false };
         }
 
         logDebug(
@@ -337,11 +356,16 @@ export class SyncEngine {
         if (fetched.length > 0) {
             await this.localDb.runWriteTx({ chunks: fetched });
         }
+        // Remote was consulted; whatever could not be fetched (absent on the
+        // server / corrupt) is genuinely unavailable everywhere = broken.
+        return { stillMissing: [...notFound, ...corrupt], remoteConsulted: true };
     }
 
     /** Public API for Reconciler / ConflictOrchestrator. Uses the live
-     *  session's client when available, no-op otherwise. */
-    async ensureFileChunks(fileDoc: FileDoc): Promise<void> {
+     *  session's client when available, no-op otherwise. Returns the residual
+     *  availability so the reconciler can distinguish broken (remote consulted,
+     *  still missing → quarantine) from transient (offline). */
+    async ensureFileChunks(fileDoc: FileDoc): Promise<EnsureChunksResult> {
         return this.ensureChunksInternal(this.session?.client ?? null, fileDoc);
     }
 
@@ -686,6 +710,19 @@ export class SyncEngine {
     private async openSession(rc = 0): Promise<void> {
         const tag = rc > 0 ? `[rc#${rc}] ` : "";
         if (this.session) return;
+        // Provisioning gate (Invariant: a vault sync session exists only when
+        // the vault is fully provisioned). connectionState === "syncing" is the
+        // single authoritative signal that Init/Clone committed and the codec
+        // stack is complete. A clone that failed/interrupted leaves
+        // connectionState === "settingUp" with a half-built codec (crypto
+        // dropped, compression still on); without this gate a reconnect would
+        // open a session on that broken stack and every catchup attachment
+        // fetch fails with "cannot decompress still-encrypted body".
+        const connState = this.getSettings().connectionState;
+        if (connState !== "syncing") {
+            logDebug(`${tag}openSession: skipped — connectionState=${connState} (not syncing)`);
+            return;
+        }
         if (this.auth.isBlocked()) return;
         if (this.degraded) return;
 
@@ -701,7 +738,9 @@ export class SyncEngine {
             events: this.events,
             checkpoints: this.checkpoints,
             getConflictResolver: () => this.conflictResolver,
-            ensureChunks: (doc) => this.ensureChunksInternal(client, doc),
+            // Pull-side ensureChunks only needs the side effect (fetch + persist);
+            // discard the EnsureChunksResult to keep the session contract void.
+            ensureChunks: async (doc) => { await this.ensureChunksInternal(client, doc); },
             applyPullWrite: (doc) => this.applyPullWrite(doc),
             handleLocalDbError: (e, ctx) => this.handleLocalDbError(e, ctx),
             onTransientError: (err) => this.handleTransientError(err),

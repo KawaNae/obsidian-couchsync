@@ -89,6 +89,16 @@ interface FakeVaultSync {
     alignLastSyncedToDoc(path: string, doc: FileDoc): Promise<"already-aligned" | "upgraded-legacy" | "recovered-stale">;
     getLastSynced(path: string): undefined;
     computeVaultChunks(path: string): Promise<string[]>;
+    // Quarantine (Invariant II). Defaults to "nothing quarantined, all chunks
+    // locally available" so existing restore/pull tests are unaffected.
+    quarantinedCalls: string[];
+    clearedCalls: string[];
+    quarantined: Set<string>;
+    localMissing: Map<string, string[]>;
+    wasQuarantined(path: string): Promise<boolean>;
+    localMissingChunks(doc: FileDoc): Promise<string[]>;
+    recordQuarantined(path: string, missingChunks: string[]): Promise<boolean>;
+    clearQuarantined(path: string): Promise<void>;
 }
 
 function makeVaultSync(): FakeVaultSync {
@@ -126,10 +136,30 @@ function makeVaultSync(): FakeVaultSync {
         // lastSynced so the reconciler keeps the legacy paths.
         getLastSynced(_path) { return undefined; },
         async computeVaultChunks(_path) { return []; },
+        quarantinedCalls: [],
+        clearedCalls: [],
+        quarantined: new Set<string>(),
+        localMissing: new Map<string, string[]>(),
+        async wasQuarantined(path) { return this.quarantined.has(path); },
+        async localMissingChunks(doc) {
+            return this.localMissing.get(filePathFromId(doc._id)) ?? [];
+        },
+        async recordQuarantined(path, _missingChunks) {
+            this.quarantinedCalls.push(path);
+            this.quarantined.add(path);
+            return true;
+        },
+        async clearQuarantined(path) {
+            this.clearedCalls.push(path);
+            this.quarantined.delete(path);
+        },
     };
 }
 
-function setup(files: FakeFile[]) {
+function setup(
+    files: FakeFile[],
+    ensureChunks?: (doc: FileDoc) => Promise<{ stillMissing: string[]; remoteConsulted: boolean }>,
+) {
     const db = new FakeLocalDb();
     const vaultSync = makeVaultSync();
     const notifyCalls: string[] = [];
@@ -140,6 +170,7 @@ function setup(files: FakeFile[]) {
         vaultSync as any,
         () => ({ deviceId: SELF } as any),
         (msg) => notifyCalls.push(msg),
+        ensureChunks as any,
     );
     return { reconciler, db, vaultSync, files, notifyCalls };
 }
@@ -251,6 +282,59 @@ describe("Reconciler", () => {
             // No manifest set
             const r = await h.reconciler.reconcile("manual");
             expect(r.restored).toEqual(["a.md"]);
+            expect(h.vaultSync.markDeletedCalls).toEqual([]);
+        });
+
+        // Invariant II (G2): a broken FileDoc (chunks missing on this device
+        // AND the server) must be quarantined, not restore-looped. Reproduces
+        // the field ping-pong (couchsync_log_* with GC'd chunks).
+        it("quarantines (not restores) when chunks are missing everywhere", async () => {
+            const broken = async () => ({ stillMissing: ["chunk:x64:gone"], remoteConsulted: true });
+            const h = setup([], broken);
+            h.db.fileDocs.set("a.md", makeDoc("a.md", { lastWriter: OTHER }));
+            h.db.manifest = { paths: [], updatedAt: 0 };
+
+            const r1 = await h.reconciler.reconcile("manual");
+            expect(r1.quarantined).toEqual(["a.md"]);
+            expect(r1.restored).toEqual([]);
+            expect(h.vaultSync.dbToFileCalls).toEqual([]); // no opaque restore attempt
+            expect(h.vaultSync.quarantinedCalls).toEqual(["a.md"]);
+
+            // Second cycle: still broken locally → stays quarantined silently,
+            // no re-quarantine notification, no remote re-probe ping-pong.
+            h.vaultSync.localMissing.set("a.md", ["chunk:x64:gone"]);
+            const r2 = await h.reconciler.reconcile("manual");
+            expect(r2.restored).toEqual([]);
+            expect(h.vaultSync.dbToFileCalls).toEqual([]);
+            expect(h.vaultSync.quarantinedCalls).toEqual(["a.md"]); // not re-recorded
+        });
+
+        it("recovers a quarantined file once its chunks arrive locally", async () => {
+            const broken = async () => ({ stillMissing: [], remoteConsulted: true });
+            const h = setup([], broken);
+            h.db.fileDocs.set("a.md", makeDoc("a.md", { lastWriter: OTHER }));
+            h.db.manifest = { paths: [], updatedAt: 0 };
+            // Pre-mark as quarantined; chunks are now locally available (empty
+            // localMissing) → reconcile should clear + restore.
+            h.vaultSync.quarantined.add("a.md");
+            h.vaultSync.localMissing.set("a.md", []);
+
+            const r = await h.reconciler.reconcile("manual");
+            expect(h.vaultSync.clearedCalls).toEqual(["a.md"]);
+            expect(r.restored).toEqual(["a.md"]);
+            expect(h.vaultSync.dbToFileCalls).toEqual(["a.md"]);
+        });
+    });
+
+    describe("Disposal barrier (Invariant III / G5)", () => {
+        it("destroy() stops new reconcile work (no DB writes after unload)", async () => {
+            const h = setup([]);
+            h.db.fileDocs.set("a.md", makeDoc("a.md", { lastWriter: OTHER }));
+            h.db.manifest = { paths: [], updatedAt: 0 };
+            h.reconciler.destroy();
+            const r = await h.reconciler.reconcile("manual");
+            expect(r.restored).toEqual([]);
+            expect(h.vaultSync.dbToFileCalls).toEqual([]);
             expect(h.vaultSync.markDeletedCalls).toEqual([]);
         });
     });

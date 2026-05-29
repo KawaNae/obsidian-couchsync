@@ -9,6 +9,7 @@ import { compareVC, latestDevice } from "./vector-clock.ts";
 import { filePathFromId } from "../types/doc-id.ts";
 import { toPathKey, type PathKey } from "../utils/path.ts";
 import { logDebug, logInfo, logWarn, logError } from "../ui/log.ts";
+import type { EnsureChunksResult } from "../db/sync-engine.ts";
 
 /**
  * Margin absorbing local filesystem clock jitter when asking "has any vault
@@ -64,6 +65,10 @@ export interface ReconcileReport {
     deleted: string[];
     /** Files restored from DB because another device created them (case D restore). */
     restored: string[];
+    /** Files quarantined because their chunks are unavailable on this device
+     *  AND the server (broken / missingReferenced). Restore is suppressed
+     *  until the chunks arrive — no infinite retry (Invariant II). */
+    quarantined: string[];
     /** Whether the run took the fast-path short-circuit (no full scan). */
     shortCircuited: boolean;
 }
@@ -78,6 +83,7 @@ function emptyReport(reason: ReconcileReason, mode: ReconcileMode): ReconcileRep
         pushed: [],
         deleted: [],
         restored: [],
+        quarantined: [],
         shortCircuited: false,
     };
 }
@@ -113,6 +119,11 @@ export class Reconciler {
     private pendingReason: ReconcileReason | null = null;
     private autoPendingTotal = 0;
     private autoPendingTimer: ReturnType<typeof setTimeout> | null = null;
+    /** Latched by `destroy()` on plugin unload. Once set, no new reconcile
+     *  starts and in-flight side effects are skipped, so reconcile work never
+     *  outlives the localDb it writes through (otherwise an in-flight
+     *  vclock-adopt runs after `localDb.close()` → DatabaseClosedError). */
+    private disposed = false;
 
     private conflictOrchestrator: ConflictOrchestrator | null = null;
 
@@ -122,7 +133,8 @@ export class Reconciler {
         private vaultSync: VaultSync,
         private getSettings: () => CouchSyncSettings,
         private notify: ReconcileNotify = () => {},
-        private ensureChunks: (doc: FileDoc) => Promise<void> = async () => {},
+        private ensureChunks: (doc: FileDoc) => Promise<EnsureChunksResult> =
+            async () => ({ stillMissing: [], remoteConsulted: false }),
     ) {}
 
     /**
@@ -140,8 +152,11 @@ export class Reconciler {
         return this.currentRun !== null;
     }
 
-    /** Cancel any pending auto-notify debounce. Call from plugin unload. */
+    /** Latch disposal and cancel pending work. Call from plugin unload
+     *  BEFORE closing localDb. Callers should `await settle()` afterwards to
+     *  let any in-flight run drain before the DB handle is torn down. */
     destroy(): void {
+        this.disposed = true;
         if (this.autoPendingTimer) {
             clearTimeout(this.autoPendingTimer);
             this.autoPendingTimer = null;
@@ -150,10 +165,22 @@ export class Reconciler {
         this.pendingReason = null;
     }
 
+    /** Resolve once any in-flight reconcile has finished. Lets `onunload`
+     *  drain reconcile work before `localDb.close()`. */
+    async settle(): Promise<void> {
+        if (this.currentRun) {
+            try { await this.currentRun; } catch { /* already logged */ }
+        }
+    }
+
     async reconcile(
         reason: ReconcileReason,
         opts: { mode?: ReconcileMode } = {},
     ): Promise<ReconcileReport> {
+        // Disposal barrier: never start reconcile work during/after unload.
+        // The localDb may already be closing; a write here would race the
+        // teardown (DatabaseClosedError).
+        if (this.disposed) return emptyReport(reason, opts.mode ?? "apply");
         // If a run is in flight, queue a re-run instead of dropping the
         // request. The old coalesce approach returned the in-flight promise,
         // which meant data written after the run started was never processed.
@@ -285,9 +312,9 @@ export class Reconciler {
                         report.deleted.push(displayPath);
                     }
                 } else {
-                    if (await this.tryStep(displayPath, "restore", async () => { await this.ensureChunks(doc); await this.vaultSync.dbToFile(doc); }, mode)) {
-                        report.restored.push(displayPath);
-                    }
+                    const r = await this.applyRemoteToVault(displayPath, doc, "restore", mode);
+                    if (r === "applied") report.restored.push(displayPath);
+                    else if (r === "quarantined") report.quarantined.push(displayPath);
                 }
                 continue;
             }
@@ -339,14 +366,15 @@ export class Reconciler {
                         }
                         break;
                     case "remote-edit":
-                    case "legacy-skip":
+                    case "legacy-skip": {
                         // legacy-skip: pre-extension lastSynced — fall back to
                         // pull (= old behavior when divergent guard couldn't
                         // run). PR5 startup sweep will upgrade the entries.
-                        if (await this.tryStep(displayPath, "pull", async () => { await this.ensureChunks(doc); await this.vaultSync.dbToFile(doc); }, mode)) {
-                            report.remoteWins.push(displayPath);
-                        }
+                        const r = await this.applyRemoteToVault(displayPath, doc, "pull", mode);
+                        if (r === "applied") report.remoteWins.push(displayPath);
+                        else if (r === "quarantined") report.quarantined.push(displayPath);
                         break;
+                    }
                     case "true-divergent":
                         if (this.conflictOrchestrator) {
                             if (await this.tryStep(displayPath, "conflict-edit",
@@ -359,9 +387,9 @@ export class Reconciler {
                             // ConflictOrchestrator) — fall back to pull. The
                             // divergent local edit is lost in this fallback;
                             // production main.ts always wires the orchestrator.
-                            if (await this.tryStep(displayPath, "pull", async () => { await this.ensureChunks(doc); await this.vaultSync.dbToFile(doc); }, mode)) {
-                                report.remoteWins.push(displayPath);
-                            }
+                            const r = await this.applyRemoteToVault(displayPath, doc, "pull", mode);
+                            if (r === "applied") report.remoteWins.push(displayPath);
+                            else if (r === "quarantined") report.quarantined.push(displayPath);
                         }
                         break;
                 }
@@ -388,6 +416,13 @@ export class Reconciler {
             const msg = `Large deletion detected: ${report.deleted.length} files removed (>${Math.floor(LARGE_DELETE_RATIO * 100)}% of vault). Verify with consistency check.`;
             logWarn(`CouchSync: ${msg}`);
             this.notify(msg);
+        }
+
+        // Quarantine is not a "change applied" (recordQuarantined notifies
+        // once on its own), but surface the count in the console summary so a
+        // persistent broken file is observable without log spam.
+        if (report.quarantined.length > 0) {
+            logInfo(`Reconcile (${reason}): ${report.quarantined.length} quarantined (broken — chunks missing on this device and server)`);
         }
 
         const total = totalDiscrepancies(report);
@@ -441,12 +476,80 @@ export class Reconciler {
         mode: ReconcileMode,
     ): Promise<boolean> {
         if (mode !== "apply") return true;
+        // Disposal barrier: a long restore/pull batch may still be iterating
+        // when unload latches `disposed`. Stop issuing DB writes so they don't
+        // race localDb teardown.
+        if (this.disposed) return false;
         try {
             await op();
             return true;
         } catch (e) {
-            logError(`CouchSync: reconcile ${label} failed for ${path}: ${e?.message ?? e}`);
+            this.logStepError(label, path, e);
             return false;
+        }
+    }
+
+    /** Log a reconcile step failure, downgrading shutdown-race errors
+     *  (disposed) to debug so teardown doesn't spam the log. */
+    private logStepError(label: string, path: string, e: unknown): void {
+        if (this.disposed) {
+            logDebug(`CouchSync: reconcile ${label} skipped for ${path} (shutting down)`);
+            return;
+        }
+        logError(`CouchSync: reconcile ${label} failed for ${path}: ${(e as any)?.message ?? e}`);
+    }
+
+    /**
+     * Apply a remote FileDoc to the vault (restore/pull) with broken-chunk
+     * quarantine (Invariant II). Returns the outcome so the caller records it
+     * in the right report bucket.
+     *
+     *  - "applied": chunks available, file written.
+     *  - "quarantined": chunks unavailable on this device AND the server
+     *    (broken). Recorded once, restore suppressed — no infinite retry.
+     *  - "skipped": transient (offline / shutdown / error) — retried later.
+     *
+     * Recovery: a quarantined file clears automatically once its chunks land
+     * locally (a re-pushed FileDoc pulls them in) — checked cheaply with a
+     * local-only availability probe, no per-cycle remote round-trip.
+     */
+    private async applyRemoteToVault(
+        displayPath: string,
+        doc: FileDoc,
+        label: string,
+        mode: ReconcileMode,
+    ): Promise<"applied" | "quarantined" | "skipped"> {
+        if (mode !== "apply") return "applied";
+        if (this.disposed) return "skipped";
+
+        if (await this.vaultSync.wasQuarantined(displayPath)) {
+            const localMissing = await this.vaultSync.localMissingChunks(doc);
+            if (localMissing.length > 0) return "quarantined"; // still broken, stay quiet
+            await this.vaultSync.clearQuarantined(displayPath); // chunks arrived → recover
+        }
+
+        let res: EnsureChunksResult;
+        try {
+            res = await this.ensureChunks(doc);
+        } catch (e) {
+            this.logStepError(label, displayPath, e);
+            return "skipped";
+        }
+        if (res.stillMissing.length > 0) {
+            if (res.remoteConsulted) {
+                // Unavailable here AND on the server → broken. Quarantine to
+                // end the restore ping-pong; recovers when chunks reappear.
+                await this.vaultSync.recordQuarantined(displayPath, res.stillMissing);
+                return "quarantined";
+            }
+            return "skipped"; // offline — transient, retry when online
+        }
+        try {
+            await this.vaultSync.dbToFile(doc);
+            return "applied";
+        } catch (e) {
+            this.logStepError(label, displayPath, e);
+            return "skipped";
         }
     }
 

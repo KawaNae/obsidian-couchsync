@@ -103,8 +103,12 @@ export function createSyncHarness(opts: SyncHarnessOptions = {}): SyncHarness {
         // Settings: base → harness defaults → per-device overrides
         const settings = makeSettings({
             deviceId: id,
-            // URL 系は clientFactory が無視するので任意値でOK。connectionState を
-            // syncing 以外にしておき、engine.start() を意図せず走らせないように。
+            // URL 系は clientFactory が無視するので任意値でOK。
+            // connectionState は "syncing" にする: openSession が
+            // connectionState === "syncing" でゲートされる (Invariant III) ため、
+            // engine.start() で実際にセッションが開くにはこの状態が必要。
+            // provisioning 前の挙動を見るテストは override する。
+            connectionState: "syncing",
             couchdbUri: "http://fake",
             couchdbDbName: "fake-remote",
             couchdbUser: "test",

@@ -158,6 +158,11 @@ export async function createE2EHarness(opts: CreateE2EHarnessOpts = {}): Promise
 
         const settings = makeSettings({
             deviceId: id,
+            // Provisioned, live-syncing vault: openSession gates on
+            // connectionState === "syncing" (Invariant III). The harness
+            // simulates a device past Init/Clone; tests that exercise the
+            // not-yet-provisioned path override this.
+            connectionState: "syncing",
             couchdbUri: cfg.couchUrl,
             couchdbDbName: cfg.dbName,
             couchdbUser: cfg.user,

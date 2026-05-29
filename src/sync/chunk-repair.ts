@@ -75,6 +75,23 @@ export interface ChunkRepairResult {
     elapsedMs: number;
 }
 
+/**
+ * Map a consistency report to a repair plan.
+ *
+ * Discrepancy ownership (Invariant II) — every report category has exactly
+ * ONE terminal owner:
+ *   - localOnly  (referenced) → toPush       \
+ *   - remoteOnly (referenced) → toPull        | recoverable drift, owned by repair
+ *   - localOnly  (orphan)     → toDeleteLocal  |
+ *   - remoteOnly (orphan)     → toDeleteRemote/
+ *   - orphan on BOTH sides    → chunk-gc (not here; not in localOnly/remoteOnly)
+ *   - missingReferenced (broken) → NOT repairable here. A chunk absent on
+ *     both sides cannot be pushed/pulled/deleted into existence; its owner is
+ *     the reconciler, which quarantines the referencing FileDoc (Invariant II)
+ *     and recovers it if the chunk reappears. Deliberately excluded from the
+ *     plan — see the totality test in tests/chunk-repair.test.ts. Do NOT add a
+ *     delete-here shortcut: another device may still hold the chunk.
+ */
 export function planFromReport(
     report: ChunkConsistencyReport,
 ): ChunkRepairPlan {

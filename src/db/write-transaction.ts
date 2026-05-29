@@ -15,7 +15,7 @@ import type { VectorClock } from "../sync/vector-clock.ts";
 export type DbErrorKind =
     | "quota"          // QuotaExceededError — IndexedDB out of space
     | "abort"          // AbortError — transient (concurrent tx, lock)
-    | "invalid-state"  // InvalidStateError — DB closed mid-op
+    | "invalid-state"  // InvalidStateError / DatabaseClosedError — handle died mid-op, reopen
     | "degraded"       // HandleGuard exhausted reopen attempts — unrecoverable
     | "conflict"       // CAS version mismatch (expectedVclock failed)
     | "constraint"     // ConstraintError — schema/PK violation
@@ -134,6 +134,15 @@ export function classifyDexieError(e: unknown): DbErrorKind {
     // generic `UnknownError` carrying the "without an in-progress
     // transaction" message (handled in the message fallback below).
     if (name === "InvalidStateError" || name === "TransactionInactiveError") return "invalid-state";
+    // DatabaseClosedError: Dexie throws this when an op runs against a handle
+    // that was closed mid-flight (e.g. iOS killing the IDB process, or a
+    // teardown race). It is a handle-expired signal — classify as
+    // invalid-state so HandleGuard recognises it and reopens, instead of
+    // mislabelling it "unknown" (which loses the signal once wrapped in
+    // DbError and floods logs with "unclassified"). Deliberate shutdown is
+    // handled separately by HandleGuard's `closed` latch, which fails fast
+    // without ever reaching a live Dexie op.
+    if (name === "DatabaseClosedError") return "invalid-state";
     if (name === "ConstraintError") return "constraint";
     // Some Dexie errors wrap the underlying IDB error in `.inner`.
     const inner: any = err?.inner;
@@ -142,6 +151,7 @@ export function classifyDexieError(e: unknown): DbErrorKind {
         if (iname === "QuotaExceededError") return "quota";
         if (iname === "AbortError") return "abort";
         if (iname === "InvalidStateError" || iname === "TransactionInactiveError") return "invalid-state";
+        if (iname === "DatabaseClosedError") return "invalid-state";
         if (iname === "ConstraintError") return "constraint";
     }
     // Fallback: heuristics on message text.
@@ -156,6 +166,16 @@ export function classifyDexieError(e: unknown): DbErrorKind {
     if (
         msg.includes("without an in-progress transaction") ||
         innerMsg.includes("without an in-progress transaction")
+    ) {
+        return "invalid-state";
+    }
+    // DatabaseClosedError surfaced only via message (no name) — "Database has
+    // been closed" / "database is closed". Same handle-expired signal.
+    if (
+        msg.includes("database has been closed") ||
+        msg.includes("database is closed") ||
+        innerMsg.includes("database has been closed") ||
+        innerMsg.includes("database is closed")
     ) {
         return "invalid-state";
     }

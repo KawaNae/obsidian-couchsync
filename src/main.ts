@@ -110,6 +110,21 @@ export default class CouchSyncPlugin extends Plugin {
      * the stream incompressible. Pull traverses the inverse order.
      */
     private wrapVaultClient = (raw: CouchClient): ICouchClient => {
+        // Fail-closed codec integrity (Invariant III). The encrypt layer is
+        // sourced from the in-memory `vaultCryptoProvider`, the compress layer
+        // from `activeCompression` (which falls through to the *persisted*
+        // `compressionEnabled`). These two sources have different lifecycles:
+        // a clone failure drops the crypto provider but leaves the persisted
+        // compression flag intact, so without this guard we'd silently build a
+        // compress-only stack over an encrypted vault and try to gunzip still-
+        // encrypted bodies. Refuse to build an inconsistent stack instead.
+        if (this.settings.encryptionEnabled && !this.vaultCryptoProvider) {
+            throw new Error(
+                "CouchSync: refusing to build vault client — vault is encrypted " +
+                    "but no crypto provider is unlocked (provisioning incomplete). " +
+                    "Re-run Init/Clone or unlock the vault.",
+            );
+        }
         let client: ICouchClient = raw;
         if (this.vaultCryptoProvider) {
             client = new EncryptingCouchClient(client, this.vaultCryptoProvider);
@@ -739,7 +754,12 @@ export default class CouchSyncPlugin extends Plugin {
         this.compositionTracker?.stop();
         this.replicator?.stop();
         await this.vaultSync?.teardown();
+        // Latch disposal, then drain any in-flight reconcile BEFORE closing
+        // localDb — otherwise a mid-flight vclock-adopt/restore writes through
+        // a torn-down handle (DatabaseClosedError). destroy() stops new runs;
+        // settle() waits for the current one.
         this.reconciler?.destroy();
+        await this.reconciler?.settle();
         this.statusBar?.destroy();
         this.historyStorage?.close();
         this.logStorage?.close();

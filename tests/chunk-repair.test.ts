@@ -110,6 +110,22 @@ describe("planFromReport", () => {
         expect(planIsEmpty(plan)).toBe(true);
     });
 
+    // Invariant II (G2): broken chunks (missingReferenced) are owned by the
+    // reconciler's quarantine path, NOT by repair — they can't be pushed,
+    // pulled, or deleted into existence. The plan must exclude them entirely
+    // (no silent delete-shortcut that would risk data another device holds).
+    it("missingReferenced (broken) → excluded from every repair action", () => {
+        const broken = makeChunkId("broken-everywhere");
+        const plan = planFromReport(emptyReport({
+            missingReferenced: [{ id: broken, referencedBy: ["broken-note.md"] }],
+        }));
+        expect(plan.toPush).not.toContain(broken);
+        expect(plan.toPull).not.toContain(broken);
+        expect(plan.toDeleteLocal).not.toContain(broken);
+        expect(plan.toDeleteRemote).not.toContain(broken);
+        expect(planIsEmpty(plan)).toBe(true);
+    });
+
     it("two-sided orphans (present on both, unreferenced) stay with GC", () => {
         // Such chunks are in orphanLocal + orphanRemote but NOT in
         // localOnly / remoteOnly — so plan excludes them entirely.

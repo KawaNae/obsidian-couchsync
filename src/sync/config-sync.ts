@@ -665,10 +665,18 @@ export class ConfigSync {
             try {
                 onProgress?.(path, i + 1, docs.length);
                 const chunks = await db.getChunks(doc.chunks);
-                if (chunks.length !== doc.chunks.length) {
-                    const missing = doc.chunks.filter(
-                        (id) => !chunks.some((c) => c._id === id),
-                    );
+                // Availability (Invariant I): a content-less chunk doc is
+                // unavailable, same as an absent one. Filter to usable chunks
+                // before the completeness check so config write skips cleanly
+                // (its existing non-throwing policy) instead of letting a
+                // content-less doc reach joinChunks.
+                const usableIds = new Set(
+                    chunks
+                        .filter((c) => c.content instanceof Uint8Array)
+                        .map((c) => c._id),
+                );
+                if (usableIds.size !== doc.chunks.length) {
+                    const missing = doc.chunks.filter((id) => !usableIds.has(id));
                     logWarn(
                         `CouchSync: Skipping config write ${path} \u2014 ` +
                         `missing ${missing.length} chunk(s): ${missing.slice(0, 3).join(", ")}`,

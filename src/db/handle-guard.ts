@@ -117,7 +117,10 @@ export class HandleGuard<T> {
     }
 
     /** Release the current handle (if any). The next runOp will build a
-     *  fresh one. */
+     *  fresh one — close() is reopen-able by design so iOS-style mid-op
+     *  handle death recovers transparently. Deliberate shutdown is enforced
+     *  one level up (Reconciler disposal barrier + onunload ordering), not by
+     *  latching the guard. */
     async close(): Promise<void> {
         if (!this.current) return;
         const old = this.current;

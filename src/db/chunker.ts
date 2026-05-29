@@ -1,6 +1,7 @@
 import type { ChunkDoc } from "../types.ts";
 import { CHUNK_SCHEMA_VERSION } from "../types.ts";
 import { makeChunkId, type ChunkHashAlg } from "../types/doc-id.ts";
+import { ChunkContentMissingError } from "./chunk-attachment.ts";
 
 /** Default per-binary-chunk size for vault FileDocs. Matches the previous
  *  era's effective binary boundary (100 KiB base64 → 75 KiB binary) so
@@ -194,6 +195,16 @@ function isChunkHasher(x: ChunkerConfig | ChunkHasher): x is ChunkHasher {
 }
 
 export function joinChunks(chunks: ChunkDoc[]): ArrayBuffer {
+    // Fail-closed (Invariant I): a ChunkDoc is only usable when it carries a
+    // real content buffer. A content-less doc (e.g. carried over from an old
+    // schema, or a partial/corrupt write) must raise a typed, routable error
+    // here rather than an opaque `TypeError: cannot read 'length' of
+    // undefined` deep in the reassembly loop.
+    for (const c of chunks) {
+        if (!(c.content instanceof Uint8Array)) {
+            throw new ChunkContentMissingError(c._id);
+        }
+    }
     let totalLen = 0;
     for (const c of chunks) totalLen += c.content.length;
     const out = new Uint8Array(totalLen);
