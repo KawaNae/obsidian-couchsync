@@ -34,9 +34,14 @@ import { SyncEngine } from "../../src/db/sync-engine.ts";
 import { AuthGate } from "../../src/db/sync/auth-gate.ts";
 import { VaultSync } from "../../src/sync/vault-sync.ts";
 import { ChangeTracker } from "../../src/sync/change-tracker.ts";
+import { Reconciler } from "../../src/sync/reconciler.ts";
 import { ConflictResolver } from "../../src/conflict/conflict-resolver.ts";
 import { FilesystemVaultWriter } from "../../src/sync/vault-writer.ts";
 import { CouchClient, makeCouchClient } from "../../src/db/couch-client.ts";
+import { EncryptingCouchClient } from "../../src/db/encrypting-couch-client.ts";
+import { CompressingCouchClient } from "../../src/db/compressing-couch-client.ts";
+import { deriveKeys, createCryptoProvider, type CryptoProvider } from "../../src/db/crypto-provider.ts";
+import { computeHash, type ChunkHasher } from "../../src/db/chunker.ts";
 import type { CouchSyncSettings } from "../../src/settings.ts";
 import type { ICouchClient } from "../../src/db/interfaces.ts";
 
@@ -58,6 +63,48 @@ import type { CouchSyncDoc } from "../../src/types.ts";
  */
 export function stripLocalRevs<T extends { _rev?: string }>(docs: T[]): CouchSyncDoc[] {
     return docs.map((d) => stripRev(d) as unknown as CouchSyncDoc);
+}
+
+/**
+ * Poll `predicate` until it returns truthy or the timeout elapses. The
+ * convergence primitive for true end-to-end tests: start the engines, make a
+ * change, then `waitFor(() => the other device's vault matches)`. Replaces
+ * fixed sleeps — the live push/pull loops are timing-dependent (2s push poll,
+ * longpoll), so polling a real condition is both faster (returns as soon as it
+ * converges) and more robust than guessing a delay.
+ */
+export async function waitFor(
+    predicate: () => boolean | Promise<boolean>,
+    opts: { timeoutMs?: number; intervalMs?: number; label?: string } = {},
+): Promise<void> {
+    const timeoutMs = opts.timeoutMs ?? 8000;
+    const intervalMs = opts.intervalMs ?? 100;
+    const start = Date.now();
+    let last: unknown;
+    for (;;) {
+        try {
+            if (await predicate()) return;
+        } catch (e) {
+            last = e; // predicate may throw mid-convergence (e.g. file not yet present)
+        }
+        if (Date.now() - start > timeoutMs) {
+            throw new Error(
+                `waitFor timed out after ${timeoutMs}ms` +
+                    (opts.label ? ` waiting for: ${opts.label}` : "") +
+                    (last ? ` (last error: ${(last as any)?.message ?? last})` : ""),
+            );
+        }
+        await new Promise((r) => setTimeout(r, intervalMs));
+    }
+}
+
+/** True when the two byte buffers are identical. */
+export function bytesEqual(a: ArrayBuffer, b: ArrayBuffer): boolean {
+    if (a.byteLength !== b.byteLength) return false;
+    const ua = new Uint8Array(a);
+    const ub = new Uint8Array(b);
+    for (let i = 0; i < ua.length; i++) if (ua[i] !== ub[i]) return false;
+    return true;
 }
 
 // ── Config ────────────────────────────────────────────
@@ -97,6 +144,7 @@ export interface E2EDeviceHarness {
     readonly vs: VaultSync;
     readonly ct: ChangeTracker;
     readonly engine: SyncEngine;
+    readonly reconciler: Reconciler;
     readonly resolver: ConflictResolver;
     readonly settings: CouchSyncSettings;
     /** The client pointing at the shared test CouchDB. */
@@ -131,12 +179,28 @@ export interface CreateE2EHarnessOpts {
      *  coexist on the same CouchDB without DELETE/PUT races. Recommended
      *  for new tests; default is the legacy shared dbName. */
     uniqueDb?: boolean;
+    /** Enable the real codec stack on every device (Compressing(Encrypting(raw))),
+     *  using one shared crypto provider so chunk hmac ids dedupe across devices —
+     *  exactly how an encrypted vault syncs in production. Exercises the path
+     *  that G4 (still-encrypted decompress) lived on. */
+    codec?: { passphrase: string; compression?: boolean };
 }
 
 export async function createE2EHarness(opts: CreateE2EHarnessOpts = {}): Promise<E2EHarness> {
     const cfg = e2eConfig({ uniqueDb: opts.uniqueDb });
     const adminClient = makeCouchClient(cfg.couchUrl, cfg.dbName, cfg.user, cfg.password);
     await adminClient.ensureDb();
+
+    // Shared crypto provider for codec-enabled harnesses. A fixed salt keeps
+    // the derivation deterministic across devices in one harness so their
+    // hmac chunk ids match (content-addressed dedupe). Encryption strength is
+    // not under test here — interop of the decorator stack is.
+    let sharedCrypto: CryptoProvider | undefined;
+    if (opts.codec) {
+        const salt = new TextEncoder().encode("couchsync-e2e-fixed-salt-0000000");
+        sharedCrypto = createCryptoProvider(await deriveKeys(opts.codec.passphrase, salt));
+    }
+    const codecCompression = opts.codec?.compression ?? true;
 
     const devices = new Map<string, E2EDeviceHarness>();
     const harnessId = ++harnessCounter;
@@ -180,11 +244,23 @@ export async function createE2EHarness(opts: CreateE2EHarnessOpts = {}): Promise
         );
 
         const auth = new AuthGate();
-        const clientFactory = (_s: CouchSyncSettings): ICouchClient => client;
+        // Codec stack mirrors main.ts wrapVaultClient: Compressing(Encrypting(raw)).
+        // When codec is off this is the bare client (plaintext, x64 hashing).
+        const clientFactory = (_s: CouchSyncSettings): ICouchClient => {
+            let c: ICouchClient = client;
+            if (sharedCrypto) c = new EncryptingCouchClient(c, sharedCrypto);
+            if (sharedCrypto && codecCompression) c = new CompressingCouchClient(c);
+            return c;
+        };
+        // ChunkHasher mirrors main.ts: hmac ids under encryption, x64 otherwise.
+        const hasher: ChunkHasher = {
+            get alg() { return sharedCrypto ? "hmac" : "x64"; },
+            hash: (data) => sharedCrypto ? sharedCrypto.hmacHash(data) : computeHash(data),
+        };
 
         // VaultSync を SyncEngine より先に構築 (production と同じ順序)。
         const writer = new FilesystemVaultWriter(vault);
-        const vs = new VaultSync(vault, db, getSettings, writer);
+        const vs = new VaultSync(vault, db, getSettings, writer, hasher);
         const ct = new ChangeTracker(vaultEvents, vs, getSettings);
 
         const engine = new SyncEngine(
@@ -194,6 +270,19 @@ export async function createE2EHarness(opts: CreateE2EHarnessOpts = {}): Promise
             /* isMobile */ false,
             auth,
             clientFactory,
+        );
+        engine.setChunkHasher(hasher);
+
+        // Reconciler wired to the real engine's ensureFileChunks so e2e tests
+        // can exercise the onload/manual reconcile path (broken-chunk
+        // quarantine, restore) against real CouchDB.
+        const reconciler = new Reconciler(
+            vault,
+            db,
+            vs,
+            getSettings,
+            () => {},
+            (doc) => engine.ensureFileChunks(doc),
         );
 
         const resolver = new ConflictResolver();
@@ -207,12 +296,14 @@ export async function createE2EHarness(opts: CreateE2EHarnessOpts = {}): Promise
             vs,
             ct,
             engine,
+            reconciler,
             resolver,
             client,
             get settings() {
                 return settingsRef.current;
             },
             async destroy() {
+                reconciler.destroy();
                 ct.stop();
                 // Mirror sync-harness: capture the live session before
                 // engine.stop nulls it, then await its settled so the

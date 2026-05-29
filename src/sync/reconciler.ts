@@ -509,9 +509,12 @@ export class Reconciler {
      *    (broken). Recorded once, restore suppressed — no infinite retry.
      *  - "skipped": transient (offline / shutdown / error) — retried later.
      *
-     * Recovery: a quarantined file clears automatically once its chunks land
-     * locally (a re-pushed FileDoc pulls them in) — checked cheaply with a
-     * local-only availability probe, no per-cycle remote round-trip.
+     * Recovery: `ensureChunks` only hits the network when a chunk is actually
+     * missing, so a healthy file never probes. A quarantined file re-probes
+     * once per reconcile (cheap, quiet — recordQuarantined's isNew guard
+     * suppresses repeat notices) and clears the moment its chunks reappear
+     * anywhere. No restore ping-pong: a still-broken file never reaches
+     * dbToFile, so it can't throw or loop.
      */
     private async applyRemoteToVault(
         displayPath: string,
@@ -521,12 +524,6 @@ export class Reconciler {
     ): Promise<"applied" | "quarantined" | "skipped"> {
         if (mode !== "apply") return "applied";
         if (this.disposed) return "skipped";
-
-        if (await this.vaultSync.wasQuarantined(displayPath)) {
-            const localMissing = await this.vaultSync.localMissingChunks(doc);
-            if (localMissing.length > 0) return "quarantined"; // still broken, stay quiet
-            await this.vaultSync.clearQuarantined(displayPath); // chunks arrived → recover
-        }
 
         let res: EnsureChunksResult;
         try {
@@ -543,6 +540,10 @@ export class Reconciler {
                 return "quarantined";
             }
             return "skipped"; // offline — transient, retry when online
+        }
+        // All chunks available — recover from any prior quarantine, then apply.
+        if (await this.vaultSync.wasQuarantined(displayPath)) {
+            await this.vaultSync.clearQuarantined(displayPath);
         }
         try {
             await this.vaultSync.dbToFile(doc);

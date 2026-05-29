@@ -89,14 +89,12 @@ interface FakeVaultSync {
     alignLastSyncedToDoc(path: string, doc: FileDoc): Promise<"already-aligned" | "upgraded-legacy" | "recovered-stale">;
     getLastSynced(path: string): undefined;
     computeVaultChunks(path: string): Promise<string[]>;
-    // Quarantine (Invariant II). Defaults to "nothing quarantined, all chunks
-    // locally available" so existing restore/pull tests are unaffected.
+    // Quarantine (Invariant II). Defaults to "nothing quarantined" so existing
+    // restore/pull tests are unaffected.
     quarantinedCalls: string[];
     clearedCalls: string[];
     quarantined: Set<string>;
-    localMissing: Map<string, string[]>;
     wasQuarantined(path: string): Promise<boolean>;
-    localMissingChunks(doc: FileDoc): Promise<string[]>;
     recordQuarantined(path: string, missingChunks: string[]): Promise<boolean>;
     clearQuarantined(path: string): Promise<void>;
 }
@@ -139,15 +137,14 @@ function makeVaultSync(): FakeVaultSync {
         quarantinedCalls: [],
         clearedCalls: [],
         quarantined: new Set<string>(),
-        localMissing: new Map<string, string[]>(),
         async wasQuarantined(path) { return this.quarantined.has(path); },
-        async localMissingChunks(doc) {
-            return this.localMissing.get(filePathFromId(doc._id)) ?? [];
-        },
         async recordQuarantined(path, _missingChunks) {
-            this.quarantinedCalls.push(path);
+            // Mirror the real isNew contract: record (and would-notify) only on
+            // a newly-quarantined path; repeat calls are silent.
+            const had = this.quarantined.has(path);
             this.quarantined.add(path);
-            return true;
+            if (!had) this.quarantinedCalls.push(path);
+            return !had;
         },
         async clearQuarantined(path) {
             this.clearedCalls.push(path);
@@ -300,24 +297,23 @@ describe("Reconciler", () => {
             expect(h.vaultSync.dbToFileCalls).toEqual([]); // no opaque restore attempt
             expect(h.vaultSync.quarantinedCalls).toEqual(["a.md"]);
 
-            // Second cycle: still broken locally → stays quarantined silently,
-            // no re-quarantine notification, no remote re-probe ping-pong.
-            h.vaultSync.localMissing.set("a.md", ["chunk:x64:gone"]);
+            // Second cycle: re-probes (still broken) → stays quarantined, but
+            // recordQuarantined's isNew guard means no repeat notice, and it
+            // never reaches dbToFile so there is no restore ping-pong.
             const r2 = await h.reconciler.reconcile("manual");
             expect(r2.restored).toEqual([]);
             expect(h.vaultSync.dbToFileCalls).toEqual([]);
-            expect(h.vaultSync.quarantinedCalls).toEqual(["a.md"]); // not re-recorded
+            expect(h.vaultSync.quarantinedCalls).toEqual(["a.md"]); // not re-recorded (isNew=false)
         });
 
-        it("recovers a quarantined file once its chunks arrive locally", async () => {
-            const broken = async () => ({ stillMissing: [], remoteConsulted: true });
-            const h = setup([], broken);
+        it("recovers a quarantined file once its chunks become available", async () => {
+            // ensureChunks now reports the chunks available (e.g. re-pushed) →
+            // reconcile clears the quarantine and restores.
+            const available = async () => ({ stillMissing: [], remoteConsulted: true });
+            const h = setup([], available);
             h.db.fileDocs.set("a.md", makeDoc("a.md", { lastWriter: OTHER }));
             h.db.manifest = { paths: [], updatedAt: 0 };
-            // Pre-mark as quarantined; chunks are now locally available (empty
-            // localMissing) → reconcile should clear + restore.
-            h.vaultSync.quarantined.add("a.md");
-            h.vaultSync.localMissing.set("a.md", []);
+            h.vaultSync.quarantined.add("a.md"); // previously quarantined
 
             const r = await h.reconciler.reconcile("manual");
             expect(h.vaultSync.clearedCalls).toEqual(["a.md"]);

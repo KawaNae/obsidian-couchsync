@@ -1,34 +1,47 @@
 /**
- * E2E: the ping-pong scenario that v0.20.1 fixed, now exercised against
- * a real CouchDB instead of FakeCouchClient.
+ * E2E: the ping-pong scenario that v0.20.1 fixed, exercised against a real
+ * CouchDB. The integration test (regression-chunk-repair-pingpong.integ)
+ * covers the analyzer at the fake-client level; this guards CouchDB-specific
+ * quirks (rev threading, _all_docs id enumeration over attachment-backed
+ * chunks, tombstone shape).
  *
- * The integration-level regression (tests/integration/regression-chunk-
- * repair-pingpong.integ.test.ts) already covers the invariant at the
- * analyzer level. This file guards against any CouchDB-specific quirk
- * (rev threading, tombstones, conflict shape) that the fake client
- * doesn't reproduce. It also serves as the seed for a wider 2-device
- * E2E suite.
+ * Modernised to the v0.25.x schema: chunks carry `content: Uint8Array` +
+ * `schemaVersion` and are seeded onto the remote as real binary ATTACHMENTS
+ * (bulkDocsWithAttachments), not inline JSON — matching how the live push
+ * pipeline stores them, so the analyzer enumerates the same shape it sees in
+ * production.
  *
- * Setup mirrors the integration test:
- *   - remote (CouchDB)  — FileDoc v2 (chunks D,E) + A,B,C,D,E
+ * Scenario (mirrors the integration test):
+ *   - remote (CouchDB)    — FileDoc v2 (chunks D,E) + chunks A..E
  *   - device "up-to-date" — same as remote
- *   - device "lagging"    — old FileDoc v1 (chunks A,B,C) + A,B,C
+ *   - device "lagging"    — old FileDoc v1 (chunks A,B,C) + chunks A,B,C
  *
- * Assertions: lagging side's analyze returns `needs-convergence`;
- * up-to-date side's analyze is `converged` with orphan chunks A,B,C.
+ * Assertions: lagging side's analyze → needs-convergence; up-to-date side's
+ * analyze → converged with A,B,C orphaned on both sides.
  */
 import "fake-indexeddb/auto";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { createE2EHarness, stripLocalRevs, type E2EHarness } from "./couch-harness.ts";
 import { analyzeChunkConsistency } from "../../src/sync/chunk-consistency.ts";
+import { buildChunkAttachment } from "../../src/db/chunk-attachment.ts";
 import { makeChunkId, makeFileId } from "../../src/types/doc-id.ts";
-import type { ChunkDoc, CouchSyncDoc, FileDoc, VectorClock } from "../../src/types.ts";
+import {
+    CHUNK_SCHEMA_VERSION,
+    FILE_SCHEMA_VERSION,
+    type ChunkDoc,
+    type CouchSyncDoc,
+    type FileDoc,
+    type VectorClock,
+} from "../../src/types.ts";
 
-function chunk(hash: string): ChunkDoc {
+const enc = new TextEncoder();
+
+function chunk(letter: string): ChunkDoc {
     return {
-        _id: makeChunkId(hash),
+        _id: makeChunkId(letter),
         type: "chunk",
-        data: "ZGF0YQ==", // base64("data")
+        schemaVersion: CHUNK_SCHEMA_VERSION,
+        content: enc.encode(`chunk-${letter}`),
     };
 }
 
@@ -36,6 +49,7 @@ function file(path: string, chunkIds: string[], vclock: VectorClock): FileDoc {
     return {
         _id: makeFileId(path),
         type: "file",
+        schemaVersion: FILE_SCHEMA_VERSION,
         chunks: chunkIds,
         mtime: 1000,
         ctime: 1000,
@@ -65,35 +79,22 @@ describe("E2E multi-device: chunk-repair ping-pong (real CouchDB)", () => {
         const D = chunk("D");
         const E = chunk("E");
 
-        const oldFile = file(
-            "note.md",
-            [A._id, B._id, C._id],
-            { uptodate: 1 },
-        );
-        const newFile = file(
-            "note.md",
-            [D._id, E._id],
-            { uptodate: 2 },
-        );
+        const oldFile = file("note.md", [A._id, B._id, C._id], { uptodate: 1 });
+        const newFile = file("note.md", [D._id, E._id], { uptodate: 2 });
 
-        // 1. Seed remote CouchDB with the latest state.
+        // 1. Seed remote: chunks as real binary attachments + the latest FileDoc.
+        await uptoDate.client.bulkDocsWithAttachments(
+            [A, B, C, D, E].map((c) => buildChunkAttachment(c, { keepRev: false })),
+        );
         await uptoDate.client.bulkDocs(
-            stripLocalRevs([newFile, A, B, C, D, E] as unknown as Array<
-                CouchSyncDoc & { _rev?: string }
-            >),
+            stripLocalRevs([newFile] as Array<FileDoc & { _rev?: string }>) as CouchSyncDoc[],
         );
 
-        // 2. Up-to-date device mirrors remote locally.
-        await uptoDate.db.runWriteTx({
-            docs: [{ doc: newFile }],
-            chunks: [A, B, C, D, E],
-        });
+        // 2. Up-to-date device mirrors remote locally (content present).
+        await uptoDate.db.runWriteTx({ docs: [{ doc: newFile }], chunks: [A, B, C, D, E] });
 
         // 3. Lagging device holds the older FileDoc + the old chunks only.
-        await lagging.db.runWriteTx({
-            docs: [{ doc: oldFile }],
-            chunks: [A, B, C],
-        });
+        await lagging.db.runWriteTx({ docs: [{ doc: oldFile }], chunks: [A, B, C] });
 
         // 4. Lagging device: analyzer refuses — returns needs-convergence.
         const laggingResult = await analyzeChunkConsistency({
@@ -109,8 +110,7 @@ describe("E2E multi-device: chunk-repair ping-pong (real CouchDB)", () => {
             expect(laggingResult.divergence.remoteOnly).toEqual([]);
         }
 
-        // 5. Up-to-date device: analyzer converges; old chunks A/B/C are
-        // orphan on both sides and can be safely repaired.
+        // 5. Up-to-date device: analyzer converges; A,B,C orphan on both sides.
         const uptoDateResult = await analyzeChunkConsistency({
             localDb: uptoDate.db,
             remote: uptoDate.client,

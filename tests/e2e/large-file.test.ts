@@ -1,15 +1,16 @@
 /**
- * E2E: round-trip a 5MB binary file through real CouchDB. Exercises
- * multi-chunk assembly, bulkDocs batching, and base64 transport.
+ * E2E: round-trip a 5MB binary file through the REAL engine + real CouchDB.
+ * Exercises multi-chunk split, attachment push (bulkDocsWithAttachments),
+ * longpoll pull, on-demand chunk fetch (getAttachment), and reassembly —
+ * byte-for-byte. Drives the production pipeline, not a hand-rolled bulkDocs.
  */
 import "fake-indexeddb/auto";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { createE2EHarness, stripLocalRevs, type E2EHarness } from "./couch-harness.ts";
-import { expectVault } from "../harness/assertions.ts";
+import { createE2EHarness, waitFor, bytesEqual, type E2EHarness } from "./couch-harness.ts";
 import { makeFileId } from "../../src/types/doc-id.ts";
-import type { FileDoc, CouchSyncDoc } from "../../src/types.ts";
+import type { FileDoc } from "../../src/types.ts";
 
-describe("E2E: large-file roundtrip (real CouchDB)", () => {
+describe("E2E: large-file roundtrip (real engine + real CouchDB)", () => {
     let h: E2EHarness;
 
     beforeEach(async () => {
@@ -20,7 +21,7 @@ describe("E2E: large-file roundtrip (real CouchDB)", () => {
         if (h) await h.destroyAll();
     });
 
-    it("5MB binary file survives push → pull → vault byte-for-byte", async () => {
+    it("5MB binary file survives real push → real pull → vault byte-for-byte", async () => {
         const a = h.addDevice("dev-A");
         const b = h.addDevice("dev-B");
 
@@ -36,26 +37,18 @@ describe("E2E: large-file roundtrip (real CouchDB)", () => {
         a.vault.addBinaryFile("big.bin", buf.buffer);
         await a.vs.fileToDb("big.bin");
 
-        const fileId = makeFileId("big.bin");
-        const docA = (await a.db.get(fileId)) as FileDoc;
+        // Sanity: the file really did split into multiple chunks.
+        const docA = (await a.db.get(makeFileId("big.bin"))) as FileDoc;
         expect(docA.chunks.length).toBeGreaterThan(1);
 
-        const chunksA = await a.db.getChunks(docA.chunks);
-        await a.client.bulkDocs(stripLocalRevs([docA, ...chunksA]));
+        await a.engine.start();
+        await b.engine.start();
 
-        // Pull to B.
-        const ids = [fileId, ...docA.chunks];
-        const fetched = await b.client.bulkGet<CouchSyncDoc>(ids);
-        const fileDocs = fetched.filter((d) => d._id === fileId);
-        const chunkDocs = fetched.filter((d) => d._id !== fileId);
-        await b.db.runWriteTx({
-            docs: fileDocs.map((doc) => ({ doc })),
-            chunks: chunkDocs,
-        });
-        const docOnB = (await b.db.get(fileId)) as FileDoc;
-        await b.vs.dbToFile(docOnB);
-
-        expectVault(b.vault).toHaveFile("big.bin").withSize(SIZE);
-        expectVault(b.vault).toHaveFile("big.bin").withBinary(buf.buffer);
+        await waitFor(
+            async () => (await b.vault.exists("big.bin"))
+                && bytesEqual(await b.vault.readBinary("big.bin"), buf.buffer),
+            { label: "B reassembles 5MB big.bin byte-for-byte", timeoutMs: 9000 },
+        );
+        expect((await b.vault.readBinary("big.bin")).byteLength).toBe(SIZE);
     });
 });

@@ -852,18 +852,6 @@ export class VaultSync {
         this.quarantinedPaths?.delete(key);
     }
 
-    /** Local-only availability check (no remote): which of the FileDoc's
-     *  chunks are unavailable in the local DB (absent or content-less).
-     *  Used by reconcile to detect quarantine recovery cheaply — a chunk
-     *  becomes locally available when a re-pushed FileDoc pulls it in. */
-    async localMissingChunks(fileDoc: FileDoc): Promise<string[]> {
-        const existing = await this.db.getChunks(fileDoc.chunks);
-        const usable = new Set(
-            existing.filter((c) => c.content instanceof Uint8Array).map((c) => c._id),
-        );
-        return fileDoc.chunks.filter((id) => !usable.has(id));
-    }
-
     private async localChunkIds(path: string): Promise<string[]> {
         const content = await this.vault.readBinary(path);
         const chunks = await splitIntoChunks(content, this.hasher);
