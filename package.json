@@ -10,6 +10,7 @@
         "test": "vitest run",
         "test:e2e": "vitest run --config vitest.e2e.config.ts",
         "test:all": "tsc --noEmit && vitest run && vitest run --config vitest.e2e.config.ts",
+        "bench": "vitest run --config vitest.bench.config.ts && node -e \"process.stdout.write(require('fs').readFileSync('tests/e2e/codec-bench.result.txt','utf8'))\"",
         "integ:start": "bash scripts/integ-start.sh",
         "integ:stop": "bash scripts/integ-stop.sh",
         "integ:reset": "bash scripts/integ-reset.sh"
