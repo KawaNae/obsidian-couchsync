@@ -41,12 +41,18 @@ required from any earlier 0.x build).
 - **Encryption envelope format changed.** Legacy
   `base64(IV):base64(cipher)` (string fields) and `IV || cipher`
   (attachment binary) are gone. Both forms now carry a 1-byte codec
-  header (`[bits][IV?][body]`), wrapped in base64 for string fields
-  (`ConfigDoc.data` when encrypted, `encryptedPath`) or written
-  binary-direct for attachments. The header declares encrypted /
-  compressed bits so a single byte sequence on the wire is decodable
-  without consulting `vault:meta` (invariants 12, 13). See
-  `docs/SECURITY.md#envelope-format`.
+  header (`[bits][IV?][body]`), wrapped in base64 for the one remaining
+  encrypted string field (`encryptedPath`) or written binary-direct for
+  attachments. The header declares encrypted / compressed bits so a
+  single byte sequence on the wire is decodable without consulting
+  `vault:meta` (invariants 12, 13). See `SECURITY.md#envelope-format`.
+- **`ConfigDoc` no longer carries an in-doc `data` payload.** Config
+  files are chunked exactly like vault files — `ConfigDoc.chunks` is an
+  ordered list of `chunk:<alg>:<hash>` ids and the body rides as chunk
+  attachments. `CONFIG_SCHEMA_VERSION` is `3` (independent of the
+  FileDoc/ChunkDoc v2 line so config can evolve separately). Encryption
+  now touches only the `_id`/`encryptedPath` and the chunk attachment
+  bodies — never an in-doc string blob.
 - **`encryption:meta` document and `src/db/encryption-meta.ts`
   removed.** Already superseded by `vault:meta` in the previous
   release window; the migration shim (`LegacyEncryptionMetaDoc`) stays
@@ -81,9 +87,11 @@ required from any earlier 0.x build).
 - **CompressingCouchClient decorator** — gzip attachment bodies on
   push, gunzip on pull. Compression layer is outside encryption so
   the push path is plain → gzip → encrypt → wire.
-- **CryptoProvider binary I/O**: `encryptBytes` / `decryptBytes`
-  return `IV(12B) || AES-GCM(plain)` as one Uint8Array. Used by
-  attachment encryption (no base64 envelope on the wire).
+- **CryptoProvider binary I/O**: `encryptBytesIv()` returns
+  `{ iv, cipher }` and `decryptBytesIv(iv, cipher)` reverses it. The
+  attachment encryptor packs these into the codec envelope
+  (`[bits][IV][cipher]`), so raw cipher bytes never travel outside the
+  self-describing format.
 - **Pull pipeline reads chunks via attachment GET**, not `_changes`.
   Chunk rows in `_changes` are now dropped; `ensureChunks` fetches
   the binary payload directly. Catchup `_changes` feed shrinks
@@ -98,8 +106,8 @@ required from any earlier 0.x build).
 - **Settings: `compressionEnabled` toggle** (default on) wired through
   the composition root. Disabled after Init / setup (server is
   source-of-record).
-- **`docs/SECURITY.md`** — threat model and mode-selection guide for
-  end users.
+- **`SECURITY.md`** (repository root) — threat model and mode-selection
+  guide for end users.
 - **Test matrix**: `tests/sync-mode-matrix.test.ts` runs the
   attachment round-trip suite across all four codec modes via
   `describe.each` so regressions in any mode surface immediately.
@@ -126,6 +134,15 @@ required from any earlier 0.x build).
   `compression.version` but is now explicitly the "capability
   declaration" of the vault, never consulted for per-blob decode
   (which is fully self-describing via the envelope header).
+- **Init/Clone bulk paths paginated** to match steady-state robustness.
+  `pullAll` streams `_all_docs` over keyset continuation
+  (`DEFAULT_BATCH_SIZE` per request), fetching each batch's chunk
+  attachments and committing it in its own write tx; `pushAll`
+  enumerates ids via `listIds` and pushes one page at a time. Keys-mode
+  `allDocs` is batched on the same boundary as `bulkGet`/`bulkDocs`.
+  Bounds per-request HTTP payload (survivable under the 30 s mobile
+  timeout) and peak memory (a large vault's chunk bodies are never all
+  resident at once).
 - **Init/Clone factory unification** — `VaultRemoteOps.setClientWrapper`
   (mutable setter) removed. The codec stack (`compress(encrypt(raw))`)
   is now built by a single private `wrapRemoteClient` closure on the
@@ -142,11 +159,13 @@ required from any earlier 0.x build).
   mis-tagging as `chunk:x64:<64-hex>`. `ChunkHashAlg` gains the
   `hmac` variant and `ID_RANGE.chunk.hmac` joins `chunk.x64` for
   per-algorithm range queries.
-- 14-phase implementation plan tracked in
-  `docs/superpowers/plans/2026-05-28-data-layer-v2.md` (untracked,
-  local working notes) plus the v0.25.0 schema-finalisation plan in
-  `~/.claude/plans/dreamy-riding-star.md`.
-- ConfigDoc chunk-ification deferred to v2.1 (see plan).
+- **ConfigDoc chunk-ification completed** (`CONFIG_SCHEMA_VERSION = 3`).
+  Config files split into content-addressed chunks via the same
+  `chunker` + `ChunkHasher` path as vault files; `config-sync` assembles
+  them on write (`getChunks` / `assembleChunks`). Config thus inherits
+  the full codec stack (gzip + encrypt + attachment storage) and the
+  `config:meta` doc stays codec-free so a fresh-Clone device can read it
+  before unlocking.
 
 ### Performance (dev vault baseline — 279 files, 900 docs, encrypted+gzipped baseline)
 
