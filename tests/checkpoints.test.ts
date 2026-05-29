@@ -130,6 +130,57 @@ describe("Checkpoints", () => {
                 }),
             ).rejects.toThrow("boom");
         });
+
+        it("folds pendingApplyAdd into the same tx as the remote-seq advance", async () => {
+            const localDb = makeCommitLocalDb();
+            const cp = new Checkpoints(localDb);
+
+            await cp.commitPullBatch({
+                docs: [],
+                nextRemoteSeq: "9",
+                pendingApplyAdd: ["file:a.md", "file:b.md"],
+                onCommit: async () => {},
+            });
+
+            expect(localDb.runWriteTx).toHaveBeenCalledTimes(1);
+            const tx = localDb._calls[0];
+            // remote-seq + both pending-apply puts in one atomic tx.
+            expect(tx.meta).toContainEqual({ op: "put", key: "_sync/remote-seq", value: "9" });
+            const pa = tx.meta.filter((m: any) => m.key.startsWith("_sync/pending-apply/"));
+            expect(pa.map((m: any) => m.key)).toEqual([
+                "_sync/pending-apply/file:a.md",
+                "_sync/pending-apply/file:b.md",
+            ]);
+            expect(pa[0].value).toMatchObject({ reason: "missing-chunks", attempts: 0 });
+        });
+    });
+
+    describe("commitPendingApply", () => {
+        it("writes adds and removes in one tx; removing an absent key is a no-op", async () => {
+            const localDb = makeLocalDb();
+            const cp = new Checkpoints(localDb);
+            localDb._meta["_sync/pending-apply/file:done.md"] = {
+                addedAt: 1, reason: "missing-chunks", attempts: 0,
+            };
+
+            await cp.commitPendingApply({
+                add: [{ id: "file:stuck.md", reason: "missing-chunks", attempts: 3 }],
+                remove: ["file:done.md", "file:never-there.md"],
+            });
+
+            expect(localDb._meta["_sync/pending-apply/file:done.md"]).toBeUndefined();
+            expect(localDb._meta["_sync/pending-apply/file:stuck.md"]).toMatchObject({
+                reason: "missing-chunks", attempts: 3,
+            });
+        });
+
+        it("is a no-op tx when nothing to add or remove", async () => {
+            const localDb = makeLocalDb();
+            const spy = localDb.runWriteTx;
+            const cp = new Checkpoints(localDb);
+            await cp.commitPendingApply({});
+            expect(spy).not.toHaveBeenCalled();
+        });
     });
 
     describe("saveEmptyPullBatch", () => {

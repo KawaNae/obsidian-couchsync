@@ -26,6 +26,7 @@ function makeLocalDb(): any {
         getChunks: vi.fn().mockResolvedValue([]),
         changes: vi.fn().mockResolvedValue({ results: [], last_seq: 0 }),
         getMeta: vi.fn().mockResolvedValue(null),
+        getMetaByPrefix: vi.fn().mockResolvedValue([]),
         getMetaStoreValue: vi.fn().mockResolvedValue(null),
         runMetaWriteTx: vi.fn().mockResolvedValue(undefined),
     };

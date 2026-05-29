@@ -507,4 +507,105 @@ describe("PushPipeline integration", () => {
             spy.mockRestore();
         });
     });
+
+    // ── Invariant A: push order contract ─────────────────
+    //
+    // A file doc may only become visible on remote after every chunk it
+    // references is durably committed. pushDocs enforces this with a
+    // two-phase transport: chunks first, then the files whose chunks all
+    // landed. These tests pin the ordering and the durability gate.
+
+    describe("Invariant A — push order contract", () => {
+        const chunkId = "chunk:x64:aaaaaaaaaaaaaaaa";
+        const makeChunkDoc = () => ({
+            _id: chunkId,
+            type: "chunk",
+            schemaVersion: 1,
+            content: new Uint8Array([1, 2, 3]),
+        } as unknown as CouchSyncDoc);
+        const makeFileDoc = (path: string) => ({
+            _id: makeFileId(path),
+            type: "file",
+            chunks: [chunkId],
+            vclock: {},
+            mtime: 0,
+            ctime: 0,
+            size: 3,
+        } as unknown as CouchSyncDoc);
+
+        it("commits chunks (attachment bulk) before files (plain bulk)", async () => {
+            h = createSyncHarness();
+            const a = h.addDevice("dev-A");
+            const rig = attachPushPipeline({ device: a, couch: h.couch });
+
+            const attSpy = vi.spyOn(h.couch, "bulkDocsWithAttachments");
+            const fileSpy = vi.spyOn(h.couch, "bulkDocs");
+
+            await rig.pipeline.pushDocs([makeChunkDoc(), makeFileDoc("note.md")]);
+
+            // Both transports fired, and the chunk transport's global
+            // invocation order strictly precedes the file transport's.
+            expect(attSpy.mock.invocationCallOrder[0]).toBeLessThan(
+                fileSpy.mock.invocationCallOrder.at(-1)!,
+            );
+            attSpy.mockRestore();
+            fileSpy.mockRestore();
+        });
+
+        it("withholds a file whose chunk hard-fails, re-queuing it race-stale", async () => {
+            h = createSyncHarness();
+            const a = h.addDevice("dev-A");
+            const rig = attachPushPipeline({ device: a, couch: h.couch });
+
+            // Chunk push returns a non-conflict error → chunk did NOT land.
+            const attSpy = vi.spyOn(h.couch, "bulkDocsWithAttachments")
+                .mockResolvedValueOnce([
+                    { id: chunkId, error: "unauthorized", reason: "nope" },
+                ] as any);
+            const fileSpy = vi.spyOn(h.couch, "bulkDocs");
+
+            const fileId = makeFileId("note.md");
+            const result = await rig.pipeline.pushDocs([
+                makeChunkDoc(), makeFileDoc("note.md"),
+            ]);
+
+            // File was withheld from the actual file bulk...
+            const fileBatches = fileSpy.mock.calls.map(
+                (c) => (c[0] as Array<CouchSyncDoc>).map((d) => d._id),
+            );
+            expect(fileBatches.flat()).not.toContain(fileId);
+            // ...and surfaced as a conflict so step [9] re-queues it.
+            expect(result.conflicts).toContain(fileId);
+            expect(result.pushed).not.toContain(fileId);
+            attSpy.mockRestore();
+            fileSpy.mockRestore();
+        });
+
+        it("does NOT withhold a file when its chunk returns a 409 conflict (already durable)", async () => {
+            h = createSyncHarness();
+            const a = h.addDevice("dev-A");
+            const rig = attachPushPipeline({ device: a, couch: h.couch });
+
+            // 409 on a content-addressed chunk = identical body already on
+            // remote = durable. The file must proceed.
+            const attSpy = vi.spyOn(h.couch, "bulkDocsWithAttachments")
+                .mockResolvedValueOnce([
+                    { id: chunkId, error: "conflict", reason: "exists" },
+                ] as any);
+            const fileSpy = vi.spyOn(h.couch, "bulkDocs");
+
+            const fileId = makeFileId("note.md");
+            const result = await rig.pipeline.pushDocs([
+                makeChunkDoc(), makeFileDoc("note.md"),
+            ]);
+
+            const fileBatches = fileSpy.mock.calls.map(
+                (c) => (c[0] as Array<CouchSyncDoc>).map((d) => d._id),
+            );
+            expect(fileBatches.flat()).toContain(fileId);
+            expect(result.pushed).toContain(fileId);
+            attSpy.mockRestore();
+            fileSpy.mockRestore();
+        });
+    });
 });

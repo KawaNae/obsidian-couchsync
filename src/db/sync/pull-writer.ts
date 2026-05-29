@@ -37,6 +37,7 @@ import { logDebug, logError, logInfo } from "../../ui/log.ts";
 import type { EchoTracker } from "./echo-tracker.ts";
 import type { SyncEvents } from "./sync-events.ts";
 import type { Checkpoints } from "./checkpoints.ts";
+import { loadAllPendingApply, type PendingApplyReason } from "./pending-apply.ts";
 
 export interface PullApplyResult {
     nextRemoteSeq: number | string;
@@ -97,6 +98,11 @@ interface ConcurrentEntry {
 
 export class PullWriter {
     constructor(private deps: PullWriterDeps) {}
+
+    /** In-memory count of the pending-apply set (Invariant B). -1 = not
+     *  yet loaded this session; a non-negative value lets `drainPendingApply`
+     *  short-circuit the common empty case without a meta scan. */
+    private pendingApplyCount = -1;
 
     async apply(result: ChangesResult<CouchSyncDoc>): Promise<PullApplyResult> {
         const { accepted, concurrent, stats } = await this.classify(result);
@@ -309,9 +315,20 @@ export class PullWriter {
         nextRemoteSeq: number | string,
         stats: BatchStats,
     ): Promise<void> {
+        // Invariant B pre-record: file docs whose chunks aren't local yet
+        // might fail to apply in `onCommit` (which runs AFTER this tx
+        // durably commits, so its outcome can't ride the tx). Record those
+        // ids in the SAME tx as the remoteSeq advance, then drop the ones
+        // that apply cleanly. What remains is exactly the genuine misses,
+        // retried by `drainPendingApply`.
+        const pendingApplyAdd = await this.computePendingApplyAdd(accepted);
+        const pendingSet = new Set(pendingApplyAdd);
+        const resolved: string[] = [];
+
         await this.deps.checkpoints.commitPullBatch({
             docs: accepted,
             nextRemoteSeq,
+            pendingApplyAdd,
             onCommit: async () => {
                 const { updateSeq } = await this.deps.localDb.info();
                 const seq = typeof updateSeq === "number"
@@ -335,13 +352,89 @@ export class PullWriter {
                             logDebug(`  ← ${path} (pull-skipped: ${result.reason})`);
                             stats.skipCount++;
                         }
+                        // Applied or skipped (IME divergence, owned by the
+                        // pull-skipped → reconcile path) — either way this
+                        // is no longer a missing-chunk failure.
+                        if (pendingSet.has(doc._id)) resolved.push(doc._id);
                     } catch (e: any) {
+                        // Missing-chunk (or other) apply failure. The id was
+                        // pre-recorded above and stays in the set for the
+                        // drain to retry — no silent checkpoint-past loss.
                         logError(`pull vault write failed: ${path}: ${e?.message ?? e}`);
                         stats.writeFailCount++;
                     }
                 }
             },
         });
+
+        if (resolved.length > 0) {
+            await this.deps.checkpoints.commitPendingApply({ remove: resolved });
+        }
+        if (this.pendingApplyCount >= 0) {
+            this.pendingApplyCount += pendingApplyAdd.length - resolved.length;
+        }
+    }
+
+    /** Probe which accepted file docs reference chunks not yet on disk.
+     *  In live pull, chunks never arrive via `_changes` (they're fetched
+     *  in `onCommit`), so this typically flags every file-with-chunks —
+     *  intended: those are exactly the docs whose apply can fail. Files
+     *  whose chunks are already local (vclock-only updates, re-delivery)
+     *  are skipped, avoiding needless set churn. */
+    private async computePendingApplyAdd(accepted: CouchSyncDoc[]): Promise<string[]> {
+        const out: string[] = [];
+        for (const doc of accepted) {
+            if (!isFileDoc(doc) || doc.deleted) continue;
+            if (!doc.chunks || doc.chunks.length === 0) continue;
+            const have = await this.deps.localDb.getChunks(doc.chunks);
+            if (have.length < doc.chunks.length) out.push(doc._id);
+        }
+        return out;
+    }
+
+    /**
+     * Drain the pending-apply set (Invariant B recovery). For each id whose
+     * file still exists, re-fetch its chunks and re-apply to the vault; on
+     * success (or a deliberate skip) the id leaves the set, otherwise its
+     * attempt count is bumped and it stays for the next cycle. Called every
+     * pull cycle — including the empty-longpoll branch, since a freshly-
+     * durable chunk does not flow through `_changes` to wake the loop.
+     */
+    async drainPendingApply(): Promise<void> {
+        if (this.pendingApplyCount === 0) return;
+        const rows = await loadAllPendingApply(this.deps.localDb);
+        if (rows.length === 0) { this.pendingApplyCount = 0; return; }
+
+        const remove: string[] = [];
+        const reAdd: Array<{ id: string; reason: PendingApplyReason; attempts: number }> = [];
+        for (const { id, entry } of rows) {
+            const doc = await this.deps.localDb.get<FileDoc>(id);
+            if (!doc || !isFileDoc(doc) || doc.deleted) {
+                // File no longer present locally (deleted / superseded) —
+                // nothing left to apply.
+                remove.push(id);
+                continue;
+            }
+            const path = filePathFromId(id);
+            try {
+                await this.deps.ensureChunks(doc);
+                const result = await this.deps.applyPullWrite(doc);
+                remove.push(id);
+                if (result.applied === true) {
+                    logDebug(`  ← ${path} (pending-apply recovered)`);
+                    this.deps.events.emit("auto-resolve", { filePath: path });
+                } else {
+                    logDebug(`  ← ${path} (pending-apply skipped: ${result.reason})`);
+                }
+            } catch (e: any) {
+                logDebug(
+                    `pending-apply: ${path} still missing chunks (attempt ${entry.attempts + 1})`,
+                );
+                reAdd.push({ id, reason: "missing-chunks", attempts: entry.attempts + 1 });
+            }
+        }
+        await this.deps.checkpoints.commitPendingApply({ add: reAdd, remove });
+        this.pendingApplyCount = reAdd.length;
     }
 
     // ── Phase 3: dispatch ───────────────────────────────

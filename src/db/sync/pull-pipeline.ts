@@ -126,6 +126,9 @@ export class PullPipeline {
                 } catch (e) {
                     this.deps.handleLocalDbError(e, "checkpoint save");
                 }
+                // One drain at catchup end: chunks for files pulled earlier
+                // in this catchup may now all be durable (Invariant B).
+                await this.deps.pullWriter.drainPendingApply();
                 return;
             }
         }
@@ -174,8 +177,15 @@ export class PullPipeline {
                         // signals that a batch was applied. SyncEngine subscribes
                         // to "paused" to update lastHealthyAt.
                         this.deps.events.emit("paused");
+                    } else {
+                        // Empty result (longpoll max-wait): stay connected.
+                        // Drain any pending-apply ghosts — their chunks may
+                        // have become durable since the last attempt, and a
+                        // chunk landing never wakes this loop on its own
+                        // (chunks don't flow through _changes). Cheap no-op
+                        // when the set is empty.
+                        await this.deps.pullWriter.drainPendingApply();
                     }
-                    // Empty result (longpoll max-wait): stay connected.
                 } catch (e: any) {
                     // halt-class DbError (degraded / quota) must surface
                     // even when dispose() raced ahead — see push-pipeline
@@ -249,6 +259,9 @@ export class PullPipeline {
                 this.deps.handleLocalDbError(e, "checkpoint save");
             }
         }
+        // Invariant B: retry any files checkpointed-past without a vault
+        // write (chunks landed late). Short-circuits when the set is empty.
+        await this.deps.pullWriter.drainPendingApply();
     }
 
     // ── Introspection (tests) ───────────────────────────

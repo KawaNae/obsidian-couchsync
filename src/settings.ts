@@ -1,7 +1,22 @@
 /** Keep only the N most recent previous device IDs. */
 export const MAX_PREVIOUS_DEVICE_IDS = 10;
 
-export type ConnectionState = "editing" | "tested" | "setupDone" | "syncing";
+/**
+ * Vault-sync setup state machine.
+ *
+ *   editing → tested → setupDone → syncing
+ *
+ * `settingUp` is a non-syncable transient entered at the START of Init/
+ * Clone, before the destructive `localDb.destroy()` (Invariant C — setup
+ * atomicity). It is persisted pessimistically so that a setup which fails
+ * (or whose process dies) mid-flight can never leave the prior
+ * `setupDone`/`syncing` state behind — which would let the user start
+ * sync against a half-built local DB. Only a confirmed-successful setup
+ * advances to `setupDone`; a failure stays in `settingUp` (Init/Clone
+ * remain enabled to retry, Live Sync stays disabled).
+ */
+export type ConnectionState =
+    | "editing" | "tested" | "settingUp" | "setupDone" | "syncing";
 
 export interface MobileStatusPosition {
     align: "left" | "right";

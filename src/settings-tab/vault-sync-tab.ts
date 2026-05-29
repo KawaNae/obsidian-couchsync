@@ -19,6 +19,7 @@ import type { AuthGate } from "../db/sync/auth-gate.ts";
 import type { VaultRemoteOps } from "../db/sync/vault-remote-ops.ts";
 import type { LocalDB } from "../db/local-db.ts";
 import { validateDeviceName } from "../utils/device-name.ts";
+import { setupGating } from "./setup-gating.ts";
 
 export interface VaultSyncTabDeps {
     app: App;
@@ -98,9 +99,9 @@ export class VaultSyncTab {
 
     render(el: HTMLElement): void {
         const state = this.deps.getSettings().connectionState;
-        const locked = state === "syncing";
-        const initCloneEnabled = state === "tested" || state === "setupDone";
-        const syncToggleEnabled = state === "setupDone" || state === "syncing";
+        // Pure state→affordance mapping (Invariant C / Bug 1). `settingUp`
+        // keeps Init/Clone enabled to retry but Live Sync disabled.
+        const { locked, initCloneEnabled, syncToggleEnabled } = setupGating(state);
 
         // Reset DOM references
         this.pencils.clear();
@@ -164,9 +165,11 @@ export class VaultSyncTab {
                 ? "Complete Step 2 first."
                 : state === "tested"
                     ? "Choose how to initialize this vault."
-                    : state === "setupDone"
-                        ? "Setup complete. You can re-run if needed."
-                        : "Disable sync to re-run setup.";
+                    : state === "settingUp"
+                        ? "Setup did not finish — re-run Init or Clone. Sync stays disabled until it completes."
+                        : state === "setupDone"
+                            ? "Setup complete. You can re-run if needed."
+                            : "Disable sync to re-run setup.";
 
         el.createEl("p", { text: setupDesc, cls: "setting-item-description" });
 
@@ -187,8 +190,10 @@ export class VaultSyncTab {
                             await this.deps.initVault();
                             this.deps.refresh();
                         } catch {
-                            btn.setButtonText("Init");
-                            btn.setDisabled(false);
+                            // Re-render so the now-`settingUp` state is
+                            // reflected: Init/Clone re-enabled, Live Sync
+                            // stays disabled (Invariant C / Bug 1).
+                            this.deps.refresh();
                         }
                     })
             );
@@ -207,8 +212,8 @@ export class VaultSyncTab {
                             await this.deps.cloneFromRemote();
                             this.deps.refresh();
                         } catch {
-                            btn.setButtonText("Clone");
-                            btn.setDisabled(false);
+                            // See Init catch: re-render to reflect `settingUp`.
+                            this.deps.refresh();
                         }
                     })
             );

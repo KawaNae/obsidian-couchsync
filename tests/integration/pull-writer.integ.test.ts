@@ -611,4 +611,112 @@ describe("PullWriter integration", () => {
             expect(concurrent[0].remoteDeleted).toBe(true);
         });
     });
+
+    // ── Invariant B: pending-apply recovery ──────────────
+    //
+    // A file pulled while its chunk is not yet durable must NOT be
+    // checkpointed-past silently: it is recorded in the pending-apply set
+    // (in the same tx as the remoteSeq advance) and recovered by
+    // drainPendingApply once the chunk becomes available.
+
+    describe("Invariant B — pending-apply recovery", () => {
+        const PENDING_PREFIX = "_sync/pending-apply/";
+
+        /** Build a PullWriter whose chunk availability is flag-controlled. */
+        function attachRecoverable(device: DeviceHarness, chunkId: string) {
+            const events = new SyncEvents();
+            const echoes = new EchoTracker();
+            const checkpoints = new Checkpoints(device.db);
+            const state = { chunkReady: false };
+            const writer = new PullWriter({
+                localDb: device.db,
+                events,
+                echoes,
+                checkpoints,
+                getConflictResolver: () => undefined,
+                ensureChunks: async () => {
+                    // Models remote fetch: only lands the chunk locally once
+                    // it is durable on the remote.
+                    if (!state.chunkReady) return;
+                    await device.db.runWriteTx({
+                        chunks: [{
+                            _id: chunkId, type: "chunk", schemaVersion: 1,
+                            content: new Uint8Array([1, 2, 3]),
+                        } as unknown as CouchSyncDoc],
+                    });
+                },
+                applyPullWrite: async (doc) => {
+                    const have = await device.db.getChunks(doc.chunks);
+                    if (have.length < doc.chunks.length) {
+                        throw new Error(`Missing ${doc.chunks.length - have.length} chunk(s)`);
+                    }
+                    return { applied: true };
+                },
+            });
+            return { writer, events, checkpoints, state };
+        }
+
+        it("records the file when its chunk is missing, advancing remoteSeq", async () => {
+            h = createSyncHarness();
+            const b = h.addDevice("dev-B");
+            const chunkId = makeChunkId("deadbeefdeadbeef");
+            const rig = attachRecoverable(b, chunkId);
+
+            const fileDoc = makeRemoteFileDoc("ghost.md", { A: 1 }, { chunks: [chunkId] });
+            await rig.writer.apply(makeChangesResult(
+                [{ id: fileDoc._id, seq: "5", doc: fileDoc }], "5",
+            ));
+
+            // Checkpoint advanced (file is committed to LocalDB)...
+            expect(await b.db.getMeta<string>("_sync/remote-seq")).toBe("5");
+            // ...but the file is recorded for retry, not lost.
+            const pending = await b.db.getMetaByPrefix(PENDING_PREFIX);
+            expect(pending.map((p) => p.key)).toEqual([PENDING_PREFIX + fileDoc._id]);
+        });
+
+        it("drainPendingApply recovers the file once the chunk is durable, then empties the set", async () => {
+            h = createSyncHarness();
+            const b = h.addDevice("dev-B");
+            const chunkId = makeChunkId("cafef00dcafef00d");
+            const rig = attachRecoverable(b, chunkId);
+
+            const fileDoc = makeRemoteFileDoc("late.md", { A: 1 }, { chunks: [chunkId] });
+            await rig.writer.apply(makeChangesResult(
+                [{ id: fileDoc._id, seq: "5", doc: fileDoc }], "5",
+            ));
+            expect((await b.db.getMetaByPrefix(PENDING_PREFIX)).length).toBe(1);
+
+            // Drain while the chunk is still missing → stays pending, bumps attempt.
+            await rig.writer.drainPendingApply();
+            const stillPending = await b.db.getMetaByPrefix<{ attempts: number }>(PENDING_PREFIX);
+            expect(stillPending.length).toBe(1);
+            expect(stillPending[0].value.attempts).toBe(1);
+
+            // Chunk becomes durable → next drain applies the file and clears it.
+            const recovered: string[] = [];
+            rig.events.on("auto-resolve", ({ filePath }) => recovered.push(filePath));
+            rig.state.chunkReady = true;
+            await rig.writer.drainPendingApply();
+
+            expect(await b.db.getMetaByPrefix(PENDING_PREFIX)).toEqual([]);
+            expect(recovered).toContain("late.md");
+        });
+
+        it("drops a pending entry whose file no longer exists locally", async () => {
+            h = createSyncHarness();
+            const b = h.addDevice("dev-B");
+            const chunkId = makeChunkId("0badf00d0badf00d");
+            const rig = attachRecoverable(b, chunkId);
+
+            const fileDoc = makeRemoteFileDoc("vanish.md", { A: 1 }, { chunks: [chunkId] });
+            await rig.writer.apply(makeChangesResult(
+                [{ id: fileDoc._id, seq: "5", doc: fileDoc }], "5",
+            ));
+            // Remove the file doc from LocalDB (e.g. superseded by a delete).
+            await b.db.runWriteTx({ deletes: [fileDoc._id] });
+
+            await rig.writer.drainPendingApply();
+            expect(await b.db.getMetaByPrefix(PENDING_PREFIX)).toEqual([]);
+        });
+    });
 });

@@ -37,6 +37,18 @@
  * never enter the unpushed-set. The orphan-chunk side effect (file
  * conflict → chunk lands ahead) is harmless: the file's next push
  * cycle re-batches the chunk via the file's `chunks[]` reference.
+ *
+ * ## Push order contract (Invariant A)
+ *
+ * A file doc becomes visible in the remote `_changes` feed only after
+ * every chunk it references is durably committed. `pushDocs` enforces
+ * this with a two-phase transport: chunks first (attachment-aware bulk),
+ * await their durable commit, then the files whose chunks all landed.
+ * A file referencing a chunk that hard-failed is withheld and re-queued
+ * as race-stale. This is the source-side prevention layer; pull-side
+ * recovery (Invariant B, pending-apply.ts) is the safety net for the
+ * cases push ordering cannot see (cross-cycle / cross-device races,
+ * expired attachments, pre-fix peers).
  */
 
 import type { CouchSyncDoc, FileDoc, ChunkDoc } from "../../types.ts";
@@ -430,11 +442,11 @@ export class PushPipeline {
             });
         }
 
-        // [8] Bulk push: chunks first, then classified-proceed files.
-        //     Chunks must precede files in the bulkDocs array so they
-        //     receive lower update_seq values on the remote. This ensures
-        //     a pull-side _changes reader always sees chunks committed
-        //     before the file doc that references them.
+        // [8] Assemble the push batch: chunks + classified-proceed files.
+        //     The chunks-before-files ordering is no longer carried by the
+        //     array order here — `pushDocs` enforces it structurally via a
+        //     two-phase transport (chunks committed, then dependent files).
+        //     We still list chunks first for readability.
         const toBulk: Array<CouchSyncDoc & { _rev?: string }> = [];
         for (const c of chunkCandidates) {
             toBulk.push(stripRev(c) as CouchSyncDoc & { _rev?: string });
@@ -595,11 +607,20 @@ export class PushPipeline {
             }
         }
 
-        // v2: chunks ship via attachment-aware bulk; everything else via
-        // the plain JSON bulkDocs path. Order is preserved by zipping the
-        // results back into the original prepared[] order — callers (run,
-        // tests) rely on positional alignment between input docs and
-        // result rows.
+        // v2 ordered two-phase transport (Invariant A — push order
+        // contract): a file doc may become visible in the remote
+        // `_changes` feed only AFTER every chunk it references is durably
+        // committed. Chunks ride the attachment-aware bulk; files ride the
+        // plain JSON bulk. We push chunks FIRST, await their durable
+        // commit, THEN push only the files whose chunks all landed. This
+        // restores the ordering the pre-v2 single-array bulkDocs gave for
+        // free (chunks earlier in the array → lower update_seq) and that
+        // the parallel `Promise.all` split silently broke — the root cause
+        // of pull-side "Missing N chunk(s)".
+        //
+        // Results are zipped back into the original prepared[] order —
+        // callers (run, tests) rely on positional alignment between input
+        // docs and result rows.
         const chunkPositions: number[] = [];
         const filePositions: number[] = [];
         const chunkItems: DocWithAttachments[] = [];
@@ -617,26 +638,58 @@ export class PushPipeline {
         }
 
         const results: BulkDocsResult[] = new Array(prepared.length);
-        const work: Promise<unknown>[] = [];
-        if (fileDocs.length > 0) {
-            work.push(
-                this.deps.client.bulkDocs(fileDocs, signal).then((res) => {
-                    for (let i = 0; i < res.length; i++) {
-                        results[filePositions[i]] = res[i];
-                    }
-                }),
-            );
-        }
+
+        // ── Phase 1: chunks ────────────────────────────────────
+        // Throwing here (network/abort) propagates and aborts the whole
+        // cycle before any file ships — exactly what we want: no file is
+        // made visible without its chunks.
+        const failedChunks = new Set<string>();
         if (chunkItems.length > 0) {
-            work.push(
-                this.deps.client.bulkDocsWithAttachments(chunkItems, signal).then((res) => {
-                    for (let i = 0; i < res.length; i++) {
-                        results[chunkPositions[i]] = res[i];
-                    }
-                }),
-            );
+            const res = await this.deps.client.bulkDocsWithAttachments(chunkItems, signal);
+            for (let i = 0; i < res.length; i++) {
+                const pos = chunkPositions[i];
+                results[pos] = res[i];
+                // Chunks are content-addressed: ok → durable; a 409
+                // conflict means the identical body already lives on
+                // remote, so it is durable too. Any other error means the
+                // chunk did NOT land — files referencing it must wait.
+                if (res[i].error && res[i].error !== "conflict") {
+                    failedChunks.add(prepared[pos]._id);
+                }
+            }
         }
-        await Promise.all(work);
+
+        // ── Phase 2: files, gated on chunk durability ──────────
+        // Ship a file only if none of the chunks it references hard-failed
+        // in Phase 1. Chunks absent from this batch are presumed durable
+        // from a prior cycle (Invariant B is the recovery net if that
+        // presumption is ever wrong). A withheld file gets a synthetic
+        // `conflict` result so step [9] re-queues it as race-stale and the
+        // next cycle retries — the same path a real rev-race takes.
+        const survivingFiles: Array<CouchSyncDoc & { _rev?: string }> = [];
+        const survivingPositions: number[] = [];
+        for (let k = 0; k < fileDocs.length; k++) {
+            const pos = filePositions[k];
+            const doc = fileDocs[k];
+            const refs = isFileDoc(doc) ? doc.chunks : undefined;
+            const blocked = refs?.some((c) => failedChunks.has(c)) ?? false;
+            if (blocked) {
+                results[pos] = {
+                    id: doc._id,
+                    error: "conflict",
+                    reason: "withheld: referenced chunk failed to push",
+                };
+                continue;
+            }
+            survivingFiles.push(doc);
+            survivingPositions.push(pos);
+        }
+        if (survivingFiles.length > 0) {
+            const res = await this.deps.client.bulkDocs(survivingFiles, signal);
+            for (let i = 0; i < res.length; i++) {
+                results[survivingPositions[i]] = res[i];
+            }
+        }
 
         let fileCount = 0;
         let chunkCount = 0;

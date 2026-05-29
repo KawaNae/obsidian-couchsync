@@ -84,6 +84,16 @@ export default class CouchSyncPlugin extends Plugin {
      *  config:meta unlocks `configCryptoProvider`. */
     private vaultCryptoProvider?: CryptoProvider;
     private configCryptoProvider?: CryptoProvider;
+    /** Transient compression override active only during Clone (Invariant
+     *  C — setup atomicity). The vault decorator stack reads
+     *  `activeCompression`, not `settings.compressionEnabled` directly, so
+     *  Clone can run the remote's codec config in-memory and persist
+     *  `settings.compressionEnabled` only on success. Undefined at all
+     *  other times → the getter falls back to the persisted setting, so
+     *  the Step-1 toggle, onload reconcile, and Init all flow through
+     *  unchanged. Symmetric to how `vaultCryptoProvider` overrides the
+     *  persisted encryption flag. */
+    private compressionOverride?: boolean;
     encryptionMismatch?: EncryptionAgreement;
     /** Mismatch surfaced from the config:meta agreement check, if any.
      *  Symmetric to `encryptionMismatch` (vault). */
@@ -104,11 +114,19 @@ export default class CouchSyncPlugin extends Plugin {
         if (this.vaultCryptoProvider) {
             client = new EncryptingCouchClient(client, this.vaultCryptoProvider);
         }
-        if (this.settings.compressionEnabled) {
+        if (this.activeCompression) {
             client = new CompressingCouchClient(client);
         }
         return client;
     };
+
+    /** Compression flag the vault decorator stack actually uses. Equals
+     *  the persisted setting except during Clone, when the remote's flag
+     *  is applied in-memory before `settings.compressionEnabled` is
+     *  committed (Invariant C). See `compressionOverride`. */
+    private get activeCompression(): boolean {
+        return this.compressionOverride ?? this.settings.compressionEnabled;
+    }
 
     /**
      * Wrap a raw CouchClient with the config-DB decorator stack. Mirror
@@ -754,6 +772,12 @@ export default class CouchSyncPlugin extends Plugin {
     async initVault(): Promise<void> {
         this.replicator.stop();
         this.changeTracker.stop();
+        // Invariant C: drop to a non-syncable state and persist it BEFORE
+        // setupService.init destroys the local DB. A failure (or a crash)
+        // mid-init then leaves "settingUp", never the prior setupDone/
+        // syncing — so the user can't start sync on a half-built DB.
+        this.settings.connectionState = "settingUp";
+        await this.saveSettings();
         const progress = new ProgressNotice("Init");
         try {
             const enc = this.settings.encryptionEnabled;
@@ -826,6 +850,14 @@ export default class CouchSyncPlugin extends Plugin {
         );
         const meta = await fetchVaultMeta(rawClient);
 
+        // Invariant C: Clone is a transaction. We derive the remote's codec
+        // config into IN-MEMORY state only (vaultCryptoProvider for
+        // encryption, compressionOverride for compression) so the pull can
+        // decrypt/decompress, but we DO NOT touch persisted settings until
+        // the clone succeeds. The target values to persist on success are
+        // computed up front and held locally.
+        let targetEncryptionEnabled: boolean;
+        let targetPassphrase: string;
         if (meta && meta.encryption.enabled) {
             let passphrase = this.settings.encryptionPassphrase;
             if (!passphrase) {
@@ -839,32 +871,47 @@ export default class CouchSyncPlugin extends Plugin {
             if (!unlockResult) throw new Error("Wrong passphrase.");
 
             this.vaultCryptoProvider = unlockResult.crypto;
-            this.settings.encryptionEnabled = true;
-            this.settings.encryptionPassphrase = passphrase;
+            targetEncryptionEnabled = true;
+            targetPassphrase = passphrase;
         } else {
             this.vaultCryptoProvider = undefined;
-            this.settings.encryptionEnabled = false;
-            this.settings.encryptionPassphrase = "";
+            targetEncryptionEnabled = false;
+            targetPassphrase = "";
         }
 
-        // Clone-side: the server's compression flag wins. The local
-        // setting is overwritten to match so the decorator stack rebuilds
-        // identically across devices in the same vault.
-        if (meta) {
-            this.settings.compressionEnabled = meta.compression.enabled;
-        }
+        // Clone-side: the server's compression flag wins. Apply it as an
+        // in-memory override so the decorator stack uses it during the
+        // pull; the persisted `compressionEnabled` is written only on
+        // success (below), keeping the setting atomic with the rest.
+        const targetCompression = meta
+            ? meta.compression.enabled
+            : this.settings.compressionEnabled;
+        this.compressionOverride = targetCompression;
 
         this.replicator.stop();
         this.changeTracker.stop();
+        // Persist the non-syncable transient before the destructive clone
+        // (see initVault). On failure we stay here, persisted settings
+        // untouched.
+        this.settings.connectionState = "settingUp";
+        await this.saveSettings();
         const progress = new ProgressNotice("Clone");
         try {
             const result = await this.setupService.clone((msg) => progress.update(msg));
 
+            // Success: commit the codec config + setupDone in one save.
+            this.settings.encryptionEnabled = targetEncryptionEnabled;
+            this.settings.encryptionPassphrase = targetPassphrase;
+            this.settings.compressionEnabled = targetCompression;
+            this.compressionOverride = undefined;
             this.settings.connectionState = "setupDone";
             this.encryptionMismatch = undefined;
             await this.saveSettings();
             progress.done(`Clone complete! ${result.vaultFiles} files written.`);
         } catch (e: any) {
+            // Failure: roll back in-memory codec state. Persisted settings
+            // were never mutated; connectionState stays "settingUp".
+            this.compressionOverride = undefined;
             if (meta) {
                 this.vaultCryptoProvider = undefined;
             }

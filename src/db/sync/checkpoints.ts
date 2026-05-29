@@ -17,6 +17,9 @@ import type { LocalDB } from "../local-db.ts";
 import type { MetaWrite } from "../write-transaction.ts";
 import { logDebug } from "../../ui/log.ts";
 import { unpushedKey, type UnpushedEntry, type UnpushedReason } from "./unpushed-ids.ts";
+import {
+    pendingApplyKey, type PendingApplyEntry, type PendingApplyReason,
+} from "./pending-apply.ts";
 
 export const META_REMOTE_SEQ = "_sync/remote-seq";
 export const META_PUSH_SEQ = "_sync/push-seq";
@@ -72,24 +75,70 @@ export class Checkpoints {
     }
 
     /**
-     * Commit a pull batch: docs + new remoteSeq in a single atomic tx.
-     * The in-memory `remoteSeq` is advanced at the start of `onCommit`
-     * (inside the tx boundary) before the caller's `onCommit` fires, so
-     * downstream side effects always observe a consistent cursor.
+     * Commit a pull batch: docs + new remoteSeq (+ optional pending-apply
+     * adds) in a single atomic tx. The in-memory `remoteSeq` is advanced
+     * at the start of `onCommit` (inside the tx boundary) before the
+     * caller's `onCommit` fires, so downstream side effects always observe
+     * a consistent cursor.
+     *
+     * `pendingApplyAdd` carries the file-doc ids whose chunks are not yet
+     * local (so their vault apply, attempted in `onCommit` AFTER this tx
+     * durably commits, may fail). Recording them in the SAME tx as the
+     * `remoteSeq` advance is the load-bearing half of Invariant B: the
+     * cursor can never move past a file that isn't either applied or
+     * remembered for retry. The caller removes the ids that apply cleanly
+     * (post-commit), leaving only genuine misses in the set.
      */
     async commitPullBatch(params: {
         docs: CouchSyncDoc[];
         nextRemoteSeq: number | string;
+        pendingApplyAdd?: string[];
         onCommit: () => Promise<void>;
     }): Promise<void> {
+        const meta: MetaWrite[] = [
+            { op: "put", key: META_REMOTE_SEQ, value: params.nextRemoteSeq },
+        ];
+        const now = Date.now();
+        for (const id of params.pendingApplyAdd ?? []) {
+            const entry: PendingApplyEntry = {
+                addedAt: now, reason: "missing-chunks", attempts: 0,
+            };
+            meta.push({ op: "put", key: pendingApplyKey(id), value: entry });
+        }
         await this.localDb.runWriteTx({
             docs: params.docs.map((d) => ({ doc: d })),
-            meta: [{ op: "put", key: META_REMOTE_SEQ, value: params.nextRemoteSeq }],
+            meta,
             onCommit: async () => {
                 this.remoteSeq = params.nextRemoteSeq;
                 await params.onCommit();
             },
         });
+    }
+
+    /**
+     * Add and/or remove pending-apply entries (Invariant B). Used by the
+     * post-commit cleanup (remove the ids that applied cleanly) and by the
+     * drain (remove resolved ids, re-add still-missing ones with a bumped
+     * attempt count). A standalone tx — not paired with a cursor advance,
+     * because by the time we know an apply outcome the cursor has already
+     * committed; the pre-record in `commitPullBatch` is what bounds the
+     * cursor. Removing an absent key is a harmless no-op.
+     */
+    async commitPendingApply(params: {
+        add?: Array<{ id: string; reason: PendingApplyReason; attempts: number }>;
+        remove?: string[];
+    }): Promise<void> {
+        const meta: MetaWrite[] = [];
+        for (const id of params.remove ?? []) {
+            meta.push({ op: "delete", key: pendingApplyKey(id) });
+        }
+        const now = Date.now();
+        for (const { id, reason, attempts } of params.add ?? []) {
+            const entry: PendingApplyEntry = { addedAt: now, reason, attempts };
+            meta.push({ op: "put", key: pendingApplyKey(id), value: entry });
+        }
+        if (meta.length === 0) return;
+        await this.localDb.runWriteTx({ meta });
     }
 
     /**
