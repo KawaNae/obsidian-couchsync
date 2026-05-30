@@ -836,6 +836,12 @@ export default class CouchSyncPlugin extends Plugin {
                 }
                 meta = {
                     ...existing,
+                    // Preserve salt + keyCheck (same passphrase still unlocks),
+                    // but stamp the current cipher format: a re-init on a build
+                    // that writes encBody bodies produces a cipherVersion-3 vault
+                    // (#2). Without this the marker would wrongly stay at the
+                    // value the vault was first created with.
+                    encryption: { ...existing.encryption, cipherVersion: 3 },
                     compression: compress
                         ? { enabled: true, algorithm: "gzip", version: 1 }
                         : { enabled: false },

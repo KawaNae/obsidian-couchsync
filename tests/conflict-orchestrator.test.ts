@@ -153,6 +153,33 @@ describe("ConflictOrchestrator", () => {
         expect(saveConflictCalls[0][3]).toBe("remote"); // winner
     });
 
+    it("suppresses a duplicate concurrent modal while one is already in flight (#3 re-emit dedup)", async () => {
+        const replicator = makeReplicator();
+        createOrchestrator(replicator);
+
+        const localDoc = await seedFileDoc(db, "a.md", "local edit", { "dev-A": 2 });
+        const remoteDoc = await seedFileDoc(db, "a.md", "remote", { "dev-B": 1 });
+
+        // Fire #1 with NO response queued → its modal stays open (in flight).
+        const p1 = replicator.fireConcurrent("a.md", localDoc, remoteDoc);
+        await new Promise((r) => setTimeout(r, 10)); // let the modal open + inFlight set
+
+        // A fresh sync session's pending-conflict drain (or a reconnect) re-emits
+        // the SAME conflict while the first modal is still open. Without the
+        // in-flight guard this stacked a second modal (observed live: 33 modals).
+        await replicator.fireConcurrent("a.md", localDoc, remoteDoc);
+        expect(modal.conflictCalls.filter((c) => c.filePath === "a.md")).toHaveLength(1);
+
+        // Resolve the open modal → the in-flight guard releases.
+        modal.dismissConflict("a.md");
+        await p1;
+
+        // A later re-emit (after resolution) is allowed to surface again.
+        replicator.fireConcurrent("a.md", localDoc, remoteDoc);
+        await new Promise((r) => setTimeout(r, 10));
+        expect(modal.conflictCalls.filter((c) => c.filePath === "a.md").length).toBeGreaterThanOrEqual(2);
+    });
+
     it("auto-dismiss does not apply choice", async () => {
         const replicator = makeReplicator();
         createOrchestrator(replicator);

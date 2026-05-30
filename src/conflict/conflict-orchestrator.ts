@@ -49,6 +49,14 @@ const EMPTY_BUF = new ArrayBuffer(0);
  */
 export class ConflictOrchestrator {
     private openConflictDismiss = new Map<string, () => void>();
+    /** Paths whose concurrent conflict is currently being handled (modal open
+     *  or mid-resolution). Guards against duplicate modals when the same
+     *  deletion conflict is re-emitted by a fresh sync session's
+     *  pending-conflict drain or a reconnect — the per-session `emittedConflicts`
+     *  set in PullWriter does NOT survive across sessions, so without this the
+     *  modals stack. Set synchronously (before any await) so concurrent emits
+     *  can't both pass the guard. */
+    private inFlightConflicts = new Set<string>();
 
     constructor(private deps: ConflictOrchestratorDeps) {}
 
@@ -84,9 +92,19 @@ export class ConflictOrchestrator {
         localDoc: CouchSyncDoc,
         remoteDoc: CouchSyncDoc,
     ): Promise<void> {
+        // Dedup: a modal for this path is already open / mid-resolution (the
+        // same deletion conflict re-emitted by a new session's drain or a
+        // reconnect). Skip WITHOUT touching the durable record — the open modal
+        // still governs both the resolution and the pending-conflict cleanup.
+        if (this.inFlightConflicts.has(filePath)) {
+            logDebug(`Concurrent for ${filePath.split("/").pop()} suppressed — already in flight`);
+            return;
+        }
+        this.inFlightConflicts.add(filePath);
         try {
             await this.handleConcurrentInner(filePath, localDoc, remoteDoc);
         } finally {
+            this.inFlightConflicts.delete(filePath);
             // The deletion-conflict has now been surfaced and handled (resolved,
             // kept-local on error, or dismissed) — drop its durable record so
             // the pull drain does not re-present it (#3). No-op for ids that
