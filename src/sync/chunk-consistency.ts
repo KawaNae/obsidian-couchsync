@@ -283,6 +283,21 @@ export async function liveRemoteChunkRefs(
     return new Set(collectFileChunkRefs(files).keys());
 }
 
+/**
+ * The set of chunk ids currently referenced by some local FileDoc — the LOCAL
+ * mirror of `liveRemoteChunkRefs`, used as the re-validation guard immediately
+ * before a destructive repair deletes "orphan-local" chunks (#9). Same TOCTOU
+ * shape: the report is a scan-time snapshot, and a concurrent pull may land a
+ * FileDoc that re-references a chunk the report classified as orphan-local
+ * between the scan and the delete. Re-deriving the live local reference set at
+ * the destructive boundary closes that window. Errs toward NOT deleting; a
+ * still-orphan chunk is reclaimed by the next GC pass.
+ */
+export async function liveLocalChunkRefs(localDb: LocalDB): Promise<Set<string>> {
+    const files = await localDb.allFileDocs();
+    return new Set(collectFileChunkRefs(files).keys());
+}
+
 // ── FileDoc convergence ─────────────────────────────────────────────
 
 /**

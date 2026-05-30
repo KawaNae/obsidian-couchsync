@@ -32,7 +32,7 @@ import {
     pullDocs,
     deleteRemoteDocs,
 } from "../db/remote-couch.ts";
-import { liveRemoteChunkRefs } from "./chunk-consistency.ts";
+import { liveRemoteChunkRefs, liveLocalChunkRefs } from "./chunk-consistency.ts";
 import { logWarn } from "../ui/log.ts";
 
 export interface ChunkRepairPlan {
@@ -152,20 +152,40 @@ export async function repairChunkDrift(
             }),
     );
 
+    // #9: re-validate at the destructive LOCAL boundary, symmetric with the
+    // delete-remote guard below. `toDeleteLocal` came from a scan-time report;
+    // a concurrent pull may have landed a FileDoc that re-references one of
+    // these "orphan-local" chunks since. Re-enumerate the live local references
+    // and drop any chunk that is now referenced — deleting it would transiently
+    // break the referencing file. Content-addressing makes "don't delete" the
+    // safe side (a still-orphan chunk is reclaimed by the next GC).
+    let toDeleteLocal = plan.toDeleteLocal;
+    if (plan.toDeleteLocal.length > 0) {
+        const liveRefs = await liveLocalChunkRefs(deps.localDb);
+        toDeleteLocal = plan.toDeleteLocal.filter((id) => !liveRefs.has(id));
+        const skipped = plan.toDeleteLocal.length - toDeleteLocal.length;
+        if (skipped > 0) {
+            logWarn(
+                `chunk-repair: skipped deleting ${skipped} local chunk(s) that a local ` +
+                `FileDoc re-referenced since the report was generated (TOCTOU guard, #9)`,
+            );
+        }
+    }
+
     const deletedLocal = await runPhase(
         "delete-local",
-        plan.toDeleteLocal,
+        toDeleteLocal,
         failed,
         async (onIndividual) => {
-            await deps.localDb.runWriteTx({ deletes: plan.toDeleteLocal });
+            await deps.localDb.runWriteTx({ deletes: toDeleteLocal });
             let count = 0;
-            for (const id of plan.toDeleteLocal) {
+            for (const id of toDeleteLocal) {
                 onIndividual(id);
                 count++;
                 deps.onProgress?.(
                     "delete-local",
                     count,
-                    plan.toDeleteLocal.length,
+                    toDeleteLocal.length,
                 );
             }
             return count;

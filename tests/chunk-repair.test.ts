@@ -246,6 +246,33 @@ describe("repairChunkDrift", () => {
         expect(rows[0]?.value?.deleted ?? false).toBe(false);
     });
 
+    it("does NOT delete an orphan-local chunk re-referenced by a local FileDoc since the scan (#9 TOCTOU)", async () => {
+        // Chunk was orphan-local at scan time, so the plan says delete-local...
+        const chunk = await makeChunk("toctou-local");
+        await putLocal(db, chunk);
+        // ...but a concurrent pull landed a local FileDoc that references it
+        // between scan and repair. The destructive boundary must re-check and
+        // skip it — symmetric with the #4 delete-remote guard above.
+        const referencingFile: CouchSyncDoc = {
+            _id: makeFileId("re-referenced-local.md"),
+            type: "file",
+            schemaVersion: 2,
+            chunks: [chunk._id],
+            mtime: 1, ctime: 1, size: 1,
+            vclock: { B: 1 },
+        } as CouchSyncDoc;
+        await db.runWriteTx({ docs: [{ doc: referencingFile }] });
+
+        const result = await repairChunkDrift(
+            { toPush: [], toPull: [], toDeleteLocal: [chunk._id], toDeleteRemote: [] },
+            { localDb: db, remote, chunkHasher: h },
+        );
+
+        // Skipped, not deleted — the referencing file stays intact locally.
+        expect(result.deletedLocal).toBe(0);
+        expect(await db.get(chunk._id)).not.toBeNull();
+    });
+
     it("runs all four quadrants in one call", async () => {
         const pushC = await makeChunk("q-push");
         const pullC = await makeChunk("q-pull");
