@@ -21,7 +21,7 @@ import {
 } from "../src/sync/chunk-repair.ts";
 import type { ChunkConsistencyReport } from "../src/sync/chunk-consistency.ts";
 import type { ChunkDoc, CouchSyncDoc } from "../src/types.ts";
-import { makeChunkId } from "../src/types/doc-id.ts";
+import { makeChunkId, makeFileId } from "../src/types/doc-id.ts";
 import { buildChunkAttachment } from "../src/db/chunk-attachment.ts";
 import { computeHash, type ChunkHasher } from "../src/db/chunker.ts";
 
@@ -215,6 +215,35 @@ describe("repairChunkDrift", () => {
             })
         ).rows;
         expect(rows[0]?.value?.deleted ?? true).toBe(true);
+    });
+
+    it("does NOT tombstone an orphan chunk re-referenced by a remote FileDoc since the scan (#4 TOCTOU)", async () => {
+        // Chunk was orphan at scan time, so the plan says delete-remote...
+        const chunk = await makeChunk("toctou");
+        await seedRemoteChunk(remote, chunk);
+        // ...but between scan and repair another device pushed a FileDoc that
+        // references it. The destructive boundary must re-check and skip it.
+        const referencingFile: CouchSyncDoc = {
+            _id: makeFileId("re-referenced.md"),
+            type: "file",
+            schemaVersion: 2,
+            chunks: [chunk._id],
+            mtime: 1, ctime: 1, size: 1,
+            vclock: { B: 1 },
+        } as CouchSyncDoc;
+        await remote.bulkDocs([referencingFile]);
+
+        const result = await repairChunkDrift(
+            { toPush: [], toPull: [], toDeleteLocal: [], toDeleteRemote: [chunk._id] },
+            { localDb: db, remote, chunkHasher: h },
+        );
+
+        // Skipped, not tombstoned — the referencing file stays intact.
+        expect(result.deletedRemote).toBe(0);
+        const rows = (
+            await remote.allDocs<any>({ keys: [chunk._id], include_docs: true })
+        ).rows;
+        expect(rows[0]?.value?.deleted ?? false).toBe(false);
     });
 
     it("runs all four quadrants in one call", async () => {

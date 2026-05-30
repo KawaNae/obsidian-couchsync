@@ -32,6 +32,8 @@ import {
     pullDocs,
     deleteRemoteDocs,
 } from "../db/remote-couch.ts";
+import { liveRemoteChunkRefs } from "./chunk-consistency.ts";
+import { logWarn } from "../ui/log.ts";
 
 export interface ChunkRepairPlan {
     /** referenced chunks present only locally — push to remote */
@@ -170,20 +172,40 @@ export async function repairChunkDrift(
         },
     );
 
+    // #4: re-validate at the destructive boundary. `toDeleteRemote` was
+    // derived from a report snapshot; between scan and now another device may
+    // have pushed a FileDoc that re-references one of these "orphan" chunks.
+    // Re-enumerate the live remote references and drop any chunk that is now
+    // referenced — tombstoning it would break the referencing file. Content-
+    // addressing makes "don't delete" the safe side (a still-orphan chunk is
+    // reclaimed by the next GC), so we never need to re-add anything here.
+    let toTombstone = plan.toDeleteRemote;
+    if (plan.toDeleteRemote.length > 0) {
+        const liveRefs = await liveRemoteChunkRefs(deps.remote, undefined, deps.signal);
+        toTombstone = plan.toDeleteRemote.filter((id) => !liveRefs.has(id));
+        const skipped = plan.toDeleteRemote.length - toTombstone.length;
+        if (skipped > 0) {
+            logWarn(
+                `chunk-repair: skipped tombstoning ${skipped} chunk(s) that a remote ` +
+                `FileDoc re-referenced since the report was generated (TOCTOU guard)`,
+            );
+        }
+    }
+
     const deletedRemote = await runPhase(
         "delete-remote",
-        plan.toDeleteRemote,
+        toTombstone,
         failed,
         (onIndividual) =>
             deleteRemoteDocs(
                 deps.remote,
-                plan.toDeleteRemote,
+                toTombstone,
                 (id, count) => {
                     onIndividual(id);
                     deps.onProgress?.(
                         "delete-remote",
                         count,
-                        plan.toDeleteRemote.length,
+                        toTombstone.length,
                     );
                 },
             ),

@@ -159,8 +159,21 @@ export async function runChunkConsistencyReport(
             plugin.app,
             result,
             async (currentReport) => {
-                const plan = planFromReport(currentReport);
+                void currentReport; // the displayed snapshot is a preview only
                 const repairProgress = new ProgressNotice("Chunk repair");
+                // #4: re-analyze immediately before acting. The report shown in
+                // the modal may be stale (arbitrary user think-time), and acting
+                // on a stale snapshot can tombstone a chunk another device just
+                // re-referenced. A fresh analyze also re-checks the convergence
+                // gate; if the vault diverged meanwhile, abort rather than repair.
+                const fresh = await analyze();
+                if (fresh.state !== "converged") {
+                    repairProgress.fail(
+                        "Repair aborted — vault not converged. Let sync settle and retry.",
+                    );
+                    return fresh;
+                }
+                const plan = planFromReport(fresh.report);
                 const repairResult = await repairChunkDrift(plan, {
                     localDb: plugin.localDb,
                     remote,

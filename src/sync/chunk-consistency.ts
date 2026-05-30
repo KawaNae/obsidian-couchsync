@@ -258,6 +258,31 @@ export async function analyzeChunkConsistency(
     return { state: "converged", report };
 }
 
+/**
+ * The set of chunk ids currently referenced by some live (non-deleted)
+ * FileDoc on the remote.
+ *
+ * Used as a re-validation guard immediately before a destructive repair
+ * tombstones "orphan" chunks (#4). A consistency report is a snapshot taken
+ * at scan time; between the scan and the (user-initiated, arbitrarily later)
+ * repair, another device may have pushed a FileDoc that re-references a chunk
+ * the report classified as orphan. Re-deriving the live reference set at the
+ * destructive boundary closes that TOCTOU window. Chunks are content-
+ * addressed, so the guard only ever errs toward NOT deleting — a chunk that
+ * is still genuinely orphaned is reclaimed by the next GC pass.
+ */
+export async function liveRemoteChunkRefs(
+    remote: ICouchClient,
+    pageSize: number = DEFAULT_PAGE_SIZE,
+    signal?: AbortSignal,
+): Promise<Set<string>> {
+    const files: FileDoc[] = [];
+    for await (const fd of pagedRemoteFileDocs(remote, pageSize, signal)) {
+        files.push(fd);
+    }
+    return new Set(collectFileChunkRefs(files).keys());
+}
+
 // ── FileDoc convergence ─────────────────────────────────────────────
 
 /**
