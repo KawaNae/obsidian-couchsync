@@ -227,6 +227,19 @@ export class ConfigSync {
         return this.clientFactory(this.getSettings());
     }
 
+    /** Raw (un-wrapped) client for Config Init's DB-level ops (destroy /
+     *  ensureDb / reachability probe), which run BEFORE the config crypto
+     *  provider exists. The wrapped `makeConfigClient` would trip
+     *  `wrapConfigClient`'s fail-closed guard (encryption enabled + no provider
+     *  yet) and make the FIRST encrypted Config Init impossible. The encrypted
+     *  doc push later in Init uses `makeEncryptingClient`, by which point the
+     *  provider is set. (#config-init) */
+    private makeRawClient(): ICouchClient | null {
+        return this.rawClientFactory
+            ? this.rawClientFactory(this.getSettings())
+            : defaultClientFactory(this.getSettings());
+    }
+
     // ── Operation runner ───────────────────────────────
 
     /**
@@ -237,6 +250,7 @@ export class ConfigSync {
     private async runOperation<T>(
         label: string,
         body: (ctx: ConfigOpContext, progress: ProgressNotice) => Promise<T>,
+        opts: { rawClient?: boolean } = {},
     ): Promise<T> {
         if (this.inflight !== null) {
             throw new Error(
@@ -248,7 +262,13 @@ export class ConfigSync {
             auth: this.auth,
             visibility: this.visibility,
             reconnectBridge: this.reconnectBridge,
-            makeClient: () => this.makeConfigClient(),
+            // Config Init builds its DB (destroy/ensureDb/probe) on a RAW client
+            // because the crypto provider doesn't exist yet; pull/push use the
+            // wrapped client. Without this the first encrypted Init throws in
+            // wrapConfigClient's fail-closed guard. (#config-init)
+            makeClient: () => opts.rawClient
+                ? this.makeRawClient()
+                : this.makeConfigClient(),
         });
         this.inflight = op;
         const progress = new ProgressNotice(label);
@@ -359,7 +379,7 @@ export class ConfigSync {
                 `Config init: scanned ${result.scanned} file(s), pushed ${result.pushed}.`,
             );
             return result.scanned;
-        });
+        }, { rawClient: true });
     }
 
     /**
@@ -381,7 +401,8 @@ export class ConfigSync {
     ): Promise<void> {
         const db = this.configDb;
         if (!db) return;
-        const client = this.clientFactory(this.getSettings());
+        // Raw client: reinit also runs before the new provider exists (#config-init).
+        const client = this.makeRawClient();
         if (!client) return;
         const controller = new AbortController();
         const setup = new ConfigSetupService(

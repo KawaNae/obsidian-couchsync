@@ -2,6 +2,19 @@
 
 All notable changes to obsidian-couchsync.
 
+## 0.27.1
+
+Hotfix for v0.27.0: the **first encrypted Config Init was impossible**. Config
+Init builds its database (destroy → recreate → reachability probe) *before* it
+derives the config crypto provider, but it routed those DB-level ops through the
+wrapped client, whose fail-closed guard throws when encryption is enabled and no
+provider is unlocked yet — so Init failed with "refusing to build config client
+(provisioning incomplete)" before it could create the provider. Config Init and
+reinit now run their DB-level ops (destroy / ensureDb / reachability probe) on a
+raw, un-wrapped client; the encrypted document push still uses the wrapped
+client, by which point the provider exists. Verified on Dev with the provider
+cleared (first-Init simulation).
+
 ## 0.27.0
 
 Two themes. First, a post-release review of v0.26.1 (a multi-agent pass with

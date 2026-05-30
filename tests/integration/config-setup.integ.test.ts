@@ -255,4 +255,34 @@ describe("ConfigSetupService — setup atomicity (#err-9)", () => {
         await expect(cs.pull()).rejects.toThrow(/interrupted/);
         await expect(cs.write()).rejects.toThrow(/interrupted/);
     });
+
+    it("first encrypted Config Init succeeds despite a fail-closed wrapped client (#config-init)", async () => {
+        // wrapConfigClient is fail-closed: it throws when encryption is on but
+        // no crypto provider is unlocked. The FIRST encrypted Config Init has no
+        // provider yet, so Init must run its DB-level ops (destroy/ensureDb/
+        // probe) on the raw client; the wrapped client is only used for the doc
+        // push once the provider exists. Pre-fix this threw in
+        // ConfigOperation.makeClient before Init could start.
+        let providerReady = false;
+        const cs2 = new ConfigSync(
+            vault, new FakeModalPresenter(), db, auth, ALWAYS_VISIBLE, NoopReconnectBridge,
+            () => settings,
+            {
+                clientFactory: () => {
+                    if (!providerReady) {
+                        throw new Error("refusing to build config client — no provider");
+                    }
+                    return asCouchClient(remote);
+                },
+                rawClientFactory: () => asCouchClient(remote),
+                onConfigCryptoChange: () => { providerReady = true; },
+            },
+        );
+        vault.addFile(".obsidian/a.json", "{}");
+
+        const n = await cs2.init({ encryption: true, passphrase: "test-pass-123", compression: false });
+
+        expect(n).toBeGreaterThanOrEqual(0);
+        expect(providerReady).toBe(true);
+    });
 });
