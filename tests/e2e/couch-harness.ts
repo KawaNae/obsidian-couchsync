@@ -279,12 +279,16 @@ export async function createE2EHarness(opts: CreateE2EHarnessOpts = {}): Promise
         // mutable so runInit/runClone can derive and install it dynamically.
         // Seeded from the harness shared provider for codec-enabled harnesses.
         let deviceCrypto: CryptoProvider | undefined = sharedCrypto;
+        // Local cipherVersion floor (mirrors main.ts `activeCipherVersion`):
+        // installed by runInit/runClone so the decode layer enforces the
+        // downgrade floor end-to-end (#1/#3).
+        let deviceCipherVersion: number | undefined = sharedCrypto ? 3 : undefined;
         // Codec stack mirrors main.ts wrapVaultClient: Compressing(Encrypting(raw)).
         // Encrypt iff a crypto provider is installed; compress per the persisted
         // flag — the exact two-source composition that G4 exercised.
         const wrapVaultClient = (raw: CouchClient): ICouchClient => {
             let c: ICouchClient = raw;
-            if (deviceCrypto) c = new EncryptingCouchClient(c, deviceCrypto);
+            if (deviceCrypto) c = new EncryptingCouchClient(c, deviceCrypto, deviceCipherVersion);
             if (settingsRef.current.compressionEnabled) c = new CompressingCouchClient(c);
             return c;
         };
@@ -342,6 +346,9 @@ export async function createE2EHarness(opts: CreateE2EHarnessOpts = {}): Promise
                 compression: o.compression,
             });
             deviceCrypto = built.crypto ?? undefined; // install before any push
+            deviceCipherVersion = built.meta.encryption.enabled
+                ? built.meta.encryption.cipherVersion : undefined;
+            settingsRef.current.vaultCipherVersion = deviceCipherVersion;
             await setupService.init(() => {});
             await pushVaultMeta(remoteOps.makeClient(), built.meta);
             settingsRef.current.connectionState = "syncing";
@@ -356,11 +363,17 @@ export async function createE2EHarness(opts: CreateE2EHarnessOpts = {}): Promise
                 const unlocked = await unlockVaultMeta(meta, o.passphrase);
                 if (!unlocked) throw new Error("runClone: wrong passphrase");
                 deviceCrypto = unlocked.crypto;
+                // Clone anchors the floor to the adopted vault's cipherVersion
+                // (in-memory before the pull, like main.ts cipherVersionOverride).
+                deviceCipherVersion = meta.encryption.cipherVersion;
                 settingsRef.current.encryptionEnabled = true;
                 settingsRef.current.encryptionPassphrase = o.passphrase;
+                settingsRef.current.vaultCipherVersion = deviceCipherVersion;
             } else {
                 deviceCrypto = undefined;
+                deviceCipherVersion = undefined;
                 settingsRef.current.encryptionEnabled = false;
+                settingsRef.current.vaultCipherVersion = undefined;
             }
             settingsRef.current.compressionEnabled = meta.compression.enabled;
             await setupService.clone(() => {});

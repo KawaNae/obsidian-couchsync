@@ -97,6 +97,21 @@ export interface CouchSyncSettings {
     configEncryptionPassphrase?: string;
     configCompressionEnabled?: boolean;
 
+    /** Locally-anchored cipherVersion policy floor (TOFU — trust on first
+     *  unlock). Recorded the first time this device trust-unlocks the vault
+     *  (Init/Clone/first-unlock) and ratcheted up on re-init; it never
+     *  decreases. The decode layer refuses any file/config doc that is not a
+     *  sealed `encBody` once the floor is >= 3, and the encryption-agreement
+     *  check refuses a remote `vault:meta` whose cipherVersion is below it.
+     *  Sourced from client-local state, never re-read live from the
+     *  server-writable meta, so a curious server cannot lower the floor by
+     *  rewriting meta (closes the v3 downgrade hole, #1/#3). `undefined` on a
+     *  not-yet-observed or plaintext vault — permissive (legacy dual-read). */
+    vaultCipherVersion?: number;
+    /** Config-DB equivalent of `vaultCipherVersion` (invariant 18: each DB is
+     *  its own crypto root). */
+    configCipherVersion?: number;
+
     // Internal
     connectionState: ConnectionState;
     /** Human-readable device name used as the vclock key (e.g. "desktop", "iphone"). */

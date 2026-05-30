@@ -336,10 +336,9 @@ describe("EncryptingCouchClient v3 encBody (#2: authenticated, confidential body
         expect(env.bits.compressed).toBe(false);
     });
 
-    it("dual-read: still decrypts a legacy v1 (encryptedPath + plaintext body) doc", async () => {
-        const inner = new FakeCouchClient();
-        const enc = new EncryptingCouchClient(inner, crypto);
-        // Hand-build a legacy-scheme remote doc as a pre-#2 build would have.
+    // Hand-build a legacy-scheme remote doc as a pre-encBody build would have:
+    // path-only encryption (`encryptedPath`) with the body fields plaintext.
+    async function seedLegacyDoc(inner: FakeCouchClient): Promise<void> {
         const hmac = await crypto.hmacHash(te.encode("legacy.md"));
         const encPath = await encryptString("legacy.md", crypto);
         await inner.bulkDocs([{
@@ -347,11 +346,72 @@ describe("EncryptingCouchClient v3 encBody (#2: authenticated, confidential body
             type: "file", chunks: ["chunk:x64:legacy"], vclock: { d: 7 },
             mtime: 1, ctime: 1, size: 3, schemaVersion: 2,
         }]);
+    }
+
+    it("floor < 3 (v2 vault): still dual-reads a legacy v1 encryptedPath doc", async () => {
+        const inner = new FakeCouchClient();
+        // cipherVersion floor 2 → not-yet-re-init'd vault, dual-read preserved.
+        const enc = new EncryptingCouchClient(inner, crypto, 2);
+        await seedLegacyDoc(inner);
 
         const back = await enc.getDoc<any>("file:legacy.md");
         expect(back._id).toBe("file:legacy.md");
         expect(back.chunks).toEqual(["chunk:x64:legacy"]);
         expect(back.vclock).toEqual({ d: 7 });
         expect(back.encryptedPath).toBeUndefined();
+    });
+
+    it("undefined floor: still dual-reads (back-compat default)", async () => {
+        const inner = new FakeCouchClient();
+        const enc = new EncryptingCouchClient(inner, crypto); // no floor
+        await seedLegacyDoc(inner);
+        const back = await enc.getDoc<any>("file:legacy.md");
+        expect(back.chunks).toEqual(["chunk:x64:legacy"]);
+    });
+
+    it("cipherVersion-3 floor: REFUSES a legacy encryptedPath doc (downgrade, #1)", async () => {
+        const inner = new FakeCouchClient();
+        // A re-init'd v3 vault must reject the unauthenticated legacy body a
+        // curious server replays after dropping encBody.
+        const enc = new EncryptingCouchClient(inner, crypto, 3);
+        await seedLegacyDoc(inner);
+
+        await expect(enc.getDoc<any>("file:legacy.md")).rejects.toBeInstanceOf(EncryptionError);
+    });
+
+    it("cipherVersion-3 floor: REFUSES a plaintext-injected file doc (#3)", async () => {
+        const inner = new FakeCouchClient();
+        const enc = new EncryptingCouchClient(inner, crypto, 3);
+        // Server forges a plaintext file doc (no encBody, no encryptedPath) at
+        // the real path's hmac id, with a destructive body (deleted/empty).
+        const hmac = await crypto.hmacHash(te.encode("realnote.md"));
+        await inner.bulkDocs([{
+            _id: "file:" + hmac, type: "file", chunks: [], vclock: { evil: 9 },
+            mtime: 0, ctime: 0, size: 0, deleted: true, schemaVersion: 2,
+        }]);
+
+        await expect(enc.getDoc<any>("file:realnote.md")).rejects.toBeInstanceOf(EncryptionError);
+    });
+
+    it("cipherVersion-3 floor: still round-trips a legitimately sealed encBody doc", async () => {
+        const inner = new FakeCouchClient();
+        const enc = new EncryptingCouchClient(inner, crypto, 3);
+        // A normally-written (sealed) doc must remain readable under the floor.
+        await enc.bulkDocs([{
+            _id: "file:ok.md", type: "file", chunks: ["chunk:x64:ok"],
+            vclock: { d: 1 }, mtime: 0, ctime: 0, size: 2, schemaVersion: 2,
+        }]);
+        const back = await enc.getDoc<any>("file:ok.md");
+        expect(back._id).toBe("file:ok.md");
+        expect(back.chunks).toEqual(["chunk:x64:ok"]);
+    });
+
+    it("cipherVersion-3 floor: passes through non-path docs (chunk docs untouched)", async () => {
+        const inner = new FakeCouchClient();
+        const enc = new EncryptingCouchClient(inner, crypto, 3);
+        // Chunk docs carry no encBody legitimately and must not be rejected.
+        await inner.bulkDocs([{ _id: "chunk:x64:deadbeef", type: "chunk" }]);
+        const back = await enc.getDoc<any>("chunk:x64:deadbeef");
+        expect(back._id).toBe("chunk:x64:deadbeef");
     });
 });

@@ -38,7 +38,14 @@ export type EncryptionAgreement =
     /** Legacy `encryption:meta` doc found on remote but no `vault:meta`.
      *  Triggers a migration prompt in main.ts. Vault-DB-only — config
      *  DB never carried a legacy meta. */
-    | { status: "legacy-meta-only" };
+    | { status: "legacy-meta-only" }
+    /** The remote meta declares a cipherVersion BELOW this device's locally
+     *  recorded floor (`settings.vaultCipherVersion` / `configCipherVersion`).
+     *  Because the meta doc is server-writable, a curious server can rewrite
+     *  cipherVersion 3 → 2 to re-enable the unauthenticated legacy/plaintext
+     *  decode path (#1/#3). Refusing it here, before any data flows, keeps the
+     *  TOFU floor monotonic. Surfaced like a wrong-passphrase / tamper error. */
+    | { status: "cipher-downgrade-detected"; meta: DbMetaDoc; localFloor: number };
 
 /**
  * Check codec agreement against a specific meta doc id.
@@ -52,12 +59,28 @@ export async function checkEncryptionAgreement(
     rawClient: ICouchClient,
     localEncryptionEnabled: boolean,
     metaDocId: typeof VAULT_META_DOC_ID | typeof CONFIG_META_DOC_ID = VAULT_META_DOC_ID,
+    /** This device's locally-recorded cipherVersion floor (TOFU). When set and
+     *  the remote meta is encrypted with a LOWER cipherVersion, the result is
+     *  `cipher-downgrade-detected` — a server cannot lower the floor by
+     *  rewriting the (server-writable) meta. `undefined` skips the gate (first
+     *  observation / plaintext vault). */
+    localCipherFloor?: number,
 ): Promise<EncryptionAgreement> {
     const meta = metaDocId === VAULT_META_DOC_ID
         ? await fetchVaultMeta(rawClient)
         : await fetchConfigMeta(rawClient);
     if (meta) {
         const remoteEncrypted = meta.encryption.enabled;
+        if (
+            meta.encryption.enabled && localCipherFloor !== undefined
+            && meta.encryption.cipherVersion < localCipherFloor
+        ) {
+            return {
+                status: "cipher-downgrade-detected",
+                meta,
+                localFloor: localCipherFloor,
+            };
+        }
         if (remoteEncrypted && localEncryptionEnabled) {
             return { status: "agreed-encrypted", meta };
         }

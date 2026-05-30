@@ -46,6 +46,7 @@ import {
     pushVaultMeta,
     unlockVaultMeta,
     unlockConfigMeta,
+    VAULT_META_DOC_ID,
     CONFIG_META_DOC_ID,
     type VaultMetaDoc,
     type ConfigMetaDoc,
@@ -94,6 +95,14 @@ export default class CouchSyncPlugin extends Plugin {
      *  unchanged. Symmetric to how `vaultCryptoProvider` overrides the
      *  persisted encryption flag. */
     private compressionOverride?: boolean;
+    /** Transient cipherVersion floor active only during Clone, before
+     *  `settings.vaultCipherVersion` is persisted on success. Mirrors
+     *  `compressionOverride`: the vault decorator reads `activeCipherVersion`,
+     *  so Clone can decrypt with the just-unlocked remote meta's cipherVersion
+     *  in-memory while keeping the persisted floor atomic with the rest of the
+     *  clone commit. Undefined at all other times → the getter falls back to
+     *  the persisted floor. */
+    private cipherVersionOverride?: number;
     encryptionMismatch?: EncryptionAgreement;
     /** Mismatch surfaced from the config:meta agreement check, if any.
      *  Symmetric to `encryptionMismatch` (vault). */
@@ -127,7 +136,9 @@ export default class CouchSyncPlugin extends Plugin {
         }
         let client: ICouchClient = raw;
         if (this.vaultCryptoProvider) {
-            client = new EncryptingCouchClient(client, this.vaultCryptoProvider);
+            client = new EncryptingCouchClient(
+                client, this.vaultCryptoProvider, this.activeCipherVersion,
+            );
         }
         if (this.activeCompression) {
             client = new CompressingCouchClient(client);
@@ -143,6 +154,37 @@ export default class CouchSyncPlugin extends Plugin {
         return this.compressionOverride ?? this.settings.compressionEnabled;
     }
 
+    /** cipherVersion policy floor the vault decorator stack enforces. Equals
+     *  the persisted floor (`settings.vaultCipherVersion`, TOFU) except during
+     *  Clone, when the just-unlocked remote meta's cipherVersion is applied
+     *  in-memory before the floor is committed (Invariant C). See
+     *  `cipherVersionOverride`. */
+    private get activeCipherVersion(): number | undefined {
+        return this.cipherVersionOverride ?? this.settings.vaultCipherVersion;
+    }
+
+    /** TOFU ratchet for the vault cipherVersion floor: record the highest
+     *  cipherVersion observed at a trusted unlock. Never decreases (a server
+     *  cannot lower it — the agreement check refuses meta below the floor).
+     *  Mutates `this.settings` only; the caller owns `saveSettings()` so it can
+     *  batch with other Init/Clone writes. Returns true if the floor changed. */
+    private ratchetVaultCipherFloor(observed: number): boolean {
+        if (observed > (this.settings.vaultCipherVersion ?? 0)) {
+            this.settings.vaultCipherVersion = observed;
+            return true;
+        }
+        return false;
+    }
+
+    /** Config-DB equivalent of `ratchetVaultCipherFloor`. */
+    private ratchetConfigCipherFloor(observed: number): boolean {
+        if (observed > (this.settings.configCipherVersion ?? 0)) {
+            this.settings.configCipherVersion = observed;
+            return true;
+        }
+        return false;
+    }
+
     /**
      * Wrap a raw CouchClient with the config-DB decorator stack. Mirror
      * of `wrapVaultClient` but reads `configCryptoProvider` and the
@@ -153,7 +195,9 @@ export default class CouchSyncPlugin extends Plugin {
     private wrapConfigClient = (raw: CouchClient): ICouchClient => {
         let client: ICouchClient = raw;
         if (this.configCryptoProvider) {
-            client = new EncryptingCouchClient(client, this.configCryptoProvider);
+            client = new EncryptingCouchClient(
+                client, this.configCryptoProvider, this.settings.configCipherVersion,
+            );
         }
         const compress = this.settings.configCompressionEnabled
             ?? this.settings.compressionEnabled;
@@ -292,7 +336,24 @@ export default class CouchSyncPlugin extends Plugin {
                 );
                 const agreement = await checkEncryptionAgreement(
                     raw, this.settings.encryptionEnabled,
+                    VAULT_META_DOC_ID, this.settings.vaultCipherVersion,
                 );
+                if (agreement.status === "cipher-downgrade-detected") {
+                    // Server tried to lower the vault's cipherVersion below this
+                    // device's TOFU floor — refuse to flow data (#1/#3).
+                    this.encryptionMismatch = agreement;
+                    this.settings.connectionState = "tested";
+                    await this.saveSettings();
+                    notify(
+                        "CouchSync: vault encryption was downgraded on the server " +
+                        `(cipherVersion below this device's floor ${agreement.localFloor}). ` +
+                        "Sync paused — verify the server has not been tampered with.",
+                        15000,
+                    );
+                    throw new Error(
+                        `cipherVersion downgrade detected (floor ${agreement.localFloor})`,
+                    );
+                }
                 if (agreement.status === "remote-encrypted"
                     || agreement.status === "remote-plaintext") {
                     this.encryptionMismatch = agreement;
@@ -511,8 +572,15 @@ export default class CouchSyncPlugin extends Plugin {
                     );
                     const agreement = await checkEncryptionAgreement(
                         rawClient, this.settings.encryptionEnabled,
+                        VAULT_META_DOC_ID, this.settings.vaultCipherVersion,
                     );
-                    if (agreement.status === "agreed-encrypted"
+                    if (agreement.status === "cipher-downgrade-detected") {
+                        logWarn(
+                            `CouchSync: vault:meta cipherVersion downgrade detected ` +
+                            `(below floor ${agreement.localFloor}) — refusing early unlock.`,
+                        );
+                        this.encryptionMismatch = agreement;
+                    } else if (agreement.status === "agreed-encrypted"
                         && !this.vaultCryptoProvider
                         && this.settings.encryptionPassphrase
                         && agreement.meta && (agreement.meta as VaultMetaDoc).type === "vault-meta") {
@@ -521,6 +589,10 @@ export default class CouchSyncPlugin extends Plugin {
                         );
                         if (result) {
                             this.vaultCryptoProvider = result.crypto;
+                            // TOFU: anchor / ratchet the local cipherVersion floor.
+                            const cv = agreement.meta.encryption.enabled
+                                ? agreement.meta.encryption.cipherVersion : 0;
+                            if (this.ratchetVaultCipherFloor(cv)) await this.saveSettings();
                         }
                     }
                 } catch (e: any) {
@@ -543,8 +615,15 @@ export default class CouchSyncPlugin extends Plugin {
                             ?? this.settings.encryptionPassphrase;
                         const agreement = await checkEncryptionAgreement(
                             rawConfigClient, configEncEnabled, CONFIG_META_DOC_ID,
+                            this.settings.configCipherVersion,
                         );
-                        if (agreement.status === "agreed-encrypted"
+                        if (agreement.status === "cipher-downgrade-detected") {
+                            logWarn(
+                                `CouchSync: config:meta cipherVersion downgrade detected ` +
+                                `(below floor ${agreement.localFloor}) — refusing early unlock.`,
+                            );
+                            this.configEncryptionMismatch = agreement;
+                        } else if (agreement.status === "agreed-encrypted"
                             && !this.configCryptoProvider
                             && configPassphrase
                             && agreement.meta && agreement.meta.type === "config-meta") {
@@ -571,6 +650,11 @@ export default class CouchSyncPlugin extends Plugin {
                                 );
                                 if (result) {
                                     this.configCryptoProvider = result.crypto;
+                                    const cv = configMeta.encryption.enabled
+                                        ? configMeta.encryption.cipherVersion : 0;
+                                    if (this.ratchetConfigCipherFloor(cv)) {
+                                        await this.saveSettings();
+                                    }
                                 } else {
                                     logWarn(
                                         "CouchSync: config:meta unlock failed — passphrase mismatch. " +
@@ -667,8 +751,20 @@ export default class CouchSyncPlugin extends Plugin {
                     );
                     const agreement = await checkEncryptionAgreement(
                         rawClient, this.settings.encryptionEnabled,
+                        VAULT_META_DOC_ID, this.settings.vaultCipherVersion,
                     );
-                    if (agreement.status === "agreed-encrypted") {
+                    if (agreement.status === "cipher-downgrade-detected") {
+                        this.encryptionMismatch = agreement;
+                        this.settings.connectionState = "tested";
+                        await this.saveSettings();
+                        notify(
+                            "CouchSync: vault encryption was downgraded on the server " +
+                            `(cipherVersion below floor ${agreement.localFloor}). Sync paused.`,
+                            15000,
+                        );
+                        this.fireReconcile("onload");
+                        return;
+                    } else if (agreement.status === "agreed-encrypted") {
                         if (!this.vaultCryptoProvider) {
                             let passphrase = this.settings.encryptionPassphrase;
                             if (!passphrase) {
@@ -693,6 +789,10 @@ export default class CouchSyncPlugin extends Plugin {
                                 await this.saveSettings();
                             }
                             this.vaultCryptoProvider = result.crypto;
+                            // TOFU: anchor / ratchet the local cipherVersion floor.
+                            const cv = agreement.meta.encryption.enabled
+                                ? agreement.meta.encryption.cipherVersion : 0;
+                            if (this.ratchetVaultCipherFloor(cv)) await this.saveSettings();
                             // wrapVaultClient picks up the new provider on
                             // next invocation — no mutable setter needed.
                         }
@@ -867,6 +967,11 @@ export default class CouchSyncPlugin extends Plugin {
             }
             this.settings.connectionState = "setupDone";
             this.encryptionMismatch = undefined;
+            // TOFU: anchor the local cipherVersion floor to the just-written
+            // meta (re-init stamps 3; fresh encrypted init also mints v3).
+            if (meta.encryption.enabled) {
+                this.ratchetVaultCipherFloor(meta.encryption.cipherVersion);
+            }
             await this.saveSettings();
             const modes: string[] = [];
             if (enc) modes.push("encrypted");
@@ -897,6 +1002,12 @@ export default class CouchSyncPlugin extends Plugin {
         // computed up front and held locally.
         let targetEncryptionEnabled: boolean;
         let targetPassphrase: string;
+        // Clone re-anchors the cipherVersion floor to the vault being adopted
+        // (set, NOT ratchet): a device re-cloning a legitimately-v2 vault must
+        // not inherit a stale v3 floor from a previously-cloned vault.
+        // `undefined` for a plaintext clone (no floor). This is the TOFU
+        // first-sight anchor — clone has the passphrase-holder present.
+        let targetCipherVersion: number | undefined;
         if (meta && meta.encryption.enabled) {
             let passphrase = this.settings.encryptionPassphrase;
             if (!passphrase) {
@@ -912,10 +1023,12 @@ export default class CouchSyncPlugin extends Plugin {
             this.vaultCryptoProvider = unlockResult.crypto;
             targetEncryptionEnabled = true;
             targetPassphrase = passphrase;
+            targetCipherVersion = meta.encryption.cipherVersion;
         } else {
             this.vaultCryptoProvider = undefined;
             targetEncryptionEnabled = false;
             targetPassphrase = "";
+            targetCipherVersion = undefined;
         }
 
         // Clone-side: the server's compression flag wins. Apply it as an
@@ -926,6 +1039,10 @@ export default class CouchSyncPlugin extends Plugin {
             ? meta.compression.enabled
             : this.settings.compressionEnabled;
         this.compressionOverride = targetCompression;
+        // Same in-memory-during-clone treatment for the cipherVersion floor:
+        // the pull decrypts under the remote's declared cipherVersion before
+        // the floor is persisted on success.
+        this.cipherVersionOverride = targetCipherVersion;
 
         this.replicator.stop();
         this.changeTracker.stop();
@@ -942,7 +1059,9 @@ export default class CouchSyncPlugin extends Plugin {
             this.settings.encryptionEnabled = targetEncryptionEnabled;
             this.settings.encryptionPassphrase = targetPassphrase;
             this.settings.compressionEnabled = targetCompression;
+            this.settings.vaultCipherVersion = targetCipherVersion;
             this.compressionOverride = undefined;
+            this.cipherVersionOverride = undefined;
             this.settings.connectionState = "setupDone";
             this.encryptionMismatch = undefined;
             await this.saveSettings();
@@ -951,6 +1070,7 @@ export default class CouchSyncPlugin extends Plugin {
             // Failure: roll back in-memory codec state. Persisted settings
             // were never mutated; connectionState stays "settingUp".
             this.compressionOverride = undefined;
+            this.cipherVersionOverride = undefined;
             if (meta) {
                 this.vaultCryptoProvider = undefined;
             }

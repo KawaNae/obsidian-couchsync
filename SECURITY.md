@@ -54,12 +54,30 @@ and recorded in the `vault:meta` document. They form four named modes:
   `encBody` is GCM-bound to its `_id` (the id is the AES-GCM additional
   authenticated data), and every chunk body is re-hashed to its content-
   addressed id on *every* pull path — live sync, Clone, and repair alike.
-  A server (or MITM) that reorders/substitutes chunk references, swaps a
-  body onto another doc, rolls back a vclock, or tampers a chunk's bytes is
-  **detected** (authentication failure → the doc/chunk is rejected and
-  routed to repair) rather than silently restoring forged content. Note:
-  this is tamper-*evidence*, not availability — a malicious server can
-  still withhold or delete data; it just cannot forge it undetected.
+  A server (or MITM) that *forges* a body, swaps a body onto a different
+  doc, substitutes chunk *content*, or injects a chunk under the wrong id is
+  **detected** (authentication / hash failure → the doc/chunk is rejected
+  and routed to repair) rather than silently accepted.
+  - **Downgrade is refused.** A re-init'd cipherVersion-3 vault rejects any
+    file/config doc that is not a sealed `encBody` — a server cannot drop
+    `encBody` and serve an unauthenticated legacy (`encryptedPath`) or
+    plaintext body. The cipherVersion floor is anchored in client-local
+    state on first unlock (trust-on-first-use), and the server cannot lower
+    it by rewriting the (server-writable) `vault:meta`, which is checked
+    against the recorded floor before any data flows.
+  - **Rollback is only partially detected.** Because the AAD binds an
+    `encBody` to its `_id` but not to its revision, *every past `encBody` a
+    doc ever had stays a valid, authenticating ciphertext for that id.* A
+    server replaying a genuine older `encBody` (older vclock / older chunk
+    set) is **not** caught by authentication. On an established device the
+    rollback is rejected by the vector-clock classifier (the older clock is
+    dominated → kept-local); **but a fresh Clone has no local baseline to
+    compare against, so a rollback to a genuine prior state is accepted
+    undetected.** This is the inherent first-sight (TOFU) window. Defending
+    it cryptographically would require a sealed monotonic checkpoint (a
+    schema change) and is future work.
+  - This is tamper-*evidence*, not availability — a malicious server can
+    still withhold or delete data; it just cannot forge it undetected.
 
 ## What encryption does **not** protect
 

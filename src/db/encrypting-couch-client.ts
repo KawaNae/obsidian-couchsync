@@ -90,6 +90,17 @@ export class EncryptingCouchClient implements ICouchClient {
     constructor(
         private readonly inner: ICouchClient,
         private readonly crypto: CryptoProvider,
+        /** The vault's locally-anchored cipherVersion policy floor (TOFU).
+         *  When >= 3, `decryptDoc` refuses any file/config doc that is not a
+         *  sealed `encBody` — rejecting both the legacy `encryptedPath` branch
+         *  and the plaintext passthrough, which are unauthenticated and let a
+         *  curious server downgrade a v3 vault (#1/#3). When `undefined` or 2,
+         *  the legacy dual-read is preserved for vaults not yet re-init'd to
+         *  v3. The floor MUST come from client-local state (see
+         *  `settings.vaultCipherVersion`), never from the server-writable
+         *  `vault:meta`; the non-downgrade gate in `encryption-agreement`
+         *  refuses a remote meta below the recorded floor. */
+        private readonly cipherVersion?: number,
     ) {}
 
     /**
@@ -135,6 +146,25 @@ export class EncryptingCouchClient implements ICouchClient {
 
     private async decryptDoc<T>(doc: T): Promise<T> {
         const d = doc as AnyDoc;
+        // cipherVersion-3 policy floor (checked before the shape dispatch).
+        // In a re-init'd v3 vault every file/config doc MUST be a sealed
+        // `encBody`. A path doc that arrives WITHOUT `encBody` is either a
+        // legacy `encryptedPath` body or a plaintext injection — both
+        // unauthenticated, both let a curious server roll back a vclock,
+        // resurrect a deleted file, or swap chunk references undetected
+        // (#1/#3). Refuse them. The floor is local-anchored (TOFU), so a
+        // server cannot re-open the hole by rewriting `vault:meta`. Docs that
+        // are not path docs (chunks, `_local`, the raw meta docs) carry no
+        // `encBody` legitimately and pass through untouched. Floor < 3 (or
+        // undefined) keeps the dual-read below for not-yet-re-init'd v2 vaults.
+        if (this.cipherVersion !== undefined && this.cipherVersion >= 3
+            && hasPathId(d) && typeof d[ENC_BODY_FIELD] !== "string") {
+            throw new EncryptionError(
+                `cipherVersion-${this.cipherVersion} floor: refusing unsealed ` +
+                    `file/config doc ${d._id} (missing encBody — possible ` +
+                    `server downgrade attack)`,
+            );
+        }
         try {
             if (typeof d[ENC_BODY_FIELD] === "string") {
                 return await this.decryptEncBody(d) as T;
@@ -398,7 +428,11 @@ export class EncryptingCouchClient implements ICouchClient {
     }
 
     withTimeout(ms: number): ICouchClient {
-        return new EncryptingCouchClient(this.inner.withTimeout(ms), this.crypto);
+        // Forward the policy floor — a timed-out client that dropped it would
+        // silently revert to the permissive (floor-undefined) dual-read.
+        return new EncryptingCouchClient(
+            this.inner.withTimeout(ms), this.crypto, this.cipherVersion,
+        );
     }
 
     getLastPullBodyChunkAt(): number | null {

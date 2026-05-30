@@ -79,4 +79,48 @@ describe("Encrypted body integrity (review finding #2: encBody is authenticated 
             await h.destroyAll();
         }
     });
+
+    it("cipherVersion-3 floor: a Clone refuses a server-dropped encBody (downgrade, #1/#3)", async () => {
+        const h = await createE2EHarness({ uniqueDb: true, codec: { passphrase: PASS, compression: true } });
+        const base = h.config.couchUrl.replace(/\/+$/, "");
+        const db = h.config.dbName;
+        try {
+            // ── Device A: encrypted Init (cipherVersion 3) ──
+            const A = h.addDevice("A");
+            await A.vault.createBinary("note.md", enc.encode("REAL-content").buffer as ArrayBuffer);
+            await A.runInit({ encryption: true, passphrase: PASS, compression: true });
+
+            const fileRows = await fetch(
+                `${base}/${db}/_all_docs?include_docs=true&startkey=%22file%3A%22&endkey=%22file%3B%22`,
+                { headers: { Authorization: authHeader() } },
+            ).then((r) => r.json());
+            const target = (fileRows.rows ?? []).map((r: any) => r.doc).filter(Boolean)[0];
+            expect(target.encBody).toBeTypeOf("string");
+
+            // ── Tamper: server drops encBody and forges a plaintext, destructive
+            //    body (deleted/blanked) under the real doc id — a downgrade. ──
+            const { encBody: _drop, ...rest } = target;
+            const res = await fetch(`${base}/${db}/${encodeURIComponent(target._id)}`, {
+                method: "PUT",
+                headers: { Authorization: authHeader(), "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    ...rest, _rev: target._rev,
+                    type: "file", chunks: [], vclock: { evil: 9 },
+                    mtime: 0, ctime: 0, size: 0, deleted: true, schemaVersion: 2,
+                }),
+            });
+            expect(res.ok).toBe(true);
+
+            // ── Device B: Clone establishes floor = cipherVersion 3 and must
+            //    REFUSE the unsealed (encBody-less) doc instead of accepting the
+            //    forged deletion/blank. ──
+            const B = h.addDevice("B");
+            let cloneError: any = null;
+            await B.runClone({ passphrase: PASS }).catch((e) => (cloneError = e));
+            expect(cloneError).not.toBeNull();
+            expect(String(cloneError?.message ?? cloneError)).toMatch(/floor|downgrade|unsealed|encBody|encrypt/i);
+        } finally {
+            await h.destroyAll();
+        }
+    });
 });
