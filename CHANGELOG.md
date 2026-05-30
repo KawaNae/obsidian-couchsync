@@ -2,6 +2,80 @@
 
 All notable changes to obsidian-couchsync.
 
+## 0.26.0
+
+Closes the four highest-severity findings from a full integrated review of the
+v0.25.x data layer. They are fixed as the symmetric completion of two
+invariants the codebase already relied on elsewhere — *everything read from the
+(untrusted) remote is authenticated at a single boundary before it is trusted*,
+and *no unresolved decision is lost when the pull cursor advances*. Each was
+reproduced first (in a Docker e2e harness and on a real three-device fleet), and
+the migration to the new encrypted-body format was rehearsed end to end on real
+devices — which also surfaced and fixed two bugs that only appear under live
+reconnect churn.
+
+### ⚠️ Breaking — encrypted vaults must be re-initialised
+
+The on-the-wire format for encrypted **file and config documents** changed
+(`cipherVersion` 3, the new "encBody" scheme). A v0.26.0 client can still *read*
+the previous format, but it only ever *writes* the new one, so a vault must not
+be left running a mix of old and new clients.
+
+**Encrypted vaults require a one-time destructive re-init:** stop sync on every
+device → run **Init** on one device → **Clone** on the rest (the same procedure
+used for past encryption changes; the passphrase is unchanged). The re-init also
+clears any orphaned documents left by earlier re-inits. **Plaintext
+(unencrypted) vaults are unaffected** and need no migration.
+
+### Security
+
+- **File and config document bodies are now authenticated and confidential.**
+  Previously only the path was encrypted; the chunk list, vector clock, size and
+  timestamps rode in the clear, and the AES-GCM ciphertext was not bound to the
+  document id. A malicious or man-in-the-middle CouchDB could therefore reorder
+  or substitute chunk references, swap a body onto another document, or roll back
+  a vector clock undetected — and could read the vault's structure. Now the whole
+  body is compressed-then-encrypted into a single `encBody` field, GCM-bound to
+  the document id (the id is the additional authenticated data). Any tampering or
+  id-swap fails authentication and the document is rejected; the server can no
+  longer see which chunks a file is built from or its history. (Compression
+  precedes encryption, so long chunk-id arrays still pack down — no size
+  regression.)
+- **Pulled chunks are verified on every path.** Live sync already re-hashed each
+  pulled chunk against its content-addressed id, but the Clone (full-resync) and
+  repair paths did not — so an untrusted server could substitute or roll back a
+  chunk body during a Clone and the corruption landed silently. The hasher is now
+  threaded through every fetch boundary; a chunk whose bytes don't match its id
+  (or whose id algorithm can't be verified) is skipped and routed to repair
+  instead of being trusted.
+
+### Fixed
+
+- **A remote deletion no longer silently un-deletes a locally edited file.** When
+  a pulled deletion collided with an unpushed local edit, the conflict was shown
+  only as an in-memory modal while the pull cursor advanced past it — so a missed
+  or dismissed modal, or a restart, lost the deletion intent and the surviving
+  edit quietly resurrected the file on the next push. The conflict is now recorded
+  durably in the same transaction as the cursor advance and re-presented after a
+  restart, exactly like the existing pending-apply recovery.
+- **Chunk repair can no longer delete a chunk that was re-referenced after the
+  scan.** The repair plan was derived from a possibly-stale consistency report;
+  a chunk that another device re-referenced between the scan and the click was
+  tombstoned anyway, breaking the referencing file. Repair now re-validates the
+  live reference set immediately before deleting and re-analyses at click time.
+
+### Hardening
+
+- KDF parameters (PBKDF2 600k / SHA-256 / 16-byte salt) are now pinned by a
+  regression test so a strength reduction can't slip in unnoticed, and
+  `SECURITY.md` documents the new integrity / metadata-confidentiality
+  guarantees alongside the residual offline-bruteforce and `data.json`-plaintext
+  caveats.
+- Duplicate conflict modals no longer stack when a long-lived unresolved
+  conflict is re-emitted by successive sync sessions or reconnects (a guard in
+  the conflict orchestrator), and a re-init of an already-encrypted vault now
+  stamps the correct `cipherVersion`.
+
 ## 0.25.3
 
 Hardens the data layer against the failure modes seen in the v0.25.0–0.25.2
