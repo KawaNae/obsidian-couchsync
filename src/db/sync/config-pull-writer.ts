@@ -47,6 +47,15 @@ import {
 } from "./config-checkpoints.ts";
 
 const PULL_BATCH_LIMIT = 100;
+
+/** Numeric prefix of a CouchDB update seq ("225-g1AA…" → 225). Mirrors the
+ *  vault pull-pipeline helper; used to detect a remote that was recreated
+ *  (its seq counter reset below our cursor). */
+function seqNumeric(seq: number | string): number {
+    if (typeof seq === "number") return seq;
+    const n = parseInt(seq, 10);
+    return Number.isNaN(n) ? 0 : n;
+}
 /** Hard guard against runaway loops if the server returns the same
  *  last_seq with non-empty results indefinitely. 100k configs is well
  *  beyond any realistic vault. */
@@ -117,6 +126,23 @@ export class ConfigPullWriter {
                 { since, limit: PULL_BATCH_LIMIT, include_docs: true },
                 this.deps.signal,
             );
+
+            // Seq regression: the remote config DB was destroyed + recreated by
+            // a Config Init on another device, so its update-seq counter reset
+            // below our cursor — `since > last_seq` means we'd silently fetch
+            // nothing forever. Reset to 0 and re-pull the whole DB. The vault
+            // pull guard (pull-pipeline.ts) throws into an error state, but a
+            // config Init is an admin op the other devices should simply follow,
+            // so we self-heal instead. (#config-codec)
+            if (seqNumeric(batch.last_seq) < seqNumeric(since)) {
+                logWarn(
+                    `Config pull: remote seq regression (last_seq=${batch.last_seq} ` +
+                    `< cursor=${since}) — config DB recreated elsewhere; ` +
+                    `resetting cursor and re-pulling from scratch.`,
+                );
+                this.deps.checkpoints.setPullSeq(0);
+                continue;
+            }
 
             if (batch.results.length === 0) {
                 if (batch.last_seq !== since) {

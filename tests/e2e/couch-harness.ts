@@ -309,6 +309,7 @@ export async function createE2EHarness(opts: CreateE2EHarnessOpts = {}): Promise
             db,
             getSettings,
             (doc) => vs.dbToFile(doc),
+            (path) => vs.hasUnpushedChanges(path),
             /* isMobile */ false,
             auth,
             clientFactory,

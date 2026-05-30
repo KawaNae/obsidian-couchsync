@@ -102,6 +102,17 @@ export class PullPipeline {
                 }, this.deps.signal);
             } catch (e) {
                 if (isAbortError(e) || this.deps.isCancelled()) return;
+                if (e instanceof EncryptionError && e.retriable) {
+                    // Transient decrypt failure (e.g. another device's key
+                    // material not yet pulled). Back off and let the 60s idle
+                    // timeout halt catchup if it never clears, instead of
+                    // tearing the whole session down. A non-retriable
+                    // EncryptionError (downgrade gate) falls through to throw →
+                    // classifyError → schema-mismatch → terminal. (#enc-1)
+                    await this.deps.delay(this.retryMs);
+                    this.retryMs = Math.min(this.retryMs * 2, PULL_RETRY_MAX_MS);
+                    continue;
+                }
                 throw e;
             }
 
@@ -220,6 +231,19 @@ export class PullPipeline {
                     }
 
                     if (e instanceof EncryptionError) {
+                        if (!e.retriable) {
+                            // Policy/security violation (cipherVersion
+                            // downgrade gate / encBody HMAC mismatch).
+                            // classifyError maps it to schema-mismatch, which
+                            // handleTransientError escalates to a hard error
+                            // immediately — no backoff, no 10s grace. Exit the
+                            // loop; the session is terminal. (#enc-1)
+                            this.deps.onTransientError(e);
+                            exitReason = "halted";
+                            return;
+                        }
+                        // Retriable decrypt failure (key not yet distributed,
+                        // partial write) — transient, keep the loop alive.
                         this.deps.onTransientError(e);
                         await this.deps.delay(this.retryMs);
                         this.retryMs = Math.min(this.retryMs * 2, PULL_RETRY_MAX_MS);

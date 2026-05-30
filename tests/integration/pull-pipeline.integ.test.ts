@@ -25,6 +25,7 @@ import { DbError } from "../../src/db/write-transaction.ts";
 import { makeFileId } from "../../src/types/doc-id.ts";
 import type { FileDoc, CouchSyncDoc } from "../../src/types.ts";
 import { ALWAYS_VISIBLE } from "../../src/db/visibility-gate.ts";
+import { EncryptionError } from "../../src/db/codec-errors.ts";
 
 interface PipelineRig {
     pipeline: PullPipeline;
@@ -36,6 +37,8 @@ interface PipelineRig {
     signal: AbortSignal;
     /** Calls captured by the handleLocalDbError stub. */
     dbErrorCalls: Array<{ err: unknown; ctx: string }>;
+    /** Errors routed to onTransientError. */
+    transientErrors: unknown[];
 }
 
 function attachPullPipeline(opts: {
@@ -60,6 +63,7 @@ function attachPullPipeline(opts: {
     let cancelled = false;
     const controller = new AbortController();
     const dbErrorCalls: Array<{ err: unknown; ctx: string }> = [];
+    const transientErrors: unknown[] = [];
 
     const pipeline = new PullPipeline({
         client: opts.couch,
@@ -71,7 +75,7 @@ function attachPullPipeline(opts: {
         isCancelled: () => cancelled,
         signal: controller.signal,
         handleLocalDbError: (err, ctx) => { dbErrorCalls.push({ err, ctx }); },
-        onTransientError: () => {},
+        onTransientError: (e) => { transientErrors.push(e); },
         delay: async () => {},
     });
 
@@ -84,6 +88,7 @@ function attachPullPipeline(opts: {
         abort: () => controller.abort(),
         signal: controller.signal,
         dbErrorCalls,
+        transientErrors,
     };
 }
 
@@ -365,6 +370,80 @@ describe("PullPipeline integration", () => {
 
             await rig.pipeline.runCatchup();
             expect(capturedSignal).toBe(rig.signal);
+            spy.mockRestore();
+        });
+    });
+
+    // ── EncryptionError classification (#enc-1) ──────────
+    describe("EncryptionError classification", () => {
+        it("longpoll: non-retriable EncryptionError halts immediately (no backoff)", async () => {
+            // cipherVersion downgrade gate: must terminate the loop on the
+            // first violation, not enter the transient backoff/escalation path.
+            h = createSyncHarness();
+            const b = h.addDevice("dev-B");
+            const rig = attachPullPipeline({ device: b, couch: h.couch });
+
+            let calls = 0;
+            const spy = vi.spyOn(h.couch, "changesLongpoll").mockImplementation(async () => {
+                calls++;
+                throw new EncryptionError("cipherVersion-3 floor: refusing unsealed doc", undefined, false);
+            });
+
+            await rig.pipeline.runLongpoll();
+
+            expect(calls).toBe(1);                       // halted, no retry storm
+            expect(rig.transientErrors).toHaveLength(1); // routed once for escalation
+            expect(rig.pipeline.getRetryMs()).toBe(2_000); // PULL_RETRY_MIN_MS — no bump
+            spy.mockRestore();
+        });
+
+        it("longpoll: retriable EncryptionError stays transient with backoff", async () => {
+            h = createSyncHarness();
+            const b = h.addDevice("dev-B");
+            const rig = attachPullPipeline({ device: b, couch: h.couch });
+
+            let calls = 0;
+            const spy = vi.spyOn(h.couch, "changesLongpoll").mockImplementation(async () => {
+                calls++;
+                if (calls > 3) rig.cancel();
+                throw new EncryptionError("Failed to decrypt doc x"); // retriable (default)
+            });
+
+            await rig.pipeline.runLongpoll();
+
+            expect(rig.transientErrors.length).toBeGreaterThan(1);  // kept retrying
+            expect(rig.pipeline.getRetryMs()).toBeGreaterThan(2_000); // backoff bumped
+            spy.mockRestore();
+        });
+
+        it("catchup: non-retriable EncryptionError propagates (terminal)", async () => {
+            h = createSyncHarness();
+            const b = h.addDevice("dev-B");
+            const rig = attachPullPipeline({ device: b, couch: h.couch });
+
+            const spy = vi.spyOn(h.couch, "changes").mockImplementation(async () => {
+                throw new EncryptionError("cipherVersion-3 floor: unsealed", undefined, false);
+            });
+
+            await expect(rig.pipeline.runCatchup()).rejects.toThrow(/floor/);
+            spy.mockRestore();
+        });
+
+        it("catchup: retriable EncryptionError backs off instead of tearing down", async () => {
+            h = createSyncHarness();
+            const b = h.addDevice("dev-B");
+            const rig = attachPullPipeline({ device: b, couch: h.couch });
+
+            let calls = 0;
+            const spy = vi.spyOn(h.couch, "changes").mockImplementation(async () => {
+                calls++;
+                if (calls > 3) rig.cancel();
+                throw new EncryptionError("Failed to decrypt doc x"); // retriable
+            });
+
+            // Does NOT throw — backs off and exits cleanly when cancelled.
+            await rig.pipeline.runCatchup();
+            expect(calls).toBeGreaterThan(1);
             spy.mockRestore();
         });
     });

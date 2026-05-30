@@ -22,6 +22,7 @@ import { SyncEvents } from "../../src/db/sync/sync-events.ts";
 import { Checkpoints } from "../../src/db/sync/checkpoints.ts";
 import { DbError } from "../../src/db/write-transaction.ts";
 import { makeFileId } from "../../src/types/doc-id.ts";
+import { unpushedKey } from "../../src/db/sync/unpushed-ids.ts";
 import type { FileDoc, CouchSyncDoc } from "../../src/types.ts";
 import { ALWAYS_VISIBLE, type VisibilityGate } from "../../src/db/visibility-gate.ts";
 
@@ -606,6 +607,50 @@ describe("PushPipeline integration", () => {
             expect(result.pushed).toContain(fileId);
             attSpy.mockRestore();
             fileSpy.mockRestore();
+        });
+    });
+
+    describe("race-stale escalation (#sync-001)", () => {
+        it("emits concurrent with the real remote doc, not a local placeholder", async () => {
+            h = createSyncHarness();
+            const b = h.addDevice("dev-B");
+
+            const id = makeFileId("note.md");
+            // Local clock dominates remote, with DIFFERENT chunks so the
+            // #sync-005 churn guard doesn't skip it.
+            const localDoc: FileDoc = {
+                _id: id, type: "file", chunks: ["chunk:localY"],
+                mtime: 2000, ctime: 1000, size: 10, vclock: { "dev-B": 2 },
+            };
+            await b.db.runWriteTx({ docs: [{ doc: localDoc }] });
+            // Remote: older clock, different content.
+            await h.couch.bulkDocs([{
+                _id: id, type: "file", chunks: ["chunk:remoteX"],
+                mtime: 1000, ctime: 1000, size: 10, vclock: { "dev-B": 1 },
+            } as unknown as CouchSyncDoc]);
+            // Inject a race-stale entry already AT the escalation threshold so a
+            // single push cycle escalates it.
+            await b.db.runWriteTx({
+                meta: [{
+                    op: "put",
+                    key: unpushedKey(id),
+                    value: { addedAt: 0, reason: "race-stale", attempts: 3 },
+                }],
+            });
+
+            const rig = attachPushPipeline({ device: b, couch: h.couch, runOnce: true });
+            let captured: { localDoc: FileDoc; remoteDoc: FileDoc } | null = null;
+            rig.events.on("concurrent", (p: any) => { captured = p; });
+
+            await rig.pipeline.run();
+
+            expect(captured).not.toBeNull();
+            // The fix: remoteDoc is the REAL remote (older clock / different
+            // chunks), not the local placeholder. Pre-fix it was localDoc, so
+            // the conflict modal showed identical content on both sides.
+            expect(captured!.remoteDoc.vclock).toEqual({ "dev-B": 1 });
+            expect(captured!.localDoc.vclock).toEqual({ "dev-B": 2 });
+            expect(captured!.remoteDoc.chunks).toEqual(["chunk:remoteX"]);
         });
     });
 });

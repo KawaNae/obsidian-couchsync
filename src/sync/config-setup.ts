@@ -87,6 +87,21 @@ export interface ConfigSetupHostHooks {
      *  meta push runs against the same in-memory remote as the rest of
      *  the test fixture. */
     makeRawConfigClient?: () => ICouchClient;
+    /** Persist the config-setup-in-progress flag (Invariant C, config side).
+     *  Called with `true` immediately before the destructive local+remote
+     *  wipe and `false` only after a fully-successful init. A mid-flight
+     *  failure leaves it `true` so the host blocks sync against the half-built
+     *  config DB (#err-9). Optional: omitted in tests that don't exercise
+     *  crash atomicity. */
+    markSettingUp?: (active: boolean) => Promise<void>;
+    /** Build a config client wrapped with the CURRENT crypto provider. Called
+     *  AFTER `onCryptoProviderReady`, so the push uses the freshly-derived
+     *  config keys. Without this the push reused the client captured at init
+     *  start (old/plaintext provider), encrypting docs under a DIFFERENT key
+     *  than config:meta — making every config doc undecryptable on all devices
+     *  (#config-codec). Optional: tests that don't exercise encryption omit it
+     *  and fall back to the init-time client. */
+    makeEncryptingClient?: () => ICouchClient;
 }
 
 export class ConfigSetupService {
@@ -102,6 +117,12 @@ export class ConfigSetupService {
         onProgress: (msg: string) => void,
         opts: ConfigSetupInitOpts,
     ): Promise<ConfigSetupResult> {
+        // 0. Persist the setup-in-progress flag BEFORE the destructive wipe
+        //    (Invariant C, config side). If the process dies after this point
+        //    the flag stays true and the host refuses to sync the half-built
+        //    config DB until a fresh Init clears it (#err-9).
+        await this.host.markSettingUp?.(true);
+
         // 1. Wipe local DB completely (meta + docs in one go).
         onProgress("Wiping local config database...");
         await this.db.destroy();
@@ -138,14 +159,22 @@ export class ConfigSetupService {
         //    effectively a one-shot bulk write.
         const checkpoints = new ConfigCheckpoints(this.db);
         await checkpoints.load(); // both seqs are 0 after destroy
+        // Push with a client wrapped by the just-derived crypto provider (set
+        // via onCryptoProviderReady above), NOT the `client` captured at init
+        // start — otherwise docs encrypt under a different key than config:meta
+        // and become undecryptable everywhere (#config-codec).
+        const pushClient = this.host.makeEncryptingClient?.() ?? client;
         const pipeline = new ConfigPushPipeline({
             db: this.db,
-            client,
+            client: pushClient,
             checkpoints,
             getDeviceId: () => this.getSettings().deviceId,
             signal,
         });
         const pushResult = await pipeline.run((msg) => onProgress(msg));
+
+        // Init fully succeeded — clear the setup-in-progress flag (#err-9).
+        await this.host.markSettingUp?.(false);
 
         return { scanned, pushed: pushResult.stats.pushed, meta, crypto };
     }

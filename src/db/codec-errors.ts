@@ -17,7 +17,16 @@
  *  decrypted (wrong key, missing IV, failed GCM tag) or when the vault's
  *  cipherVersion policy floor refuses an unsealed body (#1/#3). */
 export class EncryptionError extends Error {
-    constructor(message: string, public readonly cause?: unknown) {
+    constructor(
+        message: string,
+        public readonly cause?: unknown,
+        /** `false` for policy/security violations (cipherVersion downgrade
+         *  gate, encBody id/path HMAC mismatch) that retrying never fixes —
+         *  they route to a terminal hard-error. `true` (default) for transient
+         *  decrypt failures (key not yet distributed, partial write) that
+         *  survive backoff. Read by `classifyError` (#enc-1). */
+        public readonly retriable: boolean = true,
+    ) {
         super(message);
         this.name = "EncryptionError";
     }

@@ -114,6 +114,13 @@ export interface CouchSyncSettings {
 
     // Internal
     connectionState: ConnectionState;
+    /** Config-sync equivalent of `connectionState`'s `settingUp` transient
+     *  (Invariant C). Set true before ConfigSetupService destroys the local
+     *  config DB and cleared only on a fully-successful init; if init dies
+     *  mid-flight it stays true, so config push/pull/write refuse to run
+     *  against a half-built config DB until a fresh Config Init completes
+     *  (#err-9). */
+    configSettingUp: boolean;
     /** Human-readable device name used as the vclock key (e.g. "desktop", "iphone"). */
     deviceId: string;
     /** Old deviceIds this device has used (UUIDs from pre-v0.12, renamed names).
@@ -159,6 +166,7 @@ export const DEFAULT_SETTINGS: CouchSyncSettings = {
     compressionEnabled: true,
 
     connectionState: "editing",
+    configSettingUp: false,
     deviceId: "",
     previousDeviceIds: [],
 };

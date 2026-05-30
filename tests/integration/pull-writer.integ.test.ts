@@ -51,6 +51,9 @@ function attachPullWriter(opts: {
     /** Re-fetch a remote FileDoc for the local-delete-vs-remote-edit
      *  re-presentation (#7). Defaults to "absent". */
     getRemoteDoc?: (id: string) => Promise<FileDoc | null>;
+    /** Probe for an unpushed local edit (hard-delete path, #del-1). Defaults
+     *  to "no unpushed" so a tombstone applies durably. */
+    probeUnpushed?: (path: string) => Promise<boolean>;
 }): WriterRig {
     const events = new SyncEvents();
     const echoes = new EchoTracker();
@@ -71,6 +74,7 @@ function attachPullWriter(opts: {
             // Backwards-compat: legacy callbacks returning void are treated as success.
             return ret ?? { applied: true };
         },
+        probeUnpushed: opts.probeUnpushed ?? (async () => false),
     });
     return { writer, echoes, events, checkpoints };
 }
@@ -526,47 +530,54 @@ describe("PullWriter integration", () => {
     // ── deletion handling ────────────────────────────────
 
     describe("deletion handling", () => {
-        it("fires pull-delete query for file doc tombstones", async () => {
+        it("probes unpushed for file tombstones and applies the deletion durably (#del-1)", async () => {
             h = createSyncHarness();
             const b = h.addDevice("dev-B");
-            const rig = attachPullWriter({ device: b });
+            const probed: string[] = [];
+            const applied: FileDoc[] = [];
+            const rig = attachPullWriter({
+                device: b,
+                probeUnpushed: async (path) => { probed.push(path); return false; },
+                applyPullWrite: async (doc) => { applied.push(doc); return { applied: true }; },
+            });
 
             await seedLocalFileDoc(b, "deleted.md", { A: 1 });
-
-            const queries: Array<{ path: string; localId: string }> = [];
-            rig.events.onQuery("pull-delete", async ({ path, localDoc }) => {
-                queries.push({ path, localId: localDoc._id });
-                return false; // no unpushed edits → tombstone applied silently
-            });
 
             await rig.writer.apply(makeChangesResult(
                 [{ id: makeFileId("deleted.md"), seq: "3", deleted: true }], "3",
             ));
 
-            expect(queries).toHaveLength(1);
-            expect(queries[0].path).toBe("deleted.md");
-            expect(queries[0].localId).toBe(makeFileId("deleted.md"));
+            // Probed, then routed through the durable accepted → pending-deletion
+            // path (applyPullWrite invoked with a deleted tombstone) — NOT the
+            // former tx-external immediate applyRemoteDeletion.
+            expect(probed).toEqual(["deleted.md"]);
+            expect(applied).toHaveLength(1);
+            expect(applied[0]._id).toBe(makeFileId("deleted.md"));
+            expect(applied[0].deleted).toBe(true);
+            // LocalDB now carries the tombstone (committed atomically with cursor).
+            const stored = await b.db.get<FileDoc>(makeFileId("deleted.md"));
+            expect(stored?.deleted).toBe(true);
         });
 
-        it("skips chunk doc tombstones (never fires pull-delete)", async () => {
+        it("skips chunk doc tombstones (never probes unpushed)", async () => {
             h = createSyncHarness();
             const b = h.addDevice("dev-B");
-            const rig = attachPullWriter({ device: b });
-
-            let queryCount = 0;
-            rig.events.onQuery("pull-delete", async () => { queryCount++; return false; });
+            let probeCount = 0;
+            const rig = attachPullWriter({
+                device: b,
+                probeUnpushed: async () => { probeCount++; return false; },
+            });
 
             await rig.writer.apply(makeChangesResult(
                 [{ id: makeChunkId("abc123"), seq: "3", deleted: true }], "3",
             ));
 
-            expect(queryCount).toBe(0);
+            expect(probeCount).toBe(0);
         });
 
-        it("skips already-deleted local docs", async () => {
+        it("skips already-deleted local docs (never probes)", async () => {
             h = createSyncHarness();
             const b = h.addDevice("dev-B");
-            const rig = attachPullWriter({ device: b });
 
             // Seed a tombstone locally.
             const tombstone: FileDoc = {
@@ -584,25 +595,26 @@ describe("PullWriter integration", () => {
                 docs: [{ doc: tombstone as unknown as CouchSyncDoc }],
             });
 
-            let queryCount = 0;
-            rig.events.onQuery("pull-delete", async () => { queryCount++; return false; });
+            let probeCount = 0;
+            const rig = attachPullWriter({
+                device: b,
+                probeUnpushed: async () => { probeCount++; return false; },
+            });
 
             await rig.writer.apply(makeChangesResult(
                 [{ id: makeFileId("gone.md"), seq: "3", deleted: true }], "3",
             ));
 
-            expect(queryCount).toBe(0);
+            expect(probeCount).toBe(0);
         });
 
-        it("query returning true → emits concurrent with a tombstone remoteDoc", async () => {
+        it("probe returning true → emits concurrent with a tombstone remoteDoc", async () => {
             h = createSyncHarness();
             const b = h.addDevice("dev-B");
-            const rig = attachPullWriter({ device: b });
+            const rig = attachPullWriter({ device: b, probeUnpushed: async () => true });
 
             await seedLocalFileDoc(b, "edited.md", { A: 2 });
 
-            // "yes, B has unpushed edits" → conflict path.
-            rig.events.onQuery("pull-delete", async () => true);
             const concurrent: Array<{ filePath: string; remoteDeleted?: boolean }> = [];
             rig.events.on("concurrent", ({ filePath, remoteDoc }) => {
                 concurrent.push({
@@ -618,6 +630,57 @@ describe("PullWriter integration", () => {
             expect(concurrent).toHaveLength(1);
             expect(concurrent[0].filePath).toBe("edited.md");
             expect(concurrent[0].remoteDeleted).toBe(true);
+        });
+
+        it("durable deletion survives an apply crash and recovers on drain (#del-1)", async () => {
+            h = createSyncHarness();
+            const b = h.addDevice("dev-B");
+            await seedLocalFileDoc(b, "doomed.md", { A: 1 });
+
+            let failNext = true;
+            const rig = attachPullWriter({
+                device: b,
+                probeUnpushed: async () => false,
+                applyPullWrite: async () => {
+                    if (failNext) { failNext = false; throw new Error("vault delete crashed mid-op"); }
+                    return { applied: true };
+                },
+            });
+
+            // First apply: the tombstone is committed (LocalDB + cursor +
+            // pending-deletion in one tx) but the vault delete throws. Pre-fix
+            // (tx-external apply) this would advance the cursor past a lost file.
+            await rig.writer.apply(makeChangesResult(
+                [{ id: makeFileId("doomed.md"), seq: "3", deleted: true }], "3",
+            ));
+            // The pending-deletion entry is durable → the drain re-applies it.
+            await rig.writer.drainPendingApply();
+
+            const stored = await b.db.get<FileDoc>(makeFileId("doomed.md"));
+            expect(stored?.deleted).toBe(true); // no permanent loss
+        });
+
+        it("treats a probe I/O error as a conflict, not a silent deletion (#err-10)", async () => {
+            h = createSyncHarness();
+            const b = h.addDevice("dev-B");
+            await seedLocalFileDoc(b, "risky.md", { A: 1 });
+
+            const applied: FileDoc[] = [];
+            const concurrent: string[] = [];
+            const rig = attachPullWriter({
+                device: b,
+                probeUnpushed: async () => { throw new Error("disk read failed"); },
+                applyPullWrite: async (doc) => { applied.push(doc); return { applied: true }; },
+            });
+            rig.events.on("concurrent", ({ filePath }) => { concurrent.push(filePath); });
+
+            await rig.writer.apply(makeChangesResult(
+                [{ id: makeFileId("risky.md"), seq: "3", deleted: true }], "3",
+            ));
+
+            // Safe-side: surfaced as a conflict, NOT applied as a deletion.
+            expect(concurrent).toEqual(["risky.md"]);
+            expect(applied).toHaveLength(0);
         });
     });
 

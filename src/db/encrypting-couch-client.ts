@@ -169,6 +169,8 @@ export class EncryptingCouchClient implements ICouchClient {
                 `cipherVersion-${this.cipherVersion} floor: refusing unsealed ` +
                     `file/config doc ${d._id} (missing encBody — possible ` +
                     `server downgrade attack)`,
+                undefined,
+                false, // policy violation — terminal, never retry (#enc-1)
             );
         }
         try {
@@ -216,6 +218,8 @@ export class EncryptingCouchClient implements ICouchClient {
         if (idPayload(remoteId) !== expectedHmac) {
             throw new EncryptionError(
                 `encBody id/path mismatch: ${remoteId} does not HMAC to its path`,
+                undefined,
+                false, // identity/security violation — terminal (#enc-1)
             );
         }
         const { path: _omitPath, ...rest } = payload;

@@ -114,6 +114,11 @@ export class CouchSyncSettingTab extends PluginSettingTab {
             remoteOps: this.plugin.remoteOps,
             modalPresenter: this.plugin.modalPresenter,
             configEncryptionMismatch: this.plugin.configEncryptionMismatch,
+            ratchetConfigCipherFloor: async (cv: number) => {
+                if (this.plugin.ratchetConfigCipherFloor(cv)) {
+                    await this.plugin.saveSettings();
+                }
+            },
             refresh: () => this.display(),
         };
         if (!this.configSyncTab) {

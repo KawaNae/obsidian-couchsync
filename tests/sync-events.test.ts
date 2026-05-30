@@ -70,57 +70,12 @@ describe("SyncEvents", () => {
     // into PullWriter's existing try/catch and increment writeFailCount
     // instead of being silently swallowed by the bus's catch-all.
 
-    describe("queries (emitAsyncAny / onQuery)", () => {
-        it("returns true when any handler returns true", async () => {
-            const ev = new SyncEvents();
-            ev.onQuery("pull-delete", async () => false);
-            ev.onQuery("pull-delete", async () => true);
-
-            const result = await ev.emitAsyncAny("pull-delete", {
-                path: "x.md",
-                localDoc: makeFileDoc("file:x.md"),
-            });
-
-            expect(result).toBe(true);
-        });
-
-        it("returns false when all handlers return false", async () => {
-            const ev = new SyncEvents();
-            ev.onQuery("pull-delete", async () => false);
-            ev.onQuery("pull-delete", async () => false);
-
-            const result = await ev.emitAsyncAny("pull-delete", {
-                path: "x.md",
-                localDoc: makeFileDoc("file:x.md"),
-            });
-
-            expect(result).toBe(false);
-        });
-
-        it("returns false when no subscriber is registered", async () => {
-            const ev = new SyncEvents();
-
-            const result = await ev.emitAsyncAny("pull-delete", {
-                path: "x.md",
-                localDoc: makeFileDoc("file:x.md"),
-            });
-
-            expect(result).toBe(false);
-        });
-
-        it("a throwing query handler does not block others", async () => {
-            const ev = new SyncEvents();
-            ev.onQuery("pull-delete", async () => { throw new Error("bad"); });
-            ev.onQuery("pull-delete", async () => true);
-
-            const result = await ev.emitAsyncAny("pull-delete", {
-                path: "x.md",
-                localDoc: makeFileDoc("file:x.md"),
-            });
-
-            expect(result).toBe(true);
-        });
-    });
+    // The boolean-aggregated query API (emitAsyncAny / onQuery) was removed in
+    // v0.26.2: its sole subscriber was the `pull-delete` unpushed-edit probe,
+    // whose catch swallowed I/O errors into a `false` (= apply the deletion),
+    // violating the safe-side principle (#err-10). It is now the
+    // `probeUnpushed` function DI on the pull-writer, wrapped in a safe-side
+    // try/catch — covered by tests/integration/pull-writer.integ.test.ts.
 
     describe("idle once-latch", () => {
         it("fires every pending callback exactly once when tripped", () => {

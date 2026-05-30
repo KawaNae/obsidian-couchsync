@@ -603,7 +603,7 @@ function formatAge(timestamp: number): string {
     return `${Math.floor(diffSec / 86400)}d ago`;
 }
 
-function addPasswordToggle(setting: Setting): void {
+export function addPasswordToggle(setting: Setting): void {
     const input = setting.controlEl.querySelector(
         'input[type="password"], input[type="text"]',
     ) as HTMLInputElement | null;

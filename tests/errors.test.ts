@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { classifyError } from "../src/db/sync/errors.ts";
+import { EncryptionError } from "../src/db/codec-errors.ts";
 
 describe("classifyError", () => {
     it("401/403 → auth", () => {
@@ -54,5 +55,23 @@ describe("classifyError", () => {
         expect(d.code).toBe(500);
         expect(d.message).toMatch(/500/);
         expect(d.message).toMatch(/oops/);
+    });
+
+    it("non-retriable EncryptionError → schema-mismatch (terminal, #enc-1)", () => {
+        // cipherVersion downgrade gate / encBody HMAC mismatch are policy
+        // violations: retrying never succeeds, so they must halt like a
+        // schema mismatch rather than enter the transient backoff loop.
+        const floor = new EncryptionError("cipherVersion-3 floor: refusing unsealed doc", undefined, false);
+        const d = classifyError(floor);
+        expect(d.kind).toBe("schema-mismatch");
+        expect(d.message).toMatch(/floor/);
+    });
+
+    it("retriable EncryptionError → unknown (stays transient, #enc-1)", () => {
+        // A decrypt failure (key not yet distributed) is transient — it must
+        // NOT map to the terminal kind.
+        expect(classifyError(new EncryptionError("Failed to decrypt doc x")).kind).toBe("unknown");
+        // Default retriable flag is true.
+        expect(classifyError(new EncryptionError("boom", new Error("cause"))).kind).toBe("unknown");
     });
 });

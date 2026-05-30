@@ -188,6 +188,29 @@ describe("Reconciler", () => {
         });
     });
 
+    describe("disposal barrier (#err-7)", () => {
+        it("skips the trailing manifest/cursor persist when disposed mid-run", async () => {
+            const h = setup([makeFile("a.md", 1000)]);
+            h.db.fileDocs.set("a.md", makeDoc("a.md", { lastWriter: SELF }));
+            // Slow path: null manifest + cursor so runOnce reaches the
+            // trailing persist instead of short-circuiting on the fast path.
+            h.db.manifest = null;
+            h.db.cursor = null;
+            // Latch disposed mid-run (during classify), before the persist.
+            h.vaultSync.classifyFileVsDoc = (async () => {
+                h.reconciler.destroy();
+                return "identical";
+            }) as any;
+
+            await h.reconciler.reconcile("manual");
+
+            // The unguarded persist used to race teardown (DatabaseClosedError);
+            // now it is skipped, leaving manifest/cursor untouched.
+            expect(h.db.manifest).toBeNull();
+            expect(h.db.cursor).toBeNull();
+        });
+    });
+
     describe("Case B: content differs", () => {
         it("local-win when vault is newer", async () => {
             const h = setup([makeFile("a.md", 5000)]);

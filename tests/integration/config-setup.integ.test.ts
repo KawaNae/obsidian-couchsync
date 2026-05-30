@@ -190,3 +190,69 @@ describe("ConfigSetupService — clean-slate init (PR5)", () => {
         expect(revNum).toBeLessThan(phantomRevNum);
     });
 });
+
+describe("ConfigSetupService — setup atomicity (#err-9)", () => {
+    let vault: FakeVaultIO;
+    let db: ConfigLocalDB;
+    let auth: AuthGate;
+    let settings: ReturnType<typeof makeSettings>;
+    let remote: FakeCouchClient;
+    let cs: ConfigSync;
+    let settingUpCalls: boolean[];
+
+    beforeEach(() => {
+        vault = new FakeVaultIO();
+        db = new ConfigLocalDB(uniqueName());
+        db.open();
+        auth = new AuthGate();
+        settings = makeSettings({
+            deviceId: "dev-A",
+            couchdbUri: "http://localhost:5984",
+            couchdbConfigDbName: "config-test",
+        });
+        remote = new FakeCouchClient();
+        settingUpCalls = [];
+        cs = new ConfigSync(
+            vault, new FakeModalPresenter(), db, auth, ALWAYS_VISIBLE, NoopReconnectBridge,
+            () => settings,
+            {
+                clientFactory: () => asCouchClient(remote),
+                rawClientFactory: () => asCouchClient(remote),
+                persistConfigSettingUp: async (active) => {
+                    settingUpCalls.push(active);
+                    settings.configSettingUp = active;
+                },
+            },
+        );
+    });
+
+    afterEach(async () => {
+        await db.destroy().catch(() => {});
+    });
+
+    it("marks settingUp true before the wipe and false only after success", async () => {
+        vault.addFile(".obsidian/a.json", `{}`);
+        await cs.init({ encryption: false, compression: false });
+        expect(settingUpCalls).toEqual([true, false]);
+        expect(settings.configSettingUp).toBe(false);
+    });
+
+    it("leaves settingUp true when init fails mid-flight (no false cleared)", async () => {
+        vault.addFile(".obsidian/a.json", `{}`);
+        // Fail the remote write after the destructive wipe — init throws
+        // before reaching the success markSettingUp(false).
+        vi.spyOn(remote, "bulkDocs").mockRejectedValue(new Error("network down"));
+
+        await expect(cs.init({ encryption: false, compression: false })).rejects.toThrow();
+
+        expect(settingUpCalls).toEqual([true]);   // false never reached
+        expect(settings.configSettingUp).toBe(true);
+    });
+
+    it("blocks push/pull/write while a prior init is unfinished (gating)", async () => {
+        settings.configSettingUp = true;
+        await expect(cs.push()).rejects.toThrow(/interrupted/);
+        await expect(cs.pull()).rejects.toThrow(/interrupted/);
+        await expect(cs.write()).rejects.toThrow(/interrupted/);
+    });
+});

@@ -29,6 +29,7 @@ import type { AuthGate } from "../db/sync/auth-gate.ts";
 import type { VaultRemoteOps } from "../db/sync/vault-remote-ops.ts";
 import type { IModalPresenter } from "../types/modal-presenter.ts";
 import { logWarn } from "../ui/log.ts";
+import { addPasswordToggle } from "./vault-sync-tab.ts";
 
 export interface ConfigSyncTabDeps {
     app: App;
@@ -44,6 +45,10 @@ export interface ConfigSyncTabDeps {
      *  downgrade was detected). Symmetric to the vault tab's
      *  `encryptionMismatch`. */
     configEncryptionMismatch?: { status: string };
+    /** Ratchet the config cipherVersion floor + persist (#config-codec). Called
+     *  after a successful encrypted Init & Push so a downgrade is refused
+     *  immediately, not only after the next onload early-derive. */
+    ratchetConfigCipherFloor: (cv: number) => Promise<void>;
     refresh: () => void;
 }
 
@@ -112,6 +117,92 @@ export class ConfigSyncTab {
             : "Test connection first.";
     }
 
+    /**
+     * Config-DB codec settings, independent from Vault Sync. Each value is a
+     * config-specific override (`config* ?? vault`): we surface the effective
+     * value and persist an explicit config value the moment the user toggles it
+     * — no migration backfills the inherited defaults, so an untouched install
+     * keeps inheriting. Mirrors `VaultSyncTab.renderEncryptionStep`. A codec
+     * change only takes effect on the next Init & Push (Step 3), which destroys
+     * and rebuilds the config DB — flagged in the descriptions here.
+     */
+    private renderConfigCodecStep(el: HTMLElement, settings: CouchSyncSettings): void {
+        el.createEl("h3", { text: "Step 1: Encryption & compression" });
+        el.createEl("p", {
+            text: "Config sync has its own codec, independent of Vault Sync. " +
+                "Unset values inherit the Vault Sync setting. Changes apply on the " +
+                "next Init & Push (Step 3), which rebuilds the config database.",
+            cls: "setting-item-description",
+        });
+
+        if (this.deps.configEncryptionMismatch) {
+            const warn = el.createEl("p", {
+                text: "Config DB encryption state disagrees with this device " +
+                    "(or a cipherVersion downgrade was detected on the server). " +
+                    "Re-run Config Init & Push, or verify the server.",
+                cls: "setting-item-description mod-warning",
+            });
+            warn.style.color = "var(--text-error)";
+        }
+
+        const encEnabled = settings.configEncryptionEnabled ?? settings.encryptionEnabled;
+        const inheritingEnc = settings.configEncryptionEnabled === undefined;
+        new Setting(el)
+            .setName("E2E encryption")
+            .setDesc(
+                inheritingEnc
+                    ? `Inheriting Vault Sync (${settings.encryptionEnabled ? "encrypted" : "plaintext"}). Toggle to set an independent value.`
+                    : "Independent config setting. Re-run Init & Push to apply.",
+            )
+            .addToggle((toggle) =>
+                toggle
+                    .setValue(encEnabled)
+                    .onChange(async (value) => {
+                        const patch: Partial<CouchSyncSettings> = { configEncryptionEnabled: value };
+                        if (!value) patch.configEncryptionPassphrase = "";
+                        await this.deps.updateSettings(patch);
+                        this.deps.refresh();
+                    })
+            );
+
+        if (encEnabled) {
+            const passphraseSetting = new Setting(el)
+                .setName("Passphrase")
+                .setDesc(
+                    settings.configEncryptionPassphrase
+                        ? "Independent config passphrase. Re-run Init & Push to apply."
+                        : "Empty inherits the Vault Sync passphrase; set a value to use a different one.",
+                )
+                .addText((text) => {
+                    text.setPlaceholder("Inherit Vault Sync passphrase")
+                        .setValue(settings.configEncryptionPassphrase ?? "")
+                        .onChange(async (value) => {
+                            await this.deps.updateSettings({ configEncryptionPassphrase: value });
+                        });
+                    text.inputEl.type = "password";
+                });
+            addPasswordToggle(passphraseSetting);
+        }
+
+        const compressEnabled = settings.configCompressionEnabled ?? settings.compressionEnabled;
+        const inheritingCompress = settings.configCompressionEnabled === undefined;
+        new Setting(el)
+            .setName("Compress (gzip)")
+            .setDesc(
+                inheritingCompress
+                    ? `Inheriting Vault Sync (${settings.compressionEnabled ? "on" : "off"}). Toggle to set an independent value.`
+                    : "Independent config setting. Re-run Init & Push to apply.",
+            )
+            .addToggle((toggle) =>
+                toggle
+                    .setValue(compressEnabled)
+                    .onChange(async (value) => {
+                        await this.deps.updateSettings({ configCompressionEnabled: value });
+                        this.deps.refresh();
+                    })
+            );
+    }
+
     render(el: HTMLElement): void {
         const settings = this.deps.getSettings();
         const vaultState = settings.connectionState;
@@ -132,30 +223,8 @@ export class ConfigSyncTab {
             cls: "cs-inherited-value",
         });
 
-        // ── Step 1: Encryption (inherited) ──────────────────
-        el.createEl("h3", { text: "Step 1: Encryption" });
-        new Setting(el)
-            .setName("E2E encryption")
-            .setDesc(
-                settings.encryptionEnabled
-                    ? "Enabled — shared with Vault Sync. Change in the Vault Sync tab."
-                    : "Disabled — shared with Vault Sync. Change in the Vault Sync tab.",
-            )
-            .addToggle((toggle) =>
-                toggle
-                    .setValue(settings.encryptionEnabled)
-                    .setDisabled(true)
-            );
-
-        if (this.deps.configEncryptionMismatch) {
-            const warn = el.createEl("p", {
-                text: "Config DB encryption state disagrees with this device " +
-                    "(or a cipherVersion downgrade was detected on the server). " +
-                    "Re-run Config Init & Push, or verify the server.",
-                cls: "setting-item-description mod-warning",
-            });
-            warn.style.color = "var(--text-error)";
-        }
+        // ── Step 1: Encryption & compression (independent) ──
+        this.renderConfigCodecStep(el, settings);
 
         // ── Gate: vault sync must be at least Tested ────────
         if (!vaultReady) {
@@ -247,19 +316,28 @@ export class ConfigSyncTab {
                         btn.setButtonText("Initializing...");
                         btn.setDisabled(true);
                         try {
-                            // Phase 2: config crypto is independent.
-                            // Pull encryption/passphrase/compression from
-                            // vault settings as default; Phase 3 will
-                            // surface separate UI for these.
+                            // Config codec is independent (#config-codec): read
+                            // the config overrides, falling back to the vault
+                            // setting when unset.
                             const s = this.deps.getSettings();
+                            const encryption = s.configEncryptionEnabled
+                                ?? s.encryptionEnabled;
                             await this.deps.configSync.init({
-                                encryption: s.configEncryptionEnabled
-                                    ?? s.encryptionEnabled,
+                                encryption,
+                                // Empty = inherit the vault passphrase (|| not
+                                // ?? — "" must fall through, see main.ts).
                                 passphrase: s.configEncryptionPassphrase
-                                    ?? s.encryptionPassphrase,
+                                    || s.encryptionPassphrase,
                                 compression: s.configCompressionEnabled
                                     ?? s.compressionEnabled,
                             });
+                            // Init minted a fresh config:meta at cipherVersion 3
+                            // when encrypted — ratchet the local floor now so a
+                            // downgrade is refused immediately, not only after
+                            // the next onload early-derive.
+                            if (encryption) {
+                                await this.deps.ratchetConfigCipherFloor(3);
+                            }
                         } catch { /* handled */ }
                         btn.setButtonText("Init & Push");
                         btn.setDisabled(false);

@@ -46,6 +46,7 @@ export interface SyncSessionDeps {
      *  account skips separately and emit `pull-skipped` for the supervisor
      *  to reconcile. Throws are caught into `writeFailCount`. */
     applyPullWrite: (doc: FileDoc) => Promise<WriteResult>;
+    probeUnpushed: (path: string) => Promise<boolean>;
     handleLocalDbError: (e: unknown, ctx: string) => void;
     /** Invoked from pipelines when a transient upstream error (auth /
      *  5xx) occurs. The supervisor (SyncEngine) decides escalation. */
@@ -101,6 +102,7 @@ export class SyncSession {
                 return d ? (stripRev(d) as FileDoc) : null;
             },
             applyPullWrite: deps.applyPullWrite,
+            probeUnpushed: deps.probeUnpushed,
         });
         const isCancelled = () => this._disposed;
         const delay = (ms: number) => this.delay(ms);

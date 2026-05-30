@@ -206,6 +206,10 @@ export class SyncEngine {
          *  schedules a reconciler retry. Throws are caught into
          *  `writeFailCount` so the batch log reflects reality. */
         private applyPullWrite: (doc: FileDoc) => Promise<WriteResult>,
+        /** True if the vault has an unpushed local edit for `path`. The
+         *  pull-writer's hard-delete path uses it to choose between durable
+         *  deletion apply and a delete-vs-edit conflict (#del-1/#err-10). */
+        private probeUnpushed: (path: string) => Promise<boolean>,
         /** True on Obsidian mobile (iOS + Android). Selects
          *  BrowserVisibilityGate so push/pull loops pause on
          *  visibilitychange→hidden. Desktop Electron keeps the loops
@@ -581,7 +585,12 @@ export class SyncEngine {
             `transient error: kind=${detail.kind} code=${detail.code ?? "-"} msg=${detail.message}`,
         );
 
-        if (detail.kind === "auth") {
+        if (detail.kind === "auth" || detail.kind === "schema-mismatch") {
+            // auth is user-gated; schema-mismatch (a doc shape this build can't
+            // read, or a non-retriable EncryptionError = cipherVersion
+            // downgrade gate) is terminal. Both must halt immediately rather
+            // than burn the 10s transient grace window — enterError handles
+            // each terminal class. (#enc-1)
             this.enterError(detail);
             return;
         }
@@ -746,6 +755,7 @@ export class SyncEngine {
             // discard the EnsureChunksResult to keep the session contract void.
             ensureChunks: async (doc) => { await this.ensureChunksInternal(client, doc); },
             applyPullWrite: (doc) => this.applyPullWrite(doc),
+            probeUnpushed: (path) => this.probeUnpushed(path),
             handleLocalDbError: (e, ctx) => this.handleLocalDbError(e, ctx),
             onTransientError: (err) => this.handleTransientError(err),
             visibility: this.visibility,

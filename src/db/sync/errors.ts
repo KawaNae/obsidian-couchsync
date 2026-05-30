@@ -10,6 +10,7 @@
  */
 
 import type { SyncErrorDetail, SyncErrorKind } from "../reconnect-policy.ts";
+import { EncryptionError } from "../codec-errors.ts";
 
 export type { SyncErrorDetail, SyncErrorKind };
 
@@ -34,6 +35,16 @@ export function classifyError(err: unknown): SyncErrorDetail {
             kind: "schema-mismatch",
             message: typeof e?.userMessage === "string" ? e.userMessage : rawMessage,
         };
+    }
+
+    // A non-retriable EncryptionError is a policy/security violation — a
+    // cipherVersion downgrade-gate breach or an encBody id/path HMAC mismatch.
+    // Like a schema mismatch, retrying never succeeds, so it maps to the same
+    // terminal kind the engine halts on rather than the backoff loop. A
+    // retriable EncryptionError (decrypt failure) falls through to "unknown"
+    // and stays transient. (#enc-1)
+    if (err instanceof EncryptionError && err.retriable === false) {
+        return { kind: "schema-mismatch", message: rawMessage };
     }
 
     if (code === 401 || code === 403) {

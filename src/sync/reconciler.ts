@@ -396,8 +396,14 @@ export class Reconciler {
             }
         }
 
-        // Persist the new manifest and cursor (apply mode only).
-        if (mode === "apply") {
+        // Persist the new manifest and cursor (apply mode only). Skip when
+        // disposed: onunload latches `disposed` then closes localDb right after
+        // settle(), so an unguarded write here races teardown
+        // (DatabaseClosedError). The per-file writes above already gate on
+        // `disposed` (tryStep / applyRemoteToVault); this trailing persist was
+        // the lone gap (#err-7). A skipped persist just means a full rescan
+        // next session — safe.
+        if (mode === "apply" && !this.disposed) {
             const newManifest: VaultManifest = {
                 paths: vaultFiles.map((f) => f.path),
                 updatedAt: Date.now(),
@@ -408,6 +414,8 @@ export class Reconciler {
                 lastScanCompletedAt: Date.now(),
                 lastSeenUpdateSeq: seqBeforeScan,
             });
+        } else if (mode === "apply") {
+            logDebug("reconcile: skipped manifest/cursor persist (shutting down)");
         }
 
         // Safety net: warn on large deletions so a corrupt manifest can't

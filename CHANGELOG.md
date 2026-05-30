@@ -2,6 +2,95 @@
 
 All notable changes to obsidian-couchsync.
 
+## 0.27.0
+
+Two themes. First, a post-release review of v0.26.1 (a multi-agent pass with
+adversarial verification) surfaced ten confirmed issues; they are not
+independent bugs but the same recurring shape — *a boundary where an invariant
+was enforced on one side but not the other* — closed here as a return to a few
+structural principles rather than spot fixes. Second, **config sync gains its
+own independent codec settings** (see Added). No wire-format or schema change
+and no re-initialisation of existing vaults; the only persisted-shape additions
+are a `configSettingUp` flag and the (already-present, now UI-exposed) config
+codec overrides — all defaulting to inherit/false, so an untouched install is
+unchanged.
+
+### Added
+
+- **Config sync codec is configurable independently of Vault Sync.** The Config
+  Sync tab's Step 1 now exposes an E2E-encryption toggle, an optional separate
+  passphrase, and a gzip toggle for the config database. Each value falls back
+  to the corresponding Vault Sync setting when left unset (no migration — an
+  untouched install keeps inheriting), so you can e.g. encrypt the vault while
+  keeping config plaintext on a trusted server, or encrypt config under a
+  different passphrase. Changes take effect on the next Config Init & Push,
+  which now also ratchets the config cipherVersion floor immediately so a
+  downgrade is refused without waiting for the next reload.
+  Bringing this to real use surfaced three latent defects that had silently
+  made config encryption non-functional — all fixed and verified on a live
+  two-device fleet:
+  - **config Init encrypted documents under a different key than `config:meta`**:
+    the push reused the client captured *before* the freshly-derived crypto
+    provider was installed, so every config doc was undecryptable on all
+    devices. The push now uses a client wrapped with the post-derivation provider.
+  - **an empty config passphrase field did not inherit the vault passphrase**
+    (`??` treated `""` as an explicit empty value); it now falls through (`||`).
+  - **config pull had no seq-regression guard**: after a config Init recreated
+    the remote DB, other devices' pull cursors sat above the reset seq and
+    silently pulled nothing. Config pull now detects this (like vault pull) and
+    self-heals by resetting the cursor and re-pulling from scratch.
+
+### Security
+
+- **An encryption downgrade is refused on every pull path, synchronously.** A
+  cipherVersion floor violation (an unsealed body in a v3 vault) is a
+  non-retriable policy violation: it now maps to a terminal error in the single
+  `classifyError` classifier, so the longpoll path halts immediately instead of
+  treating it as a transient error with a 10-second grace window. The catchup
+  path already halted — the two paths are now symmetric. A transient decrypt
+  failure (key not yet distributed) still backs off and retries. (#enc-1)
+
+### Fixed
+
+- **Remote hard-deletions are now applied durably.** A CouchDB tombstone was
+  applied to the vault outside the commit transaction, so a crash between the
+  vault delete and the local-tombstone write could lose the file permanently
+  with no recovery on restart. Hard-deletions now flow through the same
+  `accepted → pending-deletion → drain` path as soft-deletions: committed
+  atomically with the cursor advance and retried on apply failure. (#del-1, #del-2)
+- **A pull-delete with an unreadable unpushed-edit probe now fails safe-side.**
+  The probe's I/O error was swallowed into "no unpushed edits" (= apply the
+  deletion); it now surfaces a conflict instead, honouring the "when unsure,
+  treat it as a conflict" rule. The error-prone query bus this relied on was
+  removed in favour of a direct, safe-wrapped function call. (#err-10)
+- **The reconciler no longer persists its manifest/cursor during teardown.** The
+  trailing persist was the one DB write not gated on the disposal barrier, so it
+  could race `localDb.close()` on unload (DatabaseClosedError). (#err-7)
+- **Config Init is now atomic.** It records a `configSettingUp` flag before
+  wiping the local config DB and clears it only on success, mirroring vault
+  setup (Invariant C); config push/pull/write refuse to run against a config DB
+  left half-built by an interrupted init. (#err-9)
+- **A persistent push conflict now surfaces the real remote content.** When a
+  race-stale entry escalated to a conflict, the modal was handed the local
+  document as the "remote" side, showing identical content on both panes; it now
+  uses the remote document fetched in the same cycle, or defers to the next
+  cycle when fresh remote state isn't available. (#sync-001)
+- **Redundant pushes are avoided** for a document whose vector clock advanced
+  but whose chunks are byte-identical to the remote (e.g. after a pull-side
+  clock merge). (#sync-005)
+- A config concurrent-pull notice is fire-and-forget but now logs a rejection
+  instead of leaving an unhandled promise. (#err-1)
+
+### Changed
+
+- **Exported diagnostic logs sync again.** v0.26.1 hard-coded a
+  `couchsync_log_*.md` exclusion in the sync filter; that special-casing
+  contradicted the design rule that sync membership is decided only by the
+  user's `syncFilter` / `syncIgnore` (and dotfile) rules, not by built-in
+  filename patterns. Choosing an unencrypted vault means trusting the server, so
+  the plaintext-exposure concern that motivated the exclusion does not apply, and
+  it has been removed.
+
 ## 0.26.1
 
 A follow-up integrated review of the v0.26.0 release surfaced 19 confirmed

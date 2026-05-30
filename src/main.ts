@@ -176,8 +176,10 @@ export default class CouchSyncPlugin extends Plugin {
         return false;
     }
 
-    /** Config-DB equivalent of `ratchetVaultCipherFloor`. */
-    private ratchetConfigCipherFloor(observed: number): boolean {
+    /** Config-DB equivalent of `ratchetVaultCipherFloor`. Public so the
+     *  settings tab can ratchet the floor right after an encrypted Config
+     *  Init (#config-codec); caller persists via saveSettings on a true return. */
+    ratchetConfigCipherFloor(observed: number): boolean {
         if (observed > (this.settings.configCipherVersion ?? 0)) {
             this.settings.configCipherVersion = observed;
             return true;
@@ -341,6 +343,7 @@ export default class CouchSyncPlugin extends Plugin {
             this.localDb,
             () => this.settings,
             (doc) => this.vaultSync.dbToFile(doc),
+            (path) => this.vaultSync.hasUnpushedChanges(path),
             Platform.isMobile,
             this.auth,
             encClientFactory,
@@ -429,6 +432,10 @@ export default class CouchSyncPlugin extends Plugin {
                 ownDataJsonPath: this.manifest.dir
                     ? `${this.manifest.dir}/data.json`
                     : `${this.app.vault.configDir}/plugins/${this.manifest.id}/data.json`,
+                persistConfigSettingUp: async (active) => {
+                    this.settings.configSettingUp = active;
+                    await this.saveSettings();
+                },
             },
         );
         this.statusBar = new StatusBar(
@@ -506,20 +513,11 @@ export default class CouchSyncPlugin extends Plugin {
         this.conflictOrchestrator.register();
         this.reconciler.setConflictOrchestrator(this.conflictOrchestrator);
 
-        // Pull-driven deletions: if the remote deleted a file, apply
-        // locally unless there are unpushed local edits (→ concurrent).
-        // PR-B: hasUnpushedChanges is now chunks-aware (invariant 4)
-        // and looks at the actual vault disk + ChangeTracker pending
-        // state, not the in-lockstep vclock pair. Catches the silent
-        // loss race where a remote tombstone arrives during the
-        // ChangeTracker debounce window for a fresh user edit.
-        this.replicator.events.onQuery("pull-delete", async ({ path }) => {
-            if (await this.vaultSync.hasUnpushedChanges(path)) {
-                return true; // → concurrent conflict
-            }
-            await this.vaultSync.applyRemoteDeletion(path);
-            return false;
-        });
+        // Pull-driven deletions are handled entirely inside the pull-writer
+        // now (#del-1): the unpushed-edit probe is the `probeUnpushed` DI wired
+        // into SyncEngine below, and the deletion is applied through the same
+        // durable accepted→pending-deletion→drain path as a soft-delete rather
+        // than the former tx-external applyRemoteDeletion in this handler.
 
         // Reconcile AFTER catchup completes — never concurrent with pull.
         // This ordering guarantees reconcile sees the latest DB state.
@@ -582,7 +580,7 @@ export default class CouchSyncPlugin extends Plugin {
             // Phase 2: vault and config are independent crypto principals
             // (invariant 18). Each meta is unlocked against its own
             // passphrase source — vault uses `encryptionPassphrase`;
-            // config uses `configEncryptionPassphrase ?? encryptionPassphrase`
+            // config uses `configEncryptionPassphrase || encryptionPassphrase` (empty = inherit)
             // so the common "one passphrase for both" UX stays default
             // while advanced users can decouple. Errors here fall through
             // — the legacy guard runs anyway, the user just stays in a
@@ -637,8 +635,12 @@ export default class CouchSyncPlugin extends Plugin {
                         );
                         const configEncEnabled = this.settings.configEncryptionEnabled
                             ?? this.settings.encryptionEnabled;
+                        // Empty string means "inherit" (the UI stores "" when the
+                        // config passphrase is left blank), so fall back with ||
+                        // not ?? — ?? would treat "" as an explicit empty
+                        // passphrase and unlock would fail. (#config-codec)
                         const configPassphrase = this.settings.configEncryptionPassphrase
-                            ?? this.settings.encryptionPassphrase;
+                            || this.settings.encryptionPassphrase;
                         const agreement = await checkEncryptionAgreement(
                             rawConfigClient, configEncEnabled, CONFIG_META_DOC_ID,
                             this.settings.configCipherVersion,

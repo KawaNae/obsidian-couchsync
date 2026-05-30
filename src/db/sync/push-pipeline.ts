@@ -58,6 +58,7 @@ import {
 } from "../../types/doc-id.ts";
 import { stripRev } from "../../utils/doc.ts";
 import { compareVC, type VectorClock } from "../../sync/vector-clock.ts";
+import { chunkListsEqual } from "../../sync/chunk-equality.ts";
 import type { LocalDB } from "../local-db.ts";
 import type {
     ICouchClient, BulkDocsResult, DocWithAttachments,
@@ -119,9 +120,14 @@ interface DivergentFile {
 interface FileClassifyResult {
     proceed: ClassifiedFile[];
     divergent: DivergentFile[];
-    /** Ids whose local already matches remote (vclock equal) — drop from
+    /** Ids whose local already matches remote (vclock equal, OR vclock
+     *  dominates but chunks are byte-identical — #sync-005) — drop from
      *  unpushed-set if they were previously flagged. */
     skippedEqual: string[];
+    /** Remote docs fetched this cycle, keyed by id. Lets race-stale
+     *  escalation surface the REAL remote content instead of a local
+     *  placeholder (#sync-001). */
+    remoteDocMap: Map<string, FileDoc>;
 }
 
 export interface PushPipelineDeps {
@@ -401,7 +407,7 @@ export class PushPipeline {
         // [6] Race-stale escalation: any pre-existing race-stale entry
         //     that's been retrying past the threshold gets re-routed
         //     into divergent for the orchestrator.
-        const escalated: DivergentFile[] = [];
+        const escalatedNoRemote: Array<{ id: string; attempts: number }> = [];
         for (let i = classified.proceed.length - 1; i >= 0; i--) {
             const p = classified.proceed[i];
             const sticky = stickyDivergent.find((s) => s.id === p.doc._id);
@@ -409,21 +415,28 @@ export class PushPipeline {
                 sticky?.reason === "race-stale"
                 && p.prevAttempts >= RACE_STALE_ESCALATION_THRESHOLD
             ) {
-                // Demote to divergent; we don't have remoteDoc here (the
-                // pre-classify said dominates/absent), so we can't emit
-                // concurrent — just keep in set as divergent so the next
-                // cycle's pre-classify catches the actual remote state.
                 classified.proceed.splice(i, 1);
-                classified.divergent.push({
-                    filePath: filePathFromId(p.doc._id),
-                    localDoc: p.doc,
-                    // remoteDoc absent — we'll surface on next cycle when
-                    // remote state is freshly fetched.
-                    remoteDoc: p.doc,
-                    relation: "concurrent",
-                    prevAttempts: p.prevAttempts,
-                });
-                void escalated; // (placeholder; stats only)
+                const rDoc = classified.remoteDocMap.get(p.doc._id);
+                if (rDoc) {
+                    // Surface the conflict with the REAL remote doc fetched this
+                    // cycle, not a local placeholder (#sync-001). The old code
+                    // set `remoteDoc: p.doc`, so the orchestrator fetched local
+                    // chunks for BOTH sides and rendered an identical-content modal.
+                    classified.divergent.push({
+                        filePath: filePathFromId(p.doc._id),
+                        localDoc: p.doc,
+                        remoteDoc: rDoc,
+                        relation: "concurrent",
+                        prevAttempts: p.prevAttempts,
+                    });
+                } else {
+                    // No fresh remote state this cycle (doc absent on remote).
+                    // Re-flag as divergent in the set so push retry stops, but
+                    // DON'T emit a placeholder conflict with local content
+                    // (#sync-001) — the next cycle's pre-classify fetches the
+                    // real remote and emits via the normal divergent path.
+                    escalatedNoRemote.push({ id: p.doc._id, attempts: p.prevAttempts });
+                }
             }
         }
 
@@ -442,6 +455,11 @@ export class PushPipeline {
                 remoteDoc: div.remoteDoc,
                 source: "push",
             });
+        }
+        // Escalated race-stale entries with no fresh remote state: re-flag as
+        // divergent (stop push retry) without emitting a placeholder (#sync-001).
+        for (const e of escalatedNoRemote) {
+            unpushedAdd.push({ id: e.id, reason: "divergent", attempts: e.attempts + 1 });
         }
 
         // [8] Assemble the push batch: chunks + classified-proceed files.
@@ -496,7 +514,7 @@ export class PushPipeline {
         signal: AbortSignal,
     ): Promise<FileClassifyResult> {
         if (docs.length === 0) {
-            return { proceed: [], divergent: [], skippedEqual: [] };
+            return { proceed: [], divergent: [], skippedEqual: [], remoteDocMap: new Map() };
         }
         const ids = docs.map((d) => d._id);
         // include_docs:true is required because vclock lives in the doc
@@ -533,6 +551,16 @@ export class PushPipeline {
             }
             const rel = compareVC(doc.vclock ?? {}, rVc);
             if (rel === "dominates") {
+                // Churn guard (#sync-005): a local clock that dominates remote
+                // but whose chunks are byte-identical (e.g. a pull-side silent
+                // vclock merge) needs no push — the content is already
+                // replicated. Skipping avoids a write that only bumps the clock
+                // and the _changes round-trip it triggers on every peer.
+                const rDoc = remoteDocMap.get(doc._id);
+                if (rDoc && chunkListsEqual(doc.chunks, rDoc.chunks)) {
+                    skippedEqual.push(doc._id);
+                    continue;
+                }
                 proceed.push({
                     doc,
                     remoteRev: remoteRev.get(doc._id),
@@ -555,7 +583,7 @@ export class PushPipeline {
             });
         }
 
-        return { proceed, divergent, skippedEqual };
+        return { proceed, divergent, skippedEqual, remoteDocMap };
     }
 
     /**

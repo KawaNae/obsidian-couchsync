@@ -106,6 +106,9 @@ export interface ConfigSyncOptions {
      *  "/data.json"); excluded from replication (#14). Falls back to the
      *  default-folder literal when omitted. */
     ownDataJsonPath?: string;
+    /** Persist the config-setup-in-progress flag (#err-9). The host writes
+     *  `settings.configSettingUp` and saves. Omitted in tests. */
+    persistConfigSettingUp?: (active: boolean) => Promise<void>;
 }
 
 export class ConfigSync {
@@ -178,6 +181,7 @@ export class ConfigSync {
      *  so the meta push lands on the same fixture instead of hitting the
      *  network. */
     private readonly rawClientFactory?: (settings: CouchSyncSettings) => ICouchClient | null;
+    private readonly persistConfigSettingUp?: (active: boolean) => Promise<void>;
 
     constructor(
         private vault: IVaultIO,
@@ -199,6 +203,7 @@ export class ConfigSync {
         this.hasher = opts.hasher;
         this.onConfigCryptoChange = opts.onConfigCryptoChange;
         this.rawClientFactory = opts.rawClientFactory;
+        this.persistConfigSettingUp = opts.persistConfigSettingUp;
         this.skipPaths = new Set([opts.ownDataJsonPath ?? ConfigSync.DEFAULT_OWN_DATA_PATH]);
     }
 
@@ -266,6 +271,18 @@ export class ConfigSync {
         this.inflight?.cancel();
     }
 
+    /** Refuse a sync op when a prior Config Init died mid-flight, leaving a
+     *  half-built config DB (Invariant C, config side — #err-9). The user must
+     *  re-run Config Init (which clears the flag) before push/pull/write can
+     *  run again. */
+    private assertConfigReady(): void {
+        if (this.getSettings().configSettingUp) {
+            throw new Error(
+                "Config setup was interrupted — re-run Config Init before syncing.",
+            );
+        }
+    }
+
     /** True iff an op is currently running. UI uses this to disable buttons. */
     isInflight(): boolean {
         return this.inflight !== null;
@@ -323,6 +340,13 @@ export class ConfigSync {
                             return c;
                         }
                         : undefined,
+                    markSettingUp: (active) =>
+                        this.persistConfigSettingUp?.(active) ?? Promise.resolve(),
+                    makeEncryptingClient: () => {
+                        const c = this.makeConfigClient();
+                        if (!c) throw new Error("ConfigSync: config client unavailable for push");
+                        return c;
+                    },
                 },
             );
             const result = await setup.init(
@@ -370,6 +394,13 @@ export class ConfigSync {
                 onCryptoProviderReady: (crypto) => {
                     this.onConfigCryptoChange?.(crypto);
                 },
+                markSettingUp: (active) =>
+                    this.persistConfigSettingUp?.(active) ?? Promise.resolve(),
+                makeEncryptingClient: () => {
+                    const c = this.makeConfigClient();
+                    if (!c) throw new Error("ConfigSync: config client unavailable for push");
+                    return c;
+                },
             },
         );
         await setup.init(client, controller.signal, onProgress, opts);
@@ -385,6 +416,7 @@ export class ConfigSync {
      *  local vclocks above remote and re-run the pipeline. */
     async push(): Promise<number> {
         const db = this.requireConfigDb();
+        this.assertConfigReady();
         return this.runOperation("Config Push", async (ctx, progress) => {
             await this.ensureCheckpointsLoaded();
 
@@ -433,6 +465,7 @@ export class ConfigSync {
      *  them again until manually resolved (matches vault-sync semantics). */
     async pull(): Promise<number> {
         const db = this.requireConfigDb();
+        this.assertConfigReady();
         return this.runOperation("Config Pull", async (ctx, progress) => {
             await this.ensureCheckpointsLoaded();
 
@@ -501,14 +534,16 @@ export class ConfigSync {
         const preview = entries.slice(0, previewLimit).map((e) => e.path).join(", ");
         const more = entries.length > previewLimit ? ` (+${entries.length - previewLimit} more)` : "";
         // Fire-and-forget: this is informational, the op already completed.
-        void this.modal.showConfirmModal(
+        // Observe rejection so a modal-presentation failure lands in the log
+        // instead of an unhandled promise rejection (#err-1).
+        this.modal.showConfirmModal(
             `Config pull: ${entries.length} concurrent edit(s) detected`,
             `Local copies of ${preview}${more} have diverged from remote. ` +
             `See the Log View for the full list. ` +
             `Edit a file or trigger Init to advance past the conflict.`,
             "OK",
             false,
-        );
+        ).catch((e) => logWarn(`CouchSync: config concurrent-pull notice failed: ${e?.message ?? e}`));
     }
 
     /**
@@ -661,6 +696,7 @@ export class ConfigSync {
      *  but the field is honoured for safety. */
     async write(onProgress?: (path: string, index: number, total: number) => void): Promise<number> {
         const db = this.requireConfigDb();
+        this.assertConfigReady();
         const paths = this.getSettings().configSyncPaths;
         if (paths.length === 0) return 0;
 

@@ -38,4 +38,8 @@ export function migrateSettings(data: Record<string, any>): void {
     // schema obvious on inspection.
     if (data.logRetentionDays === undefined) data.logRetentionDays = 7;
     if (data.logMaxStorageMB === undefined) data.logMaxStorageMB = 50;
+
+    // v0.26.2: config-setup atomicity flag (#err-9). Default false is also
+    // supplied by DEFAULT_SETTINGS; explicit migration keeps the schema obvious.
+    if (data.configSettingUp === undefined) data.configSettingUp = false;
 }

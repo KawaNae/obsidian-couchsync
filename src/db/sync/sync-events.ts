@@ -9,11 +9,12 @@
  *     subscribers react. Handler exceptions are logged and swallowed so
  *     one buggy subscriber can't block the controller.
  *
- *   - Queries (`emitAsyncAny`): each subscriber returns a boolean; the
- *     aggregate answer is "any subscriber said true". Used for
- *     `pull-delete`, where the caller asks "does anyone have unpushed
- *     local edits for this path?" and treats a yes as a concurrent
- *     conflict.
+ * (A boolean-aggregated query API — `emitAsyncAny` / `onQuery` — used to
+ * live here for the `pull-delete` "does anyone have unpushed edits?" probe.
+ * Its catch swallowed I/O errors into a `false` (= apply the deletion),
+ * violating the safe-side principle (#err-10). The single subscriber was
+ * promoted to the `probeUnpushed` function DI on the pull-writer and the
+ * query API was removed so the trap can't be fallen into again.)
  *
  * Plus one once-latch primitive (`onceIdle` / `fireIdle`) that fires
  * every registered callback exactly once when the session first reaches
@@ -31,7 +32,7 @@
  */
 
 import { logError } from "../../ui/log.ts";
-import type { CouchSyncDoc, FileDoc } from "../../types.ts";
+import type { CouchSyncDoc } from "../../types.ts";
 import type { SyncState } from "../reconnect-policy.ts";
 
 // ── Event payloads ───────────────────────────────────────
@@ -67,16 +68,9 @@ export interface SyncEventMap {
     degraded: { message: string };
 }
 
-export interface SyncQueryEventMap {
-    /** Return true if local has unpushed edits for this path (→ concurrent conflict). */
-    "pull-delete": { path: string; localDoc: FileDoc };
-}
-
 type SyncHandler<T> = T extends void
     ? () => void
     : (payload: T) => void;
-
-type SyncQueryHandler<T> = (payload: T) => Promise<boolean>;
 
 // Fire-and-forget uses a normalized `(p: T) => void` storage signature:
 // void-payload handlers (`() => void`) are structurally assignable via
@@ -85,9 +79,6 @@ type InternalHandler<T> = (payload: T) => void;
 
 type FireAndForgetHandlers = {
     [K in keyof SyncEventMap]: Set<InternalHandler<SyncEventMap[K]>>;
-};
-type QueryHandlers = {
-    [K in keyof SyncQueryEventMap]: Set<SyncQueryHandler<SyncQueryEventMap[K]>>;
 };
 
 // ── SyncEvents ───────────────────────────────────────────
@@ -105,10 +96,6 @@ export class SyncEvents {
         "catchup-failed": new Set(),
         degraded: new Set(),
     };
-    private queries: QueryHandlers = {
-        "pull-delete": new Set(),
-    };
-
     private idleCallbacks: Array<() => void> = [];
     private idleFired = false;
 
@@ -141,34 +128,6 @@ export class SyncEvents {
                 logError(`SyncEvents[${String(type)}] handler error: ${e?.message ?? e}`);
             }
         }
-    }
-
-    // ── Queries ─────────────────────────────────────────
-
-    onQuery<K extends keyof SyncQueryEventMap>(
-        type: K,
-        handler: SyncQueryHandler<SyncQueryEventMap[K]>,
-    ): () => void {
-        const set = this.queries[type];
-        set.add(handler);
-        return () => { set.delete(handler); };
-    }
-
-    /** True if any subscriber returned true (or false when none registered). */
-    async emitAsyncAny<K extends keyof SyncQueryEventMap>(
-        type: K,
-        payload: SyncQueryEventMap[K],
-    ): Promise<boolean> {
-        const set = this.queries[type];
-        let any = false;
-        for (const h of set) {
-            try {
-                if (await h(payload)) any = true;
-            } catch (e: any) {
-                logError(`SyncEvents[${String(type)}] query error: ${e?.message ?? e}`);
-            }
-        }
-        return any;
     }
 
     // ── Idle once-latch ─────────────────────────────────

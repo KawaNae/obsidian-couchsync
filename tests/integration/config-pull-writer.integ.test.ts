@@ -138,6 +138,24 @@ describe("ConfigPullWriter — incremental pull", () => {
         expect(Number(cps.getPullSeq())).toBeGreaterThanOrEqual(2);
     });
 
+    it("self-heals on seq regression: remote recreated below cursor (#config-codec)", async () => {
+        // A Config Init on another device destroys + recreates the remote DB,
+        // resetting its update-seq below our cursor. Without regression
+        // detection the pull fetches nothing forever; the writer must reset its
+        // cursor to 0 and re-pull the whole DB.
+        const a = await makeConfigDoc(".obsidian/app.json", `{"v":1}`, { "dev-A": 1 });
+        await seedRemote(remote, [a]);
+        // Stale cursor far ahead of the recreated remote's seq.
+        cps.setPullSeq(99999);
+
+        const result = await writer.run();
+
+        // Regression detected → cursor reset to 0 → full re-pull succeeds.
+        expect(result.stats.accepted).toBe(1);
+        expect(await db.get(a.doc._id)).not.toBeNull();
+        expect(Number(cps.getPullSeq())).toBeLessThan(99999);
+    });
+
     it("second run returns empty when remote is unchanged (cursor sticks)", async () => {
         await seedRemote(remote, [
             await makeConfigDoc(".obsidian/a.json", "1", { "dev-A": 1 }),

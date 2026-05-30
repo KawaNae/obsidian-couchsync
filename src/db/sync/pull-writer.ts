@@ -80,6 +80,13 @@ export interface PullWriterDeps {
      *  the former `events.emitAsync("pull-write", ...)` indirection,
      *  whose try/catch swallowed errors and let `writtenCount` lie. */
     applyPullWrite: (doc: FileDoc) => Promise<WriteResult>;
+    /** True if the vault has an unpushed local edit for `path` (a divergent
+     *  write not yet on remote). The hard-delete path uses it to choose
+     *  between applying the deletion durably and surfacing a delete-vs-edit
+     *  conflict. Replaces the former `events.emitAsyncAny("pull-delete")`
+     *  query whose catch swallowed I/O errors into a `false` (= unsafe
+     *  apply) — `probeUnpushedSafe` wraps this to fail safe-side (#err-10). */
+    probeUnpushed: (path: string) => Promise<boolean>;
 }
 
 interface BatchStats {
@@ -128,6 +135,25 @@ function buildDeletionTombstone(docId: string, localDoc: FileDoc): FileDoc {
         _id: docId, type: "file", schemaVersion: FILE_SCHEMA_VERSION,
         chunks: [], mtime: localDoc.mtime, ctime: localDoc.ctime,
         size: 0, deleted: true, vclock: {},
+    };
+}
+
+/**
+ * Build the tombstone that carries a SAFE remote hard-deletion into the
+ * durable `accepted → pending-deletion → drain` path (#del-1/#del-2).
+ *
+ * Unlike `buildDeletionTombstone` (a flag carrier with `vclock: {}` shown in
+ * the conflict modal), this tombstone is COMMITTED to LocalDB and APPLIED to
+ * the vault, exactly like a soft-delete `deleted:true` doc. It therefore
+ * inherits the local vclock: this path is only taken when `probeUnpushed`
+ * reported no unpushed edit, i.e. the local doc is already in causal sync with
+ * the deletion, so carrying its clock forward introduces no causal regression.
+ */
+function buildAcceptedTombstone(docId: string, localDoc: FileDoc): FileDoc {
+    return {
+        _id: docId, type: "file", schemaVersion: FILE_SCHEMA_VERSION,
+        chunks: [], mtime: localDoc.mtime, ctime: localDoc.ctime,
+        size: 0, deleted: true, vclock: localDoc.vclock ?? {},
     };
 }
 
@@ -200,7 +226,7 @@ export class PullWriter {
         for (const row of result.results) {
             if (row.deleted) {
                 if (isFileDocId(row.id)) {
-                    await this.handlePulledDeletion(row.id, concurrent, pendingConflictAdd);
+                    await this.handlePulledDeletion(row.id, accepted, concurrent, pendingConflictAdd);
                     stats.deletedCount++;
                 }
                 continue;
@@ -342,6 +368,7 @@ export class PullWriter {
 
     private async handlePulledDeletion(
         docId: string,
+        accepted: CouchSyncDoc[],
         concurrent: ConcurrentEntry[],
         pendingConflictAdd: Array<{ id: string; kind: PendingConflictKind }>,
     ): Promise<void> {
@@ -350,20 +377,42 @@ export class PullWriter {
 
         if (!localDoc || !isFileDoc(localDoc) || localDoc.deleted) return;
 
-        const hasUnpushed = await this.deps.events.emitAsyncAny("pull-delete", {
-            path, localDoc,
-        });
-        if (hasUnpushed) {
-            // Durably remember the deletion-vs-edit conflict (Invariant B): the
-            // caller persists `pendingConflictAdd` in the SAME tx as the cursor
-            // advance, so a missed modal / restart cannot lose the deletion.
+        if (await this.probeUnpushedSafe(path)) {
+            // Unpushed local edit present (or the probe couldn't tell —
+            // safe-side, #err-10). Durably remember the deletion-vs-edit
+            // conflict (Invariant B): the caller persists `pendingConflictAdd`
+            // in the SAME tx as the cursor advance, so a missed modal / restart
+            // cannot lose the deletion. Surface it live; the per-cycle drain
+            // won't re-emit a modal already open for this doc.
             pendingConflictAdd.push({ id: docId, kind: "pull-delete-vs-edit" });
-            // Surfaced live this session — the per-cycle drain must not re-emit
-            // a modal that is already open for this doc.
             this.emittedConflicts.add(docId);
             const tombstone = buildDeletionTombstone(docId, localDoc);
             concurrent.push({ filePath: path, localDoc, remoteDoc: tombstone });
             logDebug(`  ⚡ ${path} (concurrent: remote-deleted vs local-edit)`);
+            return;
+        }
+
+        // No unpushed local edit: the deletion is safe to apply. Route it
+        // through the SAME durable `accepted → pending-deletion → drain` path
+        // as a soft-delete (#del-1/#del-2) — committed atomically with the
+        // cursor advance and retried by drainPendingApply on apply failure —
+        // instead of the former tx-external immediate applyRemoteDeletion that
+        // could lose the file on a mid-delete crash.
+        accepted.push(buildAcceptedTombstone(docId, localDoc));
+        logDebug(`  ⌫ ${path} (remote deletion → durable apply)`);
+    }
+
+    /** Probe for an unpushed local edit, failing safe-side: if the probe
+     *  throws (I/O error), assume "yes, unpushed" and surface a conflict
+     *  rather than silently applying the deletion. The old
+     *  `emitAsyncAny("pull-delete")` swallowed the exception and returned
+     *  `false` (= apply), violating the safe-side principle (#err-10). */
+    private async probeUnpushedSafe(path: string): Promise<boolean> {
+        try {
+            return await this.deps.probeUnpushed(path);
+        } catch (e: any) {
+            logError(`pull-delete unpushed probe failed for ${path}: ${e?.message ?? e}`);
+            return true;
         }
     }
 

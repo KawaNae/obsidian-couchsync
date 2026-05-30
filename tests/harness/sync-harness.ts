@@ -134,6 +134,7 @@ export function createSyncHarness(opts: SyncHarnessOptions = {}): SyncHarness {
             db,
             getSettings,
             (doc) => vs.dbToFile(doc),
+            (path) => vs.hasUnpushedChanges(path),
             /* isMobile */ false,
             auth,
             clientFactory,
