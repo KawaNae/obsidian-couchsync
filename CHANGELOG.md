@@ -2,6 +2,80 @@
 
 All notable changes to obsidian-couchsync.
 
+## 0.26.1
+
+A follow-up integrated review of the v0.26.0 release surfaced 19 confirmed
+issues; this patch closes all of them. There is **no wire-format or schema
+change and no re-initialisation** — every fix is either consuming state the
+vault already records or extending an existing invariant to the boundary where
+it was missing. The whole set was verified on a real three-device fleet
+(desktop ×2 + Android) against a live cipherVersion-3 vault, plus the Docker
+e2e harness (1179 unit + 14 e2e tests).
+
+The theme continues v0.26.0's: *trust decisions belong to the client's known
+policy, never to data the untrusted server supplies*, and *every invariant is
+enforced symmetrically on both sides of a boundary*.
+
+### Security
+
+- **A re-initialised cipherVersion-3 vault now refuses an encryption
+  downgrade.** v0.26.0 sealed file/config bodies into an authenticated `encBody`,
+  but the decoder still dispatched on whichever fields the server sent: if a
+  curious server dropped `encBody` and served the older path-only (or a plaintext)
+  body, the client accepted it unauthenticated — re-opening exactly the vclock
+  rollback / chunk-substitution / deleted-resurrection attacks `encBody` was meant
+  to close. The decoder now enforces a per-vault cipherVersion **policy floor**:
+  in a v3 vault every file/config document must be a sealed `encBody`, and the
+  legacy/plaintext paths are rejected. The floor is anchored in client-local state
+  on first unlock (trust-on-first-use) and the server cannot lower it by rewriting
+  the (server-writable) `vault:meta` — a remote meta below the recorded floor is
+  refused before any data flows. Vaults still on cipherVersion 2 keep reading the
+  legacy format until they re-init.
+- **The config-DB client is now fail-closed**, symmetric with the vault client:
+  it refuses to build a plaintext stack when config encryption is enabled but the
+  crypto provider has not unlocked, instead of silently writing unencrypted config
+  bodies into an encrypted database.
+- **The plugin's own `data.json` is excluded from config replication by its real
+  install path** (from the manifest) rather than a hardcoded folder name, so a
+  renamed install (e.g. a BRAT side-load) no longer risks pushing the plaintext
+  CouchDB password and passphrase to the config server.
+- **Exported diagnostic logs are no longer synced.** `couchsync_log_*.md` exports
+  carry device/OS metadata and internal paths; they are now excluded from vault
+  sync so they don't reach the server as plaintext on an unencrypted vault.
+- `SECURITY.md` was corrected: rollback of a document to a *genuine prior*
+  `encBody` is detected on established devices by the vector-clock classifier, not
+  by authentication, and is **not** detected on a fresh Clone (which has no local
+  baseline) — the inherent trust-on-first-use window.
+
+### Fixed
+
+- **A malformed chunk no longer loops forever in live sync.** A corrupt chunk was
+  classified identically at the Clone/repair boundary but the live-sync boundary
+  caught only a hash mismatch, not a structurally malformed envelope — so a
+  tampered/bit-rotted chunk retried indefinitely instead of being quarantined.
+  Both boundaries now share one classifier.
+- **A failed deletion is retried instead of silently un-applying.** A clean remote
+  deletion applies the vault delete after the durable commit; if that delete threw
+  or the process was killed mid-pull, the deletion was lost (a database tombstone
+  with the file still on disk) and never retried. It is now recorded for durable
+  re-application, the same net the content-apply path already had.
+- **A concurrent remote edit is no longer dropped when the local copy is deleted.**
+  The mirror of the v0.26.0 delete-vs-edit fix: a local deletion racing a remote
+  edit is now persisted and re-presented after a restart, instead of the remote
+  edit being lost once the local deletion had pushed.
+- **A pulled deletion over a legacy baseline now surfaces a conflict instead of
+  silently overwriting a divergent local edit**, by falling back to the stored
+  document as the comparison baseline.
+- **Chunk repair re-validates local references before deleting a local chunk**,
+  closing the same scan-then-delete race the remote side already guarded against.
+
+### Internal
+
+- Codec error types moved to a dependency-free module so the sync pipeline no
+  longer compile-depends on the encryption decorator.
+- `ConfigSync`'s optional wiring is now a single options object rather than a long
+  positional argument list.
+
 ## 0.26.0
 
 Closes the four highest-severity findings from a full integrated review of the
