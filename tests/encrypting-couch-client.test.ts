@@ -1,13 +1,13 @@
 import { describe, it, expect, beforeAll } from "vitest";
 import { FakeCouchClient } from "./helpers/fake-couch-client.ts";
-import { EncryptingCouchClient } from "../src/db/encrypting-couch-client.ts";
+import { EncryptingCouchClient, EncryptionError } from "../src/db/encrypting-couch-client.ts";
 import {
     deriveKeys,
     generateSalt,
     createCryptoProvider,
     type CryptoProvider,
 } from "../src/db/crypto-provider.ts";
-import { decryptString } from "../src/db/envelope.ts";
+import { encryptString, decodeEnvelope, base64ToUint8 } from "../src/db/envelope.ts";
 
 let crypto: CryptoProvider;
 beforeAll(async () => {
@@ -21,24 +21,29 @@ function makeClient() {
 }
 
 describe("EncryptingCouchClient push (bulkDocs)", () => {
-    it("translates config _id and adds encryptedPath (body rides as chunks)", async () => {
+    it("encrypts config _id + body into encBody (no plaintext fields on the wire)", async () => {
         const { inner, enc } = makeClient();
-        // v3 ConfigDoc carries its body as chunk attachments (like FileDoc),
-        // not an in-doc `data` field. The encrypting client only HMAC-
-        // translates the _id and adds encryptedPath; chunk bodies are
-        // encrypted at the attachment layer.
-        const config = { _id: "config:.obsidian/app.json", type: "config", chunks: ["chunk:x64:abc"], vclock: {}, mtime: 0, size: 2, schemaVersion: 3 };
+        const config = { _id: "config:.obsidian/app.json", type: "config", chunks: ["chunk:x64:abc"], vclock: { d: 2 }, mtime: 0, size: 2, schemaVersion: 3 };
         await enc.bulkDocs([config]);
 
         const allDocs = await inner.allDocs<any>({ startkey: "config:", endkey: "config:￰", include_docs: true });
         const stored = allDocs.rows[0]?.doc;
         expect(stored).toBeDefined();
         expect(stored._id).toMatch(/^config:[0-9a-f]{64}$/);
-        expect(stored.chunks).toEqual(["chunk:x64:abc"]);
-        expect(stored.encryptedPath).toBeDefined();
+        // v3: the body is sealed — nothing plaintext leaks to the server.
+        expect(stored.encBody).toBeDefined();
+        expect(stored.chunks).toBeUndefined();
+        expect(stored.vclock).toBeUndefined();
+        expect(stored.encryptedPath).toBeUndefined();
+        // Round-trips back to the full plaintext doc through the decorator.
+        const back = await enc.getDoc<any>("config:.obsidian/app.json");
+        expect(back._id).toBe("config:.obsidian/app.json");
+        expect(back.chunks).toEqual(["chunk:x64:abc"]);
+        expect(back.vclock).toEqual({ d: 2 });
+        expect(back.encBody).toBeUndefined();
     });
 
-    it("does NOT encrypt FileDoc body fields but encrypts _id", async () => {
+    it("encrypts FileDoc body into encBody bound to the _id (#2)", async () => {
         const { inner, enc } = makeClient();
         const file = { _id: "file:note.md", type: "file", chunks: ["chunk:x64:abc"], vclock: { d: 1 }, mtime: 1, ctime: 1, size: 5, schemaVersion: 2 };
         await enc.bulkDocs([file]);
@@ -46,10 +51,18 @@ describe("EncryptingCouchClient push (bulkDocs)", () => {
         const allDocs = await inner.allDocs<any>({ startkey: "file:", endkey: "file:￰", include_docs: true });
         const stored = allDocs.rows[0]?.doc;
         expect(stored._id).toMatch(/^file:[0-9a-f]{64}$/);
-        expect(stored.vclock).toEqual({ d: 1 });
-        expect(stored.chunks).toEqual(["chunk:x64:abc"]);
-        expect(stored.mtime).toBe(1);
-        expect(stored.encryptedPath).toBeDefined();
+        // Body fields are no longer plaintext on the wire.
+        expect(stored.encBody).toBeDefined();
+        expect(stored.vclock).toBeUndefined();
+        expect(stored.chunks).toBeUndefined();
+        expect(stored.mtime).toBeUndefined();
+        expect(stored.encryptedPath).toBeUndefined();
+        // Decorator restores the full plaintext doc on read.
+        const back = await enc.getDoc<any>("file:note.md");
+        expect(back._id).toBe("file:note.md");
+        expect(back.chunks).toEqual(["chunk:x64:abc"]);
+        expect(back.vclock).toEqual({ d: 1 });
+        expect(back.mtime).toBe(1);
     });
 
     it("does not encrypt vault:meta doc fields (no path id, no data string)", async () => {
@@ -152,7 +165,7 @@ describe("EncryptingCouchClient roundtrip", () => {
 });
 
 describe("EncryptingCouchClient Level 2 (path encryption)", () => {
-    it("encrypts file _id on push and adds encryptedPath", async () => {
+    it("encrypts file _id on push and seals the body into encBody", async () => {
         const { inner, enc } = makeClient();
         const file = { _id: "file:notes/hello.md", type: "file", chunks: [], vclock: {}, mtime: 0, ctime: 0, size: 0, schemaVersion: 2 };
         await enc.bulkDocs([file]);
@@ -162,13 +175,13 @@ describe("EncryptingCouchClient Level 2 (path encryption)", () => {
         expect(stored).toBeDefined();
         expect(stored._id).not.toBe("file:notes/hello.md");
         expect(stored._id).toMatch(/^file:[0-9a-f]{64}$/);
-        // encryptedPath is the base64-wrapped envelope, no longer the
-        // legacy `base64(iv):base64(cipher)` shape.
-        expect(stored.encryptedPath).toBeDefined();
-        expect(stored.encryptedPath).not.toContain(":");
-        // Roundtrip via decryptString to confirm the envelope is well-formed.
-        const decoded = await decryptString(stored.encryptedPath, crypto);
-        expect(decoded).toBe("notes/hello.md");
+        // v3: the path (and the whole body) lives inside encBody, not a
+        // standalone encryptedPath field.
+        expect(stored.encBody).toBeDefined();
+        expect(stored.encryptedPath).toBeUndefined();
+        // Round-trips back to the plaintext id+path through the decorator.
+        const back = await enc.getDoc<any>("file:notes/hello.md");
+        expect(back._id).toBe("file:notes/hello.md");
     });
 
     it("decrypts file _id on pull (getDoc)", async () => {
@@ -250,5 +263,95 @@ describe("EncryptingCouchClient passthrough", () => {
     it("getLastPullBodyChunkAt delegates", () => {
         const { enc } = makeClient();
         expect(enc.getLastPullBodyChunkAt()).toBeNull();
+    });
+});
+
+describe("EncryptingCouchClient v3 encBody (#2: authenticated, confidential body)", () => {
+    const te = new TextEncoder();
+
+    it("binds encBody to the _id via AAD — moving a body onto another doc fails authentication", async () => {
+        // Produce a valid encBody for a.md.
+        const innerA = new FakeCouchClient();
+        const encA = new EncryptingCouchClient(innerA, crypto);
+        await encA.bulkDocs([{ _id: "file:a.md", type: "file", chunks: ["chunk:x64:aaa"], vclock: { d: 1 }, mtime: 0, ctime: 0, size: 0, schemaVersion: 2 }]);
+        const rawA = (await innerA.allDocs<any>({ startkey: "file:", endkey: "file:￰", include_docs: true })).rows[0].doc;
+
+        // Compute b.md's hmac id by pushing it through a fresh client.
+        const innerB = new FakeCouchClient();
+        const encB = new EncryptingCouchClient(innerB, crypto);
+        await encB.bulkDocs([{ _id: "file:b.md", type: "file", chunks: ["chunk:x64:bbb"], vclock: { d: 1 }, mtime: 0, ctime: 0, size: 0, schemaVersion: 2 }]);
+        const rawB = (await innerB.allDocs<any>({ startkey: "file:", endkey: "file:￰", include_docs: true })).rows[0].doc;
+        expect(rawB._id).not.toBe(rawA._id);
+
+        // Tampering server: place A's (valid) encBody under B's id.
+        const tampered = new FakeCouchClient();
+        await tampered.bulkDocs([{ _id: rawB._id, encBody: rawA.encBody }]);
+        const encT = new EncryptingCouchClient(tampered, crypto);
+
+        // Reading b.md fetches the doc under hmac(b) and tries to decrypt A's
+        // body with AAD = hmac(b) — the GCM tag was computed over hmac(a) → fail.
+        await expect(encT.getDoc<any>("file:b.md")).rejects.toBeInstanceOf(EncryptionError);
+    });
+
+    it("detects in-place tampering of encBody bytes", async () => {
+        const inner = new FakeCouchClient();
+        const enc = new EncryptingCouchClient(inner, crypto);
+        await enc.bulkDocs([{ _id: "file:t.md", type: "file", chunks: ["chunk:x64:abc"], vclock: { d: 1 }, mtime: 0, ctime: 0, size: 0, schemaVersion: 2 }]);
+        const raw = (await inner.allDocs<any>({ startkey: "file:", endkey: "file:￰", include_docs: true })).rows[0].doc;
+
+        // Flip a byte of the ciphertext (skip the codec byte + IV at the front).
+        const bytes = base64ToUint8(raw.encBody);
+        bytes[bytes.length - 1] ^= 0xff;
+        const tamperedB64 = Buffer.from(bytes).toString("base64");
+        const tampered = new FakeCouchClient();
+        await tampered.bulkDocs([{ _id: raw._id, encBody: tamperedB64 }]);
+        const encT = new EncryptingCouchClient(tampered, crypto);
+
+        await expect(encT.getDoc<any>("file:t.md")).rejects.toBeInstanceOf(EncryptionError);
+    });
+
+    it("compresses a large, repetitive body before encrypting (compress-then-encrypt)", async () => {
+        const inner = new FakeCouchClient();
+        const enc = new EncryptingCouchClient(inner, crypto);
+        // ~200 chunk ids = a long, highly-repetitive array → should gzip well.
+        const chunks = Array.from({ length: 200 }, (_, i) =>
+            `chunk:x64:${i.toString(16).padStart(16, "0")}`);
+        await enc.bulkDocs([{ _id: "file:big.md", type: "file", chunks, vclock: { d: 1 }, mtime: 0, ctime: 0, size: 0, schemaVersion: 2 }]);
+        const raw = (await inner.allDocs<any>({ startkey: "file:", endkey: "file:￰", include_docs: true })).rows[0].doc;
+
+        const env = decodeEnvelope(base64ToUint8(raw.encBody));
+        expect(env.bits.encrypted).toBe(true);
+        expect(env.bits.compressed).toBe(true); // large body packed down
+        // Still round-trips losslessly.
+        const back = await enc.getDoc<any>("file:big.md");
+        expect(back.chunks).toEqual(chunks);
+    });
+
+    it("keeps a tiny body uncompressed (keep-smaller guard avoids gzip-header bloat)", async () => {
+        const inner = new FakeCouchClient();
+        const enc = new EncryptingCouchClient(inner, crypto);
+        await enc.bulkDocs([{ _id: "file:s.md", type: "file", chunks: [], vclock: {}, mtime: 0, ctime: 0, size: 0, schemaVersion: 2 }]);
+        const raw = (await inner.allDocs<any>({ startkey: "file:", endkey: "file:￰", include_docs: true })).rows[0].doc;
+        const env = decodeEnvelope(base64ToUint8(raw.encBody));
+        expect(env.bits.compressed).toBe(false);
+    });
+
+    it("dual-read: still decrypts a legacy v1 (encryptedPath + plaintext body) doc", async () => {
+        const inner = new FakeCouchClient();
+        const enc = new EncryptingCouchClient(inner, crypto);
+        // Hand-build a legacy-scheme remote doc as a pre-#2 build would have.
+        const hmac = await crypto.hmacHash(te.encode("legacy.md"));
+        const encPath = await encryptString("legacy.md", crypto);
+        await inner.bulkDocs([{
+            _id: "file:" + hmac, encryptedPath: encPath,
+            type: "file", chunks: ["chunk:x64:legacy"], vclock: { d: 7 },
+            mtime: 1, ctime: 1, size: 3, schemaVersion: 2,
+        }]);
+
+        const back = await enc.getDoc<any>("file:legacy.md");
+        expect(back._id).toBe("file:legacy.md");
+        expect(back.chunks).toEqual(["chunk:x64:legacy"]);
+        expect(back.vclock).toEqual({ d: 7 });
+        expect(back.encryptedPath).toBeUndefined();
     });
 });

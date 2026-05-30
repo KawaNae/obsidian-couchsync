@@ -31,11 +31,19 @@ const bs = (u: Uint8Array): BufferSource => u as unknown as BufferSource;
 export interface CryptoProvider {
     /** Encrypt arbitrary plain bytes. Returns the AES-GCM ciphertext
      *  (which already includes the authentication tag) and the random
-     *  IV used. Callers compose the envelope. */
-    encryptBytesIv(plain: Uint8Array): Promise<{ iv: Uint8Array; cipher: Uint8Array }>;
-    /** Decrypt ciphertext produced by `encryptBytesIv`. The IV must be
-     *  the exact 12-byte value from the corresponding encrypt call. */
-    decryptBytesIv(iv: Uint8Array, cipher: Uint8Array): Promise<Uint8Array>;
+     *  IV used. Callers compose the envelope.
+     *
+     *  `aad` (additional authenticated data) is covered by the GCM tag but
+     *  NOT encrypted: the same exact bytes must be supplied to `decryptBytesIv`
+     *  or authentication fails. Used to bind a ciphertext to its identity (the
+     *  doc `_id`) so a tampering server cannot move an encrypted body onto a
+     *  different doc. Omit for unbound payloads (e.g. chunk attachments, which
+     *  are bound by content-addressing instead). */
+    encryptBytesIv(plain: Uint8Array, aad?: Uint8Array): Promise<{ iv: Uint8Array; cipher: Uint8Array }>;
+    /** Decrypt ciphertext produced by `encryptBytesIv`. The IV must be the
+     *  exact 12-byte value, and `aad` the exact bytes, from the corresponding
+     *  encrypt call — otherwise the GCM tag check throws. */
+    decryptBytesIv(iv: Uint8Array, cipher: Uint8Array, aad?: Uint8Array): Promise<Uint8Array>;
     /** HMAC-SHA256 over binary input. Returns hex-encoded MAC. Callers
      *  hashing a string (e.g. vault path) must `TextEncoder.encode` it
      *  themselves — this method does not infer encoding. */
@@ -94,22 +102,26 @@ export async function deriveKeys(
 
 export function createCryptoProvider(keys: EncryptionKeys): CryptoProvider {
     return {
-        async encryptBytesIv(plain: Uint8Array): Promise<{ iv: Uint8Array; cipher: Uint8Array }> {
+        async encryptBytesIv(plain: Uint8Array, aad?: Uint8Array): Promise<{ iv: Uint8Array; cipher: Uint8Array }> {
             const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES));
+            const params: AesGcmParams = { name: "AES-GCM", iv: bs(iv) };
+            if (aad !== undefined) params.additionalData = bs(aad);
             const cipherBuf = await crypto.subtle.encrypt(
-                { name: "AES-GCM", iv: bs(iv) },
+                params,
                 keys.contentKey,
                 bs(plain),
             );
             return { iv, cipher: new Uint8Array(cipherBuf) };
         },
 
-        async decryptBytesIv(iv: Uint8Array, cipher: Uint8Array): Promise<Uint8Array> {
+        async decryptBytesIv(iv: Uint8Array, cipher: Uint8Array, aad?: Uint8Array): Promise<Uint8Array> {
             if (iv.length !== IV_BYTES) {
                 throw new Error(`decryptBytesIv: IV must be ${IV_BYTES} bytes`);
             }
+            const params: AesGcmParams = { name: "AES-GCM", iv: bs(iv) };
+            if (aad !== undefined) params.additionalData = bs(aad);
             const plainBuf = await crypto.subtle.decrypt(
-                { name: "AES-GCM", iv: bs(iv) },
+                params,
                 keys.contentKey,
                 bs(cipher),
             );

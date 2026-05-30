@@ -85,8 +85,14 @@ export interface VaultMetaDoc {
             enabled: true;
             /** Key-derivation algorithm version. v1 = PBKDF2 600k SHA-256. */
             kdfVersion: 1;
-            /** Cipher / envelope version. v2 = `IV(12B) || AES-GCM(plain)` binary blob. */
-            cipherVersion: 2;
+            /** Cipher / envelope version.
+             *  - v2: `IV(12B) || AES-GCM(plain)` attachment blobs; file/config
+             *        doc bodies were plaintext with only the path encrypted
+             *        (`encryptedPath`).
+             *  - v3: file/config doc bodies are compressed-then-encrypted into a
+             *        single `encBody`, GCM-bound to the `_id` (AAD). Attachment
+             *        framing is unchanged. (#2 — authenticated, confidential body.) */
+            cipherVersion: 2 | 3;
             salt: string; // base64
             keyCheck: string; // encrypted token
         };
@@ -305,7 +311,7 @@ export async function buildInitialMeta(opts: BuildMetaOpts): Promise<BuildMetaRe
             encryption: {
                 enabled: true,
                 kdfVersion: 1,
-                cipherVersion: 2,
+                cipherVersion: 3,
                 salt: saltB64,
                 keyCheck,
             },

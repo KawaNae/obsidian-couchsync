@@ -43,15 +43,31 @@ and recorded in the `vault:meta` document. They form four named modes:
   AES-256-GCM under a key derived from your passphrase via PBKDF2-SHA-256
   (600,000 iterations). The server stores only ciphertext.
 - **File and config paths**: doc IDs are HMAC-SHA-256 of the original
-  path. The original path is also stored, encrypted, inside the doc so
-  authorised clients can recover it.
+  path. The original path is encrypted inside the doc body so authorised
+  clients can recover it.
+- **The whole file/config doc body**: chunk references, vector clock,
+  sizes and timestamps are compressed-then-encrypted into a single
+  `encBody` field (AES-256-GCM). Only the HMAC'd `_id` rides in the clear.
+  The server cannot see which chunks a file is built from, its causal
+  history, or its size.
+- **Integrity against a malicious server** (cipherVersion 3): every
+  `encBody` is GCM-bound to its `_id` (the id is the AES-GCM additional
+  authenticated data), and every chunk body is re-hashed to its content-
+  addressed id on *every* pull path — live sync, Clone, and repair alike.
+  A server (or MITM) that reorders/substitutes chunk references, swaps a
+  body onto another doc, rolls back a vclock, or tampers a chunk's bytes is
+  **detected** (authentication failure → the doc/chunk is rejected and
+  routed to repair) rather than silently restoring forged content. Note:
+  this is tamper-*evidence*, not availability — a malicious server can
+  still withhold or delete data; it just cannot forge it undetected.
 
 ## What encryption does **not** protect
 
 - **Total number and size distribution of chunks**: a server admin can
-  count chunks and observe their cipher sizes. From these they can
-  estimate vault size and the rough shape of content (many small chunks
-  vs few large ones, etc.).
+  count chunk *attachments* and observe their cipher sizes. From these they
+  can estimate vault size and the rough shape of content (many small chunks
+  vs few large ones). The per-file chunk *mapping* is hidden (it lives in
+  the encrypted body), but the chunk inventory itself is not.
 - **Linkability of identical content**: chunks are content-addressed.
   A given plaintext chunk produces the same chunk ID across files, so
   a server admin can observe "this content appears in N files in this
@@ -59,7 +75,15 @@ and recorded in the `vault:meta` document. They form four named modes:
 - **Update timing**: when you write a file, the resulting push is
   observable by anyone watching the server's `_changes` feed.
 - **Anything stored locally on your devices**: Obsidian writes
-  plaintext to disk. Local file-system compromise reveals everything.
+  plaintext to disk. Local file-system compromise reveals everything. The
+  plugin's own `data.json` also stores your CouchDB password and encryption
+  passphrase in plaintext.
+- **A weak passphrase against offline brute force**: the per-vault `salt`
+  and `keyCheck` are readable by anyone with server access, so an attacker
+  who copies them can guess passphrases offline. Each guess costs one
+  PBKDF2-SHA-256 (600k) derivation — strong against casual attempts but
+  PBKDF2-SHA-256 is comparatively GPU-friendly, so a short or common
+  passphrase is recoverable. Use a long, high-entropy passphrase.
 
 ## Why turn compression off (`encrypt` mode)
 

@@ -45,6 +45,7 @@ import type {
     AttachmentBlob,
 } from "./interfaces.ts";
 import { decodeEnvelope, encodeEnvelope } from "./envelope.ts";
+import { gzipCompress, gzipDecompress } from "./gzip.ts";
 
 export class CompressingCouchClient implements ICouchClient {
     constructor(private readonly inner: ICouchClient) {}
@@ -155,41 +156,4 @@ export class CompressingCouchClient implements ICouchClient {
     getLastPullBodyChunkAt(): number | null {
         return this.inner.getLastPullBodyChunkAt();
     }
-}
-
-/** Gzip a binary buffer using the Web Streams `CompressionStream` API.
- *
- *  Available in Node 18+, all modern browsers, and Electron — the
- *  runtimes Obsidian / vitest deploy on.
- *
- *  Implementation note: we *do not* `await writer.write` / `writer.close`
- *  before starting to read the output, because in Chromium-based runtimes
- *  (including Electron / Obsidian) the writer's promise only resolves
- *  once the consumer drains the stream. Awaiting first would deadlock —
- *  the writer waits for the (not-yet-started) reader, and the reader is
- *  never started. We use `new Response(stream).arrayBuffer()` which
- *  consumes the readable side, and let the writer's promises settle
- *  asynchronously in the background. */
-async function gzipCompress(data: Uint8Array): Promise<Uint8Array> {
-    const cs = new CompressionStream("gzip");
-    const writer = cs.writable.getWriter();
-    // TS 5.7+ types a bare Uint8Array as Uint8Array<ArrayBufferLike>, which the
-    // stream writer's BufferSource chunk type rejects; the buffer is always
-    // ArrayBuffer-backed at runtime, so the assertion is sound.
-    void writer.write(data as unknown as BufferSource).catch((): void => undefined);
-    void writer.close().catch((): void => undefined);
-    const buf = await new Response(cs.readable).arrayBuffer();
-    return new Uint8Array(buf);
-}
-
-async function gzipDecompress(data: Uint8Array): Promise<Uint8Array> {
-    const ds = new DecompressionStream("gzip");
-    const writer = ds.writable.getWriter();
-    // TS 5.7+ types a bare Uint8Array as Uint8Array<ArrayBufferLike>, which the
-    // stream writer's BufferSource chunk type rejects; the buffer is always
-    // ArrayBuffer-backed at runtime, so the assertion is sound.
-    void writer.write(data as unknown as BufferSource).catch((): void => undefined);
-    void writer.close().catch((): void => undefined);
-    const buf = await new Response(ds.readable).arrayBuffer();
-    return new Uint8Array(buf);
 }

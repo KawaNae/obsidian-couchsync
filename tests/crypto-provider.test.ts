@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll } from "vitest";
+import { describe, it, expect, beforeAll, vi } from "vitest";
 import {
     deriveKeys,
     generateSalt,
@@ -156,5 +156,49 @@ describe("generateSalt", () => {
         const s1 = generateSalt();
         const s2 = generateSalt();
         expect(Array.from(s1)).not.toEqual(Array.from(s2));
+    });
+});
+
+describe("encryptBytesIv additional-authenticated-data (#2)", () => {
+    const enc = new TextEncoder();
+
+    it("round-trips when the same AAD is supplied to decrypt", async () => {
+        const p = createCryptoProvider(await makeTestKeys());
+        const aad = enc.encode("file:abc");
+        const { iv, cipher } = await p.encryptBytesIv(new Uint8Array([1, 2, 3]), aad);
+        const back = await p.decryptBytesIv(iv, cipher, aad);
+        expect(Array.from(back)).toEqual([1, 2, 3]);
+    });
+
+    it("fails the GCM tag check when the AAD differs (id-binding)", async () => {
+        const p = createCryptoProvider(await makeTestKeys());
+        const { iv, cipher } = await p.encryptBytesIv(new Uint8Array([1, 2, 3]), enc.encode("id-A"));
+        await expect(p.decryptBytesIv(iv, cipher, enc.encode("id-B"))).rejects.toBeTruthy();
+    });
+
+    it("fails when an AAD-bound ciphertext is decrypted without any AAD", async () => {
+        const p = createCryptoProvider(await makeTestKeys());
+        const { iv, cipher } = await p.encryptBytesIv(new Uint8Array([9]), enc.encode("id"));
+        await expect(p.decryptBytesIv(iv, cipher)).rejects.toBeTruthy();
+    });
+});
+
+describe("KDF parameters regression (#13)", () => {
+    it("derives with PBKDF2 >= 600k iterations and SHA-256 (GPU-bruteforce resistance floor)", async () => {
+        const spy = vi.spyOn(globalThis.crypto.subtle, "deriveBits");
+        try {
+            await deriveKeys("pw", generateSalt());
+            const call = spy.mock.calls.find((c) => (c[0] as any)?.name === "PBKDF2");
+            expect(call).toBeTruthy();
+            const params = call![0] as Pbkdf2Params;
+            expect(params.iterations).toBeGreaterThanOrEqual(600_000);
+            expect(params.hash).toBe("SHA-256");
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    it("uses a 16-byte salt", () => {
+        expect(generateSalt().length).toBe(16);
     });
 });

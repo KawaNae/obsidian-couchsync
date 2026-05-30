@@ -32,7 +32,10 @@ import {
     encodeEnvelope,
     encryptString,
     decryptString,
+    uint8ToBase64,
+    base64ToUint8,
 } from "./envelope.ts";
+import { gzipIfSmaller, gzipDecompress } from "./gzip.ts";
 import { VAULT_META_DOC_ID, CONFIG_META_DOC_ID } from "./vault-meta.ts";
 
 /** Reserved meta doc ids that must NEVER be path-encrypted. `config:meta`
@@ -75,33 +78,75 @@ function encodePathForHmac(path: string): Uint8Array {
     return PATH_ENCODER.encode(path);
 }
 
+const UTF8 = new TextEncoder();
+const UTF8_DEC = new TextDecoder();
+
+/** The field that carries the encrypted+authenticated doc body on the wire.
+ *  A doc with `encBody` uses the v2 (encBody) scheme; a doc with the legacy
+ *  `encryptedPath` uses the v1 scheme (path-only encryption). */
+const ENC_BODY_FIELD = "encBody";
+
 export class EncryptingCouchClient implements ICouchClient {
     constructor(
         private readonly inner: ICouchClient,
         private readonly crypto: CryptoProvider,
     ) {}
 
+    /**
+     * v2 (encBody) scheme: the WHOLE sensitive body of a file/config doc is
+     * compressed-then-encrypted into a single `encBody` field, bound to the
+     * doc's identity via AES-GCM additional-authenticated-data (the remote
+     * `_id`). Only `_id` (the HMAC'd path) and `_rev` ride in the clear.
+     *
+     * This closes the integrity gap where `chunks` / `vclock` / `size` /
+     * `deleted` were plaintext and unbound: a tampering server could reorder
+     * or substitute chunk references, swap a body onto another doc, or roll
+     * back the vclock undetected. Now any mutation of the body OR a move to a
+     * different `_id` fails the GCM tag. It also hides the doc structure
+     * (chunk count, causal history) from the server. Compression precedes
+     * encryption so the long, repetitive chunk-id arrays still pack down.
+     */
     private async encryptDoc(doc: AnyDoc): Promise<AnyDoc> {
-        let out = doc;
-        if (hasPathId(doc)) {
-            const id = doc._id as string;
-            const prefix = idPrefix(id);
-            const path = idPayload(id);
-            const hmac = await this.crypto.hmacHash(encodePathForHmac(path));
-            const encPath = await encryptString(path, this.crypto);
-            out = { ...out, _id: prefix + hmac, encryptedPath: encPath };
-        }
+        if (!hasPathId(doc)) return doc;
+        const id = doc._id as string;
+        const prefix = idPrefix(id);
+        const path = idPayload(id);
+        const hmac = await this.crypto.hmacHash(encodePathForHmac(path));
+        const remoteId = prefix + hmac;
+
+        // Payload = everything except the CouchDB-managed _id/_rev, plus the
+        // plaintext path so decrypt can restore the id. _rev stays in the clear
+        // (MVCC is managed by the server and is not sensitive).
+        const { _id: _omitId, _rev, ...body } = doc;
+        void _omitId;
+        const payload = UTF8.encode(JSON.stringify({ path, ...body }));
+        const { compressed, body: maybeGz } = await gzipIfSmaller(payload);
+        const { iv, cipher } = await this.crypto.encryptBytesIv(
+            maybeGz, UTF8.encode(remoteId),
+        );
+        const encBody = uint8ToBase64(encodeEnvelope({
+            bits: { encrypted: true, compressed }, iv, body: cipher,
+        }));
+
+        const out: AnyDoc = { _id: remoteId, [ENC_BODY_FIELD]: encBody };
+        if (_rev !== undefined) out._rev = _rev;
         return out;
     }
 
     private async decryptDoc<T>(doc: T): Promise<T> {
-        let d = doc as AnyDoc;
+        const d = doc as AnyDoc;
         try {
+            if (typeof d[ENC_BODY_FIELD] === "string") {
+                return await this.decryptEncBody(d) as T;
+            }
+            // v1 legacy scheme (path-only encryption). Kept for the migration
+            // window: a v2 build reading a not-yet-re-init'd v1 vault. New
+            // writes are always v2. Remove once all vaults are re-init'd.
             if (typeof d.encryptedPath === "string") {
                 const prefix = idPrefix(d._id as string);
                 const path = await decryptString(d.encryptedPath as string, this.crypto);
-                const { encryptedPath: _, ...rest } = d;
-                d = { ...rest, _id: prefix + path };
+                const { encryptedPath: _omit, ...rest } = d;
+                return { ...rest, _id: prefix + path } as T;
             }
         } catch (e) {
             throw new EncryptionError(
@@ -110,6 +155,38 @@ export class EncryptingCouchClient implements ICouchClient {
             );
         }
         return d as T;
+    }
+
+    /** Inverse of `encryptDoc`'s v2 path. Verifies the GCM tag (with the
+     *  remote `_id` as AAD), decompresses, and rebuilds the plaintext doc. A
+     *  defence-in-depth identity check confirms the decrypted path actually
+     *  HMACs to the id payload — so a server cannot pair a valid ciphertext
+     *  with a mismatched id even within the same vault. */
+    private async decryptEncBody(d: AnyDoc): Promise<AnyDoc> {
+        const remoteId = d._id as string;
+        const prefix = idPrefix(remoteId);
+        const env = decodeEnvelope(base64ToUint8(d[ENC_BODY_FIELD] as string));
+        if (!env.iv) throw new EncryptionError(`encBody missing IV: ${remoteId}`);
+        const plain = await this.crypto.decryptBytesIv(
+            env.iv, env.body, UTF8.encode(remoteId),
+        );
+        const json = env.bits.compressed ? await gzipDecompress(plain) : plain;
+        const payload = JSON.parse(UTF8_DEC.decode(json)) as AnyDoc & { path?: string };
+        const path = payload.path;
+        if (typeof path !== "string") {
+            throw new EncryptionError(`encBody payload missing path: ${remoteId}`);
+        }
+        const expectedHmac = await this.crypto.hmacHash(encodePathForHmac(path));
+        if (idPayload(remoteId) !== expectedHmac) {
+            throw new EncryptionError(
+                `encBody id/path mismatch: ${remoteId} does not HMAC to its path`,
+            );
+        }
+        const { path: _omitPath, ...rest } = payload;
+        void _omitPath;
+        const out: AnyDoc = { ...rest, _id: prefix + path };
+        if (d._rev !== undefined) out._rev = d._rev;
+        return out;
     }
 
     private async translateId(plainId: string): Promise<string> {
