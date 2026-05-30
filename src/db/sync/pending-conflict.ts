@@ -29,8 +29,13 @@ import type { LocalDB } from "../local-db.ts";
 export const PENDING_CONFLICT_KEY_PREFIX = "_sync/pending-conflict/";
 
 export type PendingConflictKind =
-    /** Remote deletion pulled while the local copy had an unpushed edit. */
-    | "pull-delete-vs-edit";
+    /** Remote deletion pulled while the local copy had an unpushed edit.
+     *  Re-presented by rebuilding a tombstone as the remote side. */
+    | "pull-delete-vs-edit"
+    /** The mirror: the local copy is a soft-delete tombstone and the pulled
+     *  remote doc is a concurrent ALIVE edit (#7). Re-presented by re-fetching
+     *  the remote edit, since the surviving local side is the tombstone. */
+    | "local-delete-vs-remote-edit";
 
 export interface PendingConflictEntry {
     addedAt: number;
@@ -88,7 +93,9 @@ export async function clearPendingConflict(db: LocalDB, docId: string): Promise<
 function parseEntry(raw: unknown): PendingConflictEntry | null {
     if (!raw || typeof raw !== "object") return null;
     const r = raw as Partial<PendingConflictEntry>;
-    if (r.kind !== "pull-delete-vs-edit") return null;
+    if (r.kind !== "pull-delete-vs-edit" && r.kind !== "local-delete-vs-remote-edit") {
+        return null;
+    }
     const addedAt = typeof r.addedAt === "number" ? r.addedAt : 0;
     return { kind: r.kind, addedAt };
 }

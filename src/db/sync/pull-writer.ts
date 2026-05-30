@@ -38,18 +38,21 @@ import type { EchoTracker } from "./echo-tracker.ts";
 import type { SyncEvents } from "./sync-events.ts";
 import type { Checkpoints } from "./checkpoints.ts";
 import { loadAllPendingApply, type PendingApplyReason } from "./pending-apply.ts";
-import { loadAllPendingConflict, clearPendingConflict } from "./pending-conflict.ts";
+import {
+    loadAllPendingConflict, clearPendingConflict, type PendingConflictKind,
+} from "./pending-conflict.ts";
 
 export interface PullApplyResult {
     nextRemoteSeq: number | string;
     /** True when the batch had no accepted docs (caller may still want
      *  to advance its checkpoint outside the tx). */
     empty: boolean;
-    /** File-doc ids whose remote-deletion-vs-local-edit conflict must be
-     *  persisted in the same tx as the cursor advance. Only consumed by the
-     *  caller on the `empty` path (saveEmptyPullBatch); when the batch had
-     *  accepted docs, `commit` already persisted them in commitPullBatch. */
-    pendingConflictAdd: string[];
+    /** File-doc ids whose deletion-vs-edit conflict (either direction) must be
+     *  persisted in the same tx as the cursor advance, tagged with the kind so
+     *  the drain re-presents the correct side. Only consumed by the caller on
+     *  the `empty` path (saveEmptyPullBatch); when the batch had accepted docs,
+     *  `commit` already persisted them in commitPullBatch. */
+    pendingConflictAdd: Array<{ id: string; kind: PendingConflictKind }>;
 }
 
 export interface PullWriterDeps {
@@ -59,6 +62,12 @@ export interface PullWriterDeps {
     checkpoints: Checkpoints;
     getConflictResolver: () => ConflictResolver | undefined;
     ensureChunks: (doc: FileDoc) => Promise<void>;
+    /** Fetch the current remote FileDoc by id (decoded through the codec
+     *  stack), or null if absent. Used by `drainPendingConflict` to re-present
+     *  a persisted local-delete-vs-remote-edit conflict (#7): the surviving
+     *  local side is a tombstone, so the remote alive edit — which is not in
+     *  LocalDB — must be re-fetched to show the conflict. */
+    getRemoteDoc: (id: string) => Promise<FileDoc | null>;
     /** Apply a pulled FileDoc to the vault. Called inside the post-
      *  commit closure. Returns `WriteResult`: `applied:true` means the
      *  vault now matches the doc; `applied:false` means the writer
@@ -171,11 +180,11 @@ export class PullWriter {
         accepted: CouchSyncDoc[];
         concurrent: ConcurrentEntry[];
         stats: BatchStats;
-        pendingConflictAdd: string[];
+        pendingConflictAdd: Array<{ id: string; kind: PendingConflictKind }>;
     }> {
         const accepted: CouchSyncDoc[] = [];
         const concurrent: ConcurrentEntry[] = [];
-        const pendingConflictAdd: string[] = [];
+        const pendingConflictAdd: Array<{ id: string; kind: PendingConflictKind }> = [];
         const stats: BatchStats = {
             writtenCount: 0,
             writeFailCount: 0,
@@ -264,18 +273,32 @@ export class PullWriter {
                             if (isFileDoc(remoteDoc)) {
                                 await this.deps.ensureChunks(remoteDoc);
                             }
-                            // Durability for the deletion-conflict class (#3).
-                            // File deletions are soft (a `deleted:true` doc, not
-                            // a CouchDB tombstone), so a remote-delete-vs-local-
-                            // edit conflict arrives here — NOT via the hard-delete
-                            // `handlePulledDeletion` path. Persist it in the same
-                            // tx as the cursor advance so a missed modal / restart
-                            // cannot silently un-delete the file. Edit-vs-edit
-                            // concurrency is deliberately NOT persisted: both
-                            // versions survive, so there is no silent loss.
-                            if (isFileDoc(remoteDoc) && remoteDoc.deleted === true) {
-                                pendingConflictAdd.push(remoteDoc._id);
-                                this.emittedConflicts.add(remoteDoc._id);
+                            // Durability for the deletion-conflict class — both
+                            // directions (Invariant B). File deletions are soft
+                            // (a `deleted:true` doc, not a CouchDB tombstone), so
+                            // a delete-vs-edit conflict arrives HERE, not via the
+                            // hard-delete `handlePulledDeletion` path. Persist it
+                            // in the same tx as the cursor advance so a missed
+                            // modal / restart cannot silently lose a side.
+                            // Edit-vs-edit concurrency is deliberately NOT
+                            // persisted: both versions survive, so no silent loss.
+                            if (isFileDoc(remoteDoc) && isFileDoc(localDoc)) {
+                                if (remoteDoc.deleted === true && localDoc.deleted !== true) {
+                                    // remote-delete vs local-edit (#3).
+                                    pendingConflictAdd.push({
+                                        id: remoteDoc._id, kind: "pull-delete-vs-edit",
+                                    });
+                                    this.emittedConflicts.add(remoteDoc._id);
+                                } else if (localDoc.deleted === true && remoteDoc.deleted !== true) {
+                                    // The mirror: local-delete vs remote-edit (#7).
+                                    // The remote alive doc is NOT accepted (we don't
+                                    // auto-resurrect); without this record a missed
+                                    // modal / restart would drop the remote edit.
+                                    pendingConflictAdd.push({
+                                        id: remoteDoc._id, kind: "local-delete-vs-remote-edit",
+                                    });
+                                    this.emittedConflicts.add(remoteDoc._id);
+                                }
                             }
                             logDebug(`  ⚡ ${docPath} (concurrent)`);
                             concurrent.push({
@@ -320,7 +343,7 @@ export class PullWriter {
     private async handlePulledDeletion(
         docId: string,
         concurrent: ConcurrentEntry[],
-        pendingConflictAdd: string[],
+        pendingConflictAdd: Array<{ id: string; kind: PendingConflictKind }>,
     ): Promise<void> {
         const path = filePathFromId(docId);
         const localDoc = await this.deps.localDb.get<FileDoc>(docId);
@@ -334,7 +357,7 @@ export class PullWriter {
             // Durably remember the deletion-vs-edit conflict (Invariant B): the
             // caller persists `pendingConflictAdd` in the SAME tx as the cursor
             // advance, so a missed modal / restart cannot lose the deletion.
-            pendingConflictAdd.push(docId);
+            pendingConflictAdd.push({ id: docId, kind: "pull-delete-vs-edit" });
             // Surfaced live this session — the per-cycle drain must not re-emit
             // a modal that is already open for this doc.
             this.emittedConflicts.add(docId);
@@ -356,9 +379,37 @@ export class PullWriter {
     async drainPendingConflict(): Promise<void> {
         const rows = await loadAllPendingConflict(this.deps.localDb);
         if (rows.length === 0) return;
-        for (const { id } of rows) {
+        for (const { id, entry } of rows) {
             if (this.emittedConflicts.has(id)) continue;
             const localDoc = await this.deps.localDb.get<FileDoc>(id);
+            const path = filePathFromId(id);
+
+            if (entry.kind === "local-delete-vs-remote-edit") {
+                // The mirror direction (#7): the surviving local side is the
+                // tombstone, and the thing to re-present is the REMOTE alive
+                // edit, which is not in LocalDB. The conflict is moot if the
+                // local doc is no longer a tombstone (a newer local edit
+                // superseded the deletion) — do NOT treat `localDoc.deleted`
+                // as moot, that is the EXPECTED state here.
+                if (!localDoc || !isFileDoc(localDoc) || !localDoc.deleted) {
+                    await clearPendingConflict(this.deps.localDb, id);
+                    continue;
+                }
+                const remoteDoc = await this.deps.getRemoteDoc(id);
+                if (!remoteDoc || !isFileDoc(remoteDoc) || remoteDoc.deleted) {
+                    // Remote edit gone / itself deleted → the divergence
+                    // resolved without us; nothing to surface.
+                    await clearPendingConflict(this.deps.localDb, id);
+                    continue;
+                }
+                this.emittedConflicts.add(id);
+                logDebug(`  ⚡ ${path} (pending-conflict re-presented: local-deleted vs remote-edit)`);
+                this.deps.events.emit("concurrent", { filePath: path, localDoc, remoteDoc });
+                continue;
+            }
+
+            // "pull-delete-vs-edit" (#3): the surviving local side is the edit;
+            // re-present a tombstone as the remote deletion intent.
             if (!localDoc || !isFileDoc(localDoc) || localDoc.deleted) {
                 // The local edit is gone (the deletion was applied locally, or a
                 // newer rev superseded it) — the conflict is moot. Drop it.
@@ -366,7 +417,6 @@ export class PullWriter {
                 continue;
             }
             this.emittedConflicts.add(id);
-            const path = filePathFromId(id);
             const tombstone = buildDeletionTombstone(id, localDoc);
             logDebug(`  ⚡ ${path} (pending-conflict re-presented: remote-deleted vs local-edit)`);
             this.deps.events.emit("concurrent", { filePath: path, localDoc, remoteDoc: tombstone });
@@ -388,7 +438,7 @@ export class PullWriter {
         accepted: CouchSyncDoc[],
         nextRemoteSeq: number | string,
         stats: BatchStats,
-        pendingConflictAdd: string[],
+        pendingConflictAdd: Array<{ id: string; kind: PendingConflictKind }>,
     ): Promise<void> {
         // Invariant B pre-record: file docs whose chunks aren't local yet
         // might fail to apply in `onCommit` (which runs AFTER this tx
@@ -397,7 +447,7 @@ export class PullWriter {
         // that apply cleanly. What remains is exactly the genuine misses,
         // retried by `drainPendingApply`.
         const pendingApplyAdd = await this.computePendingApplyAdd(accepted);
-        const pendingSet = new Set(pendingApplyAdd);
+        const pendingSet = new Set(pendingApplyAdd.map((p) => p.id));
         const resolved: string[] = [];
 
         await this.deps.checkpoints.commitPullBatch({
@@ -457,13 +507,25 @@ export class PullWriter {
      *  intended: those are exactly the docs whose apply can fail. Files
      *  whose chunks are already local (vclock-only updates, re-delivery)
      *  are skipped, avoiding needless set churn. */
-    private async computePendingApplyAdd(accepted: CouchSyncDoc[]): Promise<string[]> {
-        const out: string[] = [];
+    private async computePendingApplyAdd(
+        accepted: CouchSyncDoc[],
+    ): Promise<Array<{ id: string; reason: PendingApplyReason }>> {
+        const out: Array<{ id: string; reason: PendingApplyReason }> = [];
         for (const doc of accepted) {
-            if (!isFileDoc(doc) || doc.deleted) continue;
+            if (!isFileDoc(doc)) continue;
+            if (doc.deleted) {
+                // #5: a clean remote soft-deletion is applied post-commit in
+                // `onCommit`; if that vault delete throws or the process is
+                // killed the deletion silently un-applies. Record it so the
+                // drain re-applies the deletion — the symmetric counterpart of
+                // the missing-chunks case below. Dropped post-commit if it
+                // applies cleanly, exactly like missing-chunks.
+                out.push({ id: doc._id, reason: "pending-deletion" });
+                continue;
+            }
             if (!doc.chunks || doc.chunks.length === 0) continue;
             const have = await this.deps.localDb.getChunks(doc.chunks);
-            if (have.length < doc.chunks.length) out.push(doc._id);
+            if (have.length < doc.chunks.length) out.push({ id: doc._id, reason: "missing-chunks" });
         }
         return out;
     }
@@ -485,13 +547,41 @@ export class PullWriter {
         const reAdd: Array<{ id: string; reason: PendingApplyReason; attempts: number }> = [];
         for (const { id, entry } of rows) {
             const doc = await this.deps.localDb.get<FileDoc>(id);
+            const path = filePathFromId(id);
+
+            if (entry.reason === "pending-deletion") {
+                // #5 recovery: the durable tombstone must still be a deletion.
+                // If the local doc is gone or superseded by a live (non-deleted)
+                // edit, the deletion is moot — drop it. `doc.deleted` is the
+                // EXPECTED state here, NOT a moot signal. Re-apply the vault
+                // deletion (dbToFile dispatches `applyRemoteDeletion`); no
+                // ensureChunks since a tombstone references none.
+                if (!doc || !isFileDoc(doc) || !doc.deleted) {
+                    remove.push(id);
+                    continue;
+                }
+                try {
+                    const result = await this.deps.applyPullWrite(doc);
+                    remove.push(id);
+                    if (result.applied === true) {
+                        logDebug(`  ← ${path} (pending-deletion recovered)`);
+                    } else {
+                        logDebug(`  ← ${path} (pending-deletion skipped: ${result.reason})`);
+                    }
+                } catch (e: any) {
+                    logDebug(`pending-deletion: ${path} re-apply failed (attempt ${entry.attempts + 1})`);
+                    reAdd.push({ id, reason: "pending-deletion", attempts: entry.attempts + 1 });
+                }
+                continue;
+            }
+
+            // "missing-chunks": the file must still be a live (non-deleted) doc.
             if (!doc || !isFileDoc(doc) || doc.deleted) {
                 // File no longer present locally (deleted / superseded) —
                 // nothing left to apply.
                 remove.push(id);
                 continue;
             }
-            const path = filePathFromId(id);
             try {
                 await this.deps.ensureChunks(doc);
                 const result = await this.deps.applyPullWrite(doc);

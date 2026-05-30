@@ -117,11 +117,12 @@ describe("regression: PR-B pull-delete vs debounce silent loss", () => {
         expect(queryResult).toBe(true);
     });
 
-    it("legacy lastSynced (chunks: undefined) returns false (pre-PR-B behaviour)", async () => {
-        // Backwards compat: legacy entries pre-`{chunks,size}` extension
-        // can't run the chunks comparison. PR-B falls back to "no
-        // pending" rather than panicking. PR5 of the prior plan
-        // upgrades these entries on the next reconcile pass.
+    it("legacy lastSynced (chunks: undefined): divergent disk edit returns TRUE (#8, no silent delete)", async () => {
+        // A legacy entry pre-`{chunks,size}` extension can't run the lastSynced
+        // chunks comparison. The old code returned false unconditionally, which
+        // let a remote deletion silently destroy a divergent on-disk edit (#8).
+        // The fix falls back to the LocalDB FileDoc as the baseline, so the
+        // divergence is detected and the deletion surfaces a conflict instead.
         const path = "notes/legacy.md";
         vault.addFile(path, "v0");
         await vs.fileToDb(path);
@@ -134,9 +135,28 @@ describe("regression: PR-B pull-delete vs debounce silent loss", () => {
         await vs.loadLastSyncedVclocks();
         expect(vs.getLastSynced(path)?.chunks).toBeUndefined();
 
-        // Vault drifts after the legacy meta is in place, but without
-        // the baseline chunks we can't tell. Conservative false.
+        // Disk diverges from the integrated "v0" → detected via the DB-doc
+        // baseline fallback. Non-destructive: prefer conflict over deletion.
         vault.addFile(path, "v1 different", { size: 12 });
+        expect(await vs.hasUnpushedChanges(path)).toBe(true);
+    });
+
+    it("legacy lastSynced: unchanged disk returns FALSE (no spurious conflict)", async () => {
+        // The DB-doc baseline fallback must NOT cry pending for a file the user
+        // never touched — otherwise every legacy-baseline remote deletion would
+        // surface a spurious conflict.
+        const path = "notes/legacy-clean.md";
+        vault.addFile(path, "stable");
+        await vs.fileToDb(path);
+
+        const fileDoc = (await db.get(makeFileId(path))) as any;
+        await db.runWriteTx({
+            vclocks: [{ path, op: "set", clock: fileDoc.vclock ?? {} }],
+        });
+        await vs.loadLastSyncedVclocks();
+        expect(vs.getLastSynced(path)?.chunks).toBeUndefined();
+
+        // Disk identical to the integrated content → no unpushed work.
         expect(await vs.hasUnpushedChanges(path)).toBe(false);
     });
 });

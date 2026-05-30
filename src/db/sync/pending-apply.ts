@@ -31,7 +31,14 @@ export const PENDING_APPLY_KEY_PREFIX = "_sync/pending-apply/";
 export type PendingApplyReason =
     /** Apply failed because a referenced chunk was not yet on remote.
      *  Auto-retries every pull cycle until the chunk becomes durable. */
-    | "missing-chunks";
+    | "missing-chunks"
+    /** A clean remote soft-deletion (take-remote, no local edit) whose vault
+     *  delete runs post-commit in `onCommit`. If that delete throws or the
+     *  process is killed between the durable tombstone commit and the vault
+     *  delete, the deletion silently un-applies (LocalDB tombstone vs surviving
+     *  vault file). Recorded so `drainPendingApply` re-applies the deletion —
+     *  the symmetric counterpart of `missing-chunks` for deletions (#5). */
+    | "pending-deletion";
 
 export interface PendingApplyEntry {
     addedAt: number;
@@ -83,7 +90,7 @@ export async function loadAllPendingApply(db: MetaReader): Promise<PendingApplyR
 function parseEntry(raw: unknown): PendingApplyEntry | null {
     if (!raw || typeof raw !== "object") return null;
     const r = raw as Partial<PendingApplyEntry>;
-    if (r.reason !== "missing-chunks") return null;
+    if (r.reason !== "missing-chunks" && r.reason !== "pending-deletion") return null;
     const addedAt = typeof r.addedAt === "number" ? r.addedAt : 0;
     const attempts = typeof r.attempts === "number" ? r.attempts : 0;
     return { reason: r.reason, addedAt, attempts };

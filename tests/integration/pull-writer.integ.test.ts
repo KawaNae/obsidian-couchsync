@@ -23,6 +23,7 @@ import {
     loadAllPendingConflict,
     clearPendingConflict,
 } from "../../src/db/sync/pending-conflict.ts";
+import { loadAllPendingApply } from "../../src/db/sync/pending-apply.ts";
 import { ConflictResolver } from "../../src/conflict/conflict-resolver.ts";
 import type { WriteResult } from "../../src/sync/vault-writer.ts";
 import { makeFileId, makeChunkId } from "../../src/types/doc-id.ts";
@@ -47,6 +48,9 @@ function attachPullWriter(opts: {
      *  Pass an async returning `{applied:false, reason}` to simulate vault writer
      *  decline (IME divergence etc.). */
     applyPullWrite?: (doc: FileDoc) => Promise<WriteResult> | Promise<void>;
+    /** Re-fetch a remote FileDoc for the local-delete-vs-remote-edit
+     *  re-presentation (#7). Defaults to "absent". */
+    getRemoteDoc?: (id: string) => Promise<FileDoc | null>;
 }): WriterRig {
     const events = new SyncEvents();
     const echoes = new EchoTracker();
@@ -60,6 +64,7 @@ function attachPullWriter(opts: {
         checkpoints,
         getConflictResolver: () => resolver,
         ensureChunks: async () => {},
+        getRemoteDoc: opts.getRemoteDoc ?? (async () => null),
         applyPullWrite: async (doc) => {
             if (!callback) return { applied: true };
             const ret = await callback(doc);
@@ -751,7 +756,9 @@ describe("PullWriter integration", () => {
             // pipeline advances the cursor on the empty path — and MUST carry the
             // conflict id so it persists in the same tx.
             expect(applied.empty).toBe(true);
-            expect(applied.pendingConflictAdd).toContain(localEdit._id);
+            expect(applied.pendingConflictAdd).toContainEqual({
+                id: localEdit._id, kind: "pull-delete-vs-edit",
+            });
             await rig.checkpoints.saveEmptyPullBatch(
                 applied.nextRemoteSeq, applied.pendingConflictAdd,
             );
@@ -807,6 +814,128 @@ describe("PullWriter integration", () => {
 
             expect(reEmits).toEqual([]); // moot — not re-presented
             expect(await loadAllPendingConflict(b.db)).toEqual([]); // and cleared
+        });
+    });
+
+    // ── #5: clean-deletion apply durability ──────────────
+    // A clean remote soft-deletion (take-remote, no local edit) applies the
+    // vault delete post-commit; if it throws / the process dies, the old code
+    // never retried (it was excluded from pending-apply). Now it is recorded
+    // as `pending-deletion` and re-applied by the drain.
+    describe("pending-deletion (clean soft-delete apply durability, #5)", () => {
+        it("records a failed take-remote deletion and re-applies it on the next drain", async () => {
+            h = createSyncHarness();
+            const b = h.addDevice("dev-B");
+
+            // Local file exists; a remote soft-deletion dominates it (no conflict).
+            await seedLocalFileDoc(b, "notes/del.md", { A: 1 }, [makeChunkId("cccc3333cccc3333")]);
+            const remoteDelete = makeRemoteFileDoc(
+                "notes/del.md", { A: 2 }, { deleted: true, chunks: [] },
+            );
+
+            let throwOnApply = true;
+            const appliedDocs: FileDoc[] = [];
+            const rig = attachPullWriter({
+                device: b, withResolver: true,
+                applyPullWrite: async (doc) => {
+                    appliedDocs.push(doc);
+                    if (throwOnApply) throw new Error("EBUSY io.delete");
+                    return { applied: true };
+                },
+            });
+
+            await rig.writer.apply(makeChangesResult(
+                [{ id: remoteDelete._id, seq: "5", doc: remoteDelete }], "5",
+            ));
+
+            // Take-remote ran (LocalDB doc is now the tombstone) and the failed
+            // vault delete is durably recorded — NOT silently checkpointed-past.
+            const pending = await loadAllPendingApply(b.db);
+            expect(pending.map((r) => ({ id: r.id, reason: r.entry.reason }))).toContainEqual({
+                id: remoteDelete._id, reason: "pending-deletion",
+            });
+
+            // Drain with a working writer re-applies the deletion and clears it.
+            throwOnApply = false;
+            appliedDocs.length = 0;
+            await rig.writer.drainPendingApply();
+            expect(appliedDocs.some((d) => d._id === remoteDelete._id && d.deleted === true)).toBe(true);
+            expect(await loadAllPendingApply(b.db)).toEqual([]);
+        });
+    });
+
+    // ── #7: reverse deletion-conflict durability ─────────
+    // Mirror of #3: the local copy is a tombstone and the pulled remote is a
+    // concurrent ALIVE edit. Must persist + re-present (the remote edit), not
+    // drop it silently. The dominated case (remote strictly newer) must NOT
+    // record a conflict — that is a legitimate resurrection.
+    describe("pending-conflict reverse (local-delete vs remote-edit, #7)", () => {
+        function seedLocalTombstone(b: DeviceHarness, path: string, vclock: Record<string, number>): FileDoc {
+            const doc: FileDoc = {
+                _id: makeFileId(path), type: "file", schemaVersion: FILE_SCHEMA_VERSION,
+                chunks: [], vclock, mtime: 1, ctime: 1, size: 0, deleted: true,
+            };
+            return doc;
+        }
+
+        it("concurrent: persists the reverse conflict and re-presents the remote edit after restart", async () => {
+            h = createSyncHarness();
+            const b = h.addDevice("dev-B");
+
+            const tomb = seedLocalTombstone(b, "notes/rev.md", { "dev-B": 1 });
+            await b.db.runWriteTx({ docs: [{ doc: tomb as unknown as CouchSyncDoc }] });
+            // Remote alive edit, concurrent with the local tombstone.
+            const remoteAlive = makeRemoteFileDoc(
+                "notes/rev.md", { "dev-A": 1 }, { chunks: [makeChunkId("dddd4444dddd4444")], size: 5 },
+            );
+
+            const rig = attachPullWriter({ device: b, withResolver: true });
+            const applied = await rig.writer.apply(makeChangesResult(
+                [{ id: remoteAlive._id, seq: "3", doc: remoteAlive }], "3",
+            ));
+
+            // Reverse conflict recorded with the distinct kind; remote NOT accepted.
+            expect(applied.empty).toBe(true);
+            expect(applied.pendingConflictAdd).toContainEqual({
+                id: remoteAlive._id, kind: "local-delete-vs-remote-edit",
+            });
+            await rig.checkpoints.saveEmptyPullBatch(
+                applied.nextRemoteSeq, applied.pendingConflictAdd,
+            );
+
+            // Restart: a fresh writer re-presents by re-fetching the remote edit.
+            const rig2 = attachPullWriter({
+                device: b, withResolver: true,
+                getRemoteDoc: async (id) => (id === remoteAlive._id ? remoteAlive : null),
+            });
+            const reEmits: Array<{ filePath: string; remoteDeleted: boolean }> = [];
+            rig2.events.on("concurrent", ({ filePath, remoteDoc }) =>
+                reEmits.push({ filePath, remoteDeleted: remoteDoc.deleted === true }));
+            await rig2.writer.drainPendingConflict();
+            // Re-presented, and the remote side shown is the ALIVE edit (not a tombstone).
+            expect(reEmits).toEqual([{ filePath: "notes/rev.md", remoteDeleted: false }]);
+        });
+
+        it("dominated: does NOT record a conflict (legitimate resurrection)", async () => {
+            h = createSyncHarness();
+            const b = h.addDevice("dev-B");
+
+            const tomb = seedLocalTombstone(b, "notes/res.md", { "dev-B": 1 });
+            await b.db.runWriteTx({ docs: [{ doc: tomb as unknown as CouchSyncDoc }] });
+            // Remote alive edit that strictly DOMINATES the tombstone.
+            const remoteAlive = makeRemoteFileDoc(
+                "notes/res.md", { "dev-B": 1, "dev-A": 1 },
+                { chunks: [makeChunkId("eeee5555eeee5555")], size: 4 },
+            );
+
+            const rig = attachPullWriter({ device: b, withResolver: true });
+            const applied = await rig.writer.apply(makeChangesResult(
+                [{ id: remoteAlive._id, seq: "4", doc: remoteAlive }], "4",
+            ));
+
+            // Take-remote → resurrected, no conflict persisted.
+            expect(applied.pendingConflictAdd).toEqual([]);
+            await expectDb(b.db).toHaveFileDoc("notes/res.md").withVclock({ "dev-B": 1, "dev-A": 1 });
         });
     });
 });

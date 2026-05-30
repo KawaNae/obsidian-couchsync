@@ -17,6 +17,7 @@
  */
 
 import type { FileDoc } from "../../types.ts";
+import { stripRev } from "../../utils/doc.ts";
 import type { LocalDB } from "../local-db.ts";
 import type { ICouchClient } from "../interfaces.ts";
 import type { ConflictResolver } from "../../conflict/conflict-resolver.ts";
@@ -92,6 +93,13 @@ export class SyncSession {
             checkpoints: deps.checkpoints,
             getConflictResolver: deps.getConflictResolver,
             ensureChunks: deps.ensureChunks,
+            // Re-fetch a remote FileDoc (codec-decoded, _rev stripped) for the
+            // local-delete-vs-remote-edit conflict re-presentation (#7). This
+            // session already owns the client, so no new engine-level dep.
+            getRemoteDoc: async (id) => {
+                const d = await deps.client.getDoc<FileDoc>(id);
+                return d ? (stripRev(d) as FileDoc) : null;
+            },
             applyPullWrite: deps.applyPullWrite,
         });
         const isCancelled = () => this._disposed;

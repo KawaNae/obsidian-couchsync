@@ -738,13 +738,25 @@ export class VaultSync {
         if (this.pendingProbe?.hasPending(path)) return true;
         const ls = this.lastSynced.get(toPathKey(path));
         if (!ls || ls.chunks === undefined || ls.size === undefined) {
-            // No integration baseline (or legacy entry pre-extension):
-            // we can't tell whether the disk has unpushed work without
-            // the chunks/size baseline. Conservative: report no pending
-            // (matches pre-PR-B behaviour for legacy entries; PR5 of
-            // the prior plan upgrades these on the next "identical"
-            // reconcile pass).
-            return false;
+            // Legacy baseline (pre-{chunks,size} extension). The old code
+            // returned false unconditionally here — which let a remote
+            // deletion silently overwrite a divergent, un-integrated on-disk
+            // edit (#8). Choose the non-destructive side instead: fall back to
+            // the LocalDB FileDoc (which still carries the last-integrated
+            // chunks/size) as the baseline; if even that is unavailable, a
+            // present-on-disk file is treated as possibly-unpushed so the
+            // deletion surfaces a CONFLICT rather than destroying local work.
+            // The legacy entry self-heals to a real baseline on the next
+            // identical reconcile (alignLastSyncedToDoc).
+            const stat = await this.vault.stat(path);
+            if (!stat) return false; // nothing on disk to lose
+            const doc = await this.db.get<FileDoc>(makeFileId(path));
+            if (doc && !doc.deleted && doc.chunks !== undefined && doc.size !== undefined) {
+                if (stat.size !== doc.size) return true;
+                const diskChunks = await this.localChunkIds(path);
+                return !chunkListsEqual(diskChunks, doc.chunks);
+            }
+            return true;
         }
         const stat = await this.vault.stat(path);
         if (!stat) {

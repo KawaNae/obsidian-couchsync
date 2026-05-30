@@ -138,7 +138,10 @@ describe("Checkpoints", () => {
             await cp.commitPullBatch({
                 docs: [],
                 nextRemoteSeq: "9",
-                pendingApplyAdd: ["file:a.md", "file:b.md"],
+                pendingApplyAdd: [
+                    { id: "file:a.md", reason: "missing-chunks" },
+                    { id: "file:b.md", reason: "missing-chunks" },
+                ],
                 onCommit: async () => {},
             });
 
