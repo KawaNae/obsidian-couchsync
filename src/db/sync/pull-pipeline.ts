@@ -24,7 +24,8 @@ import type { PullWriter } from "./pull-writer.ts";
 import type { SyncEvents } from "./sync-events.ts";
 import type { Checkpoints } from "./checkpoints.ts";
 import { classifyError } from "./errors.ts";
-import { EncryptionError } from "../encrypting-couch-client.ts";
+// Codec error from its decorator-independent home (#18).
+import { EncryptionError } from "../codec-errors.ts";
 import type { VisibilityGate } from "../visibility-gate.ts";
 
 function seqNumeric(seq: number | string): number {

@@ -37,6 +37,13 @@ import {
 } from "./envelope.ts";
 import { gzipIfSmaller, gzipDecompress } from "./gzip.ts";
 import { VAULT_META_DOC_ID, CONFIG_META_DOC_ID } from "./vault-meta.ts";
+import { EncryptionError } from "./codec-errors.ts";
+
+// Re-exported from its canonical home (`codec-errors.ts`) for back-compat:
+// callers that `import { EncryptionError } from "./encrypting-couch-client.ts"`
+// keep working. New sync-stack consumers should import from `codec-errors.ts`
+// directly so they do not compile-depend on this decorator.
+export { EncryptionError };
 
 /** Reserved meta doc ids that must NEVER be path-encrypted. `config:meta`
  *  in particular starts with the `config:` prefix that `hasPathId` matches,
@@ -46,13 +53,6 @@ import { VAULT_META_DOC_ID, CONFIG_META_DOC_ID } from "./vault-meta.ts";
  *  id) — silently corrupting the crypto root. Production always reads/writes
  *  meta via a raw client; this makes that invariant defense-in-depth. */
 const RESERVED_META_IDS = new Set<string>([VAULT_META_DOC_ID, CONFIG_META_DOC_ID]);
-
-export class EncryptionError extends Error {
-    constructor(message: string, public readonly cause?: unknown) {
-        super(message);
-        this.name = "EncryptionError";
-    }
-}
 
 type AnyDoc = Record<string, unknown>;
 

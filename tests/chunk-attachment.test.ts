@@ -4,9 +4,11 @@ import {
     chunkFromAttachment,
     ChunkIntegrityError,
     ChunkAlgMismatchError,
+    isCorruptChunkError,
     CHUNK_ATTACHMENT_NAME,
     CHUNK_CONTENT_TYPE,
 } from "../src/db/chunk-attachment.ts";
+import { EnvelopeError } from "../src/db/codec-errors.ts";
 import { CHUNK_SCHEMA_VERSION, type ChunkDoc } from "../src/types.ts";
 import { makeChunkId } from "../src/types/doc-id.ts";
 import { computeHash, type ChunkHasher } from "../src/db/chunker.ts";
@@ -98,5 +100,27 @@ describe("chunk-attachment round-trip", () => {
             buildChunkAttachment(chunk).attachments.c.data,
         );
         expect(back.schemaVersion).toBe(CHUNK_SCHEMA_VERSION);
+    });
+
+    it("throws EnvelopeError on a structurally-malformed attachment blob", async () => {
+        const chunk = await makeChunk(new Uint8Array([1, 2]));
+        // 0x04 sets a reserved bit → decodeEnvelope rejects before hashing.
+        await expect(
+            chunkFromAttachment(chunk._id, new Uint8Array([0x04]), x64Hasher),
+        ).rejects.toBeInstanceOf(EnvelopeError);
+    });
+});
+
+describe("isCorruptChunkError — shared classifier for both fetch boundaries (#4)", () => {
+    it("treats integrity, alg-mismatch and envelope errors as corrupt", () => {
+        expect(isCorruptChunkError(new ChunkIntegrityError("id", "a", "b"))).toBe(true);
+        expect(isCorruptChunkError(new ChunkAlgMismatchError("id", "hmac", "x64"))).toBe(true);
+        expect(isCorruptChunkError(new EnvelopeError("malformed"))).toBe(true);
+    });
+
+    it("lets genuine failures (network/abort/generic) propagate", () => {
+        expect(isCorruptChunkError(new Error("network down"))).toBe(false);
+        expect(isCorruptChunkError(new DOMException("aborted", "AbortError"))).toBe(false);
+        expect(isCorruptChunkError(undefined)).toBe(false);
     });
 });

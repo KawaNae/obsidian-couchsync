@@ -26,7 +26,7 @@ import type { ICouchClient } from "./interfaces.ts";
 import type { ConflictResolver } from "../conflict/conflict-resolver.ts";
 import { filePathFromId } from "../types/doc-id.ts";
 import { makeCouchClient } from "./couch-client.ts";
-import { chunkFromAttachment, ChunkIntegrityError } from "./chunk-attachment.ts";
+import { chunkFromAttachment, isCorruptChunkError } from "./chunk-attachment.ts";
 import type { ChunkHasher } from "./chunker.ts";
 import { decideReconnect } from "./reconnect-policy.ts";
 import type {
@@ -326,13 +326,17 @@ export class SyncEngine {
                     // Decorator stack has decrypted + decompressed the body.
                     // chunkFromAttachment decodes the envelope and (when a
                     // hasher is wired) verifies content hashes to the id. A
-                    // hash mismatch means the body is corrupt — treat it like
-                    // a missing chunk (skip + warn, route to repair) rather
-                    // than persisting bad bytes or failing the whole batch.
+                    // hash mismatch OR a structurally-malformed envelope means
+                    // the body is corrupt — treat it like a missing chunk (skip
+                    // + warn, route to repair) rather than persisting bad bytes
+                    // or failing the whole batch. `isCorruptChunkError` is the
+                    // shared rule with the Clone/repair boundary so the two
+                    // cannot drift (#4 — previously this path missed
+                    // EnvelopeError and looped a malformed chunk forever).
                     try {
                         fetched.push(await chunkFromAttachment(id, blob, this.chunkHasher));
                     } catch (e) {
-                        if (e instanceof ChunkIntegrityError) {
+                        if (isCorruptChunkError(e)) {
                             corrupt.push(id);
                             continue;
                         }

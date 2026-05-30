@@ -28,6 +28,7 @@ import type { ChunkDoc } from "../types.ts";
 import { CHUNK_SCHEMA_VERSION } from "../types.ts";
 import type { ChunkHasher } from "./chunker.ts";
 import { plainEnvelope, encodeEnvelope, decodeEnvelope } from "./envelope.ts";
+import { EnvelopeError } from "./codec-errors.ts";
 import { parseChunkId } from "../types/doc-id.ts";
 
 /** Attachment name carrying the chunk body. Single source of truth. */
@@ -73,6 +74,22 @@ export class ChunkAlgMismatchError extends ChunkIntegrityError {
             `"${idAlg}" — refusing to skip integrity check`;
         this.name = "ChunkAlgMismatchError";
     }
+}
+
+/** A chunk fetched from the untrusted server is UNUSABLE — and must be skipped
+ *  and routed to repair rather than persisted — when `chunkFromAttachment`
+ *  throws either:
+ *    - `ChunkIntegrityError` (incl. `ChunkAlgMismatchError`): the body does not
+ *      hash to its content-addressed id (forged/substituted content), or
+ *    - `EnvelopeError`: the envelope is structurally malformed (reserved bits,
+ *      truncation) — a tamper or bit-rot that needs no passphrase.
+ *  Both the live-sync fetch boundary (`SyncEngine.ensureChunks`) and the
+ *  one-shot Clone/repair boundary (`remote-couch.resolveChunkAttachments`) MUST
+ *  classify these identically; this single predicate is the shared rule so the
+ *  two boundaries cannot drift (#4). Any other error (network, abort) is a
+ *  genuine failure and must propagate. */
+export function isCorruptChunkError(e: unknown): boolean {
+    return e instanceof ChunkIntegrityError || e instanceof EnvelopeError;
 }
 
 /** Thrown when a ChunkDoc reaches reassembly without a usable `content`

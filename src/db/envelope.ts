@@ -26,6 +26,11 @@
  */
 
 import type { CryptoProvider } from "./crypto-provider.ts";
+import { EnvelopeError } from "./codec-errors.ts";
+
+// Re-exported from its canonical home (`codec-errors.ts`) for back-compat:
+// callers that `import { EnvelopeError } from "./envelope.ts"` keep working.
+export { EnvelopeError };
 
 const FLAG_ENCRYPTED = 0x01;
 const FLAG_COMPRESSED = 0x02;
@@ -46,13 +51,6 @@ export interface Envelope {
     iv?: Uint8Array;
     /** Payload bytes after the IV (if any). */
     body: Uint8Array;
-}
-
-export class EnvelopeError extends Error {
-    constructor(message: string) {
-        super(message);
-        this.name = "EnvelopeError";
-    }
 }
 
 export function plainEnvelope(body: Uint8Array): Envelope {

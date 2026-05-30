@@ -17,8 +17,7 @@ import type { CouchSyncDoc, ChunkDoc } from "../types.ts";
 import { stripRev } from "../utils/doc.ts";
 import { isChunkDocId } from "../types/doc-id.ts";
 import { paginateAllDocs, DEFAULT_BATCH_SIZE } from "./sync/pagination.ts";
-import { buildChunkAttachment, chunkFromAttachment, ChunkIntegrityError } from "./chunk-attachment.ts";
-import { EnvelopeError } from "./envelope.ts";
+import { buildChunkAttachment, chunkFromAttachment, isCorruptChunkError } from "./chunk-attachment.ts";
 import type { ChunkHasher } from "./chunker.ts";
 import { logWarn } from "../ui/log.ts";
 
@@ -400,11 +399,13 @@ async function resolveChunkAttachments(
                 // mismatch or malformed envelope means the chunk is corrupt
                 // or server-substituted — treat it like a missing chunk (skip,
                 // route to repair) instead of writing untrusted bytes.
-                // Symmetric with the live-sync path in SyncEngine.ensureChunks.
+                // `isCorruptChunkError` is the SAME rule the live-sync path in
+                // SyncEngine.ensureChunks uses — the two boundaries share it so
+                // they classify a corrupt chunk identically (#4).
                 try {
                     docs[i] = await chunkFromAttachment(id, blob, hasher);
                 } catch (e) {
-                    if (e instanceof ChunkIntegrityError || e instanceof EnvelopeError) {
+                    if (isCorruptChunkError(e)) {
                         notFound.add(id);
                         continue;
                     }

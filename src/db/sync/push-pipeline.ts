@@ -64,7 +64,9 @@ import type {
 } from "../interfaces.ts";
 import { buildChunkAttachment } from "../chunk-attachment.ts";
 import { DbError } from "../write-transaction.ts";
-import { EncryptionError } from "../encrypting-couch-client.ts";
+// Codec error from its decorator-independent home — the sync stack must not
+// compile-depend on the EncryptingCouchClient decorator implementation (#18).
+import { EncryptionError } from "../codec-errors.ts";
 import { classifyError } from "./errors.ts";
 import { logDebug, logInfo, logWarn } from "../../ui/log.ts";
 import type { EchoTracker } from "./echo-tracker.ts";
