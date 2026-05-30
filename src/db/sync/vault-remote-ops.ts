@@ -19,6 +19,7 @@
 import type { LocalDB } from "../local-db.ts";
 import type { CouchSyncSettings } from "../../settings.ts";
 import type { ICouchClient } from "../interfaces.ts";
+import type { ChunkHasher } from "../chunker.ts";
 import { CouchClient, makeCouchClient } from "../couch-client.ts";
 import * as remoteCouch from "../remote-couch.ts";
 import type { AuthGate } from "./auth-gate.ts";
@@ -39,6 +40,18 @@ export class VaultRemoteOps {
          * silently dropped the Compressing layer from Init pushes.
          */
         private wrapClient: (raw: CouchClient) => ICouchClient,
+        /**
+         * Vault chunk hasher (same instance the live sync loop uses, reading
+         * the live cryptoProvider via closure). Threaded into `pullAll` so the
+         * Clone / full-resync path verifies every chunk body against its
+         * content-addressed id — the authenticated fetch boundary (Invariant I)
+         * that live sync already enforced but the one-shot path did not.
+         *
+         * Public so maintenance/repair commands (chunk-repair) can thread the
+         * SAME hasher into their one-shot `pullDocs`, keeping every remote-read
+         * path verified by one source of truth.
+         */
+        public readonly chunkHasher: ChunkHasher,
     ) {}
 
     /** One-shot push of the entire vault local DB to the vault remote. */
@@ -51,7 +64,7 @@ export class VaultRemoteOps {
     async pullAll(
         onProgress?: ProgressCallback,
     ): Promise<number> {
-        return remoteCouch.pullAll(this.localDb, this.makeDataClient(), onProgress);
+        return remoteCouch.pullAll(this.localDb, this.makeDataClient(), this.chunkHasher, onProgress);
     }
 
     /** Destroy the vault remote database (auto-recreated on next push). */

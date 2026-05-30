@@ -216,31 +216,15 @@ export default class CouchSyncPlugin extends Plugin {
         const modalPresenter = this.modalPresenter;
 
         this.auth = new AuthGate();
-        this.remoteOps = new VaultRemoteOps(
-            this.localDb, () => this.settings, this.auth, this.wrapVaultClient,
-        );
-        this.historyStorage = new HistoryStorage(this.app.vault.getName());
-        await this.historyStorage.ensureSchemaVersion();
-        this.historyCapture = new HistoryCapture(vaultIO, vaultEvents, this.historyStorage, () => this.settings);
-
-        // Editor-aware write layer: defers vault writes while the
-        // path's editor is in IME composition, dispatches CodeMirror
-        // transactions instead of triggering Obsidian's external-edit
-        // reload (which would break IME), and falls back to disk
-        // write when no editor session exists.
-        this.compositionTracker = new ObsidianCompositionTracker(this.app);
-        this.compositionGate = new CompositionGate(this.compositionTracker);
-        this.vaultWriter = new EditorAwareVaultWriter(
-            this.app, vaultIO, this.compositionGate,
-            null, this.historyCapture,
-        );
         // ChunkHasher: bundles the hash function with its own algorithm
         // identity so the chunk id is stamped with the truly-used tag
         // (`chunk:x64:<xxhash>` vs `chunk:hmac:<HMAC>`). Phase 2 splits
         // this into two — vault and config each read their own
         // cryptoProvider live via closure, so encryption-state changes
         // propagate without rebuilding the hasher and the two DBs mint
-        // chunk ids in disjoint id spaces (invariant 18).
+        // chunk ids in disjoint id spaces (invariant 18). Constructed here
+        // (before remoteOps) because VaultRemoteOps.pullAll now verifies
+        // pulled chunks with it — the authenticated Clone fetch boundary.
         //
         // Outer `this` is captured via local alias because the object
         // literal's own `this` would refer to itself (not the plugin).
@@ -257,6 +241,25 @@ export default class CouchSyncPlugin extends Plugin {
                 ? plugin.configCryptoProvider.hmacHash(data)
                 : computeHash(data),
         };
+        this.remoteOps = new VaultRemoteOps(
+            this.localDb, () => this.settings, this.auth, this.wrapVaultClient,
+            vaultChunkHasher,
+        );
+        this.historyStorage = new HistoryStorage(this.app.vault.getName());
+        await this.historyStorage.ensureSchemaVersion();
+        this.historyCapture = new HistoryCapture(vaultIO, vaultEvents, this.historyStorage, () => this.settings);
+
+        // Editor-aware write layer: defers vault writes while the
+        // path's editor is in IME composition, dispatches CodeMirror
+        // transactions instead of triggering Obsidian's external-edit
+        // reload (which would break IME), and falls back to disk
+        // write when no editor session exists.
+        this.compositionTracker = new ObsidianCompositionTracker(this.app);
+        this.compositionGate = new CompositionGate(this.compositionTracker);
+        this.vaultWriter = new EditorAwareVaultWriter(
+            this.app, vaultIO, this.compositionGate,
+            null, this.historyCapture,
+        );
         this.vaultSync = new VaultSync(vaultIO, this.localDb, () => this.settings, this.vaultWriter, vaultChunkHasher);
         this.changeTracker = new ChangeTracker(vaultEvents, this.vaultSync, () => this.settings);
         // Late-bind the writeIgnore once ChangeTracker exists. It is

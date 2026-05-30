@@ -32,6 +32,11 @@ import type {
     CouchSyncDoc,
     VectorClock,
 } from "../../src/types.ts";
+import { computeHash, type ChunkHasher } from "../../src/db/chunker.ts";
+
+// Required by ChunkRepairDeps. This test only exercises the delete-remote
+// path (tombstoning stale chunks), so the verified pull boundary is never hit.
+const h: ChunkHasher = { alg: "x64", hash: (d) => computeHash(d) };
 
 let counter = 0;
 
@@ -192,6 +197,7 @@ describe("Regression: chunk-repair ping-pong across two devices", () => {
         await repairChunkDrift(plan, {
             localDb: world.uptoDate,
             remote: world.remote,
+            chunkHasher: h,
         });
 
         // Lagging device now has remote with only {newFile, D, E}, and

@@ -54,6 +54,27 @@ export class ChunkIntegrityError extends Error {
     }
 }
 
+/** Thrown when a pulled chunk's id carries an algorithm tag that the
+ *  supplied hasher cannot verify (e.g. an `hmac` id reached a path wired
+ *  with only an `x64` hasher). In a single-codec vault every chunk id
+ *  shares the active hasher's algorithm, so a mismatch is a corrupt /
+ *  server-substituted id — we refuse to skip verification and route the
+ *  chunk to repair. Extends `ChunkIntegrityError` so every existing
+ *  `instanceof ChunkIntegrityError` catch treats it as "corrupt, skip". */
+export class ChunkAlgMismatchError extends ChunkIntegrityError {
+    constructor(
+        chunkId: string,
+        public readonly idAlg: string,
+        public readonly hasherAlg: string,
+    ) {
+        super(chunkId, idAlg, hasherAlg);
+        this.message =
+            `chunk ${chunkId}: hasher alg "${hasherAlg}" cannot verify id alg ` +
+            `"${idAlg}" — refusing to skip integrity check`;
+        this.name = "ChunkAlgMismatchError";
+    }
+}
+
 /** Thrown when a ChunkDoc reaches reassembly without a usable `content`
  *  buffer (undefined/null/non-Uint8Array). A chunk is *available* only when
  *  its doc exists AND carries content; a content-less doc is treated exactly
@@ -104,11 +125,12 @@ export function buildChunkAttachment(
  * is the `[codec-byte][body]` envelope; `decodeEnvelope` recovers the
  * canonical plain bytes (and throws `EnvelopeError` on a malformed blob).
  *
- * When `hasher` is supplied and its algorithm matches the id's tag, the
- * decoded body is re-hashed and compared to the id — the inverse of the
- * mint in `splitIntoChunks`. A mismatch throws `ChunkIntegrityError`. The
- * check is skipped when no hasher is given or its alg differs from the
- * id's (e.g. an `hmac` chunk with only an `x64` hasher available).
+ * When `hasher` is supplied, the decoded body is re-hashed and compared to
+ * the id — the inverse of the mint in `splitIntoChunks`. A content mismatch
+ * throws `ChunkIntegrityError`; an algorithm mismatch (the hasher cannot
+ * verify this id's tag) throws `ChunkAlgMismatchError` rather than skipping
+ * (#10 — fail-closed). The check is only skipped when no hasher is given,
+ * and the fetch boundaries that read untrusted remote bytes always pass one.
  *
  * NULL/absent attachments are not handled here — callers keep their own
  * notFound semantics.
@@ -121,11 +143,16 @@ export async function chunkFromAttachment(
     const content = decodeEnvelope(blob).body;
     if (hasher) {
         const { alg, hash: expected } = parseChunkId(id);
-        if (hasher.alg === alg) {
-            const actual = await hasher.hash(content);
-            if (actual !== expected) {
-                throw new ChunkIntegrityError(id, expected, actual);
-            }
+        if (hasher.alg !== alg) {
+            // Fail-closed (#10): a hasher was supplied but its algorithm
+            // does not match the id's tag, so it cannot verify these bytes.
+            // Silently skipping would let a server present an unverifiable id
+            // and have its body trusted. Route to repair instead.
+            throw new ChunkAlgMismatchError(id, alg, hasher.alg);
+        }
+        const actual = await hasher.hash(content);
+        if (actual !== expected) {
+            throw new ChunkIntegrityError(id, expected, actual);
         }
     }
     return {

@@ -17,7 +17,9 @@ import type { CouchSyncDoc, ChunkDoc } from "../types.ts";
 import { stripRev } from "../utils/doc.ts";
 import { isChunkDocId } from "../types/doc-id.ts";
 import { paginateAllDocs, DEFAULT_BATCH_SIZE } from "./sync/pagination.ts";
-import { buildChunkAttachment, chunkFromAttachment } from "./chunk-attachment.ts";
+import { buildChunkAttachment, chunkFromAttachment, ChunkIntegrityError } from "./chunk-attachment.ts";
+import { EnvelopeError } from "./envelope.ts";
+import type { ChunkHasher } from "./chunker.ts";
 import { logWarn } from "../ui/log.ts";
 
 /** Partition a doc list into chunk attachments vs everything else,
@@ -138,6 +140,7 @@ export async function pushDocs(
 export async function pullDocs(
     local: IDocStore<CouchSyncDoc>,
     remote: ICouchClient,
+    hasher: ChunkHasher,
     docIds: string[],
     onProgress?: ProgressCallback,
     signal?: AbortSignal,
@@ -153,9 +156,9 @@ export async function pullDocs(
     // only the body, so a chunk doc arrives as an empty shell. Reconstruct
     // content from the attachment — the same primitive pullAll/ensureChunks
     // use — so a repaired chunk lands with its actual bytes. Non-chunk docs
-    // are left untouched; chunks whose attachment is missing are dropped
-    // rather than written content-less.
-    const notFound = await resolveChunkAttachments(localDocs, remote, signal);
+    // are left untouched; chunks whose attachment is missing OR fails the
+    // hash check are dropped rather than written content-less/untrusted.
+    const notFound = await resolveChunkAttachments(localDocs, remote, hasher, signal);
     const toWrite = notFound.size === 0
         ? localDocs
         : localDocs.filter((d) => !notFound.has(d._id));
@@ -369,6 +372,7 @@ const PULL_ATTACHMENT_CONCURRENCY = 4;
 async function resolveChunkAttachments(
     docs: CouchSyncDoc[],
     remote: ICouchClient,
+    hasher: ChunkHasher,
     signal?: AbortSignal,
 ): Promise<Set<string>> {
     const queue: number[] = [];
@@ -390,10 +394,22 @@ async function resolveChunkAttachments(
                     notFound.add(id);
                     continue;
                 }
-                // Decoder stack already stripped encryption + compression
-                // (no hasher here — Clone runs before a stable hmac hasher
-                // is available).
-                docs[i] = await chunkFromAttachment(id, blob);
+                // Authenticate at the fetch boundary (Invariant I). The
+                // decoder stack already decrypted + decompressed; verify the
+                // bytes still hash to the content-addressed id. A hash/alg
+                // mismatch or malformed envelope means the chunk is corrupt
+                // or server-substituted — treat it like a missing chunk (skip,
+                // route to repair) instead of writing untrusted bytes.
+                // Symmetric with the live-sync path in SyncEngine.ensureChunks.
+                try {
+                    docs[i] = await chunkFromAttachment(id, blob, hasher);
+                } catch (e) {
+                    if (e instanceof ChunkIntegrityError || e instanceof EnvelopeError) {
+                        notFound.add(id);
+                        continue;
+                    }
+                    throw e;
+                }
             }
         })());
     }
@@ -416,6 +432,7 @@ async function resolveChunkAttachments(
 export async function pullAll(
     local: IDocStore<CouchSyncDoc>,
     remote: ICouchClient,
+    hasher: ChunkHasher,
     onProgress?: ProgressCallback,
     signal?: AbortSignal,
 ): Promise<number> {
@@ -433,10 +450,11 @@ export async function pullAll(
         }
         if (docs.length === 0) continue;
 
-        const notFound = await resolveChunkAttachments(docs, remote, signal);
+        const notFound = await resolveChunkAttachments(docs, remote, hasher, signal);
         for (const id of notFound) notFoundTotal.add(id);
 
-        // Exclude chunks whose attachment 404'd, then strip remote _rev.
+        // Exclude chunks whose attachment 404'd or failed verification, then
+        // strip remote _rev.
         const localDocs = docs
             .filter((d) => !notFound.has(d._id))
             .map((d) => stripRev(d) as CouchSyncDoc);
@@ -453,9 +471,9 @@ export async function pullAll(
 
     if (notFoundTotal.size > 0) {
         logWarn(
-            `pullAll: ${notFoundTotal.size} chunk attachment(s) missing on remote; ` +
-            `skipped (not written as empty): ` +
-            `${[...notFoundTotal].slice(0, 3).join(", ")}${notFoundTotal.size > 3 ? "…" : ""}`,
+            `pullAll: ${notFoundTotal.size} chunk attachment(s) missing or failed ` +
+            `integrity check on remote; skipped (not written as empty), route to ` +
+            `repair: ${[...notFoundTotal].slice(0, 3).join(", ")}${notFoundTotal.size > 3 ? "…" : ""}`,
         );
     }
     return written;

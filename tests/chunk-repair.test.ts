@@ -23,6 +23,11 @@ import type { ChunkConsistencyReport } from "../src/sync/chunk-consistency.ts";
 import type { ChunkDoc, CouchSyncDoc } from "../src/types.ts";
 import { makeChunkId } from "../src/types/doc-id.ts";
 import { buildChunkAttachment } from "../src/db/chunk-attachment.ts";
+import { computeHash, type ChunkHasher } from "../src/db/chunker.ts";
+
+// x64 hasher — the verified pull fetch boundary repair now threads through.
+// Fixtures below are content-addressed (id = x64(content)) so verification passes.
+const h: ChunkHasher = { alg: "x64", hash: (d) => computeHash(d) };
 
 /** Seed a chunk on the remote the way production does — content in the
  *  `c` attachment, not the doc body. Repair-pull reconstructs content
@@ -57,12 +62,16 @@ function emptyReport(overrides: Partial<ChunkConsistencyReport> = {}): ChunkCons
     };
 }
 
-function makeChunk(hash: string): ChunkDoc {
+/** Mint a content-addressed chunk the way production does: the id is the
+ *  x64 hash of the body, so the verified pull boundary accepts it. `label`
+ *  varies the bytes so distinct logical chunks get distinct ids. */
+async function makeChunk(label: string): Promise<ChunkDoc> {
+    const content = new TextEncoder().encode(`data-${label}`);
     return {
-        _id: makeChunkId(hash),
+        _id: makeChunkId(await computeHash(content)),
         type: "chunk",
         schemaVersion: 2,
-        content: new TextEncoder().encode("data"),
+        content,
     };
 }
 
@@ -153,49 +162,49 @@ describe("repairChunkDrift", () => {
     });
 
     it("pushes referenced localOnly → remote", async () => {
-        const chunk = makeChunk("push");
+        const chunk = await makeChunk("push");
         await putLocal(db, chunk);
 
         const result = await repairChunkDrift(
             { toPush: [chunk._id], toPull: [], toDeleteLocal: [], toDeleteRemote: [] },
-            { localDb: db, remote },
+            { localDb: db, remote, chunkHasher: h },
         );
         expect(result.pushed).toBe(1);
         expect(await remote.getDoc(chunk._id)).not.toBeNull();
     });
 
     it("pulls referenced remoteOnly → local", async () => {
-        const chunk = makeChunk("pull");
+        const chunk = await makeChunk("pull");
         await seedRemoteChunk(remote, chunk);
 
         const result = await repairChunkDrift(
             { toPush: [], toPull: [chunk._id], toDeleteLocal: [], toDeleteRemote: [] },
-            { localDb: db, remote },
+            { localDb: db, remote, chunkHasher: h },
         );
         expect(result.pulled).toBe(1);
         expect(await db.get(chunk._id)).not.toBeNull();
     });
 
     it("deletes unreferenced localOnly chunks from local", async () => {
-        const chunk = makeChunk("orphan-local");
+        const chunk = await makeChunk("orphan-local");
         await putLocal(db, chunk);
         expect(await db.get(chunk._id)).not.toBeNull();
 
         const result = await repairChunkDrift(
             { toPush: [], toPull: [], toDeleteLocal: [chunk._id], toDeleteRemote: [] },
-            { localDb: db, remote },
+            { localDb: db, remote, chunkHasher: h },
         );
         expect(result.deletedLocal).toBe(1);
         expect(await db.get(chunk._id)).toBeNull();
     });
 
     it("tombstones unreferenced remoteOnly chunks on remote", async () => {
-        const chunk = makeChunk("orphan-remote");
+        const chunk = await makeChunk("orphan-remote");
         await seedRemoteChunk(remote, chunk);
 
         const result = await repairChunkDrift(
             { toPush: [], toPull: [], toDeleteLocal: [], toDeleteRemote: [chunk._id] },
-            { localDb: db, remote },
+            { localDb: db, remote, chunkHasher: h },
         );
         expect(result.deletedRemote).toBe(1);
         // Post-delete the chunk is gone from live allDocs results.
@@ -209,10 +218,10 @@ describe("repairChunkDrift", () => {
     });
 
     it("runs all four quadrants in one call", async () => {
-        const pushC = makeChunk("q-push");
-        const pullC = makeChunk("q-pull");
-        const delL = makeChunk("q-del-local");
-        const delR = makeChunk("q-del-remote");
+        const pushC = await makeChunk("q-push");
+        const pullC = await makeChunk("q-pull");
+        const delL = await makeChunk("q-del-local");
+        const delR = await makeChunk("q-del-remote");
         await putLocal(db, pushC);
         await putLocal(db, delL);
         await seedRemoteChunk(remote, pullC);
@@ -225,7 +234,7 @@ describe("repairChunkDrift", () => {
                 toDeleteLocal: [delL._id],
                 toDeleteRemote: [delR._id],
             },
-            { localDb: db, remote },
+            { localDb: db, remote, chunkHasher: h },
         );
         expect(result.pushed).toBe(1);
         expect(result.pulled).toBe(1);
@@ -241,7 +250,7 @@ describe("repairChunkDrift", () => {
     it("empty plan → zero counts, no ops", async () => {
         const result = await repairChunkDrift(
             { toPush: [], toPull: [], toDeleteLocal: [], toDeleteRemote: [] },
-            { localDb: db, remote },
+            { localDb: db, remote, chunkHasher: h },
         );
         expect(result).toMatchObject({
             pushed: 0,
@@ -253,10 +262,10 @@ describe("repairChunkDrift", () => {
     });
 
     it("emits progress events for every direction in use", async () => {
-        const pushC = makeChunk("p-push");
-        const pullC = makeChunk("p-pull");
-        const delL = makeChunk("p-del-local");
-        const delR = makeChunk("p-del-remote");
+        const pushC = await makeChunk("p-push");
+        const pullC = await makeChunk("p-pull");
+        const delL = await makeChunk("p-del-local");
+        const delR = await makeChunk("p-del-remote");
         await putLocal(db, pushC);
         await putLocal(db, delL);
         await seedRemoteChunk(remote, pullC);
@@ -273,6 +282,7 @@ describe("repairChunkDrift", () => {
             {
                 localDb: db,
                 remote,
+                chunkHasher: h,
                 onProgress: (phase) => phases.add(phase),
             },
         );
@@ -282,8 +292,8 @@ describe("repairChunkDrift", () => {
     });
 
     it("collects push failures into failed[] and continues other phases", async () => {
-        const pushC = makeChunk("will-fail");
-        const pullC = makeChunk("ok-pull");
+        const pushC = await makeChunk("will-fail");
+        const pullC = await makeChunk("ok-pull");
         await putLocal(db, pushC);
         await seedRemoteChunk(remote, pullC);
 
@@ -308,7 +318,7 @@ describe("repairChunkDrift", () => {
                 toDeleteLocal: [],
                 toDeleteRemote: [],
             },
-            { localDb: db, remote },
+            { localDb: db, remote, chunkHasher: h },
         );
         expect(result.pushed).toBe(0);
         expect(result.pulled).toBe(1);
@@ -322,7 +332,7 @@ describe("repairChunkDrift", () => {
     it("records elapsedMs", async () => {
         const result = await repairChunkDrift(
             { toPush: [], toPull: [], toDeleteLocal: [], toDeleteRemote: [] },
-            { localDb: db, remote },
+            { localDb: db, remote, chunkHasher: h },
         );
         expect(result.elapsedMs).toBeGreaterThanOrEqual(0);
     });

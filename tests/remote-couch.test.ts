@@ -25,6 +25,13 @@ import type {
     BulkDocsResult,
 } from "../src/db/interfaces.ts";
 import { makeFileId, makeChunkId } from "../src/types/doc-id.ts";
+import type { ChunkHasher } from "../src/db/chunker.ts";
+import { computeHash } from "../src/db/chunker.ts";
+import { encodeEnvelope, plainEnvelope } from "../src/db/envelope.ts";
+
+// x64 hasher for the verified pull fetch boundary. These tests seed plaintext
+// (x64) docs, so this matches; chunks with absent attachments never reach it.
+const h: ChunkHasher = { alg: "x64", hash: (d) => computeHash(d) };
 
 // ── In-memory IDocStore stub ────────────────────────────
 
@@ -223,6 +230,7 @@ describe("remote-couch (IDocStore + ICouchClient)", () => {
             const written = await pullDocs(
                 local,
                 remote,
+                h,
                 [makeFileId("a.md"), makeFileId("b.md")],
                 (id) => seen.push(id),
             );
@@ -240,14 +248,14 @@ describe("remote-couch (IDocStore + ICouchClient)", () => {
             const docA = { ...makeFileDoc("a.md", "x"), _rev: "7-remote-only" };
             remote._docs.set(docA._id, docA);
 
-            await pullDocs(local, remote, [docA._id]);
+            await pullDocs(local, remote, h, [docA._id]);
             const stored = local._docs.get(docA._id);
             expect(stored._rev).not.toBe("7-remote-only");
             expect(stored._rev).toMatch(/-stub$/);
         });
 
         it("returns 0 immediately for an empty id list", async () => {
-            const written = await pullDocs(local, remote, [], () => {});
+            const written = await pullDocs(local, remote, h, [], () => {});
             expect(written).toBe(0);
         });
 
@@ -259,6 +267,7 @@ describe("remote-couch (IDocStore + ICouchClient)", () => {
             const written = await pullDocs(
                 local,
                 remote,
+                h,
                 [makeFileId("a.md"), makeFileId("missing.md")],
                 (id) => seen.push(id),
             );
@@ -373,7 +382,7 @@ describe("remote-couch (IDocStore + ICouchClient)", () => {
             remote._docs.set(docB._id, docB);
 
             const seen: string[] = [];
-            const written = await pullAll(local, remote, (id) => seen.push(id));
+            const written = await pullAll(local, remote, h, (id) => seen.push(id));
             expect(written).toBe(2);
             expect(seen.length).toBe(2);
             expect(local._docs.has(docA._id)).toBe(true);
@@ -392,7 +401,7 @@ describe("remote-couch (IDocStore + ICouchClient)", () => {
             remote._docs.set(chunkId, { _id: chunkId, type: "chunk", schemaVersion: 2, _rev: "1-r" });
             // getAttachment returns null (stub default) → attachment missing.
 
-            const written = await pullAll(local, remote);
+            const written = await pullAll(local, remote, h);
 
             // The chunk is NOT persisted at all (neither empty nor present).
             expect(local._docs.has(chunkId)).toBe(false);
@@ -400,6 +409,22 @@ describe("remote-couch (IDocStore + ICouchClient)", () => {
             expect(local._docs.has(file._id)).toBe(true);
             // Only the file was written, not the dropped chunk.
             expect(written).toBe(1);
+        });
+
+        it("rejects a chunk whose body does not hash to its id (verified fetch boundary, #1)", async () => {
+            // Content-addressed id for "REAL", but the attachment decodes to
+            // "EVIL" — a server-substituted body. pullAll must verify against
+            // the hasher and skip it (route to repair), not write untrusted bytes.
+            const realHash = await computeHash(new TextEncoder().encode("REAL"));
+            const chunkId = makeChunkId(realHash);
+            remote._docs.set(chunkId, { _id: chunkId, type: "chunk", schemaVersion: 2, _rev: "1-r" });
+            const tampered = encodeEnvelope(plainEnvelope(new TextEncoder().encode("EVIL")));
+            remote.getAttachment = async () => tampered;
+
+            const written = await pullAll(local, remote, h);
+
+            expect(local._docs.has(chunkId)).toBe(false); // skipped, not trusted
+            expect(written).toBe(0);
         });
     });
 });

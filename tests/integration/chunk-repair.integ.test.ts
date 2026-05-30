@@ -29,6 +29,12 @@ import { buildChunkAttachment } from "../../src/db/chunk-attachment.ts";
 import { EncryptingCouchClient } from "../../src/db/encrypting-couch-client.ts";
 import { deriveKeys, generateSalt, createCryptoProvider } from "../../src/db/crypto-provider.ts";
 import { decodeEnvelope } from "../../src/db/envelope.ts";
+import { computeHash, type ChunkHasher } from "../../src/db/chunker.ts";
+
+// x64 hasher for the verified pull boundary. Fixtures are content-addressed
+// (id = x64(content)); the encrypted test only encrypts attachment bytes, not
+// the chunk id, so x64 still matches there.
+const h: ChunkHasher = { alg: "x64", hash: (d) => computeHash(d) };
 
 /** Seed docs on the remote the way production writes them: chunk bodies
  *  ride in the `c` attachment (bulkDocsWithAttachments), everything else
@@ -72,12 +78,13 @@ function file(path: string, chunkIds: string[]): FileDoc {
     };
 }
 
-function chunk(hash: string): ChunkDoc {
+async function chunk(label: string): Promise<ChunkDoc> {
+    const content = new TextEncoder().encode(`data-${label}`);
     return {
-        _id: makeChunkId(hash),
+        _id: makeChunkId(await computeHash(content)),
         type: "chunk",
         schemaVersion: 2,
-        content: new TextEncoder().encode("data"),
+        content,
     };
 }
 
@@ -107,7 +114,7 @@ describe("Integration: chunk-repair", () => {
     it("heals a localOnly chunk: push to remote closes the gap", async () => {
         const { db, remote } = mkDevice("push");
 
-        const c = chunk("drift-push");
+        const c = await chunk("drift-push");
         const f = file("a.md", [c._id]);
         // Local has FileDoc + chunk, remote only has the FileDoc.
         await putLocal(db, [c, f]);
@@ -118,7 +125,7 @@ describe("Integration: chunk-repair", () => {
 
         const result = await repairChunkDrift(
             planFromReport(before),
-            { localDb: db, remote },
+            { localDb: db, remote, chunkHasher: h },
         );
         expect(result.pushed).toBe(1);
         expect(result.failed).toEqual([]);
@@ -132,7 +139,7 @@ describe("Integration: chunk-repair", () => {
     it("heals a remoteOnly chunk: pull from remote closes the gap", async () => {
         const { db, remote } = mkDevice("pull");
 
-        const c = chunk("drift-pull");
+        const c = await chunk("drift-pull");
         const f = file("b.md", [c._id]);
         // Remote has FileDoc + chunk, local only has the FileDoc.
         await putLocal(db, [f]);
@@ -143,7 +150,7 @@ describe("Integration: chunk-repair", () => {
 
         const result = await repairChunkDrift(
             planFromReport(before),
-            { localDb: db, remote },
+            { localDb: db, remote, chunkHasher: h },
         );
         expect(result.pulled).toBe(1);
 
@@ -155,8 +162,8 @@ describe("Integration: chunk-repair", () => {
     it("heals bidirectional drift in a single run", async () => {
         const { db, remote } = mkDevice("both");
 
-        const lc = chunk("local-drift");
-        const rc = chunk("remote-drift");
+        const lc = await chunk("local-drift");
+        const rc = await chunk("remote-drift");
         const fLocal = file("l.md", [lc._id]);
         const fRemote = file("r.md", [rc._id]);
         // Both sides have both FileDocs (so references are known everywhere),
@@ -170,7 +177,7 @@ describe("Integration: chunk-repair", () => {
 
         const result = await repairChunkDrift(
             planFromReport(before),
-            { localDb: db, remote },
+            { localDb: db, remote, chunkHasher: h },
         );
         expect(result.pushed).toBe(1);
         expect(result.pulled).toBe(1);
@@ -184,9 +191,9 @@ describe("Integration: chunk-repair", () => {
     it("deletes one-sided orphans from the side they live on", async () => {
         const { db, remote } = mkDevice("one-sided-orphans");
 
-        const kept = chunk("kept");
-        const localOrphan = chunk("loc-only-orphan");
-        const remoteOrphan = chunk("rem-only-orphan");
+        const kept = await chunk("kept");
+        const localOrphan = await chunk("loc-only-orphan");
+        const remoteOrphan = await chunk("rem-only-orphan");
         const ghost = makeChunkId("ghost");
         const healthy = file("h.md", [kept._id]);
         const broken = file("b.md", [ghost]);
@@ -200,7 +207,7 @@ describe("Integration: chunk-repair", () => {
 
         const result = await repairChunkDrift(
             planFromReport(before),
-            { localDb: db, remote },
+            { localDb: db, remote, chunkHasher: h },
         );
         // One-sided orphans are deleted from their side (neither copy
         // nor a no-op). This is where the repair complements GC.
@@ -223,7 +230,7 @@ describe("Integration: chunk-repair", () => {
     it("only cleans one-sided orphans; two-sided orphans are GC's job", async () => {
         const { db, remote } = mkDevice("two-sided");
 
-        const bothSidesOrphan = chunk("both-orphan");
+        const bothSidesOrphan = await chunk("both-orphan");
         // Seed the same unreferenced chunk on both sides, with no file
         // referencing it. The report will list it in orphanLocal AND
         // orphanRemote, but NOT in localOnly / remoteOnly.
@@ -238,7 +245,7 @@ describe("Integration: chunk-repair", () => {
 
         const result = await repairChunkDrift(
             planFromReport(before),
-            { localDb: db, remote },
+            { localDb: db, remote, chunkHasher: h },
         );
         expect(result.deletedLocal).toBe(0);
         expect(result.deletedRemote).toBe(0);
@@ -252,7 +259,7 @@ describe("Integration: chunk-repair", () => {
     it("empty drift → repair is a no-op and report stays clean", async () => {
         const { db, remote } = mkDevice("noop");
 
-        const c = chunk("kept");
+        const c = await chunk("kept");
         const f = file("a.md", [c._id]);
         await putLocal(db, [c, f]);
         await seedRemote(remote, [c, f]);
@@ -260,7 +267,7 @@ describe("Integration: chunk-repair", () => {
         const before = await analyzeConverged({ localDb: db, remote });
         const result = await repairChunkDrift(
             planFromReport(before),
-            { localDb: db, remote },
+            { localDb: db, remote, chunkHasher: h },
         );
         expect(result.pushed).toBe(0);
         expect(result.pulled).toBe(0);
@@ -287,7 +294,7 @@ describe("Integration: chunk-repair", () => {
         cleanups.push(async () => { await db.destroy(); });
         cleanups.push(async () => { await inner.destroy(); });
 
-        const c = chunk("enc-drift-pull");
+        const c = await chunk("enc-drift-pull");
         const f = file("secret.md", [c._id]);
         // Local has only the FileDoc; remote (encrypted) has both.
         await putLocal(db, [f]);
@@ -309,7 +316,7 @@ describe("Integration: chunk-repair", () => {
 
         const result = await repairChunkDrift(
             planFromReport(before),
-            { localDb: db, remote: enc },
+            { localDb: db, remote: enc, chunkHasher: h },
         );
         expect(result.pulled).toBe(1);
         expect(result.failed).toEqual([]);
@@ -317,7 +324,7 @@ describe("Integration: chunk-repair", () => {
         // Pulled chunk landed with its DECRYPTED content, not an empty shell.
         const local = await db.getChunks([c._id]);
         expect(local).toHaveLength(1);
-        expect(new TextDecoder().decode(local[0].content)).toBe("data");
+        expect(new TextDecoder().decode(local[0].content)).toBe("data-enc-drift-pull");
 
         const after = await analyzeConverged({ localDb: db, remote: enc });
         expect(after.counts.remoteOnly).toBe(0);

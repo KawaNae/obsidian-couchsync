@@ -3,6 +3,7 @@ import {
     buildChunkAttachment,
     chunkFromAttachment,
     ChunkIntegrityError,
+    ChunkAlgMismatchError,
     CHUNK_ATTACHMENT_NAME,
     CHUNK_CONTENT_TYPE,
 } from "../src/db/chunk-attachment.ts";
@@ -70,18 +71,24 @@ describe("chunk-attachment round-trip", () => {
         ).rejects.toBeInstanceOf(ChunkIntegrityError);
     });
 
-    it("skips verification when the hasher's alg differs from the id's tag", async () => {
-        // hmac-tagged id but only an x64 hasher available → cannot verify,
-        // must not false-positive throw.
+    it("fail-closed: throws ChunkAlgMismatchError when the hasher's alg differs from the id's tag (#10)", async () => {
+        // hmac-tagged id but only an x64 hasher available → the hasher cannot
+        // verify these bytes. Previously this silently skipped verification,
+        // letting a server present an unverifiable id and have its body
+        // trusted. Now it fails closed and routes to repair.
         const content = new Uint8Array([5, 5]);
         const hmacId = makeChunkId("deadbeef", "hmac");
         const blob = buildChunkAttachment(
             { _id: hmacId, type: "chunk", schemaVersion: CHUNK_SCHEMA_VERSION, content },
         ).attachments.c.data;
 
-        const back = await chunkFromAttachment(hmacId, blob, x64Hasher);
-        expect(back._id).toBe(hmacId);
-        expect(Array.from(back.content)).toEqual(Array.from(content));
+        await expect(
+            chunkFromAttachment(hmacId, blob, x64Hasher),
+        ).rejects.toBeInstanceOf(ChunkAlgMismatchError);
+        // Subclass of ChunkIntegrityError so existing catch sites treat it as corrupt.
+        await expect(
+            chunkFromAttachment(hmacId, blob, x64Hasher),
+        ).rejects.toBeInstanceOf(ChunkIntegrityError);
     });
 
     it("stamps the CHUNK_SCHEMA_VERSION constant, not a literal", async () => {

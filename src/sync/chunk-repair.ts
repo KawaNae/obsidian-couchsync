@@ -26,6 +26,7 @@
 import type { ChunkConsistencyReport } from "./chunk-consistency.ts";
 import type { LocalDB } from "../db/local-db.ts";
 import type { ICouchClient } from "../db/interfaces.ts";
+import type { ChunkHasher } from "../db/chunker.ts";
 import {
     pushDocs,
     pullDocs,
@@ -52,6 +53,10 @@ export type ChunkRepairDirection =
 export interface ChunkRepairDeps {
     localDb: LocalDB;
     remote: ICouchClient;
+    /** Verifies pulled chunk bodies against their content-addressed id —
+     *  the same authenticated fetch boundary the live loop uses (Invariant I).
+     *  A `toPull` chunk whose body fails the check is skipped, not written. */
+    chunkHasher: ChunkHasher;
     onProgress?: (
         phase: ChunkRepairDirection,
         current: number,
@@ -139,7 +144,7 @@ export async function repairChunkDrift(
         plan.toPull,
         failed,
         (onIndividual) =>
-            pullDocs(deps.localDb, deps.remote, plan.toPull, (id, count) => {
+            pullDocs(deps.localDb, deps.remote, deps.chunkHasher, plan.toPull, (id, count) => {
                 onIndividual(id);
                 deps.onProgress?.("pull", count, plan.toPull.length);
             }),

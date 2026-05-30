@@ -299,7 +299,7 @@ export async function createE2EHarness(opts: CreateE2EHarnessOpts = {}): Promise
         const writer = new FilesystemVaultWriter(vault);
         const vs = new VaultSync(vault, db, getSettings, writer, hasher);
         const ct = new ChangeTracker(vaultEvents, vs, getSettings);
-        const remoteOps = new VaultRemoteOps(db, getSettings, auth, wrapVaultClient);
+        const remoteOps = new VaultRemoteOps(db, getSettings, auth, wrapVaultClient, hasher);
 
         const engine = new SyncEngine(
             db,

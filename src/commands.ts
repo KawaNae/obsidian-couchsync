@@ -164,6 +164,7 @@ export async function runChunkConsistencyReport(
                 const repairResult = await repairChunkDrift(plan, {
                     localDb: plugin.localDb,
                     remote,
+                    chunkHasher: plugin.remoteOps.chunkHasher,
                     onProgress: (phase, current, total) =>
                         repairProgress.update(`${phase}: ${current}/${total}`),
                 });
