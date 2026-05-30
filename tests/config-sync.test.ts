@@ -123,6 +123,32 @@ describe("ConfigSync", () => {
             expect(await db.get(makeConfigId(".obsidian/plugins/obsidian-couchsync/data.json"))).toBeNull();
         });
 
+        it("skips own data.json under a RENAMED plugin folder via the host-supplied path (#14)", async () => {
+            // BRAT / manual install can put the plugin under its repo name, so a
+            // hardcoded folder literal would miss the data.json (which holds the
+            // plaintext password + passphrase) and push it to the config server.
+            const renamed = ".obsidian/plugins/KawaNae-obsidian-couchsync/data.json";
+            const cs2 = new ConfigSync(
+                vault, modal, db, auth, ALWAYS_VISIBLE, NoopReconnectBridge,
+                () => settings,
+                // clientFactory, hasher, onConfigCryptoChange, rawClientFactory
+                undefined, undefined, undefined, undefined,
+                renamed, /* ownDataJsonPath = manifest.dir + "/data.json" */
+            );
+            vault.addFile(renamed, `{"couchdbPassword":"SECRET","encryptionPassphrase":"SECRET"}`);
+            // A normal config file alongside it, to prove scan still runs.
+            vault.addFile(".obsidian/app.json", `{"theme":"dark"}`);
+
+            const count = await cs2.scan();
+            expect(count).toBe(1); // only app.json
+            expect(await db.get(makeConfigId(renamed))).toBeNull(); // secret data.json excluded
+            expect(await db.get(makeConfigId(".obsidian/app.json"))).not.toBeNull();
+            // And the default-folder literal is NOT special-cased away here.
+            vault.addFile(".obsidian/plugins/obsidian-couchsync/data.json", "{}");
+            await cs2.scan();
+            expect(await db.get(makeConfigId(".obsidian/plugins/obsidian-couchsync/data.json"))).not.toBeNull();
+        });
+
         it("skips files exceeding MAX_CONFIG_SIZE (5MB)", async () => {
             const big = "x".repeat(6 * 1024 * 1024);
             vault.addFile(".obsidian/big.json", big);

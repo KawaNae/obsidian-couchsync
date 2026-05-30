@@ -91,10 +91,19 @@ function defaultClientFactory(settings: CouchSyncSettings): ICouchClient | null 
 export class ConfigSync {
     private static readonly SKIP_DIRS = new Set(["node_modules", ".git"]);
     private static readonly SKIP_FILES = new Set(["workspace.json", "workspace-mobile.json"]);
-    /** Own data.json — contains deviceId, must not be synced across devices. */
-    private static readonly SKIP_PATHS = new Set([
-        ".obsidian/plugins/obsidian-couchsync/data.json",
-    ]);
+    /** Fallback own-data.json path, used only when the host does not supply
+     *  the real install path. Fragile (assumes the default folder name) — see
+     *  `skipPaths`, which prefers the manifest-derived path (#14). */
+    private static readonly DEFAULT_OWN_DATA_PATH =
+        ".obsidian/plugins/obsidian-couchsync/data.json";
+
+    /** Paths excluded from config replication. The plugin's OWN data.json
+     *  carries the deviceId AND the plaintext CouchDB password / encryption
+     *  passphrase, so it must NEVER be pushed to the (untrusted) config server.
+     *  Derived from the real install path the host passes in (`manifest.dir`),
+     *  not a hardcoded folder name — a BRAT / manually-renamed plugin folder
+     *  still gets its data.json excluded (#14). */
+    private readonly skipPaths: Set<string>;
     private static readonly MAX_CONFIG_SIZE = 5 * 1024 * 1024; // 5MB
 
     /** In-flight op, or null. Concurrent ops are rejected. */
@@ -162,6 +171,10 @@ export class ConfigSync {
         hasher?: ChunkHasher,
         onConfigCryptoChange?: (crypto: CryptoProvider | null) => void,
         rawClientFactory?: (settings: CouchSyncSettings) => ICouchClient | null,
+        /** The plugin's real own-data.json path (host passes `manifest.dir`
+         *  + "/data.json"). Falls back to the default-folder literal when
+         *  omitted (older tests). See `skipPaths` (#14). */
+        ownDataJsonPath?: string,
     ) {
         this.clientFactory = clientFactory ?? defaultClientFactory;
         this.lastSynced = configDb ? new ConfigLastSynced(configDb) : null;
@@ -170,6 +183,7 @@ export class ConfigSync {
         this.hasher = hasher;
         this.onConfigCryptoChange = onConfigCryptoChange;
         this.rawClientFactory = rawClientFactory;
+        this.skipPaths = new Set([ownDataJsonPath ?? ConfigSync.DEFAULT_OWN_DATA_PATH]);
     }
 
     /** Lazy-load the persisted pull/push cursors. Idempotent — safe to
@@ -548,7 +562,7 @@ export class ConfigSync {
             const file = files[i];
             const fileName = file.split("/").pop() ?? "";
             if (ConfigSync.SKIP_FILES.has(fileName)) continue;
-            if (ConfigSync.SKIP_PATHS.has(file)) continue;
+            if (this.skipPaths.has(file)) continue;
 
             try {
                 onProgress?.(file, i + 1, files.length);
@@ -661,7 +675,7 @@ export class ConfigSync {
         for (let i = 0; i < docs.length; i++) {
             const doc = docs[i];
             const path = configPathFromId(doc._id);
-            if (ConfigSync.SKIP_PATHS.has(path)) continue;
+            if (this.skipPaths.has(path)) continue;
             try {
                 onProgress?.(path, i + 1, docs.length);
                 const chunks = await db.getChunks(doc.chunks);

@@ -193,6 +193,21 @@ export default class CouchSyncPlugin extends Plugin {
      * an independent UI toggle).
      */
     private wrapConfigClient = (raw: CouchClient): ICouchClient => {
+        // Fail-closed codec integrity, symmetric with wrapVaultClient (#12).
+        // Without this, a config DB that is supposed to be encrypted but whose
+        // `configCryptoProvider` is momentarily unset (onload early-derive
+        // failed non-fatally / provisioning incomplete) would silently build a
+        // plaintext stack and write UNENCRYPTED config bodies into an encrypted
+        // config DB. Refuse to build an inconsistent stack instead.
+        const configEncEnabled = this.settings.configEncryptionEnabled
+            ?? this.settings.encryptionEnabled;
+        if (configEncEnabled && !this.configCryptoProvider) {
+            throw new Error(
+                "CouchSync: refusing to build config client — config DB is " +
+                    "encrypted but no crypto provider is unlocked (provisioning " +
+                    "incomplete). Re-run Config Init or unlock the vault.",
+            );
+        }
         let client: ICouchClient = raw;
         if (this.configCryptoProvider) {
             client = new EncryptingCouchClient(
@@ -404,6 +419,13 @@ export default class CouchSyncPlugin extends Plugin {
             // so subsequent `wrapConfigClient` calls produce the right
             // encrypting stack. Null = encryption disabled on config.
             (crypto) => { this.configCryptoProvider = crypto ?? undefined; },
+            undefined, // rawClientFactory — production builds via makeCouchClient
+            // Real own-data.json path so ConfigSync excludes it from replication
+            // even under a renamed plugin folder (#14). manifest.dir is the
+            // actual install dir; fall back to the configDir + id composition.
+            this.manifest.dir
+                ? `${this.manifest.dir}/data.json`
+                : `${this.app.vault.configDir}/plugins/${this.manifest.id}/data.json`,
         );
         this.statusBar = new StatusBar(
             this,

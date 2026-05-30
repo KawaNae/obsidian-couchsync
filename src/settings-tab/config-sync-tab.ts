@@ -39,6 +39,11 @@ export interface ConfigSyncTabDeps {
     auth: AuthGate;
     remoteOps: VaultRemoteOps;
     modalPresenter: IModalPresenter;
+    /** Config-DB codec mismatch surfaced by the onload agreement check
+     *  (remote encrypted/plaintext disagrees with local, or a cipherVersion
+     *  downgrade was detected). Symmetric to the vault tab's
+     *  `encryptionMismatch`. */
+    configEncryptionMismatch?: { status: string };
     refresh: () => void;
 }
 
@@ -141,6 +146,16 @@ export class ConfigSyncTab {
                     .setValue(settings.encryptionEnabled)
                     .setDisabled(true)
             );
+
+        if (this.deps.configEncryptionMismatch) {
+            const warn = el.createEl("p", {
+                text: "Config DB encryption state disagrees with this device " +
+                    "(or a cipherVersion downgrade was detected on the server). " +
+                    "Re-run Config Init & Push, or verify the server.",
+                cls: "setting-item-description mod-warning",
+            });
+            warn.style.color = "var(--text-error)";
+        }
 
         // ── Gate: vault sync must be at least Tested ────────
         if (!vaultReady) {
