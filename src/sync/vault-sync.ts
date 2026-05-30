@@ -878,6 +878,14 @@ export class VaultSync {
         const settings = this.getSettings();
         if (path.startsWith(".")) return false;
 
+        // Diagnostic log exports (couchsync_log_<device>_<ts>.md, written by the
+        // Maintenance "Export logs" action) carry device/OS metadata and
+        // internal file paths from error lines. Exclude them from sync so they
+        // don't reach the (untrusted) server as plaintext content on a
+        // non-encrypted vault (#19); they remain readable locally.
+        const base = path.slice(path.lastIndexOf("/") + 1);
+        if (/^couchsync_log_.*\.md$/.test(base)) return false;
+
         if (settings.syncFilter) {
             const re = this.compileSyncRegex("syncFilter", settings.syncFilter);
             if (re && !re.test(path)) return false;

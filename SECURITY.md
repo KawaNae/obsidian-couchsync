@@ -95,13 +95,18 @@ and recorded in the `vault:meta` document. They form four named modes:
 - **Anything stored locally on your devices**: Obsidian writes
   plaintext to disk. Local file-system compromise reveals everything. The
   plugin's own `data.json` also stores your CouchDB password and encryption
-  passphrase in plaintext.
+  passphrase in plaintext. This is local-FS-access only (out of scope above);
+  on the same machine an attacker already has every plaintext note. Migrating
+  these secrets to Obsidian/OS SecretStorage is planned. v0.26.0 did not change
+  this — it stores no new secret.
 - **A weak passphrase against offline brute force**: the per-vault `salt`
   and `keyCheck` are readable by anyone with server access, so an attacker
   who copies them can guess passphrases offline. Each guess costs one
   PBKDF2-SHA-256 (600k) derivation — strong against casual attempts but
   PBKDF2-SHA-256 is comparatively GPU-friendly, so a short or common
-  passphrase is recoverable. Use a long, high-entropy passphrase.
+  passphrase is recoverable. Use a long, high-entropy passphrase. v0.26.0's
+  encBody scheme added authenticated, confidential doc bodies but introduced no
+  new server-readable verification oracle.
 
 ## Why turn compression off (`encrypt` mode)
 

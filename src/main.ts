@@ -413,19 +413,23 @@ export default class CouchSyncPlugin extends Plugin {
             this.replicator.getVisibilityGate(),
             reconnectBridge,
             () => this.settings,
-            encConfigClientFactory,
-            configChunkHasher,
-            // Phase 2: hand a freshly-derived config CryptoProvider back
-            // so subsequent `wrapConfigClient` calls produce the right
-            // encrypting stack. Null = encryption disabled on config.
-            (crypto) => { this.configCryptoProvider = crypto ?? undefined; },
-            undefined, // rawClientFactory — production builds via makeCouchClient
-            // Real own-data.json path so ConfigSync excludes it from replication
-            // even under a renamed plugin folder (#14). manifest.dir is the
-            // actual install dir; fall back to the configDir + id composition.
-            this.manifest.dir
-                ? `${this.manifest.dir}/data.json`
-                : `${this.app.vault.configDir}/plugins/${this.manifest.id}/data.json`,
+            {
+                clientFactory: encConfigClientFactory,
+                hasher: configChunkHasher,
+                // Phase 2: hand a freshly-derived config CryptoProvider back
+                // so subsequent `wrapConfigClient` calls produce the right
+                // encrypting stack. Null = encryption disabled on config.
+                onConfigCryptoChange: (crypto) => {
+                    this.configCryptoProvider = crypto ?? undefined;
+                },
+                // Real own-data.json path so ConfigSync excludes it from
+                // replication even under a renamed plugin folder (#14).
+                // manifest.dir is the actual install dir; fall back to the
+                // configDir + id composition.
+                ownDataJsonPath: this.manifest.dir
+                    ? `${this.manifest.dir}/data.json`
+                    : `${this.app.vault.configDir}/plugins/${this.manifest.id}/data.json`,
+            },
         );
         this.statusBar = new StatusBar(
             this,

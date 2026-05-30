@@ -46,6 +46,17 @@ describe("buildExportFileName", () => {
         const name = buildExportFileName("dev/box:1", Date.UTC(2026, 4, 11, 23, 15, 42));
         expect(name).toBe("couchsync_log_dev_box_1_2026-05-11T23-15-42.md");
     });
+
+    it("matches the VaultSync.shouldSync exclusion pattern (#19)", () => {
+        // VaultSync excludes /^couchsync_log_.*\.md$/ from sync so exported
+        // diagnostics never reach the server as plaintext content. Pin that the
+        // generated name still matches that pattern — if the prefix ever
+        // changes here, this fails before the exclusion silently breaks.
+        const exclusion = /^couchsync_log_.*\.md$/;
+        expect(buildExportFileName("melchior-main", Date.UTC(2026, 4, 11, 23, 15, 42))).toMatch(exclusion);
+        expect(buildExportFileName("", 0)).toMatch(exclusion);
+        expect(buildExportFileName("dev/box:1", 0)).toMatch(exclusion);
+    });
 });
 
 describe("formatLogExport", () => {

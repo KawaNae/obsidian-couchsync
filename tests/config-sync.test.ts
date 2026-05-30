@@ -131,9 +131,7 @@ describe("ConfigSync", () => {
             const cs2 = new ConfigSync(
                 vault, modal, db, auth, ALWAYS_VISIBLE, NoopReconnectBridge,
                 () => settings,
-                // clientFactory, hasher, onConfigCryptoChange, rawClientFactory
-                undefined, undefined, undefined, undefined,
-                renamed, /* ownDataJsonPath = manifest.dir + "/data.json" */
+                { ownDataJsonPath: renamed }, // = manifest.dir + "/data.json"
             );
             vault.addFile(renamed, `{"couchdbPassword":"SECRET","encryptionPassphrase":"SECRET"}`);
             // A normal config file alongside it, to prove scan still runs.

@@ -88,6 +88,26 @@ function defaultClientFactory(settings: CouchSyncSettings): ICouchClient | null 
     );
 }
 
+/** Optional ConfigSync wiring. Production sets `onConfigCryptoChange` +
+ *  `ownDataJsonPath`; tests inject `clientFactory` / `rawClientFactory` fakes.
+ *  Bundled into one object so call sites name what they pass (#11). */
+export interface ConfigSyncOptions {
+    /** Override the wrapped client factory (tests inject a fake; production
+     *  uses the default `makeCouchClient`-based factory). */
+    clientFactory?: (settings: CouchSyncSettings) => ICouchClient | null;
+    /** Per-DB chunk hasher (flips x64 ↔ hmac with the config crypto provider). */
+    hasher?: ChunkHasher;
+    /** Receives a freshly-derived config CryptoProvider after Init/Pull. */
+    onConfigCryptoChange?: (crypto: CryptoProvider | null) => void;
+    /** RAW (un-wrapped) client factory for the never-encrypted `config:meta`
+     *  push. Tests inject the same fake as the wrapped factory. */
+    rawClientFactory?: (settings: CouchSyncSettings) => ICouchClient | null;
+    /** The plugin's real own-data.json path (host passes `manifest.dir` +
+     *  "/data.json"); excluded from replication (#14). Falls back to the
+     *  default-folder literal when omitted. */
+    ownDataJsonPath?: string;
+}
+
 export class ConfigSync {
     private static readonly SKIP_DIRS = new Set(["node_modules", ".git"]);
     private static readonly SKIP_FILES = new Set(["workspace.json", "workspace-mobile.json"]);
@@ -167,23 +187,19 @@ export class ConfigSync {
         private visibility: VisibilityGate,
         private reconnectBridge: ReconnectBridge,
         private getSettings: () => CouchSyncSettings,
-        clientFactory?: (settings: CouchSyncSettings) => ICouchClient | null,
-        hasher?: ChunkHasher,
-        onConfigCryptoChange?: (crypto: CryptoProvider | null) => void,
-        rawClientFactory?: (settings: CouchSyncSettings) => ICouchClient | null,
-        /** The plugin's real own-data.json path (host passes `manifest.dir`
-         *  + "/data.json"). Falls back to the default-folder literal when
-         *  omitted (older tests). See `skipPaths` (#14). */
-        ownDataJsonPath?: string,
+        // Optional wiring is bundled into one options object rather than a long
+        // positional tail — the latter was easy to mis-order (#11), since only
+        // tests ever supplied most of these and a slot could be silently skipped.
+        opts: ConfigSyncOptions = {},
     ) {
-        this.clientFactory = clientFactory ?? defaultClientFactory;
+        this.clientFactory = opts.clientFactory ?? defaultClientFactory;
         this.lastSynced = configDb ? new ConfigLastSynced(configDb) : null;
         this.checkpoints = configDb ? new ConfigCheckpoints(configDb) : null;
         this.conflictResolver = new ConflictResolver();
-        this.hasher = hasher;
-        this.onConfigCryptoChange = onConfigCryptoChange;
-        this.rawClientFactory = rawClientFactory;
-        this.skipPaths = new Set([ownDataJsonPath ?? ConfigSync.DEFAULT_OWN_DATA_PATH]);
+        this.hasher = opts.hasher;
+        this.onConfigCryptoChange = opts.onConfigCryptoChange;
+        this.rawClientFactory = opts.rawClientFactory;
+        this.skipPaths = new Set([opts.ownDataJsonPath ?? ConfigSync.DEFAULT_OWN_DATA_PATH]);
     }
 
     /** Lazy-load the persisted pull/push cursors. Idempotent — safe to

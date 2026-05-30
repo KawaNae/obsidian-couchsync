@@ -72,12 +72,12 @@ describe("ConfigSetupService — clean-slate init (PR5)", () => {
             ALWAYS_VISIBLE,
             NoopReconnectBridge,
             () => settings,
-            () => asCouchClient(remote),
-            undefined,
-            undefined,
-            // Phase 2: raw client factory reuses the in-memory fake
-            // because the test has no real codec layer to bypass.
-            () => asCouchClient(remote),
+            {
+                clientFactory: () => asCouchClient(remote),
+                // Phase 2: raw client factory reuses the in-memory fake
+                // because the test has no real codec layer to bypass.
+                rawClientFactory: () => asCouchClient(remote),
+            },
         );
     });
 

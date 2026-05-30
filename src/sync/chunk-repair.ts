@@ -199,6 +199,14 @@ export async function repairChunkDrift(
     // referenced — tombstoning it would break the referencing file. Content-
     // addressing makes "don't delete" the safe side (a still-orphan chunk is
     // reclaimed by the next GC), so we never need to re-add anything here.
+    //
+    // #16 (residual window, accepted): this is a non-transactional check-then-
+    // delete against CouchDB. A FileDoc pushed in the gap between this
+    // enumeration and the deleteRemoteDocs bulkDocs below is not re-checked, so
+    // a chunk it newly references could still be tombstoned. The window is one
+    // round-trip wide and self-healing — the owning device re-pushes the
+    // content-addressed chunk on its next sync — so it is left as-is rather
+    // than taken under a lock the storage layer does not provide.
     let toTombstone = plan.toDeleteRemote;
     if (plan.toDeleteRemote.length > 0) {
         const liveRefs = await liveRemoteChunkRefs(deps.remote, undefined, deps.signal);

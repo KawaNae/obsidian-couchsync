@@ -131,6 +131,12 @@ export class EncryptingCouchClient implements ICouchClient {
         const { _id: _omitId, _rev, ...body } = doc;
         void _omitId;
         const payload = UTF8.encode(JSON.stringify({ path, ...body }));
+        // NB (#17): doc-BODY compression here is ALWAYS-ON and independent of
+        // the user's compression toggle (which gates only attachment bodies via
+        // CompressingCouchClient). It is safe because `gzipIfSmaller` keeps the
+        // result only when strictly smaller and the envelope's self-describing
+        // `compressed` bit makes decode unambiguous regardless of any flag —
+        // chunk-id arrays must pack down before encryption renders them opaque.
         const { compressed, body: maybeGz } = await gzipIfSmaller(payload);
         const { iv, cipher } = await this.crypto.encryptBytesIv(
             maybeGz, UTF8.encode(remoteId),

@@ -73,12 +73,12 @@ describe("ConfigSync.init() — wipe-and-replace remote", () => {
             ALWAYS_VISIBLE,
             NoopReconnectBridge,
             () => settings,
-            () => asCouchClient(remote),
-            undefined,
-            undefined,
-            // Raw client factory: tests reuse the same in-memory remote
-            // since there's no actual codec to bypass.
-            () => asCouchClient(remote),
+            {
+                clientFactory: () => asCouchClient(remote),
+                // Raw client factory: tests reuse the same in-memory remote
+                // since there's no actual codec to bypass.
+                rawClientFactory: () => asCouchClient(remote),
+            },
         );
     });
 
