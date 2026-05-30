@@ -20,6 +20,9 @@ import { unpushedKey, type UnpushedEntry, type UnpushedReason } from "./unpushed
 import {
     pendingApplyKey, type PendingApplyEntry, type PendingApplyReason,
 } from "./pending-apply.ts";
+import {
+    pendingConflictKey, type PendingConflictEntry,
+} from "./pending-conflict.ts";
 
 export const META_REMOTE_SEQ = "_sync/remote-seq";
 export const META_PUSH_SEQ = "_sync/push-seq";
@@ -93,6 +96,10 @@ export class Checkpoints {
         docs: CouchSyncDoc[];
         nextRemoteSeq: number | string;
         pendingApplyAdd?: string[];
+        /** File-doc ids whose remote-deletion-vs-local-edit conflict must be
+         *  persisted in the SAME tx as the cursor advance (Invariant B for the
+         *  deletion-conflict class — see pending-conflict.ts). */
+        pendingConflictAdd?: string[];
         onCommit: () => Promise<void>;
     }): Promise<void> {
         const meta: MetaWrite[] = [
@@ -104,6 +111,12 @@ export class Checkpoints {
                 addedAt: now, reason: "missing-chunks", attempts: 0,
             };
             meta.push({ op: "put", key: pendingApplyKey(id), value: entry });
+        }
+        for (const id of params.pendingConflictAdd ?? []) {
+            const entry: PendingConflictEntry = {
+                addedAt: now, kind: "pull-delete-vs-edit",
+            };
+            meta.push({ op: "put", key: pendingConflictKey(id), value: entry });
         }
         await this.localDb.runWriteTx({
             docs: params.docs.map((d) => ({ doc: d })),
@@ -146,9 +159,26 @@ export class Checkpoints {
      * docs (empty fetch, or every row skipped by echo/keep-local). Persists
      * both seqs so the on-disk cursor matches in-memory state.
      */
-    async saveEmptyPullBatch(nextRemoteSeq: number | string): Promise<void> {
+    async saveEmptyPullBatch(
+        nextRemoteSeq: number | string,
+        pendingConflictAdd?: string[],
+    ): Promise<void> {
+        const meta: MetaWrite[] = [
+            { op: "put", key: META_REMOTE_SEQ, value: nextRemoteSeq },
+        ];
+        // A delete-only batch produces no accepted docs but may still carry a
+        // remote-deletion-vs-local-edit conflict. Persist it in the SAME tx as
+        // the cursor advance so the deletion intent survives a missed modal /
+        // restart (Invariant B for the deletion-conflict class).
+        const now = Date.now();
+        for (const id of pendingConflictAdd ?? []) {
+            const entry: PendingConflictEntry = {
+                addedAt: now, kind: "pull-delete-vs-edit",
+            };
+            meta.push({ op: "put", key: pendingConflictKey(id), value: entry });
+        }
         await this.localDb.runWriteTx({
-            meta: [{ op: "put", key: META_REMOTE_SEQ, value: nextRemoteSeq }],
+            meta,
             onCommit: () => { this.remoteSeq = nextRemoteSeq; },
         });
     }

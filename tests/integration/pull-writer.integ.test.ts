@@ -19,6 +19,10 @@ import { PullWriter } from "../../src/db/sync/pull-writer.ts";
 import { EchoTracker } from "../../src/db/sync/echo-tracker.ts";
 import { SyncEvents } from "../../src/db/sync/sync-events.ts";
 import { Checkpoints } from "../../src/db/sync/checkpoints.ts";
+import {
+    loadAllPendingConflict,
+    clearPendingConflict,
+} from "../../src/db/sync/pending-conflict.ts";
 import { ConflictResolver } from "../../src/conflict/conflict-resolver.ts";
 import type { WriteResult } from "../../src/sync/vault-writer.ts";
 import { makeFileId, makeChunkId } from "../../src/types/doc-id.ts";
@@ -717,6 +721,92 @@ describe("PullWriter integration", () => {
 
             await rig.writer.drainPendingApply();
             expect(await b.db.getMetaByPrefix(PENDING_PREFIX)).toEqual([]);
+        });
+    });
+
+    // ── #3: deletion-conflict durability ─────────────────
+    describe("pending-conflict (remote-delete vs local-edit durability)", () => {
+        it("persists a soft-delete-vs-edit conflict in the cursor-advance tx and re-presents it after a restart", async () => {
+            h = createSyncHarness();
+            const b = h.addDevice("dev-B");
+            const rig = attachPullWriter({ device: b, withResolver: true });
+
+            // Local has an unpushed edit (chunks + a device-local vclock).
+            const localEdit = await seedLocalFileDoc(
+                b, "notes/contended.md", { "dev-B": 1 }, [makeChunkId("aaaa1111aaaa1111")],
+            );
+            // Remote pushed a SOFT deletion with a concurrent vclock.
+            const remoteDelete = makeRemoteFileDoc(
+                "notes/contended.md", { "dev-A": 1 }, { deleted: true, chunks: [] },
+            );
+
+            const liveEmits: string[] = [];
+            rig.events.on("concurrent", ({ filePath }) => liveEmits.push(filePath));
+
+            const applied = await rig.writer.apply(makeChangesResult(
+                [{ id: remoteDelete._id, seq: "7", doc: remoteDelete }], "7",
+            ));
+
+            // No accepted docs (the deletion is a conflict, not applied), so the
+            // pipeline advances the cursor on the empty path — and MUST carry the
+            // conflict id so it persists in the same tx.
+            expect(applied.empty).toBe(true);
+            expect(applied.pendingConflictAdd).toContain(localEdit._id);
+            await rig.checkpoints.saveEmptyPullBatch(
+                applied.nextRemoteSeq, applied.pendingConflictAdd,
+            );
+
+            // Durable record present; surfaced once live.
+            const persisted = await loadAllPendingConflict(b.db);
+            expect(persisted.map((r) => r.id)).toContain(localEdit._id);
+            expect(liveEmits).toEqual(["notes/contended.md"]);
+
+            // Restart: a FRESH PullWriter (empty emittedConflicts) re-presents the
+            // parked conflict on its first drain — the deletion intent is NOT lost.
+            const rig2 = attachPullWriter({ device: b, withResolver: true });
+            const reEmits: string[] = [];
+            rig2.events.on("concurrent", ({ filePath }) => reEmits.push(filePath));
+            await rig2.writer.drainPendingConflict();
+            expect(reEmits).toEqual(["notes/contended.md"]);
+
+            // Resolving the conflict clears the record → no further re-presentation.
+            await clearPendingConflict(b.db, localEdit._id);
+            const rig3 = attachPullWriter({ device: b, withResolver: true });
+            const afterResolve: string[] = [];
+            rig3.events.on("concurrent", ({ filePath }) => afterResolve.push(filePath));
+            await rig3.writer.drainPendingConflict();
+            expect(afterResolve).toEqual([]);
+            expect(await loadAllPendingConflict(b.db)).toEqual([]);
+        });
+
+        it("drains a stale conflict whose local edit no longer exists", async () => {
+            h = createSyncHarness();
+            const b = h.addDevice("dev-B");
+            const rig = attachPullWriter({ device: b, withResolver: true });
+
+            const localEdit = await seedLocalFileDoc(
+                b, "notes/gone.md", { "dev-B": 1 }, [makeChunkId("bbbb2222bbbb2222")],
+            );
+            const remoteDelete = makeRemoteFileDoc(
+                "notes/gone.md", { "dev-A": 1 }, { deleted: true, chunks: [] },
+            );
+            const applied = await rig.writer.apply(makeChangesResult(
+                [{ id: remoteDelete._id, seq: "9", doc: remoteDelete }], "9",
+            ));
+            await rig.checkpoints.saveEmptyPullBatch(
+                applied.nextRemoteSeq, applied.pendingConflictAdd,
+            );
+
+            // The local edit vanishes (e.g. the user accepted the deletion).
+            await b.db.runWriteTx({ deletes: [localEdit._id] });
+
+            const rig2 = attachPullWriter({ device: b, withResolver: true });
+            const reEmits: string[] = [];
+            rig2.events.on("concurrent", ({ filePath }) => reEmits.push(filePath));
+            await rig2.writer.drainPendingConflict();
+
+            expect(reEmits).toEqual([]); // moot — not re-presented
+            expect(await loadAllPendingConflict(b.db)).toEqual([]); // and cleared
         });
     });
 });

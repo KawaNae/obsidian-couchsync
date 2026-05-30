@@ -129,6 +129,10 @@ export class PullPipeline {
                 // One drain at catchup end: chunks for files pulled earlier
                 // in this catchup may now all be durable (Invariant B).
                 await this.deps.pullWriter.drainPendingApply();
+                // And re-present any deletion conflicts parked by a prior
+                // session — this is the load-bearing restart recovery: it runs
+                // even when catchup found no new changes.
+                await this.deps.pullWriter.drainPendingConflict();
                 return;
             }
         }
@@ -185,6 +189,7 @@ export class PullPipeline {
                         // (chunks don't flow through _changes). Cheap no-op
                         // when the set is empty.
                         await this.deps.pullWriter.drainPendingApply();
+                        await this.deps.pullWriter.drainPendingConflict();
                     }
                 } catch (e: any) {
                     // halt-class DbError (degraded / quota) must surface
@@ -252,9 +257,13 @@ export class PullPipeline {
         // When the batch had no accepted docs, PullWriter didn't run a
         // tx — advance the checkpoint explicitly here. Otherwise
         // commitPullBatch already advanced remoteSeq inside its onCommit.
+        // A delete-only batch can still carry a deletion-vs-edit conflict;
+        // persist it in the SAME tx as the cursor advance (Invariant B).
         if (applied.empty) {
             try {
-                await this.deps.checkpoints.saveEmptyPullBatch(applied.nextRemoteSeq);
+                await this.deps.checkpoints.saveEmptyPullBatch(
+                    applied.nextRemoteSeq, applied.pendingConflictAdd,
+                );
             } catch (e) {
                 this.deps.handleLocalDbError(e, "checkpoint save");
             }
@@ -262,6 +271,10 @@ export class PullPipeline {
         // Invariant B: retry any files checkpointed-past without a vault
         // write (chunks landed late). Short-circuits when the set is empty.
         await this.deps.pullWriter.drainPendingApply();
+        // Invariant B (deletion-conflict class): re-present any persisted
+        // remote-deletion-vs-local-edit conflicts not yet shown this session
+        // (e.g. parked by a prior session before a restart).
+        await this.deps.pullWriter.drainPendingConflict();
     }
 
     // ── Introspection (tests) ───────────────────────────

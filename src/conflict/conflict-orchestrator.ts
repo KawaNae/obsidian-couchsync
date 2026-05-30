@@ -13,6 +13,8 @@ import { joinChunks } from "../db/chunker.ts";
 import { isDiffableText } from "../utils/binary.ts";
 import { incrementVC, mergeVC } from "../sync/vector-clock.ts";
 import { stripRev } from "../utils/doc.ts";
+import { clearPendingConflict } from "../db/sync/pending-conflict.ts";
+import { makeFileId } from "../types/doc-id.ts";
 import { logDebug, logInfo, logWarn, logError, notify } from "../ui/log.ts";
 
 export interface ConflictOrchestratorDeps {
@@ -71,10 +73,30 @@ export class ConflictOrchestrator {
                 dismiss();
                 this.openConflictDismiss.delete(filePath);
             }
+            // Another device resolved this path — drop any durable deletion-
+            // conflict record so the pull drain won't re-present it (#3).
+            void clearPendingConflict(this.deps.localDb, makeFileId(filePath)).catch(() => {});
         });
     }
 
     private async handleConcurrent(
+        filePath: string,
+        localDoc: CouchSyncDoc,
+        remoteDoc: CouchSyncDoc,
+    ): Promise<void> {
+        try {
+            await this.handleConcurrentInner(filePath, localDoc, remoteDoc);
+        } finally {
+            // The deletion-conflict has now been surfaced and handled (resolved,
+            // kept-local on error, or dismissed) — drop its durable record so
+            // the pull drain does not re-present it (#3). No-op for ids that
+            // were never persisted (edit-vs-edit, config). The key is the
+            // plaintext file-doc id (local docs are always plaintext-keyed).
+            await clearPendingConflict(this.deps.localDb, localDoc._id).catch(() => {});
+        }
+    }
+
+    private async handleConcurrentInner(
         filePath: string,
         localDoc: CouchSyncDoc,
         remoteDoc: CouchSyncDoc,
