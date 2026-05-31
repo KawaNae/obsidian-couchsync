@@ -24,7 +24,7 @@
  * cursor, with no half-applied state. Mirrors the vault PullWriter.
  */
 
-import type { ConfigDoc, CouchSyncDoc, ChunkDoc } from "../../types.ts";
+import type { ConfigDoc, CouchSyncDoc } from "../../types.ts";
 import { isConfigDoc, CONFIG_SCHEMA_VERSION } from "../../types.ts";
 import { configPathFromId, isConfigDocId } from "../../types/doc-id.ts";
 import { stripRev } from "../../utils/doc.ts";
@@ -33,7 +33,7 @@ import type { ICouchClient } from "../interfaces.ts";
 import type { ChangesResult } from "../interfaces.ts";
 import type { ConfigLocalDB } from "../config-local-db.ts";
 import type { ConflictResolver } from "../../conflict/conflict-resolver.ts";
-import { chunkFromAttachment, ChunkIntegrityError } from "../chunk-attachment.ts";
+import { fetchMissingChunks } from "../chunk-attachment.ts";
 import type { ChunkHasher } from "../chunker.ts";
 import { assertSchemaVersion } from "./schema-gate.ts";
 import { logDebug, logInfo, logWarn } from "../../ui/log.ts";
@@ -436,41 +436,18 @@ export class ConfigPullWriter {
         const missing = configDoc.chunks.filter((id) => !usableIds.has(id));
         if (missing.length === 0) return;
 
-        const CONCURRENCY = 4;
-        const fetched: ChunkDoc[] = [];
-        const queue = [...missing];
-        const notFound: string[] = [];
-        const corrupt: string[] = [];
-        const workers: Promise<void>[] = [];
-        for (let w = 0; w < CONCURRENCY; w++) {
-            workers.push((async () => {
-                while (queue.length > 0) {
-                    const id = queue.shift();
-                    if (!id) return;
-                    const blob = await this.deps.client.getAttachment(
-                        id, "c", this.deps.signal,
-                    );
-                    if (blob === null) {
-                        notFound.push(id);
-                        continue;
-                    }
-                    // Decorator stack already decrypted + decompressed.
-                    // chunkFromAttachment decodes the envelope and (when a
-                    // hasher is wired) verifies content hashes to the id; a
-                    // mismatch is treated like a missing chunk.
-                    try {
-                        fetched.push(await chunkFromAttachment(id, blob, this.deps.hasher));
-                    } catch (e) {
-                        if (e instanceof ChunkIntegrityError) {
-                            corrupt.push(id);
-                            continue;
-                        }
-                        throw e;
-                    }
-                }
-            })());
-        }
-        await Promise.all(workers);
+        // Fetch + verify + classify via the shared chunk-fetch core. This is
+        // the same implementation the vault boundary uses, so a corrupt config
+        // chunk is classified identically — `isCorruptChunkError` (incl. a
+        // structurally-malformed EnvelopeError), not just ChunkIntegrityError
+        // (L-8: the config copy previously rethrew EnvelopeError, aborting the
+        // whole doc's ensureChunks instead of skipping + warning like vault).
+        const { fetched, notFound, corrupt } = await fetchMissingChunks(missing, {
+            getAttachment: (id, name, sig) =>
+                this.deps.client.getAttachment(id, name, sig),
+            hasher: this.deps.hasher,
+            signal: this.deps.signal,
+        });
         if (notFound.length > 0 || corrupt.length > 0) {
             const bad = [...notFound, ...corrupt];
             logWarn(

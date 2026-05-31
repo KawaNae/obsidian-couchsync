@@ -179,3 +179,92 @@ export async function chunkFromAttachment(
         content,
     };
 }
+
+/** Dependencies for `fetchMissingChunks` — the parts that differ between the
+ *  vault and config fetch boundaries are injected; the fetch/verify/classify
+ *  core is shared. */
+export interface FetchMissingChunksDeps {
+    /** Fetch one chunk attachment as raw binary, or null when absent (404).
+     *  The decorator stack underneath has already decrypted + decompressed. */
+    getAttachment: (
+        id: string,
+        name: string,
+        signal?: AbortSignal,
+    ) => Promise<Uint8Array | null>;
+    /** Hasher to verify each body hashes to its content-addressed id. When
+     *  omitted, bodies are accepted without verification (plaintext-only test
+     *  call sites). */
+    hasher?: ChunkHasher;
+    signal?: AbortSignal;
+    /** Concurrent in-flight attachment fetches. Defaults to 4 — enough to
+     *  overlap round-trips on HTTP/2-multiplexed transports without flooding. */
+    concurrency?: number;
+}
+
+export interface FetchMissingChunksResult {
+    /** Chunks that fetched and verified — ready to persist. */
+    fetched: ChunkDoc[];
+    /** Ids whose attachment was absent on the server (404). */
+    notFound: string[];
+    /** Ids whose body was unusable: hash mismatch, alg mismatch, or a
+     *  structurally-malformed envelope (`isCorruptChunkError`). Route to
+     *  repair; never persist. */
+    corrupt: string[];
+}
+
+/**
+ * Fetch + verify + classify a set of missing chunk ids from an untrusted
+ * remote. The single shared implementation behind both the live-sync vault
+ * boundary (`SyncEngine.ensureChunksInternal`) and the config-pull boundary
+ * (`ConfigPullWriter.ensureChunks`) — previously near-identical copies whose
+ * corrupt-classification had already drifted (config missed `EnvelopeError`).
+ *
+ * Callers own everything outside the fetch core: computing the `missing` set
+ * (availability check), persisting `fetched`, logging, and turning the
+ * notFound/corrupt residual into their own result shape. This function only
+ * guarantees that "corrupt" means exactly `isCorruptChunkError` everywhere
+ * (the #4 shared rule), so the two boundaries cannot diverge again.
+ */
+export async function fetchMissingChunks(
+    missing: readonly string[],
+    deps: FetchMissingChunksDeps,
+): Promise<FetchMissingChunksResult> {
+    const concurrency = deps.concurrency ?? 4;
+    const fetched: ChunkDoc[] = [];
+    const notFound: string[] = [];
+    const corrupt: string[] = [];
+    const queue = [...missing];
+    const workers: Promise<void>[] = [];
+    for (let w = 0; w < concurrency; w++) {
+        workers.push((async () => {
+            while (queue.length > 0) {
+                const id = queue.shift();
+                if (!id) return;
+                const blob = await deps.getAttachment(
+                    id, CHUNK_ATTACHMENT_NAME, deps.signal,
+                );
+                if (blob === null) {
+                    notFound.push(id);
+                    continue;
+                }
+                // chunkFromAttachment decodes the envelope and (with a hasher)
+                // verifies content hashes to the id. A hash mismatch OR a
+                // structurally-malformed envelope means the body is corrupt —
+                // skip it (route to repair) rather than persisting bad bytes or
+                // failing the whole batch. Any other error (network, abort) is
+                // a genuine failure and propagates.
+                try {
+                    fetched.push(await chunkFromAttachment(id, blob, deps.hasher));
+                } catch (e) {
+                    if (isCorruptChunkError(e)) {
+                        corrupt.push(id);
+                        continue;
+                    }
+                    throw e;
+                }
+            }
+        })());
+    }
+    await Promise.all(workers);
+    return { fetched, notFound, corrupt };
+}

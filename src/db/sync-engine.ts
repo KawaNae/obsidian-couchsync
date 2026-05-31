@@ -26,7 +26,7 @@ import type { ICouchClient } from "./interfaces.ts";
 import type { ConflictResolver } from "../conflict/conflict-resolver.ts";
 import { filePathFromId } from "../types/doc-id.ts";
 import { makeCouchClient } from "./couch-client.ts";
-import { chunkFromAttachment, isCorruptChunkError } from "./chunk-attachment.ts";
+import { fetchMissingChunks } from "./chunk-attachment.ts";
 import type { ChunkHasher } from "./chunker.ts";
 import { decideReconnect } from "./reconnect-policy.ts";
 import type {
@@ -311,45 +311,13 @@ export class SyncEngine {
             `  fetching ${missing.length} missing chunk(s) from remote for ${filePathFromId(fileDoc._id)}`,
         );
 
-        const CONCURRENCY = 4;
-        const fetched: ChunkDoc[] = [];
-        const queue = [...missing];
-        const notFound: string[] = [];
-        const corrupt: string[] = [];
-        const workers: Promise<void>[] = [];
-        for (let w = 0; w < CONCURRENCY; w++) {
-            workers.push((async () => {
-                while (queue.length > 0) {
-                    const id = queue.shift();
-                    if (!id) return;
-                    const blob = await client.getAttachment(id, "c");
-                    if (blob === null) {
-                        notFound.push(id);
-                        continue;
-                    }
-                    // Decorator stack has decrypted + decompressed the body.
-                    // chunkFromAttachment decodes the envelope and (when a
-                    // hasher is wired) verifies content hashes to the id. A
-                    // hash mismatch OR a structurally-malformed envelope means
-                    // the body is corrupt — treat it like a missing chunk (skip
-                    // + warn, route to repair) rather than persisting bad bytes
-                    // or failing the whole batch. `isCorruptChunkError` is the
-                    // shared rule with the Clone/repair boundary so the two
-                    // cannot drift (#4 — previously this path missed
-                    // EnvelopeError and looped a malformed chunk forever).
-                    try {
-                        fetched.push(await chunkFromAttachment(id, blob, this.chunkHasher));
-                    } catch (e) {
-                        if (isCorruptChunkError(e)) {
-                            corrupt.push(id);
-                            continue;
-                        }
-                        throw e;
-                    }
-                }
-            })());
-        }
-        await Promise.all(workers);
+        // Fetch + verify + classify via the shared chunk-fetch core, so the
+        // vault and config boundaries cannot drift in how they treat a corrupt
+        // chunk (#4 — corrupt == isCorruptChunkError, incl. EnvelopeError).
+        const { fetched, notFound, corrupt } = await fetchMissingChunks(missing, {
+            getAttachment: (id, name, sig) => client.getAttachment(id, name, sig),
+            hasher: this.chunkHasher,
+        });
         if (notFound.length > 0 || corrupt.length > 0) {
             // A missing/corrupt chunk for a file we just committed indicates
             // an inconsistent push (chunk pushed without attachment, attachment
