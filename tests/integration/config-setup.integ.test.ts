@@ -250,6 +250,46 @@ describe("ConfigSetupService — setup atomicity (#err-9)", () => {
         expect(settings.configSettingUp).toBe(true);
     });
 
+    // ── M-2: init ordering & blast-radius minimisation ──
+
+    it("pushes config:meta as the first remote write after ensureDb, before any config doc (M-2)", async () => {
+        vault.addFile(".obsidian/app.json", `{}`);
+        const ensureSpy = vi.spyOn(remote, "ensureDb");
+        const bulkSpy = vi.spyOn(remote, "bulkDocs");
+
+        await cs.init({ encryption: false, compression: false });
+
+        // The config:meta crypto root must be the FIRST bulkDocs call — nothing
+        // (no config doc) lands on the freshly-recreated remote before it.
+        const metaIdx = bulkSpy.mock.calls.findIndex(
+            ([docs]: [any[]]) => docs.some((d) => d._id === "config:meta"),
+        );
+        expect(metaIdx).toBe(0);
+        // And the meta push happens AFTER ensureDb (remote exists) — the window
+        // where the DB exists without a meta is just this one call.
+        expect(ensureSpy.mock.invocationCallOrder[0])
+            .toBeLessThan(bulkSpy.mock.invocationCallOrder[metaIdx]);
+        // A real config doc is pushed later, never before the meta.
+        const appId = makeConfigId(".obsidian/app.json");
+        const appIdx = bulkSpy.mock.calls.findIndex(
+            ([docs]: [any[]]) => docs.some((d) => d._id === appId),
+        );
+        expect(appIdx).toBeGreaterThan(metaIdx);
+    });
+
+    it("does not destroy the remote when the pre-destroy config check fails (pre-destructive, M-2)", async () => {
+        // An empty config DB name trips the build-phase guard, which now runs
+        // BEFORE the crypto derivation and the destructive wipe. Nothing must
+        // be destroyed and the setup latch must never be set.
+        settings.couchdbConfigDbName = "";
+        const destroySpy = vi.spyOn(remote, "destroy");
+
+        await expect(cs.init({ encryption: false, compression: false })).rejects.toThrow();
+
+        expect(destroySpy).not.toHaveBeenCalled();
+        expect(settingUpCalls).toEqual([]); // latch never set — fully pre-destructive
+    });
+
     it("blocks push/pull/write while a prior init is unfinished (gating)", async () => {
         settings.configSettingUp = true;
         await expect(cs.push()).rejects.toThrow(/interrupted/);

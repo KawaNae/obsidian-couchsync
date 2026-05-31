@@ -125,20 +125,35 @@ export class ConfigSetupService {
         onProgress: (msg: string) => void,
         opts: ConfigSetupInitOpts,
     ): Promise<ConfigSetupResult> {
-        // 0. Persist the setup-in-progress flag BEFORE the destructive wipe
+        // 0. Derive the crypto root FIRST — a SELF-CONTAINED config:meta
+        //    (Phase 2: invariants 17 + 18): fresh salt + own keyCheck derived
+        //    from `opts.passphrase`. This is a PURE computation (no remote
+        //    I/O), so deriving it BEFORE any destruction means a key-derivation
+        //    failure leaves both the local and remote DBs untouched — nothing
+        //    to recover (M-2). The crypto is fed back to the host after the
+        //    meta is pinned on the remote (step 4) so subsequent
+        //    `wrapConfigClient` / chunk-hasher calls use the correct keys.
+        if (!this.getSettings().couchdbConfigDbName) {
+            throw new Error("ConfigSetup: couchdbConfigDbName not configured");
+        }
+        const { meta, crypto } = await buildInitialConfigMeta(opts);
+
+        // 1. Persist the setup-in-progress flag BEFORE the destructive wipe
         //    (Invariant C, config side). If the process dies after this point
         //    the flag stays true and the host refuses to sync the half-built
-        //    config DB until a fresh Init clears it (#err-9).
+        //    config DB until a fresh Init clears it (#err-9). The crypto
+        //    derivation above is pre-destructive, so a failure there never
+        //    reaches this latch.
         await this.host.markSettingUp?.(true);
 
-        // 1. Wipe local DB completely (meta + docs in one go).
+        // 2. Wipe local DB completely (meta + docs in one go).
         onProgress("Wiping local config database...");
         await this.db.destroy();
         this.db.open();
         this.host.clearLastSynced();
         this.host.invalidateCheckpoints();
 
-        // 2. Wipe remote. DELETE /<db> + PUT /<db> — true rev-tree reset
+        // 3. Wipe remote. DELETE /<db> + PUT /<db> — true rev-tree reset
         //    so the next push lands at rev=1- instead of stacking on top.
         //    Requires admin permission; tolerates 404 (DB already gone).
         onProgress("Destroying remote config database...");
@@ -146,23 +161,23 @@ export class ConfigSetupService {
         onProgress("Recreating remote config database...");
         await client.ensureDb(signal);
 
-        // 2b. Build the config:meta as a SELF-CONTAINED crypto root
-        //     (Phase 2: invariants 17 + 18). Fresh salt + own keyCheck
-        //     means this config DB is verifiable on any device that
-        //     holds `opts.passphrase` — vault DB sharing is no longer
-        //     required. The new cryptoProvider is fed back to the host
-        //     so subsequent `wrapConfigClient` / chunk hasher calls in
-        //     this same Init flow use the correct keys.
-        const { meta, crypto } = await this.buildAndPushConfigMeta(opts);
+        // 4. Pin the crypto root: push config:meta as the FIRST operation
+        //    after ensureDb, with nothing between, so the window in which the
+        //    remote config DB exists WITHOUT an authoritative meta is as small
+        //    as possible (M-2). A failure here leaves the remote freshly
+        //    recreated but meta-less; the setup latch (step 1) keeps THIS
+        //    device fail-closed, and a peer reading the DB in that window sees
+        //    a no-meta DB it treats as un-/mid-setup rather than corrupt.
+        await this.pushConfigMetaRaw(meta);
         this.host.onCryptoProviderReady(crypto);
 
-        // 3. Scan vault → local DB. lastSynced is empty so nothing
+        // 5. Scan vault → local DB. lastSynced is empty so nothing
         //    short-circuits; every file gets a fresh write with vclock={device:1}.
         const scanned = await this.host.scan((path, i, total) => {
             onProgress(`Scanning: ${path} (${i}/${total})`);
         });
 
-        // 4. Push everything to the now-empty remote. Conflicts are
+        // 6. Push everything to the now-empty remote. Conflicts are
         //    impossible (no remote rev tree to clash with), so this is
         //    effectively a one-shot bulk write.
         const checkpoints = new ConfigCheckpoints(this.db);
@@ -216,38 +231,31 @@ export class ConfigSetupService {
         return { scanned, pushed: pushResult.stats.pushed, meta, crypto };
     }
 
-    /** Build a fresh self-contained config:meta (own salt, own keyCheck)
-     *  and push it via a RAW client so the meta itself bypasses the
-     *  envelope codec stack. Network errors surface up — unlike Phase 1
-     *  this write is **load-bearing** (it pins the crypto root) and
-     *  must succeed before the Init can return. */
-    private async buildAndPushConfigMeta(
-        opts: ConfigSetupInitOpts,
-    ): Promise<{ meta: ConfigMetaDoc; crypto: CryptoProvider | null }> {
+    /** Push an already-built self-contained config:meta via a RAW client so
+     *  the meta itself bypasses the envelope codec stack (a fresh-Clone device
+     *  can read it before unlocking the passphrase). Network errors surface up
+     *  — this write is **load-bearing** (it pins the crypto root) and must
+     *  succeed before Init can proceed. The meta is built separately, before
+     *  any destruction, so this method only does the (post-ensureDb) push. */
+    private async pushConfigMetaRaw(meta: ConfigMetaDoc): Promise<void> {
         const settings = this.getSettings();
-        if (!settings.couchdbConfigDbName) {
-            throw new Error("ConfigSetup: couchdbConfigDbName not configured");
-        }
         // The meta doc bypasses the codec stack (never encrypted or
-        // compressed) so a fresh-Clone device can read it before unlocking
-        // the passphrase — push it via a RAW, unwrapped client. Tests inject
-        // one; production builds it from settings.
+        // compressed). Tests inject a raw client; production builds it from
+        // settings.
         const rawConfigClient = this.host.makeRawConfigClient?.()
             ?? makeCouchClient(
                 settings.couchdbUri, settings.couchdbConfigDbName,
                 settings.couchdbUser, settings.couchdbPassword,
             );
-        const { meta, crypto } = await buildInitialConfigMeta(opts);
         try {
             await pushConfigMeta(rawConfigClient, meta);
         } catch (e: any) {
-            // Network errors here are visible — the meta is the crypto
-            // root and a failed write would leave the config DB without
-            // an authoritative descriptor. Re-throw so the user sees
-            // the Init failure rather than a silent corrupt state.
+            // Network errors here are visible — the meta is the crypto root and
+            // a failed write would leave the config DB without an authoritative
+            // descriptor. Re-throw so the user sees the Init failure rather
+            // than a silent corrupt state.
             logWarn(`ConfigSetup: config:meta push failed: ${e?.message ?? e}`);
             throw e;
         }
-        return { meta, crypto };
     }
 }
