@@ -7,6 +7,7 @@ import { AuthGate } from "./db/sync/auth-gate.ts";
 import { VaultRemoteOps } from "./db/sync/vault-remote-ops.ts";
 import { VaultSync } from "./sync/vault-sync.ts";
 import { ConfigSync } from "./sync/config-sync.ts";
+import { resolveConfigCodec } from "./sync/config-codec-policy.ts";
 import type { ReconnectBridge } from "./sync/reconnect-bridge.ts";
 import { SetupService } from "./sync/setup.ts";
 import { ChangeTracker } from "./sync/change-tracker.ts";
@@ -201,9 +202,8 @@ export default class CouchSyncPlugin extends Plugin {
         // failed non-fatally / provisioning incomplete) would silently build a
         // plaintext stack and write UNENCRYPTED config bodies into an encrypted
         // config DB. Refuse to build an inconsistent stack instead.
-        const configEncEnabled = this.settings.configEncryptionEnabled
-            ?? this.settings.encryptionEnabled;
-        if (configEncEnabled && !this.configCryptoProvider) {
+        const codec = resolveConfigCodec(this.settings);
+        if (codec.encryption && !this.configCryptoProvider) {
             throw new Error(
                 "CouchSync: refusing to build config client — config DB is " +
                     "encrypted but no crypto provider is unlocked (provisioning " +
@@ -216,9 +216,7 @@ export default class CouchSyncPlugin extends Plugin {
                 client, this.configCryptoProvider, this.settings.configCipherVersion,
             );
         }
-        const compress = this.settings.configCompressionEnabled
-            ?? this.settings.compressionEnabled;
-        if (compress) {
+        if (codec.compression) {
             client = new CompressingCouchClient(client);
         }
         return client;
@@ -633,16 +631,13 @@ export default class CouchSyncPlugin extends Plugin {
                             this.settings.couchdbUser,
                             this.settings.couchdbPassword,
                         );
-                        const configEncEnabled = this.settings.configEncryptionEnabled
-                            ?? this.settings.encryptionEnabled;
-                        // Empty string means "inherit" (the UI stores "" when the
-                        // config passphrase is left blank), so fall back with ||
-                        // not ?? — ?? would treat "" as an explicit empty
-                        // passphrase and unlock would fail. (#config-codec)
-                        const configPassphrase = this.settings.configEncryptionPassphrase
-                            || this.settings.encryptionPassphrase;
+                        // Independent config codec — the single resolver applies
+                        // the per-field inherit rules (empty passphrase inherits
+                        // the vault one via ||, see config-codec-policy). (#config-codec)
+                        const configCodec = resolveConfigCodec(this.settings);
+                        const configPassphrase = configCodec.passphrase;
                         const agreement = await checkEncryptionAgreement(
-                            rawConfigClient, configEncEnabled, CONFIG_META_DOC_ID,
+                            rawConfigClient, configCodec.encryption, CONFIG_META_DOC_ID,
                             this.settings.configCipherVersion,
                         );
                         if (agreement.status === "cipher-downgrade-detected") {

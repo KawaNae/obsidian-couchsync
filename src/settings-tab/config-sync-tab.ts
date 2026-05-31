@@ -30,6 +30,11 @@ import type { VaultRemoteOps } from "../db/sync/vault-remote-ops.ts";
 import type { IModalPresenter } from "../types/modal-presenter.ts";
 import { logWarn } from "../ui/log.ts";
 import { addPasswordToggle } from "./vault-sync-tab.ts";
+import {
+    resolveConfigCodec,
+    isInheritingConfigEncryption,
+    isInheritingConfigCompression,
+} from "../sync/config-codec-policy.ts";
 
 export interface ConfigSyncTabDeps {
     app: App;
@@ -145,8 +150,9 @@ export class ConfigSyncTab {
             warn.style.color = "var(--text-error)";
         }
 
-        const encEnabled = settings.configEncryptionEnabled ?? settings.encryptionEnabled;
-        const inheritingEnc = settings.configEncryptionEnabled === undefined;
+        const codec = resolveConfigCodec(settings);
+        const encEnabled = codec.encryption;
+        const inheritingEnc = isInheritingConfigEncryption(settings);
         new Setting(el)
             .setName("E2E encryption")
             .setDesc(
@@ -184,8 +190,8 @@ export class ConfigSyncTab {
             addPasswordToggle(passphraseSetting);
         }
 
-        const compressEnabled = settings.configCompressionEnabled ?? settings.compressionEnabled;
-        const inheritingCompress = settings.configCompressionEnabled === undefined;
+        const compressEnabled = codec.compression;
+        const inheritingCompress = isInheritingConfigCompression(settings);
         new Setting(el)
             .setName("Compress (gzip)")
             .setDesc(
@@ -316,26 +322,15 @@ export class ConfigSyncTab {
                         btn.setButtonText("Initializing...");
                         btn.setDisabled(true);
                         try {
-                            // Config codec is independent (#config-codec): read
-                            // the config overrides, falling back to the vault
-                            // setting when unset.
-                            const s = this.deps.getSettings();
-                            const encryption = s.configEncryptionEnabled
-                                ?? s.encryptionEnabled;
-                            await this.deps.configSync.init({
-                                encryption,
-                                // Empty = inherit the vault passphrase (|| not
-                                // ?? — "" must fall through, see main.ts).
-                                passphrase: s.configEncryptionPassphrase
-                                    || s.encryptionPassphrase,
-                                compression: s.configCompressionEnabled
-                                    ?? s.compressionEnabled,
-                            });
+                            // Config codec is independent (#config-codec): the
+                            // single resolver applies the per-field inherit rules.
+                            const codec = resolveConfigCodec(this.deps.getSettings());
+                            await this.deps.configSync.init(codec);
                             // Init minted a fresh config:meta at cipherVersion 3
                             // when encrypted — ratchet the local floor now so a
                             // downgrade is refused immediately, not only after
                             // the next onload early-derive.
-                            if (encryption) {
+                            if (codec.encryption) {
                                 await this.deps.ratchetConfigCipherFloor(3);
                             }
                         } catch { /* handled */ }
