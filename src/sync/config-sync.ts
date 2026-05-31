@@ -54,6 +54,7 @@ import {
 } from "../db/sync/config-push-pipeline.ts";
 import { ConflictResolver } from "../conflict/conflict-resolver.ts";
 import { ConfigSetupService } from "./config-setup.ts";
+import { isConfigCodecDirty } from "./config-codec-policy.ts";
 
 /**
  * ConfigSync — scan-based replication of `.obsidian/` configuration files
@@ -109,6 +110,11 @@ export interface ConfigSyncOptions {
     /** Persist the config-setup-in-progress flag (#err-9). The host writes
      *  `settings.configSettingUp` and saves. Omitted in tests. */
     persistConfigSettingUp?: (active: boolean) => Promise<void>;
+    /** Persist the codec fingerprint a successful Config Init applied
+     *  (#config-codec). The host writes `settings.configCodecApplied` and
+     *  saves; the dirty gate compares the live codec against it. Omitted in
+     *  tests that don't exercise the dirty gate. */
+    persistConfigCodecApplied?: (fingerprint: string) => Promise<void>;
 }
 
 export class ConfigSync {
@@ -182,6 +188,7 @@ export class ConfigSync {
      *  network. */
     private readonly rawClientFactory?: (settings: CouchSyncSettings) => ICouchClient | null;
     private readonly persistConfigSettingUp?: (active: boolean) => Promise<void>;
+    private readonly persistConfigCodecApplied?: (fingerprint: string) => Promise<void>;
 
     constructor(
         private vault: IVaultIO,
@@ -204,6 +211,7 @@ export class ConfigSync {
         this.onConfigCryptoChange = opts.onConfigCryptoChange;
         this.rawClientFactory = opts.rawClientFactory;
         this.persistConfigSettingUp = opts.persistConfigSettingUp;
+        this.persistConfigCodecApplied = opts.persistConfigCodecApplied;
         this.skipPaths = new Set([opts.ownDataJsonPath ?? ConfigSync.DEFAULT_OWN_DATA_PATH]);
     }
 
@@ -291,14 +299,30 @@ export class ConfigSync {
         this.inflight?.cancel();
     }
 
-    /** Refuse a sync op when a prior Config Init died mid-flight, leaving a
-     *  half-built config DB (Invariant C, config side — #err-9). The user must
-     *  re-run Config Init (which clears the flag) before push/pull/write can
-     *  run again. */
+    /** Refuse a sync op when the config DB is not in a state live ops may
+     *  touch. Two symmetric guards (#err-9 / #config-codec):
+     *
+     *  1. `configSettingUp` — a prior Config Init died mid-flight, leaving a
+     *     half-built config DB. Re-run Config Init (which clears the flag).
+     *  2. codec dirty — the user changed an encryption / passphrase /
+     *     compression knob since the last Init, so the live codec no longer
+     *     matches what the remote config DB was built with. A push would
+     *     encode under the new codec against docs stored with the old one; a
+     *     pull would decode old-codec docs with the new policy (worst case:
+     *     encryption toggled off, the provider is gone but the server still
+     *     holds encrypted docs). Re-run Config Init & Push to re-apply the
+     *     policy. Symmetric with vault sync, where a codec change demands a
+     *     destructive re-init rather than a live switch. */
     private assertConfigReady(): void {
         if (this.getSettings().configSettingUp) {
             throw new Error(
                 "Config setup was interrupted — re-run Config Init before syncing.",
+            );
+        }
+        if (isConfigCodecDirty(this.getSettings())) {
+            throw new Error(
+                "Config codec changed (encryption / passphrase / compression) — " +
+                "re-run Config Init & Push to apply it before syncing.",
             );
         }
     }
@@ -362,6 +386,8 @@ export class ConfigSync {
                         : undefined,
                     markSettingUp: (active) =>
                         this.persistConfigSettingUp?.(active) ?? Promise.resolve(),
+                    recordCodecApplied: (fp) =>
+                        this.persistConfigCodecApplied?.(fp) ?? Promise.resolve(),
                     makeEncryptingClient: () => {
                         const c = this.makeConfigClient();
                         if (!c) throw new Error("ConfigSync: config client unavailable for push");
@@ -380,51 +406,6 @@ export class ConfigSync {
             );
             return result.scanned;
         }, { rawClient: true });
-    }
-
-    /**
-     * Re-initialize the config DB as part of an encryption state change.
-     * Called from initVault/cloneFromRemote in main.ts.
-     *
-     * Bypasses ConfigOperation (no auth/visibility gate) because the
-     * caller is already in a user-triggered Settings flow where those
-     * preconditions are satisfied. The client comes from the caller's
-     * clientFactory, which reflects the current cryptoProvider state.
-     */
-    async reinitForEncryptionChange(
-        onProgress: (msg: string) => void,
-        opts: {
-            encryption: boolean;
-            passphrase?: string;
-            compression: boolean;
-        },
-    ): Promise<void> {
-        const db = this.configDb;
-        if (!db) return;
-        // Raw client: reinit also runs before the new provider exists (#config-init).
-        const client = this.makeRawClient();
-        if (!client) return;
-        const controller = new AbortController();
-        const setup = new ConfigSetupService(
-            db,
-            this.getSettings,
-            {
-                clearLastSynced: () => this.lastSynced?.clear(),
-                invalidateCheckpoints: () => { this.checkpointsLoaded = false; },
-                scan: (cb) => this.scan(cb),
-                onCryptoProviderReady: (crypto) => {
-                    this.onConfigCryptoChange?.(crypto);
-                },
-                markSettingUp: (active) =>
-                    this.persistConfigSettingUp?.(active) ?? Promise.resolve(),
-                makeEncryptingClient: () => {
-                    const c = this.makeConfigClient();
-                    if (!c) throw new Error("ConfigSync: config client unavailable for push");
-                    return c;
-                },
-            },
-        );
-        await setup.init(client, controller.signal, onProgress, opts);
     }
 
     /** Push: scan .obsidian/ → enumerate local delta via changes feed →

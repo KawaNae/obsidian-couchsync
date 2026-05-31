@@ -397,4 +397,44 @@ describe("ConfigSync", () => {
             await expect(cs.push()).rejects.toThrow(/Auth blocked/);
         });
     });
+
+    // ── codec dirty gate (#config-codec, M-1) ───────────
+    //
+    // The dirty/not-dirty resolution itself is covered as a pure function in
+    // config-codec-policy.test; here we assert assertConfigReady wires that
+    // result into push/pull, symmetric with the configSettingUp gate.
+    describe("codec dirty gate", () => {
+        it("push refuses when the codec drifted from the Init-applied baseline", async () => {
+            // Applied plaintext ("0:0:0"), but encryption was since toggled on.
+            settings.configCodecApplied = "0:0:0";
+            settings.configEncryptionEnabled = true;
+            settings.configEncryptionPassphrase = "secret";
+            await expect(cs.push()).rejects.toThrow(/codec changed/i);
+        });
+
+        it("pull refuses when the codec drifted from the Init-applied baseline", async () => {
+            settings.configCodecApplied = "0:0:0";
+            settings.configCompressionEnabled = true; // vault default is true → flips shape
+            await expect(cs.pull()).rejects.toThrow(/codec changed/i);
+        });
+
+        it("does NOT gate when the live codec matches the applied baseline", async () => {
+            // plaintext + no compression + no passphrase → "0:0:0", matches applied.
+            settings.compressionEnabled = false;
+            settings.configCodecApplied = "0:0:0";
+            vault.addFile(".obsidian/app.json", "{}");
+            // Passes the codec gate; fails later for an unrelated reason
+            // (no config DB name configured) — proving the gate let it through.
+            await expect(cs.push()).rejects.toThrow(/not configured/i);
+        });
+
+        it("does NOT gate a pre-v0.27.2 install with no recorded baseline", async () => {
+            // configCodecApplied undefined → permissive even with a drifting override.
+            settings.compressionEnabled = false;
+            settings.configEncryptionEnabled = true;
+            settings.configEncryptionPassphrase = "secret";
+            vault.addFile(".obsidian/app.json", "{}");
+            await expect(cs.push()).rejects.toThrow(/not configured/i);
+        });
+    });
 });

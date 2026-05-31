@@ -35,6 +35,7 @@ import {
     buildInitialConfigMeta, pushConfigMeta, type ConfigMetaDoc,
 } from "../db/vault-meta.ts";
 import type { CryptoProvider } from "../db/crypto-provider.ts";
+import { codecFingerprint } from "./config-codec-policy.ts";
 import { logWarn } from "../ui/log.ts";
 import { ConfigCheckpoints } from "../db/sync/config-checkpoints.ts";
 import { ConfigPushPipeline } from "../db/sync/config-push-pipeline.ts";
@@ -102,6 +103,13 @@ export interface ConfigSetupHostHooks {
      *  (#config-codec). Optional: tests that don't exercise encryption omit it
      *  and fall back to the init-time client. */
     makeEncryptingClient?: () => ICouchClient;
+    /** Record the codec fingerprint this Init applied, on full success
+     *  (#config-codec). The host persists it as `settings.configCodecApplied`;
+     *  a later live op compares the live resolved codec against it and refuses
+     *  to sync when they drift (the config-side equivalent of vault sync's
+     *  "codec change ⇒ re-init"). Optional: omitted in tests that don't
+     *  exercise the dirty gate. */
+    recordCodecApplied?: (fingerprint: string) => Promise<void>;
 }
 
 export class ConfigSetupService {
@@ -193,7 +201,16 @@ export class ConfigSetupService {
         });
         const pushResult = await pipeline.run((msg) => onProgress(msg));
 
-        // Init fully succeeded — clear the setup-in-progress flag (#err-9).
+        // Init fully succeeded — record the codec this Init applied so live ops
+        // can detect a later policy drift (#config-codec), then clear the
+        // setup-in-progress flag (#err-9). Order: record the applied codec
+        // BEFORE clearing settingUp, so an interruption between the two still
+        // leaves the DB blocked (settingUp true) rather than wrongly readable.
+        await this.host.recordCodecApplied?.(codecFingerprint({
+            encryption: opts.encryption,
+            passphrase: opts.passphrase ?? "",
+            compression: opts.compression,
+        }));
         await this.host.markSettingUp?.(false);
 
         return { scanned, pushed: pushResult.stats.pushed, meta, crypto };

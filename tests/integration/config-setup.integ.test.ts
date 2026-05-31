@@ -17,6 +17,7 @@
 import "fake-indexeddb/auto";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { ConfigSync } from "../../src/sync/config-sync.ts";
+import { ConfigSetupService, type ConfigSetupHostHooks } from "../../src/sync/config-setup.ts";
 import { ConfigLocalDB } from "../../src/db/config-local-db.ts";
 import { AuthGate } from "../../src/db/sync/auth-gate.ts";
 import { ALWAYS_VISIBLE } from "../../src/db/visibility-gate.ts";
@@ -284,5 +285,73 @@ describe("ConfigSetupService — setup atomicity (#err-9)", () => {
 
         expect(n).toBeGreaterThanOrEqual(0);
         expect(providerReady).toBe(true);
+    });
+});
+
+describe("ConfigSetupService — fail-closed encrypting client (L-1)", () => {
+    let vault: FakeVaultIO;
+    let db: ConfigLocalDB;
+    let settings: ReturnType<typeof makeSettings>;
+    let remote: FakeCouchClient;
+
+    beforeEach(() => {
+        vault = new FakeVaultIO();
+        db = new ConfigLocalDB(uniqueName());
+        db.open();
+        settings = makeSettings({
+            deviceId: "dev-A",
+            couchdbUri: "http://localhost:5984",
+            couchdbConfigDbName: "config-test",
+        });
+        remote = new FakeCouchClient();
+    });
+
+    afterEach(async () => {
+        await db.destroy().catch(() => {});
+    });
+
+    /** Minimal host hooks; `makeEncryptingClient` is opt-in per test so we can
+     *  exercise the fail-closed branch. `scan` is stubbed (returns 0) — the DB
+     *  destroy/meta-push/push-pipeline path is what we're exercising. */
+    function hostHooks(extra: Partial<ConfigSetupHostHooks> = {}): ConfigSetupHostHooks {
+        return {
+            clearLastSynced: () => {},
+            invalidateCheckpoints: () => {},
+            scan: async () => 0,
+            onCryptoProviderReady: () => {},
+            makeRawConfigClient: () => asCouchClient(remote),
+            ...extra,
+        };
+    }
+
+    it("refuses an encrypted init when makeEncryptingClient is missing (no plaintext fallback)", async () => {
+        // No makeEncryptingClient hook → an encrypted push must throw rather
+        // than silently degrade to the raw (plaintext) init-time client.
+        const setup = new ConfigSetupService(db, () => settings, hostHooks());
+        await expect(
+            setup.init(asCouchClient(remote), new AbortController().signal, () => {}, {
+                encryption: true, passphrase: "secret", compression: false,
+            }),
+        ).rejects.toThrow(/encrypting client/i);
+    });
+
+    it("allows a plaintext init to fall back to the raw client (no hook required)", async () => {
+        const setup = new ConfigSetupService(db, () => settings, hostHooks());
+        await expect(
+            setup.init(asCouchClient(remote), new AbortController().signal, () => {}, {
+                encryption: false, compression: false,
+            }),
+        ).resolves.toBeTruthy();
+    });
+
+    it("uses the encrypting client for an encrypted init when the hook is wired", async () => {
+        let used = false;
+        const setup = new ConfigSetupService(db, () => settings, hostHooks({
+            makeEncryptingClient: () => { used = true; return asCouchClient(remote); },
+        }));
+        await setup.init(asCouchClient(remote), new AbortController().signal, () => {}, {
+            encryption: true, passphrase: "secret", compression: false,
+        });
+        expect(used).toBe(true);
     });
 });

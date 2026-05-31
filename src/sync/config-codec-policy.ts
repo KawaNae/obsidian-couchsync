@@ -50,3 +50,32 @@ export function isInheritingConfigEncryption(s: CouchSyncSettings): boolean {
 export function isInheritingConfigCompression(s: CouchSyncSettings): boolean {
     return s.configCompressionEnabled === undefined;
 }
+
+/**
+ * Structural fingerprint of a resolved config codec. Captures only the
+ * SHAPE of the codec (encryption on/off, compression on/off, passphrase
+ * blank/non-blank) — never the passphrase value, which must not be widened
+ * beyond settings. A passphrase value change (A → B) at the same shape is
+ * caught separately by the onload early-derive keyCheck, not here.
+ *
+ * Used to detect when the live codec policy has drifted from what the last
+ * Config Init applied to the remote (see `isConfigCodecDirty`).
+ */
+export function codecFingerprint(p: ConfigCodecPolicy): string {
+    return `${p.encryption ? 1 : 0}:${p.compression ? 1 : 0}:${p.passphrase ? 1 : 0}`;
+}
+
+/**
+ * True when the resolved config codec no longer matches the fingerprint the
+ * last successful Config Init recorded — i.e. the user changed an encryption /
+ * passphrase / compression knob but has not re-run Init & Push, so a live
+ * push/pull would encode/decode against a codec the remote doesn't share.
+ *
+ * `configCodecApplied === undefined` (never Init'd, or a pre-v0.27.2 install)
+ * is NOT dirty: no recorded baseline to drift from, so existing users keep the
+ * prior permissive behaviour.
+ */
+export function isConfigCodecDirty(s: CouchSyncSettings): boolean {
+    if (s.configCodecApplied === undefined) return false;
+    return s.configCodecApplied !== codecFingerprint(resolveConfigCodec(s));
+}

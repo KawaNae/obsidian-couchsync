@@ -97,6 +97,17 @@ export interface CouchSyncSettings {
     configEncryptionPassphrase?: string;
     configCompressionEnabled?: boolean;
 
+    /** Structural fingerprint of the config codec that the last successful
+     *  Config Init actually applied to the remote (see
+     *  `codecFingerprint` / `isConfigCodecDirty`). When the live resolved
+     *  codec no longer matches this, the config DB on the server was built
+     *  with a different codec and live push/pull/write are refused until a
+     *  fresh Config Init re-applies the new policy — symmetric with vault
+     *  sync, where a codec change demands a destructive re-init (#config-codec).
+     *  `undefined` = never Init'd (or a pre-v0.27.2 install): permissive, no
+     *  baseline to drift from. */
+    configCodecApplied?: string;
+
     /** Locally-anchored cipherVersion policy floor (TOFU — trust on first
      *  unlock). Recorded the first time this device trust-unlocks the vault
      *  (Init/Clone/first-unlock) and ratcheted up on re-init; it never

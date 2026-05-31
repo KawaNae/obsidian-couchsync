@@ -434,6 +434,10 @@ export default class CouchSyncPlugin extends Plugin {
                     this.settings.configSettingUp = active;
                     await this.saveSettings();
                 },
+                persistConfigCodecApplied: async (fingerprint) => {
+                    this.settings.configCodecApplied = fingerprint;
+                    await this.saveSettings();
+                },
             },
         );
         this.statusBar = new StatusBar(
