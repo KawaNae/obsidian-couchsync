@@ -116,6 +116,13 @@ export class ConfigPullWriter {
         const concurrent: ConfigConcurrentEntry[] = [];
 
         let totalReceived = 0;
+        // One-shot guard for the seq-regression self-heal (L-2/L-3). A healthy
+        // recreate-elsewhere event resets the cursor exactly once; a SECOND
+        // regression in the same run means the server keeps reporting a
+        // last_seq below our cursor — a pathological / hostile server we must
+        // not let drive us around the MAX_PULL_BATCHES loop. Bound it to one
+        // self-heal per run and fail terminally on the second.
+        let didSeqReset = false;
         for (let loop = 0; loop < MAX_PULL_BATCHES; loop++) {
             const since = this.deps.checkpoints.getPullSeq();
             onProgress?.(
@@ -135,12 +142,30 @@ export class ConfigPullWriter {
             // config Init is an admin op the other devices should simply follow,
             // so we self-heal instead. (#config-codec)
             if (seqNumeric(batch.last_seq) < seqNumeric(since)) {
+                // A second regression in one run is not a legitimate recreate —
+                // the server is unstable or lying about last_seq. Fail terminally
+                // rather than spin to MAX_PULL_BATCHES (L-3). The re-pulled docs
+                // are still integrity-checked (cipherVersion floor + HMAC), so
+                // this is an availability guard, not a confidentiality one.
+                if (didSeqReset) {
+                    throw new Error(
+                        `Config pull: repeated seq regression in one run ` +
+                        `(last_seq=${batch.last_seq} < cursor=${since}) — ` +
+                        `server is unstable; aborting.`,
+                    );
+                }
+                didSeqReset = true;
                 logWarn(
                     `Config pull: remote seq regression (last_seq=${batch.last_seq} ` +
                     `< cursor=${since}) — config DB recreated elsewhere; ` +
                     `resetting cursor and re-pulling from scratch.`,
                 );
-                this.deps.checkpoints.setPullSeq(0);
+                // Durable reset (L-2): persist pullSeq=0 to disk, not just the
+                // in-memory cursor. A crash after a memory-only reset would leave
+                // the high cursor on disk and re-trigger this regression (and a
+                // full re-pull) every session. saveEmptyPullBatch writes
+                // META_CONFIG_PULL_SEQ in its own tx and advances the cursor.
+                await this.deps.checkpoints.saveEmptyPullBatch(0);
                 continue;
             }
 
