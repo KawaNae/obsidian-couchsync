@@ -2,6 +2,72 @@
 
 All notable changes to obsidian-couchsync.
 
+## 0.27.2
+
+A post-release review of v0.27.0/v0.27.1 (a multi-agent pass with adversarial
+verification) found no high-severity defects but two medium gaps plus a cluster
+of smaller ones. As in v0.26/v0.27 these are not independent bugs but the same
+recurring shape — *a config-side path that diverged from its vault-side mirror,
+or an invariant enforced on one side of a boundary but not the other* — so they
+are closed here as a return to three structural principles rather than spot
+fixes. No wire-format or schema change and no re-initialisation of existing
+vaults; the only persisted-shape addition is a `configCodecApplied` fingerprint
+(absent on existing installs, which therefore keep their current behaviour).
+
+### Fixed
+
+- **Changing a config codec setting no longer silently desyncs live config
+  sync.** Toggling config encryption / passphrase / compression only takes
+  effect on the next Config Init & Push, but until then live push/pull kept
+  running under the new setting against a database built with the old one — worst
+  case, turning encryption *off* cleared the provider while the server still held
+  encrypted documents, so pulls failed until a full re-Init. A successful Config
+  Init now records the codec it applied, and live push/pull/write refuse to run
+  when the live codec has drifted from it, with a clear "re-run Config Init &
+  Push" message — symmetric with the existing half-built-DB (`configSettingUp`)
+  guard, and with vault sync, where a codec change has always demanded a
+  re-init rather than a live switch.
+- **An interrupted Config Init no longer leaves the shared remote without its
+  crypto root.** Init destroyed and recreated the remote config database before
+  building the `config:meta` crypto root, so a failure in between left peers
+  looking at an existing-but-meta-less database, and a key-derivation failure
+  could wipe the remote for nothing. The crypto root is now derived first (a pure
+  computation — a failure there touches neither database) and `config:meta` is
+  pushed as the very first write after the database is recreated, shrinking the
+  window in which the remote exists without an authoritative descriptor to a
+  single request. A mid-flight failure still leaves the initiating device
+  fail-closed (`configSettingUp`), unchanged.
+- **The config pull's "remote recreated elsewhere" self-heal is now durable and
+  bounded.** The cursor reset was applied in memory only, so a crash before the
+  next batch committed left the stale cursor on disk and re-triggered a full
+  re-pull every session; it is now persisted in its own transaction. A second
+  seq regression within one run (an unstable or hostile server reporting a
+  last_seq below the cursor) is now treated as terminal instead of looping up to
+  the batch cap.
+- **A structurally malformed config chunk no longer aborts the whole document's
+  chunk fetch.** Config pull classified only a hash mismatch as corrupt, while
+  vault pull also treats a malformed envelope as corrupt (skip + warn, route to
+  repair); the two boundaries now share one `fetchMissingChunks` implementation,
+  so a corrupt chunk is handled identically and a malformed config chunk is
+  skipped rather than rethrown.
+
+### Security
+
+- **Config Init's encrypted document push is fail-closed.** It previously fell
+  back to the raw (plaintext) client when the encrypting-client hook was absent;
+  production always wired it, but the fail-open default was asymmetric with the
+  fail-closed `wrapConfigClient` / `wrapVaultClient`. An encrypted Init now
+  requires the encrypting client and refuses to push plaintext bodies into an
+  encrypted config database.
+
+### Internal
+
+- The config codec resolution (the per-field `?? ` / `||` inherit rules) is now
+  defined once in `resolveConfigCodec`, removing the scattered inline copies that
+  let a mis-paired operator silently break inheritance. The dead
+  `reinitForEncryptionChange` (zero callers, and a latent hazard that ran outside
+  the operation runner) is removed; the sole config rebuild path is `init()`.
+
 ## 0.27.1
 
 Hotfix for v0.27.0: the **first encrypted Config Init was impossible**. Config
