@@ -163,7 +163,27 @@ export class ConfigSetupService {
         // via onCryptoProviderReady above), NOT the `client` captured at init
         // start — otherwise docs encrypt under a different key than config:meta
         // and become undecryptable everywhere (#config-codec).
-        const pushClient = this.host.makeEncryptingClient?.() ?? client;
+        //
+        // Fail-closed, symmetric with wrapConfigClient / wrapVaultClient (L-1):
+        // when the codec is ENCRYPTED the encrypting client is mandatory.
+        // Falling back to the raw init-time `client` here would silently push
+        // PLAINTEXT config bodies into an encrypted config DB. Only the
+        // plaintext path may fall back to the raw client (used by tests that
+        // don't wire the hook; in production the wrapped client also carries
+        // the compression layer, so the hook is still preferred there).
+        let pushClient: ICouchClient;
+        if (opts.encryption) {
+            if (!this.host.makeEncryptingClient) {
+                throw new Error(
+                    "ConfigSetup: encrypted init requires an encrypting client " +
+                        "(makeEncryptingClient hook missing) — refusing to push " +
+                        "plaintext config bodies into an encrypted config DB.",
+                );
+            }
+            pushClient = this.host.makeEncryptingClient();
+        } else {
+            pushClient = this.host.makeEncryptingClient?.() ?? client;
+        }
         const pipeline = new ConfigPushPipeline({
             db: this.db,
             client: pushClient,
