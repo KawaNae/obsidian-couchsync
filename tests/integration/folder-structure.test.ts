@@ -49,6 +49,15 @@ class FolderAwareVaultIO extends FakeVaultIO {
         }
         return { files: base.files, folders: [...folders] };
     }
+    getFolders(): string[] {
+        return [...new Set([...super.getFolders(), ...this.folderSet])];
+    }
+    async abstractType(path: string): Promise<"file" | "folder" | null> {
+        const base = await super.abstractType(path);
+        if (base) return base;
+        if (this.folderSet.has(path)) return "folder";
+        return null;
+    }
 }
 
 describe("Integration: folder structure (Phase 1)", () => {
@@ -181,5 +190,64 @@ describe("Integration: folder structure (Phase 1)", () => {
         expect(await vault.exists("Keep/gone.md")).toBe(false);
         expect(await vault.exists("Keep/stay.md")).toBe(true);
         expect(await vault.exists("Keep")).toBe(true); // sibling keeps the folder alive
+    });
+
+    it("reuses an existing folder's case instead of minting a duplicate-case folder (M-1)", async () => {
+        // Case-sensitive FS: 'Notes/' already holds a file. A doc whose parent
+        // dir differs ONLY in case ('notes/') is pulled. ensureParentDir must
+        // place the child under the existing 'Notes/', not create a second
+        // 'notes/' folder (the duplicate-folder divergence).
+        const dev = createDevice("dev-A");
+        dev.vault.addFile("Notes/real.md", "hi");
+        await dev.vs.fileToDb("Notes/real.md");
+        // Seed chunks for the incoming file via a temp source, then re-point.
+        dev.vault.addFile("Notes/_src", "x content");
+        await dev.vs.fileToDb("Notes/_src");
+        const lowerDoc: FileDoc = {
+            ...(await dev.db.get(makeFileId("Notes/_src")) as FileDoc),
+            _id: makeFileId("notes/x.md"), // lowercase parent
+        };
+
+        const result = await dev.vs.dbToFile(lowerDoc);
+
+        expect(result.applied).toBe(true);
+        expect(dev.vault.files.has("Notes/x.md")).toBe(true);  // landed in existing folder
+        expect(dev.vault.files.has("notes/x.md")).toBe(false); // no lowercase variant
+        const notesFolders = dev.vault.getFolders().filter((f) => f.toLowerCase() === "notes");
+        expect(notesFolders).toEqual(["Notes"]); // exactly one folder folds to this PathKey
+    });
+
+    it("declines a file create whose path is occupied by a folder, instead of throwing (M-2)", async () => {
+        const vault = new FolderAwareVaultIO();
+        const dev = createDevice("dev-A", vault);
+        await vault.createFolder("archive");        // a FOLDER holds 'archive'
+        vault.addFile("archive/note.md", "inside");
+        vault.addFile("_arc_src", "file body");     // seed chunks for an extensionless file doc
+        await dev.vs.fileToDb("_arc_src");
+        const fileDoc: FileDoc = {
+            ...(await dev.db.get(makeFileId("_arc_src")) as FileDoc),
+            _id: makeFileId("archive"),             // file shares the folder's path
+        };
+
+        const result = await dev.vs.dbToFile(fileDoc);
+
+        expect(result.applied).toBe(false);
+        expect((result as { reason: string }).reason).toBe("file-folder-collision");
+        expect(await vault.abstractType("archive")).toBe("folder"); // folder untouched
+    });
+
+    it("empty-folder prune does not delete a file occupying the parent's path (M-2 type guard)", async () => {
+        const vault = new FolderAwareVaultIO();
+        const dev = createDevice("dev-A", vault);
+        vault.addFile("P/only.md", "child");
+        vault.addFile("P", "i am a file, not a folder"); // shares the parent path
+        await dev.vs.fileToDb("P/only.md");
+        await dev.vs.fileToDb("P");
+
+        // Delete the child → prune walks up to "P", which resolves to a FILE.
+        await dev.vs.dbToFile({ ...(await dev.db.getFileDoc("P/only.md"))!, deleted: true });
+
+        expect(await vault.exists("P/only.md")).toBe(false);
+        expect(vault.files.has("P")).toBe(true); // the file survived the prune
     });
 });

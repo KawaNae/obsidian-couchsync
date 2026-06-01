@@ -322,26 +322,55 @@ export class Reconciler {
                 continue;
             }
 
-            // Case D: vault doesn't have it, DB alive
+            // Case D: vault doesn't have it, DB alive. The question is "have I
+            // ever integrated this path here?" — if yes, the missing file is a
+            // local delete to propagate; if no, another device created it and
+            // we restore to converge. Decide by FIDELITY-ORDERED oracles:
+            //
+            //   1. lastSynced (per-path integration baseline, written ONLY on a
+            //      successful push/pull apply — vault-sync.ts:271/404) is the
+            //      authoritative "I integrated this content" record.
+            //   2. The vault manifest is a coarse fallback: it is written ONLY
+            //      by reconcile (line ~447), so a freshly pulled-but-not-yet-
+            //      reconciled path is invisible to it. Using it as the primary
+            //      oracle resurrected user deletions in that window (the H-1
+            //      bug). Demoted to legacy / first-run / no-lastSynced fallback.
             if (!file && doc && !doc.deleted) {
-                // Divergent-delete guard runs before classifyMissingFromVault.
-                // Signal: lastSynced exists (= this device integrated the
-                // path) AND doc.vclock dominates lastSynced.vclock (= a pull
-                // advanced the doc beyond integration baseline). User
-                // deleted the file during that window — surface as conflict
-                // instead of either auto-deleting (no-op via the guard,
-                // then auto-restore on the next cycle) or auto-restoring.
                 const lastSynced = this.vaultSync.getLastSynced(displayPath);
-                if (lastSynced && this.conflictOrchestrator
-                    && compareVC(doc.vclock ?? {}, lastSynced.vclock) === "dominates") {
-                    if (await this.tryStep(displayPath, "conflict-delete",
-                        () => this.conflictOrchestrator!.handleDivergentLocalDelete(displayPath, doc),
-                        mode)) {
-                        report.deleted.push(displayPath);
+                if (lastSynced) {
+                    const rel = compareVC(doc.vclock ?? {}, lastSynced.vclock);
+                    if (rel === "dominates") {
+                        // A pull advanced the doc beyond our integration
+                        // baseline while the file was locally gone: divergent
+                        // local-delete vs remote-edit → conflict (production
+                        // always wires the orchestrator; without it, fall back
+                        // to remote-wins restore, matching the Case A/B path).
+                        if (this.conflictOrchestrator) {
+                            if (await this.tryStep(displayPath, "conflict-delete",
+                                () => this.conflictOrchestrator!.handleDivergentLocalDelete(displayPath, doc),
+                                mode)) {
+                                report.deleted.push(displayPath);
+                            }
+                        } else {
+                            const r = await this.applyRemoteToVault(displayPath, doc, "restore", mode);
+                            if (r === "applied") report.restored.push(displayPath);
+                            else if (r === "quarantined") report.quarantined.push(displayPath);
+                        }
+                    } else {
+                        // equal/dominated: we integrated this content and the
+                        // doc has NOT advanced past our baseline → the missing
+                        // file is a genuine local delete. Propagate the
+                        // tombstone (H-1 fix: previously the manifest-blind
+                        // classifier restored it on a dropped delete event).
+                        if (await this.tryStep(displayPath, "delete",
+                            () => this.vaultSync.markDeleted(displayPath), mode)) {
+                            report.deleted.push(displayPath);
+                        }
                     }
                     continue;
                 }
 
+                // No integration baseline here → fall back to the manifest.
                 const decision = this.classifyMissingFromVault(doc, deviceId, manifestPaths);
                 if (decision === "delete") {
                     if (await this.tryStep(displayPath, "delete", () => this.vaultSync.markDeleted(displayPath), mode)) {
@@ -662,14 +691,16 @@ export class Reconciler {
             return;
         }
 
-        // Canonical = causal dominator, else a deterministic tiebreak (latest
-        // writer device, then raw path) so every device converges identically.
-        const canonicalDoc = findDominator(aliveDocs) ?? [...aliveDocs].sort((a, b) => {
-            const da = latestDevice(a.vclock ?? {}) ?? "";
-            const db = latestDevice(b.vclock ?? {}) ?? "";
-            if (da !== db) return da < db ? -1 : 1;
-            return rawOf(a) < rawOf(b) ? -1 : 1;
-        })[0];
+        // Canonical = causal dominator, else the lexicographically smallest
+        // raw path. For genuinely concurrent variants there is no "latest"
+        // writer, and the content is provably equal here, so WHICH case wins
+        // is immaterial — only that every device picks the SAME one. The raw
+        // path (doc id) is the one key that is byte-identical on every device;
+        // a vclock-derived tiebreak (latestDevice) was not, because mergeVC can
+        // persist the same logical clock with different key order, so two
+        // devices could pick different canonicals and tombstone each other.
+        const canonicalDoc = findDominator(aliveDocs)
+            ?? [...aliveDocs].sort((a, b) => (rawOf(a) < rawOf(b) ? -1 : 1))[0];
         const canonicalRaw = rawOf(canonicalDoc);
 
         for (const raw of variants) {

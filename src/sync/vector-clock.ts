@@ -86,14 +86,21 @@ export function findDominator<T extends { vclock?: VectorClock } | VectorClock>(
 /**
  * The device whose counter is highest in the clock — used to answer
  * "who made the most recent write?" without consulting wall-clock time.
- * Returns null for an empty clock. Ties are broken by insertion order
- * (i.e. whichever key iterates first).
+ * Returns null for an empty clock.
+ *
+ * Ties (two devices at the same max counter) are broken by the
+ * lexicographically smallest device id, NOT by key insertion order. The
+ * latter made the result depend on how the clock happened to be serialised
+ * — and `mergeVC` can persist the same logical clock with different key
+ * order on different devices — so two devices could disagree on the "latest
+ * writer" of an identical clock. Tie-breaking on the device id (byte-stable
+ * everywhere) makes this a pure function of the clock's content.
  */
 export function latestDevice(vc: VectorClock): string | null {
     let best: string | null = null;
     let bestCount = -1;
     for (const [device, count] of Object.entries(vc)) {
-        if (count > bestCount) {
+        if (count > bestCount || (count === bestCount && (best === null || device < best))) {
             best = device;
             bestCount = count;
         }

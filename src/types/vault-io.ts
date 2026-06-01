@@ -63,6 +63,23 @@ export interface IVaultIO {
      * Each entry carries `path` and a subset of `stat` needed by Reconciler.
      */
     getFiles(): VaultFile[];
+
+    /**
+     * Return all FOLDER paths in the vault (not files, not dot-prefixed,
+     * excluding the root). Symmetric with `getFiles()`. The folder namespace
+     * is invisible to `getFiles()`, so create/delete case-safety needs this
+     * to detect a folder occupying a colliding PathKey (a case-variant parent
+     * directory).
+     */
+    getFolders(): string[];
+
+    /**
+     * What occupies `path` — a file, a folder, or nothing. Lets callers
+     * refuse a file/folder PathKey collision before `createBinary` (which
+     * throws when a folder holds the path) and type-guard a folder delete
+     * (so a file is never deleted in place of an empty folder).
+     */
+    abstractType(path: string): Promise<"file" | "folder" | null>;
 }
 
 /** Lightweight file descriptor returned by `IVaultIO.getFiles()`. */

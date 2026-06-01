@@ -43,6 +43,10 @@ class FakeVaultIO implements IVaultIO {
         return new TextDecoder().decode(b);
     }
     getFiles(): VaultFile[] { return []; }
+    getFolders(): string[] { return []; }
+    async abstractType(path: string): Promise<"file" | "folder" | null> {
+        return this.files.has(path) ? "file" : null;
+    }
 }
 
 function makeSettings(overrides: Partial<CouchSyncSettings> = {}): CouchSyncSettings {

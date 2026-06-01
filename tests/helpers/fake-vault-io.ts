@@ -107,4 +107,26 @@ export class FakeVaultIO implements IVaultIO {
         }
         return result;
     }
+
+    getFolders(): string[] {
+        // Flat map: folders are the ancestor prefixes implied by file paths.
+        const folders = new Set<string>();
+        for (const path of this.files.keys()) {
+            if (path.startsWith(".")) continue;
+            const parts = path.split("/");
+            for (let i = 1; i < parts.length; i++) {
+                folders.add(parts.slice(0, i).join("/"));
+            }
+        }
+        return [...folders];
+    }
+
+    async abstractType(path: string): Promise<"file" | "folder" | null> {
+        if (this.files.has(path)) return "file";
+        const prefix = path + "/";
+        for (const key of this.files.keys()) {
+            if (key.startsWith(prefix)) return "folder";
+        }
+        return null;
+    }
 }

@@ -62,4 +62,15 @@ export class ObsidianAdapterIO implements IVaultIO {
     getFiles(): VaultFile[] {
         return [];
     }
+
+    /** Not applicable — adapter has no vault file index. */
+    getFolders(): string[] {
+        return [];
+    }
+
+    async abstractType(path: string): Promise<"file" | "folder" | null> {
+        const s = await this.app.vault.adapter.stat(path);
+        if (!s) return null;
+        return s.type === "folder" ? "folder" : "file";
+    }
 }

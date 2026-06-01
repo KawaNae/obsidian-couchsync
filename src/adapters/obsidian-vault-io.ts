@@ -6,6 +6,7 @@
  * I/O. All TFile ↔ path resolution is confined here.
  */
 
+import { TFolder } from "obsidian";
 import type { App, TFile } from "obsidian";
 import type { IVaultIO, FileStat, VaultFile } from "../types/vault-io.ts";
 
@@ -60,6 +61,20 @@ export class ObsidianVaultIO implements IVaultIO {
             path: f.path,
             stat: { mtime: f.stat.mtime, ctime: f.stat.ctime, size: f.stat.size },
         }));
+    }
+
+    getFolders(): string[] {
+        return this.app.vault
+            .getAllLoadedFiles()
+            .filter((f): f is TFolder =>
+                f instanceof TFolder && f.path !== "" && f.path !== "/" && !f.path.startsWith("."))
+            .map((f) => f.path);
+    }
+
+    async abstractType(path: string): Promise<"file" | "folder" | null> {
+        const abs = this.app.vault.getAbstractFileByPath(path);
+        if (!abs) return null;
+        return abs instanceof TFolder ? "folder" : "file";
     }
 
     // ── internal ──────────────────────────────────────

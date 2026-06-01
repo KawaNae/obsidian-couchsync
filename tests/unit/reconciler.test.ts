@@ -3,6 +3,7 @@ import { Reconciler, totalDiscrepancies } from "../../src/sync/reconciler.ts";
 import type { ScanCursor, VaultManifest } from "../../src/db/local-db.ts";
 import type { FileDoc } from "../../src/types.ts";
 import { makeFileId, filePathFromId } from "../../src/types/doc-id.ts";
+import type { LastSynced } from "../../src/sync/last-synced.ts";
 
 const SELF = "device-self";
 const OTHER = "device-other";
@@ -92,7 +93,10 @@ interface FakeVaultSync {
     classifyFileVsDoc(doc: FileDoc, path: string, size: number): Promise<ClassifyResult>;
     adoptDocVclock(path: string, doc: FileDoc): Promise<void>;
     alignLastSyncedToDoc(path: string, doc: FileDoc): Promise<"already-aligned" | "upgraded-legacy" | "recovered-stale">;
-    getLastSynced(path: string): undefined;
+    /** Per-path integration baseline. Empty by default (legacy paths);
+     *  tests populate it to exercise the lastSynced-primary Case D logic. */
+    lastSyncedMap: Map<string, LastSynced>;
+    getLastSynced(path: string): LastSynced | undefined;
     computeVaultChunks(path: string): Promise<string[]>;
     // Quarantine (Invariant II). Defaults to "nothing quarantined" so existing
     // restore/pull tests are unaffected.
@@ -141,10 +145,11 @@ function makeVaultSync(): FakeVaultSync {
             this.alignCalls.push(path);
             return "already-aligned" as const;
         },
-        // Tests in this file don't exercise the divergent-edit / divergent-
-        // delete routing (no ConflictOrchestrator wired); always report no
-        // lastSynced so the reconciler keeps the legacy paths.
-        getLastSynced(_path) { return undefined; },
+        // Per-path integration baseline. Defaults to empty, so paths with no
+        // explicit entry fall to the manifest fallback (legacy behaviour).
+        // Tests set entries to drive the lastSynced-primary Case D branch.
+        lastSyncedMap: new Map<string, LastSynced>(),
+        getLastSynced(path) { return this.lastSyncedMap.get(path); },
         async computeVaultChunks(_path) { return []; },
         quarantinedCalls: [],
         clearedCalls: [],
@@ -354,6 +359,41 @@ describe("Reconciler", () => {
             expect(h.vaultSync.clearedCalls).toEqual(["a.md"]);
             expect(r.restored).toEqual(["a.md"]);
             expect(h.vaultSync.dbToFileCalls).toEqual(["a.md"]);
+        });
+    });
+
+    // H-1: lastSynced (per-path integration baseline) is the PRIMARY oracle
+    // for Case D; the manifest is only a fallback. A path this device pulled
+    // (lastSynced set) but had not yet reconciled into the manifest must NOT be
+    // resurrected when its delete event is dropped — the missing file is a real
+    // local delete and must propagate as a tombstone.
+    describe("Case D: lastSynced-primary classification (H-1)", () => {
+        it("tombstones a pulled-then-deleted path even when absent from the manifest", async () => {
+            const h = setup([]); // vault missing the file (deleted, event dropped)
+            h.db.fileDocs.set("a.md", makeDoc("a.md", { lastWriter: OTHER }));
+            h.db.manifest = { paths: [], updatedAt: 0 }; // manifest lags the pull
+            // Integration baseline equal to the doc (pull set it; no later pull
+            // advanced it) — the divergent guard must NOT fire here.
+            h.vaultSync.lastSyncedMap.set("a.md", { vclock: { [OTHER]: 1 } });
+
+            const r = await h.reconciler.reconcile("manual");
+
+            expect(r.deleted).toEqual(["a.md"]);
+            expect(h.vaultSync.markDeletedCalls).toEqual(["a.md"]);
+            expect(r.restored).toEqual([]); // the old manifest-blind bug
+            expect(h.vaultSync.dbToFileCalls).toEqual([]);
+        });
+
+        it("without an integration baseline, still restores (manifest fallback unchanged)", async () => {
+            const h = setup([]);
+            h.db.fileDocs.set("a.md", makeDoc("a.md", { lastWriter: OTHER }));
+            h.db.manifest = { paths: [], updatedAt: 0 };
+            // No lastSynced entry → never integrated here → remote-created.
+
+            const r = await h.reconciler.reconcile("manual");
+
+            expect(r.restored).toEqual(["a.md"]);
+            expect(h.vaultSync.markDeletedCalls).toEqual([]);
         });
     });
 
@@ -679,6 +719,26 @@ describe("Reconciler", () => {
 
             expect(r.shortCircuited).toBe(false);
             expect(r.collisionsResolved).toEqual(["Scripts/X"]);
+        });
+
+        it("concurrent variants pick a path-deterministic canonical, independent of vclock key order (H-2)", async () => {
+            // Genuinely concurrent (no causal dominator): the canonical must be
+            // a DEVICE-INVARIANT choice. The old tiebreak used latestDevice(),
+            // which depended on vclock key order — and mergeVC can persist the
+            // same logical clock with different key order per device — so two
+            // devices could pick different canonicals and tombstone each other.
+            // Raw path (doc id) is byte-identical everywhere → both key orders
+            // of {A:1,C:1} must resolve to the same canonical.
+            const run = async (scriptsUpperVclock: Record<string, number>) => {
+                const h = setup([makeFile("Scripts/X", 1000)]);
+                h.db.fileDocs.set("Scripts/X", makeDoc("Scripts/X", { vclock: scriptsUpperVclock }));
+                h.db.fileDocs.set("scripts/X", makeDoc("scripts/X", { vclock: { B: 2 } }));
+                h.db.manifest = { paths: ["Scripts/X"], updatedAt: 0 };
+                const r = await h.reconciler.reconcile("manual");
+                return r.collisionsResolved;
+            };
+            expect(await run({ A: 1, C: 1 })).toEqual(["Scripts/X"]);
+            expect(await run({ C: 1, A: 1 })).toEqual(["Scripts/X"]); // same, despite key order
         });
     });
 });

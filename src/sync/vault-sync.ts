@@ -294,28 +294,32 @@ export class VaultSync {
         }
 
         if (fileDoc.deleted) {
-            // Case-safe deletion (invariant S3/S5): only remove the physical
-            // file when an EXACT-case match exists in the vault. If the sole
-            // same-PathKey file on disk is under a DIFFERENT case, it is a
-            // distinct logical occupant — the surviving canonical of a resolved
-            // collision — and must NOT be deleted. On a case-insensitive FS the
-            // two cases share ONE physical file, so deleting "scripts/X" would
-            // nuke the canonical "Scripts/X"; `getFiles()` reports the real
-            // on-disk case, making this decision correct on every FS. The
-            // tombstone is still integrated (bookkeeping advances).
+            // Case-safe deletion (invariant S3/S5): issue a physical delete
+            // ONLY when an EXACT-case FILE is on disk. `getFiles()` reports the
+            // real on-disk case and excludes folders, so a single check covers
+            // every non-delete case correctly:
+            //   - different-case sibling (the surviving canonical of a resolved
+            //     collision) → not deleted (would nuke the canonical; on a
+            //     case-insensitive FS both cases share ONE physical file);
+            //   - a FOLDER occupying the path (file/folder PathKey collision)
+            //     → not deleted (would delete the folder — never via a file
+            //     tombstone);
+            //   - simply absent here → nothing to delete.
+            // In all of these the tombstone is still integrated (bookkeeping
+            // advances); only the disk side is skipped.
             const exactOnDisk = this.vault.getFiles().some((f) => f.path === vaultPath);
-            if (!exactOnDisk) {
+            if (exactOnDisk) {
+                await this.vaultWriter.applyRemoteDeletion(vaultPath);
+                await this.pruneEmptyParents(vaultPath);
+            } else {
                 const sibling = this.findExistingByPathKey(vaultPath);
                 if (sibling) {
                     logWarn(
                         `dbToFile: skipping disk delete of ${vaultPath} — different-case ` +
                             `sibling ${sibling} present (case-dedup tombstone)`,
                     );
-                    return { applied: true };
                 }
             }
-            await this.vaultWriter.applyRemoteDeletion(vaultPath);
-            await this.pruneEmptyParents(vaultPath);
             return { applied: true };
         }
 
@@ -375,8 +379,29 @@ export class VaultSync {
                 );
                 return { applied: false, reason: "path-key-collision" };
             }
-            await this.ensureParentDir(vaultPath);
-            await this.vaultWriter.createFile(vaultPath, content);
+            // File/folder PathKey collision (invariant S5, extended to the
+            // folder namespace): a FOLDER occupies this exact path — e.g. an
+            // extensionless file doc `archive` vs the folder `archive/`.
+            // createFile would throw "File already exists" (uncaught → the doc
+            // never converges). The two are genuinely distinct entities sharing
+            // a name; this is not auto-resolvable, so decline and surface it
+            // rather than throw.
+            if ((await this.vault.abstractType(vaultPath)) === "folder") {
+                logWarn(
+                    `dbToFile: file/folder collision for ${vaultPath} ` +
+                        `(a folder occupies this path) — declining create`,
+                );
+                return { applied: false, reason: "file-folder-collision" };
+            }
+            // M-1: resolve the parent dir to an existing same-PathKey folder's
+            // case so a case-sensitive FS does not gain a duplicate-case folder
+            // beside the canonical one. The file lands under the existing
+            // folder; the doc keeps its case and reconciles as identical
+            // (PathKey-folded), so no doc churn.
+            const resolvedDir = await this.ensureParentDir(vaultPath);
+            const basename = vaultPath.slice(vaultPath.lastIndexOf("/") + 1);
+            const writePath = resolvedDir ? `${resolvedDir}/${basename}` : vaultPath;
+            await this.vaultWriter.createFile(writePath, content);
             result = { applied: true };
         }
 
@@ -670,6 +695,10 @@ export class VaultSync {
                 const { files, folders } = await this.vault.list(dir);
                 if (files.length > 0 || folders.length > 0) return; // not empty
                 if (!(await this.vault.exists(dir))) return;
+                // Type-guard: only delete an actual FOLDER. A file/folder
+                // PathKey alias could resolve `dir` to a same-named file; never
+                // delete that in the name of empty-folder pruning (M-2).
+                if ((await this.vault.abstractType(dir)) !== "folder") return;
                 await this.vault.delete(dir);
             } catch (e: any) {
                 logWarn(`CouchSync: pruneEmptyParents ${dir}: ${e?.message ?? e}`);
@@ -1023,12 +1052,49 @@ export class VaultSync {
         }
     }
 
-    private async ensureParentDir(filePath: string): Promise<void> {
-        const parts = filePath.split("/");
-        if (parts.length <= 1) return;
-        const dir = parts.slice(0, -1).join("/");
-        if (!(await this.vault.exists(dir))) {
-            await this.vault.createFolder(dir);
+    /**
+     * Ensure `filePath`'s parent directory chain exists and return the parent
+     * dir path to actually write under ("" for a root-level file).
+     *
+     * Case-safety (invariant S5, folder namespace): when a segment does not
+     * exist under its exact case but a same-PathKey folder DOES (a different-
+     * case variant — e.g. doc path `notes/x` while `Notes/` is on disk), reuse
+     * the existing folder's case instead of minting a second-case folder. On a
+     * case-insensitive FS `exists()` already returns true for the folded name,
+     * so this only changes behaviour on a case-sensitive FS, where it prevents
+     * the duplicate-folder divergence (M-1).
+     */
+    private async ensureParentDir(filePath: string): Promise<string> {
+        const segments = filePath.split("/").slice(0, -1);
+        let resolved = "";
+        for (const seg of segments) {
+            const exact = resolved ? `${resolved}/${seg}` : seg;
+            if (await this.vault.exists(exact)) {
+                resolved = exact;
+                continue;
+            }
+            const existing = this.findFolderByPathKey(exact);
+            if (existing) {
+                resolved = existing; // reuse the on-disk case
+                continue;
+            }
+            await this.vault.createFolder(exact);
+            resolved = exact;
         }
+        return resolved;
+    }
+
+    /**
+     * Find an on-disk FOLDER that shares `targetPath`'s PathKey but differs in
+     * exact spelling. Folder-namespace twin of `findExistingByPathKey` — the
+     * file scan (`getFiles()`) cannot see folders, so folder case collisions
+     * need their own lookup. Returns the existing-case folder path, or null.
+     */
+    private findFolderByPathKey(targetPath: string): string | null {
+        const key = toPathKey(targetPath);
+        for (const dir of this.vault.getFolders()) {
+            if (dir !== targetPath && toPathKey(dir) === key) return dir;
+        }
+        return null;
     }
 }
