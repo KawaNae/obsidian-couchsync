@@ -556,8 +556,16 @@ export class PushPipeline {
                 // vclock merge) needs no push — the content is already
                 // replicated. Skipping avoids a write that only bumps the clock
                 // and the _changes round-trip it triggers on every peer.
+                //
+                // BUT a soft-delete tombstone keeps its `chunks` array (markDeleted
+                // only flips `deleted` + bumps the vclock), so a tombstone vs an
+                // alive remote doc is chunk-equal yet a REAL state change that MUST
+                // push — otherwise deletions never propagate (the root cause behind
+                // "folder/file deletes don't sync"). Only skip when the deleted
+                // state ALSO matches.
                 const rDoc = remoteDocMap.get(doc._id);
-                if (rDoc && chunkListsEqual(doc.chunks, rDoc.chunks)) {
+                if (rDoc && chunkListsEqual(doc.chunks, rDoc.chunks)
+                    && !!doc.deleted === !!rDoc.deleted) {
                     skippedEqual.push(doc._id);
                     continue;
                 }

@@ -653,4 +653,39 @@ describe("PushPipeline integration", () => {
             expect(captured!.remoteDoc.chunks).toEqual(["chunk:remoteX"]);
         });
     });
+
+    describe("tombstone churn guard (#sync-005)", () => {
+        it("pushes a soft-delete tombstone even when chunks match the alive remote", async () => {
+            // Root cause of "deletes don't propagate": markDeleted keeps the
+            // doc's `chunks`, so a tombstone is chunk-equal to the alive remote
+            // and the #sync-005 churn guard wrongly skipped it. The guard must
+            // also compare the `deleted` flag.
+            h = createSyncHarness();
+            const a = h.addDevice("dev-A");
+            const id = makeFileId("del.md");
+
+            // Remote: ALIVE doc.
+            await h.couch.bulkDocs([{
+                _id: id, type: "file", chunks: ["chunk:X"],
+                mtime: 1000, ctime: 1000, size: 10, vclock: { "dev-A": 1 },
+            } as unknown as CouchSyncDoc]);
+            // Local: TOMBSTONE — dominates remote, SAME chunks, deleted:true.
+            await a.db.runWriteTx({ docs: [{ doc: {
+                _id: id, type: "file", chunks: ["chunk:X"], deleted: true,
+                mtime: 2000, ctime: 1000, size: 10, vclock: { "dev-A": 2 },
+            } as unknown as CouchSyncDoc }] });
+
+            const fileSpy = vi.spyOn(h.couch, "bulkDocs");
+            const rig = attachPushPipeline({ device: a, couch: h.couch, runOnce: true });
+            await rig.pipeline.run();
+
+            const pushed = fileSpy.mock.calls.flatMap(
+                (c) => (c[0] as Array<CouchSyncDoc>).map((d) => ({ id: d._id, deleted: (d as any).deleted })),
+            );
+            const t = pushed.find((p) => p.id === id);
+            expect(t, "tombstone must be pushed, not skipped by the churn guard").toBeDefined();
+            expect(t!.deleted).toBe(true);
+            fileSpy.mockRestore();
+        });
+    });
 });
