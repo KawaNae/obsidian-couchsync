@@ -81,9 +81,14 @@ interface FakeVaultSync {
     alignCalls: string[];
     /** Per-path classifier override. Tests must set this explicitly. */
     compareResults: Map<string, ClassifyResult>;
+    applyRemoteDeletionCalls: string[];
+    /** Paths the test marks as having unpushed local edits (Case F gate). */
+    unpushed: Set<string>;
     fileToDb(path: string): Promise<void>;
     dbToFile(doc: FileDoc): Promise<void>;
     markDeleted(path: string): Promise<void>;
+    applyRemoteDeletion(path: string): Promise<void>;
+    hasUnpushedChanges(path: string): Promise<boolean>;
     classifyFileVsDoc(doc: FileDoc, path: string, size: number): Promise<ClassifyResult>;
     adoptDocVclock(path: string, doc: FileDoc): Promise<void>;
     alignLastSyncedToDoc(path: string, doc: FileDoc): Promise<"already-aligned" | "upgraded-legacy" | "recovered-stale">;
@@ -106,12 +111,19 @@ function makeVaultSync(): FakeVaultSync {
         markDeletedCalls: [],
         adoptVclockCalls: [],
         alignCalls: [],
+        applyRemoteDeletionCalls: [],
+        unpushed: new Set<string>(),
         compareResults: new Map(),
         async fileToDb(path) { this.fileToDbCalls.push(path); },
         // Record the bare vault path (not the prefixed _id) so tests can
         // keep asserting `expect(dbToFileCalls).toEqual(["a.md"])`.
         async dbToFile(doc) { this.dbToFileCalls.push(filePathFromId(doc._id)); },
         async markDeleted(path) { this.markDeletedCalls.push(path); },
+        async applyRemoteDeletion(path) {
+            this.applyRemoteDeletionCalls.push(path);
+            this.markDeletedCalls.push(path);
+        },
+        async hasUnpushedChanges(path) { return this.unpushed.has(path); },
         async classifyFileVsDoc(doc, _path, _size) {
             // Fake honours compareResults keyed by vault path — extract
             // from the prefixed _id to match how tests register overrides.
@@ -591,6 +603,82 @@ describe("Reconciler", () => {
 
             expect(r.localWins).toEqual(["README.md"]);
             expect(h.vaultSync.fileToDbCalls).toEqual(["README.md"]);
+        });
+    });
+
+    describe("Case F: PathKey collision (S4/S5)", () => {
+        it("converges two same-content docs to the vclock-canonical case (DB-only variant)", async () => {
+            // The scripts/Scripts incident on a case-insensitive device: vault
+            // holds one file (Scripts/X), DB holds BOTH docs. Scripts/X
+            // dominates scripts/X causally → canonical. scripts/X has no
+            // exact-case file here → tombstone only (no disk delete).
+            const h = setup([makeFile("Scripts/X", 1000)]);
+            h.db.fileDocs.set("Scripts/X", makeDoc("Scripts/X", { vclock: { [OTHER]: 1, [SELF]: 1 } }));
+            h.db.fileDocs.set("scripts/X", makeDoc("scripts/X", { vclock: { [OTHER]: 1 } }));
+            h.db.manifest = { paths: ["Scripts/X"], updatedAt: 0 };
+
+            const r = await h.reconciler.reconcile("manual");
+
+            expect(r.collisionsResolved).toEqual(["Scripts/X"]);
+            expect(h.vaultSync.markDeletedCalls).toEqual(["scripts/X"]);
+            expect(h.vaultSync.applyRemoteDeletionCalls).toEqual([]); // no disk delete
+            expect(h.vaultSync.dbToFileCalls).toEqual([]); // canonical already on disk
+        });
+
+        it("removes the non-canonical physical file on a case-sensitive FS", async () => {
+            // Android: both case-variant files on disk, both docs present.
+            const h = setup([makeFile("scripts/X", 1000), makeFile("Scripts/X", 1000)]);
+            h.db.fileDocs.set("Scripts/X", makeDoc("Scripts/X", { vclock: { [OTHER]: 1, [SELF]: 1 } }));
+            h.db.fileDocs.set("scripts/X", makeDoc("scripts/X", { vclock: { [OTHER]: 1 } }));
+            h.db.manifest = { paths: ["Scripts/X", "scripts/X"], updatedAt: 0 };
+
+            const r = await h.reconciler.reconcile("manual");
+
+            expect(r.collisionsResolved).toEqual(["Scripts/X"]);
+            // scripts/X has an exact-case file → disk delete + tombstone.
+            expect(h.vaultSync.applyRemoteDeletionCalls).toEqual(["scripts/X"]);
+        });
+
+        it("does NOT auto-resolve when the variants have different content", async () => {
+            const h = setup([makeFile("Scripts/X", 1000)]);
+            h.db.fileDocs.set("Scripts/X", makeDoc("Scripts/X", { chunks: ["chunk:aaa"], vclock: { [SELF]: 1 } }));
+            h.db.fileDocs.set("scripts/X", makeDoc("scripts/X", { chunks: ["chunk:bbb"], vclock: { [OTHER]: 1 } }));
+            h.db.manifest = { paths: ["Scripts/X"], updatedAt: 0 };
+
+            const r = await h.reconciler.reconcile("manual");
+
+            expect(r.collisionsResolved).toEqual([]);
+            expect(h.vaultSync.markDeletedCalls).toEqual([]);
+            expect(h.vaultSync.applyRemoteDeletionCalls).toEqual([]);
+        });
+
+        it("does NOT auto-resolve when a colliding file has unpushed edits", async () => {
+            const h = setup([makeFile("Scripts/X", 1000)]);
+            h.db.fileDocs.set("Scripts/X", makeDoc("Scripts/X", { vclock: { [OTHER]: 1, [SELF]: 1 } }));
+            h.db.fileDocs.set("scripts/X", makeDoc("scripts/X", { vclock: { [OTHER]: 1 } }));
+            h.db.manifest = { paths: ["Scripts/X"], updatedAt: 0 };
+            h.vaultSync.unpushed.add("Scripts/X");
+
+            const r = await h.reconciler.reconcile("manual");
+
+            expect(r.collisionsResolved).toEqual([]);
+            expect(h.vaultSync.markDeletedCalls).toEqual([]);
+        });
+
+        it("fast-path does not short-circuit when the vault holds a case-duplicate (S7)", async () => {
+            // Steady-state inputs that would otherwise short-circuit (cursor +
+            // matching manifest + unchanged seq + old mtime), but two files
+            // fold to one PathKey → the slow path must run and resolve.
+            const h = setup([makeFile("scripts/X", 100), makeFile("Scripts/X", 100)]);
+            h.db.fileDocs.set("Scripts/X", makeDoc("Scripts/X", { vclock: { [OTHER]: 1, [SELF]: 1 } }));
+            h.db.fileDocs.set("scripts/X", makeDoc("scripts/X", { vclock: { [OTHER]: 1 } }));
+            h.db.manifest = { paths: ["scripts/X", "Scripts/X"], updatedAt: 0 };
+            h.db.cursor = { lastScanStartedAt: 10_000, lastScanCompletedAt: 10_000, lastSeenUpdateSeq: 0 };
+
+            const r = await h.reconciler.reconcile("onload");
+
+            expect(r.shortCircuited).toBe(false);
+            expect(r.collisionsResolved).toEqual(["Scripts/X"]);
         });
     });
 });

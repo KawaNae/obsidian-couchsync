@@ -9,6 +9,8 @@ import type { FileStat } from "../../src/types/vault-io.ts";
 type ModifyCreateCb = (path: string, stat: FileStat) => void;
 type DeleteCb = (path: string) => void;
 type RenameCb = (path: string, oldPath: string, stat: FileStat | undefined) => void;
+type FolderDeleteCb = (path: string) => void;
+type FolderRenameCb = (path: string, oldPath: string) => void;
 
 interface Subscription {
     event: string;
@@ -24,6 +26,8 @@ export class FakeVaultEvents implements IVaultEvents {
     on(event: "create", cb: ModifyCreateCb): VaultEventRef;
     on(event: "delete", cb: DeleteCb): VaultEventRef;
     on(event: "rename", cb: RenameCb): VaultEventRef;
+    on(event: "folder-delete", cb: FolderDeleteCb): VaultEventRef;
+    on(event: "folder-rename", cb: FolderRenameCb): VaultEventRef;
     on(event: string, cb: Function): VaultEventRef {
         const id = ++refCounter;
         this.subs.set(id, { event, cb });
@@ -40,6 +44,8 @@ export class FakeVaultEvents implements IVaultEvents {
     emit(event: "modify" | "create", path: string, stat: FileStat): void;
     emit(event: "delete", path: string): void;
     emit(event: "rename", path: string, oldPath: string, stat?: FileStat): void;
+    emit(event: "folder-delete", path: string): void;
+    emit(event: "folder-rename", path: string, oldPath: string): void;
     emit(event: string, ...args: any[]): void {
         for (const sub of this.subs.values()) {
             if (sub.event === event) {

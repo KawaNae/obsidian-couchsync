@@ -225,7 +225,8 @@ describe("ChangeTracker", () => {
     describe("lifecycle", () => {
         it("stop clears all timers and unsubscribes", () => {
             tracker.start();
-            expect(events.subscriberCount).toBe(4);
+            // modify, create, delete, rename, folder-delete
+            expect(events.subscriberCount).toBe(5);
 
             events.emit("modify", "a.md", stat); // pending timer
 

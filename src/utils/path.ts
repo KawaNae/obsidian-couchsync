@@ -16,3 +16,13 @@ export type PathKey = string & { readonly __pathKey: unique symbol };
 export function toPathKey(p: string): PathKey {
     return p.normalize("NFC").toLowerCase() as PathKey;
 }
+
+/**
+ * The parent folder of a vault path, or "" for a root-level path. Original
+ * case is preserved (this is for FS I/O, not key comparison). Used by the
+ * empty-folder prune to walk upward after a deletion.
+ */
+export function parentDir(p: string): string {
+    const i = p.lastIndexOf("/");
+    return i < 0 ? "" : p.slice(0, i);
+}

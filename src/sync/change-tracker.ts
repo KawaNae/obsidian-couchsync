@@ -52,6 +52,23 @@ export class ChangeTracker implements IWriteIgnore, IPendingProbe {
                 );
             })
         );
+
+        // Folder delete (invariant S1/S6): Obsidian fires one event for the
+        // folder, not per descendant file. Desugar into per-file markDeleted
+        // by enumerating the children from the DB (they are already gone from
+        // the vault FS). The reconcile backstop (invariant S2) recovers any
+        // children missed here (e.g. an event dropped on mobile).
+        this.eventRefs.push(
+            this.events.on("folder-delete", (path) => {
+                this.vaultSync.handleFolderDelete(path).catch((e) =>
+                    logError(`CouchSync: handleFolderDelete failed: ${path} ${e?.message ?? e}`),
+                );
+            })
+        );
+        // NB: folder-rename live desugaring is Phase 2. Until then a folder
+        // rename converges via reconcile (old paths → delete, new paths →
+        // push); no live handler is wired, but the event is surfaced so a
+        // folder path never reaches the file `rename` handler (S6).
     }
 
     stop(): void {

@@ -45,6 +45,14 @@ export class ObsidianVaultEvents implements IVaultEvents {
         event: "rename",
         cb: (path: string, oldPath: string, stat: FileStat | undefined) => void,
     ): VaultEventRef;
+    on(
+        event: "folder-delete",
+        cb: (path: string) => void,
+    ): VaultEventRef;
+    on(
+        event: "folder-rename",
+        cb: (path: string, oldPath: string) => void,
+    ): VaultEventRef;
     on(event: string, cb: (...args: any[]) => void): VaultEventRef {
         switch (event) {
             case "modify":
@@ -61,20 +69,36 @@ export class ObsidianVaultEvents implements IVaultEvents {
                         cb(file.path, toStat(file));
                     }),
                 );
+            // `delete` and `folder-delete` share Obsidian's single `delete`
+            // event; the `isTFile` guard routes each abstract file to exactly
+            // one channel (invariant S6 — a folder path never reaches a
+            // file-only handler). Likewise `rename` / `folder-rename`.
             case "delete":
                 return wrap(
                     this.app.vault.on("delete", (file: TAbstractFile) => {
+                        if (!isTFile(file)) return;
+                        cb(file.path);
+                    }),
+                );
+            case "folder-delete":
+                return wrap(
+                    this.app.vault.on("delete", (file: TAbstractFile) => {
+                        if (isTFile(file)) return;
                         cb(file.path);
                     }),
                 );
             case "rename":
                 return wrap(
                     this.app.vault.on("rename", (file: TAbstractFile, oldPath: string) => {
-                        if (isTFile(file)) {
-                            cb(file.path, oldPath, toStat(file));
-                        } else {
-                            cb(file.path, oldPath, undefined);
-                        }
+                        if (!isTFile(file)) return;
+                        cb(file.path, oldPath, toStat(file));
+                    }),
+                );
+            case "folder-rename":
+                return wrap(
+                    this.app.vault.on("rename", (file: TAbstractFile, oldPath: string) => {
+                        if (isTFile(file)) return;
+                        cb(file.path, oldPath);
                     }),
                 );
             default:

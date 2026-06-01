@@ -5,7 +5,8 @@ import type { SyncRelation } from "./classify-sync-relation.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { FileDoc } from "../types.ts";
 import type { ConflictOrchestrator } from "../conflict/conflict-orchestrator.ts";
-import { compareVC, latestDevice } from "./vector-clock.ts";
+import { compareVC, latestDevice, findDominator } from "./vector-clock.ts";
+import { chunkListsEqual } from "./chunk-equality.ts";
 import { filePathFromId } from "../types/doc-id.ts";
 import { toPathKey, type PathKey } from "../utils/path.ts";
 import { logDebug, logInfo, logWarn, logError } from "../ui/log.ts";
@@ -69,6 +70,10 @@ export interface ReconcileReport {
      *  AND the server (broken / missingReferenced). Restore is suppressed
      *  until the chunks arrive — no infinite retry (Invariant II). */
     quarantined: string[];
+    /** Canonical paths kept after resolving a PathKey collision (invariant
+     *  S4/S5 — two case/NFC variants of one logical file de-duplicated to a
+     *  single canonical case). */
+    collisionsResolved: string[];
     /** Whether the run took the fast-path short-circuit (no full scan). */
     shortCircuited: boolean;
 }
@@ -84,6 +89,7 @@ function emptyReport(reason: ReconcileReason, mode: ReconcileMode): ReconcileRep
         deleted: [],
         restored: [],
         quarantined: [],
+        collisionsResolved: [],
         shortCircuited: false,
     };
 }
@@ -94,7 +100,8 @@ export function totalDiscrepancies(report: ReconcileReport): number {
         report.remoteWins.length +
         report.pushed.length +
         report.deleted.length +
-        report.restored.length
+        report.restored.length +
+        report.collisionsResolved.length
     );
 }
 
@@ -230,8 +237,16 @@ export class Reconciler {
             const currentSeq = (await this.localDb.info()).updateSeq;
             const dbUnchanged = cursor?.lastSeenUpdateSeq !== undefined &&
                 cursor.lastSeenUpdateSeq === currentSeq;
+            // Invariant S7: never let the short-circuit hide a collision. Two
+            // vault files folding to one PathKey (a case-sensitive FS holding
+            // both `scripts/X` and `Scripts/X` — the incident source) must take
+            // the slow path so Case F runs. DB-side-only duplicates always
+            // arrive via a pull, which bumps the seq → `dbUnchanged` is false,
+            // so they already force the slow path.
+            const vaultHasDup = vaultPathSet.size !== vaultFiles.length;
 
-            if (cursor && !hasMtimeChanges && manifestMatchesVault && dbUnchanged) {
+            if (cursor && !hasMtimeChanges && manifestMatchesVault && dbUnchanged
+                && !vaultHasDup) {
                 await this.localDb.putScanCursor({
                     lastScanStartedAt: startedAt,
                     lastScanCompletedAt: Date.now(),
@@ -249,14 +264,15 @@ export class Reconciler {
         // "push" (vault side) and "delete" (DB side).
         // The original-case path lives inside each value (TFile.path or
         // FileDoc._id) and is what we use for FS I/O and reporting.
-        const vaultByPath = new Map<PathKey, VaultFile>(
-            vaultFiles.map((f) => [toPathKey(f.path), f]),
-        );
+        // Group by PathKey into ARRAYS, not last-wins scalars (invariant S4):
+        // the DB id space is case-sensitive, so `scripts/X` and `Scripts/X`
+        // are distinct docs that fold to one PathKey. A scalar Map would drop
+        // the shadow and hide the collision; the array form makes a >1-occupant
+        // PathKey a first-class, detectable state resolved by Case F.
+        const vaultByPath = groupByPathKey(vaultFiles, (f) => f.path);
         const seqBeforeScan = (await this.localDb.info()).updateSeq;
         const dbDocs = await this.localDb.allFileDocs();
-        const dbByPath = new Map<PathKey, FileDoc>(
-            dbDocs.map((d) => [toPathKey(filePathFromId(d._id)), d]),
-        );
+        const dbByPath = groupByPathKey(dbDocs, (d) => filePathFromId(d._id));
         const allPaths = new Set<PathKey>([
             ...vaultByPath.keys(),
             ...dbByPath.keys(),
@@ -268,8 +284,28 @@ export class Reconciler {
         );
 
         for (const pathKey of allPaths) {
-            const file = vaultByPath.get(pathKey);
-            const doc = dbByPath.get(pathKey);
+            const files = vaultByPath.get(pathKey) ?? [];
+            const docs = dbByPath.get(pathKey) ?? [];
+            const aliveDocs = docs.filter((d) => !d.deleted);
+
+            // Case F (invariant S4/S5): a PathKey with genuine MULTIPLICITY —
+            // two case-variant files on disk (case-sensitive FS) or two alive
+            // DB docs of different case (the scripts/Scripts incident). This is
+            // distinct from benign single-occupant case drift (one vault file
+            // whose case differs from its one DB doc), which the normal Case
+            // A–E logic already handles via the vault-case `displayPath`. Two
+            // alive docs can only share a PathKey by differing in case (same
+            // case ⇒ same id ⇒ same doc); likewise two files. Resolve before
+            // the per-occupant logic, which assumes a single occupant.
+            if (files.length > 1 || aliveDocs.length > 1) {
+                await this.resolvePathKeyCollision(files, aliveDocs, mode, report);
+                continue;
+            }
+
+            const file = files[0];
+            // Representative doc: prefer an alive doc; fall back to a tombstone
+            // so the Case E / Case C deletion branches still observe it.
+            const doc = aliveDocs[0] ?? docs[0];
 
             // Case E: vault and DB both empty (or DB tombstone) → no-op
             if (!file && (!doc || doc.deleted)) continue;
@@ -563,6 +599,111 @@ export class Reconciler {
     }
 
     /**
+     * Case F — resolve a PathKey collision (invariant S4/S5): two case/NFC
+     * variants of one logical file. Converge using the SAME lens as content
+     * conflicts — chunks decide reality, vclock decides causality (symmetric
+     * with Invariant 3) — never an ad-hoc disk-preference rule.
+     *
+     *  - Auto-converge ONLY when every variant is content-equal (same chunk
+     *    list) AND no colliding on-disk file has unpushed edits. The canonical
+     *    is the causal dominator (or a deterministic tiebreak for truly
+     *    concurrent variants, so all devices pick the same case); non-canonical
+     *    docs are tombstoned and non-canonical on-disk files removed; the
+     *    canonical is restored if absent locally.
+     *  - Otherwise the variants are genuinely different files sharing a name:
+     *    Phase 1 leaves them untouched and logs (Phase 2 routes to the conflict
+     *    orchestrator). No destructive action without proven content equality.
+     *
+     * The disk-delete is FS-correct without special-casing: `files` carries
+     * each file's REAL case (from `getFiles()`), so on a case-insensitive FS a
+     * non-canonical raw is simply not an on-disk file (`hasFile` false) and the
+     * single shared physical file — which is the canonical — is never touched.
+     */
+    private async resolvePathKeyCollision(
+        files: VaultFile[],
+        aliveDocs: FileDoc[],
+        mode: ReconcileMode,
+        report: ReconcileReport,
+    ): Promise<void> {
+        const rawOf = (d: FileDoc): string => filePathFromId(d._id);
+        const variants = [...new Set<string>([
+            ...files.map((f) => f.path),
+            ...aliveDocs.map(rawOf),
+        ])];
+
+        // Content-equality gate. Equality is provable only from doc chunk
+        // lists, so every on-disk file must be backed by an alive doc and all
+        // docs must share one chunk list.
+        const docByRaw = new Map(aliveDocs.map((d) => [rawOf(d), d] as const));
+        const everyFileBacked = files.every((f) => docByRaw.has(f.path));
+        const ref = aliveDocs[0]?.chunks;
+        const contentEqual = ref !== undefined && everyFileBacked
+            && aliveDocs.every((d) => chunkListsEqual(d.chunks, ref));
+
+        // Refuse to auto-resolve if any colliding file has unpushed edits — the
+        // doc chunks would not reflect that edit, so a disk delete could lose
+        // it (Invariant 4 oracle).
+        let anyPending = false;
+        if (contentEqual) {
+            for (const f of files) {
+                if (await this.vaultSync.hasUnpushedChanges(f.path)) {
+                    anyPending = true;
+                    break;
+                }
+            }
+        }
+
+        if (!contentEqual || anyPending) {
+            logWarn(
+                `reconcile: PathKey collision among [${variants.join(", ")}] not ` +
+                    `auto-resolved (${!contentEqual ? "content differs / unbacked file" : "pending local edit"}) ` +
+                    `— left for conflict resolution`,
+            );
+            return;
+        }
+
+        // Canonical = causal dominator, else a deterministic tiebreak (latest
+        // writer device, then raw path) so every device converges identically.
+        const canonicalDoc = findDominator(aliveDocs) ?? [...aliveDocs].sort((a, b) => {
+            const da = latestDevice(a.vclock ?? {}) ?? "";
+            const db = latestDevice(b.vclock ?? {}) ?? "";
+            if (da !== db) return da < db ? -1 : 1;
+            return rawOf(a) < rawOf(b) ? -1 : 1;
+        })[0];
+        const canonicalRaw = rawOf(canonicalDoc);
+
+        for (const raw of variants) {
+            if (raw === canonicalRaw) continue;
+            const hasFile = files.some((f) => f.path === raw);
+            if (hasFile) {
+                // Disk + DB: applyRemoteDeletion removes the exact-case physical
+                // file and tombstones the doc.
+                await this.tryStep(raw, "collision-dedup",
+                    () => this.vaultSync.applyRemoteDeletion(raw), mode);
+            } else if (docByRaw.has(raw)) {
+                // DB-only variant (no exact-case file here — incl. every
+                // non-canonical variant on a case-insensitive FS): tombstone
+                // only. Its tombstone is case-safe on pull (see dbToFile).
+                await this.tryStep(raw, "collision-dedup",
+                    () => this.vaultSync.markDeleted(raw), mode);
+            }
+        }
+
+        // Ensure the canonical exists on disk (it may have been DB-only, or we
+        // just removed the non-canonical physical file on a device lacking the
+        // canonical case).
+        if (!files.some((f) => f.path === canonicalRaw)) {
+            await this.applyRemoteToVault(canonicalRaw, canonicalDoc, "collision-restore", mode);
+        }
+
+        logInfo(
+            `Reconcile: resolved PathKey collision → kept ${canonicalRaw}, ` +
+                `dropped ${variants.filter((r) => r !== canonicalRaw).join(", ")}`,
+        );
+        report.collisionsResolved.push(canonicalRaw);
+    }
+
+    /**
      * Hybrid rule for "vault doesn't have it × DB alive":
      *
      *   last-writer === self                         → this device deleted it
@@ -600,4 +741,24 @@ function setEquals<T>(a: Set<T>, b: Set<T>): boolean {
     if (a.size !== b.size) return false;
     for (const v of a) if (!b.has(v)) return false;
     return true;
+}
+
+/**
+ * Group items by their PathKey (NFC + lowercase) into arrays. Unlike a
+ * last-wins scalar Map, this preserves every original-case occupant of a
+ * folded key so a collision (invariant S4) is detectable rather than
+ * silently dropped.
+ */
+function groupByPathKey<T>(
+    items: readonly T[],
+    rawPath: (item: T) => string,
+): Map<PathKey, T[]> {
+    const map = new Map<PathKey, T[]>();
+    for (const item of items) {
+        const key = toPathKey(rawPath(item));
+        const bucket = map.get(key);
+        if (bucket) bucket.push(item);
+        else map.set(key, [item]);
+    }
+    return map;
 }

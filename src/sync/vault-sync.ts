@@ -12,7 +12,7 @@ import type { LastSynced } from "./last-synced.ts";
 import { classifySyncRelation, type SyncRelation } from "./classify-sync-relation.ts";
 import { chunkListsEqual } from "./chunk-equality.ts";
 import { makeFileId, filePathFromId } from "../types/doc-id.ts";
-import { toPathKey, type PathKey } from "../utils/path.ts";
+import { toPathKey, parentDir, type PathKey } from "../utils/path.ts";
 import { logDebug, logWarn } from "../ui/log.ts";
 import { DbError } from "../db/write-transaction.ts";
 
@@ -294,7 +294,28 @@ export class VaultSync {
         }
 
         if (fileDoc.deleted) {
+            // Case-safe deletion (invariant S3/S5): only remove the physical
+            // file when an EXACT-case match exists in the vault. If the sole
+            // same-PathKey file on disk is under a DIFFERENT case, it is a
+            // distinct logical occupant — the surviving canonical of a resolved
+            // collision — and must NOT be deleted. On a case-insensitive FS the
+            // two cases share ONE physical file, so deleting "scripts/X" would
+            // nuke the canonical "Scripts/X"; `getFiles()` reports the real
+            // on-disk case, making this decision correct on every FS. The
+            // tombstone is still integrated (bookkeeping advances).
+            const exactOnDisk = this.vault.getFiles().some((f) => f.path === vaultPath);
+            if (!exactOnDisk) {
+                const sibling = this.findExistingByPathKey(vaultPath);
+                if (sibling) {
+                    logWarn(
+                        `dbToFile: skipping disk delete of ${vaultPath} — different-case ` +
+                            `sibling ${sibling} present (case-dedup tombstone)`,
+                    );
+                    return { applied: true };
+                }
+            }
             await this.vaultWriter.applyRemoteDeletion(vaultPath);
+            await this.pruneEmptyParents(vaultPath);
             return { applied: true };
         }
 
@@ -339,6 +360,21 @@ export class VaultSync {
         if (existingStat) {
             result = await this.vaultWriter.applyRemoteContent(vaultPath, content);
         } else {
+            const collidingPath = this.findExistingByPathKey(vaultPath);
+            if (collidingPath) {
+                // A same-PathKey file already exists under a different case
+                // (the case-collision class behind the scripts/Scripts
+                // incident). Do NOT createFile — on a case-insensitive FS it
+                // throws "File already exists"; on a case-sensitive FS it
+                // would mint a second physical file. Defer to reconcile Case F
+                // (invariant S2/S5), the single authority that picks the
+                // canonical case and tombstones the rest.
+                logWarn(
+                    `dbToFile: path-key collision for ${vaultPath} ` +
+                        `(on-disk variant ${collidingPath}) — deferring to reconcile`,
+                );
+                return { applied: false, reason: "path-key-collision" };
+            }
             await this.ensureParentDir(vaultPath);
             await this.vaultWriter.createFile(vaultPath, content);
             result = { applied: true };
@@ -605,7 +641,42 @@ export class VaultSync {
 
     async applyRemoteDeletion(path: string): Promise<void> {
         await this.vaultWriter.applyRemoteDeletion(path);
+        await this.pruneEmptyParents(path);
         await this.markDeleted(path);
+    }
+
+    /**
+     * After a pull-applied deletion removes a file, prune any parent folders
+     * that became empty, walking upward until a non-empty (or root) folder.
+     *
+     * Why this is needed (invariant S1): folders have no document in the sync
+     * model, so a folder rename/delete reaches a receiving device as per-file
+     * tombstones. Deleting the files leaves the now-empty parent folder behind
+     * (the originating device's FS removed it as part of the move/delete, but
+     * the receiver only ever saw file deletions). This closes that asymmetry so
+     * both sides converge to the same folder structure.
+     *
+     * Only the pull-apply paths call this — the live local-delete path doesn't
+     * touch the FS (the user's own action already did), and Obsidian prunes the
+     * folder there. Deleting an empty folder is safe: it fires a folder-delete
+     * event whose `handleFolderDelete` finds zero alive children (no-op, no
+     * push). Best-effort — a failed prune just leaves a cosmetic empty folder,
+     * never risks data, so errors are swallowed with a warn.
+     */
+    private async pruneEmptyParents(filePath: string): Promise<void> {
+        let dir = parentDir(filePath);
+        while (dir !== "") {
+            try {
+                const { files, folders } = await this.vault.list(dir);
+                if (files.length > 0 || folders.length > 0) return; // not empty
+                if (!(await this.vault.exists(dir))) return;
+                await this.vault.delete(dir);
+            } catch (e: any) {
+                logWarn(`CouchSync: pruneEmptyParents ${dir}: ${e?.message ?? e}`);
+                return;
+            }
+            dir = parentDir(dir);
+        }
     }
 
     /**
@@ -772,6 +843,49 @@ export class VaultSync {
     async handleRename(newPath: string, oldPath: string): Promise<void> {
         await this.fileToDb(newPath);
         await this.markDeleted(oldPath);
+    }
+
+    /**
+     * Desugar a folder-level delete into per-file tombstones (invariant S1).
+     * Obsidian fires one event for the folder, not one per descendant; the
+     * children are already gone from the vault FS, so the DB is the only
+     * enumeration source (`fileDocsUnderPrefix`). Each child rides the normal
+     * `markDeleted` path, so its divergent guard still protects a child a
+     * remote device is concurrently editing (it is skipped → surfaced via
+     * conflict/reconcile, not force-deleted). A per-child failure is logged
+     * and skipped rather than aborting the whole folder — the reconcile
+     * backstop (S2) recovers anything missed here.
+     */
+    async handleFolderDelete(dir: string): Promise<void> {
+        const children = await this.db.fileDocsUnderPrefix(dir);
+        logDebug(`handleFolderDelete: ${dir} — ${children.length} child file(s)`);
+        for (const child of children) {
+            const childPath = filePathFromId(child._id);
+            try {
+                await this.markDeleted(childPath);
+            } catch (e: any) {
+                logWarn(
+                    `handleFolderDelete: child markDeleted failed for ${childPath}: ` +
+                        `${e?.message ?? e} — leaving to reconcile`,
+                );
+            }
+        }
+    }
+
+    /**
+     * Find an on-disk file that shares `targetPath`'s PathKey (NFC+lowercase)
+     * but differs in exact spelling — i.e. a case/Unicode-variant of the same
+     * logical path. Returns its original-case path, or null when the only
+     * match is `targetPath` itself. Used by `dbToFile` to avoid a
+     * create-collision and by callers that must detect a case duplicate
+     * before writing.
+     */
+    private findExistingByPathKey(targetPath: string): string | null {
+        const key = toPathKey(targetPath);
+        for (const f of this.vault.getFiles()) {
+            if (f.path !== targetPath && toPathKey(f.path) === key) return f.path;
+        }
+        return null;
     }
 
     private async loadSkippedCache(): Promise<Set<PathKey>> {

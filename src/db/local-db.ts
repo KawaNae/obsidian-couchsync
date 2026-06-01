@@ -279,6 +279,36 @@ export class LocalDB implements IDocStore<CouchSyncDoc> {
         return this.deleteAllByPrefix(prefix);
     }
 
+    /**
+     * Alive FileDocs whose vault path is strictly inside the folder `dir`
+     * (i.e. begins with `dir + "/"`). The trailing slash is mandatory so
+     * `dir="scripts"` does NOT match a sibling file `scripts.md` or a
+     * sibling folder `scriptsX/…`. Tombstones are excluded.
+     *
+     * Used to desugar a folder-level delete into per-file `markDeleted`
+     * calls (invariant S1): on a folder delete the children are already
+     * gone from the vault FS, so the DB is the only enumeration source.
+     * Operates on the LOCAL (plaintext) id space, so it is transparent to
+     * encryption — the encrypting client only rewrites ids on the wire.
+     */
+    async fileDocsUnderPrefix(dir: string): Promise<FileDoc[]> {
+        const startkey = makeFileId(dir + "/");
+        const result = await this.allDocs({
+            startkey,
+            endkey: startkey + "￰",
+            include_docs: true,
+        });
+        const files: FileDoc[] = [];
+        for (const row of result.rows) {
+            if (!row.doc) continue;
+            const doc = row.doc as unknown as CouchSyncDoc;
+            if (doc.type === "file" && !(doc as FileDoc).deleted) {
+                files.push(doc as FileDoc);
+            }
+        }
+        return files;
+    }
+
     // ── Metadata (Dexie meta store) ──────────────────────
 
     async getMeta<V = any>(key: string): Promise<V | null> {
