@@ -880,6 +880,112 @@ describe("PullWriter integration", () => {
         });
     });
 
+    // ── edit-vs-edit durability (defer / × = 保留) ────────
+    // Both sides are concurrent ALIVE edits. Pre-defer this was NOT persisted
+    // (keep-local kept the remote rev retrievable). With defer the cursor
+    // advances past the remote rev without accepting it, so the conflict must
+    // be durable and re-fetch the remote doc on drain (2026-06-02 incident).
+    describe("pending-conflict edit-vs-edit (defer durability)", () => {
+        it("persists an edit-vs-edit conflict and re-presents the remote edit after a restart", async () => {
+            h = createSyncHarness();
+            const b = h.addDevice("dev-B");
+            const rig = attachPullWriter({ device: b, withResolver: true });
+
+            // Both alive, concurrent vclocks, DIFFERENT chunks.
+            const localEdit = await seedLocalFileDoc(
+                b, "Periodic/DailyNotes/2026-05-31.md", { "dev-B": 1 },
+                [makeChunkId("1111aaaa1111aaaa")],
+            );
+            const remoteEdit = makeRemoteFileDoc(
+                "Periodic/DailyNotes/2026-05-31.md", { "dev-A": 1 },
+                { chunks: [makeChunkId("2222bbbb2222bbbb")], size: 9 },
+            );
+
+            const liveEmits: string[] = [];
+            rig.events.on("concurrent", ({ filePath }) => liveEmits.push(filePath));
+
+            const applied = await rig.writer.apply(makeChangesResult(
+                [{ id: remoteEdit._id, seq: "7", doc: remoteEdit }], "7",
+            ));
+
+            // Remote NOT accepted; conflict recorded with the edit-vs-edit kind.
+            expect(applied.empty).toBe(true);
+            expect(applied.pendingConflictAdd).toContainEqual({
+                id: localEdit._id, kind: "edit-vs-edit",
+            });
+            await rig.checkpoints.saveEmptyPullBatch(
+                applied.nextRemoteSeq, applied.pendingConflictAdd,
+            );
+            expect(liveEmits).toEqual(["Periodic/DailyNotes/2026-05-31.md"]);
+
+            // Local doc unchanged — defer applied NOTHING.
+            await expectDb(b.db).toHaveFileDoc("Periodic/DailyNotes/2026-05-31.md")
+                .withVclock({ "dev-B": 1 });
+
+            // Restart: a fresh writer re-fetches the remote edit and re-presents.
+            const rig2 = attachPullWriter({
+                device: b, withResolver: true,
+                getRemoteDoc: async (id) => (id === remoteEdit._id ? remoteEdit : null),
+            });
+            const reEmits: Array<{ filePath: string; remoteDeleted: boolean }> = [];
+            rig2.events.on("concurrent", ({ filePath, remoteDoc }) =>
+                reEmits.push({ filePath, remoteDeleted: remoteDoc.deleted === true }));
+            await rig2.writer.drainPendingConflict();
+            expect(reEmits).toEqual([
+                { filePath: "Periodic/DailyNotes/2026-05-31.md", remoteDeleted: false },
+            ]);
+
+            // Resolving clears the record → no further re-presentation.
+            await clearPendingConflict(b.db, localEdit._id);
+            const rig3 = attachPullWriter({
+                device: b, withResolver: true,
+                getRemoteDoc: async (id) => (id === remoteEdit._id ? remoteEdit : null),
+            });
+            const afterResolve: string[] = [];
+            rig3.events.on("concurrent", ({ filePath }) => afterResolve.push(filePath));
+            await rig3.writer.drainPendingConflict();
+            expect(afterResolve).toEqual([]);
+        });
+
+        it("drops the record on drain when the divergence has since converged", async () => {
+            h = createSyncHarness();
+            const b = h.addDevice("dev-B");
+            const rig = attachPullWriter({ device: b, withResolver: true });
+
+            const localEdit = await seedLocalFileDoc(
+                b, "notes/converged.md", { "dev-B": 1 }, [makeChunkId("3333cccc3333cccc")],
+            );
+            const remoteEdit = makeRemoteFileDoc(
+                "notes/converged.md", { "dev-A": 1 },
+                { chunks: [makeChunkId("4444dddd4444dddd")], size: 9 },
+            );
+            const applied = await rig.writer.apply(makeChangesResult(
+                [{ id: remoteEdit._id, seq: "7", doc: remoteEdit }], "7",
+            ));
+            await rig.checkpoints.saveEmptyPullBatch(
+                applied.nextRemoteSeq, applied.pendingConflictAdd,
+            );
+
+            // On drain, the re-fetched remote now DOMINATES the local edit
+            // (the author kept editing): no longer concurrent → let the normal
+            // pull converge it and drop the durable record.
+            const dominatingRemote = makeRemoteFileDoc(
+                "notes/converged.md", { "dev-B": 1, "dev-A": 2 },
+                { chunks: [makeChunkId("4444dddd4444dddd")], size: 9 },
+            );
+            const rig2 = attachPullWriter({
+                device: b, withResolver: true,
+                getRemoteDoc: async (id) => (id === remoteEdit._id ? dominatingRemote : null),
+            });
+            const reEmits: string[] = [];
+            rig2.events.on("concurrent", ({ filePath }) => reEmits.push(filePath));
+            await rig2.writer.drainPendingConflict();
+
+            expect(reEmits).toEqual([]);
+            expect(await loadAllPendingConflict(b.db)).toEqual([]);
+        });
+    });
+
     // ── #5: clean-deletion apply durability ──────────────
     // A clean remote soft-deletion (take-remote, no local edit) applies the
     // vault delete post-commit; if it throws / the process dies, the old code

@@ -2,6 +2,71 @@
 
 All notable changes to obsidian-couchsync.
 
+## 0.28.0
+
+A first-principles redesign of the conflict subsystem, prompted by a
+multi-device data-loss incident: a device that had been offline, then
+re-cloned, re-pushed its just-cloned files and stamped its own vector-clock
+component onto remote-authored content. The source device's next edits then
+classified as *concurrent* instead of *remote-edit*, surfacing ~190 conflict
+modals; closing them (×) defaulted to **keep-local**, which pushed the stale
+local copies back over the remote. The fix returns to three structural
+principles rather than spot-patching the symptoms.
+
+### Fixed
+
+- **A re-clone no longer stamps this device's vclock onto pulled content
+  (root cause).** `dbToFile`'s "content already on disk" fast-path returned
+  success without recording an integration baseline (`lastSynced`), so a
+  re-clone left those paths with no baseline and the next reconcile re-pushed
+  them under this device's id — turning the original author's later edits into
+  false *concurrent* conflicts. The fast-path now establishes `lastSynced`
+  from the FileDoc's vclock (Invariant 3: chunks-equal ⇒ the FileDoc is the
+  vclock authority), so a cloned file is never re-pushed and the author's edits
+  fast-forward as a clean take-remote. Single sink `establishBaseline()` now
+  backs the normal write path, the fast-path, and `adoptDocVclock`.
+- **Closing a conflict no longer overwrites the remote with a stale local
+  copy.** A conflict modal closed with × / Esc / click-outside now **defers**
+  (keeps the conflict for later, changes nothing) instead of defaulting to
+  keep-local-and-push. `ConflictChoice` gains an explicit `defer`, and the
+  modal adds a "Later" button.
+- **Deferred conflicts are durable.** Edit-vs-edit concurrency is now persisted
+  in the same transaction as the pull cursor advance (Invariant B), alongside
+  the existing delete-vs-edit records, and re-presented next session by
+  re-fetching and re-validating the remote revision. Without this, deferring an
+  edit-vs-edit conflict would silently lose the remote edit once the cursor
+  moved past it.
+
+### Changed
+
+- **Many conflicts are presented as one batch modal instead of a stack.**
+  Conflicts are now aggregated and drained serially — never more than one modal
+  open at once (the stacked semi-opaque overlays previously turned the screen
+  black at ~10+ conflicts). A burst of ≥10 conflicts shows a single batch modal
+  offering *keep all local* / *take all remote* (gated behind a confirm) /
+  *decide individually* / *defer all*; fewer than 10 are shown one at a time.
+
+No wire-format or schema change. The only persisted-shape addition is a new
+`edit-vs-edit` pending-conflict kind (local `_sync/` meta, not replicated;
+older builds defensively ignore unknown kinds). Verified on Dev / Dev2 /
+Android: normal sync unaffected, the batch modal renders a single overlay,
+closing a real concurrent conflict leaves the remote intact and re-presents it
+next session, and a re-clone followed by a source edit fast-forwards with no
+conflict.
+
+## 0.27.3
+
+### Fixed
+
+- **Folder-structure sync: three structural gaps closed (H-1/H-2/M-1/M-2).** A
+  multi-agent review surfaced four findings rooted in three gaps. Case D now
+  decides a vault-missing/DB-alive path on the `lastSynced` integration
+  baseline first (manifest demoted to a fallback), fixing a silent un-delete
+  that re-propagated (H-1, data-loss). Case F's collision tiebreak now derives
+  the canonical from device-invariant data instead of vclock key order (H-2).
+  `IVaultIO` gained `getFolders` + `abstractType` so the folder namespace is
+  handled (file/folder path collisions no longer throw on create; M-1/M-2).
+
 ## 0.27.2
 
 A post-release review of v0.27.0/v0.27.1 (a multi-agent pass with adversarial

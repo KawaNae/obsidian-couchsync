@@ -299,15 +299,16 @@ export class PullWriter {
                             if (isFileDoc(remoteDoc)) {
                                 await this.deps.ensureChunks(remoteDoc);
                             }
-                            // Durability for the deletion-conflict class — both
-                            // directions (Invariant B). File deletions are soft
-                            // (a `deleted:true` doc, not a CouchDB tombstone), so
-                            // a delete-vs-edit conflict arrives HERE, not via the
-                            // hard-delete `handlePulledDeletion` path. Persist it
-                            // in the same tx as the cursor advance so a missed
-                            // modal / restart cannot silently lose a side.
-                            // Edit-vs-edit concurrency is deliberately NOT
-                            // persisted: both versions survive, so no silent loss.
+                            // Durability for ALL concurrent shapes (Invariant B).
+                            // Persisted in the same tx as the cursor advance so a
+                            // missed modal / restart cannot silently lose a side.
+                            // File deletions are soft (a `deleted:true` doc, not a
+                            // CouchDB tombstone), so delete-vs-edit arrives HERE,
+                            // not via the hard-delete `handlePulledDeletion` path.
+                            // Edit-vs-edit is now ALSO persisted: with defer
+                            // (× = 保留) the cursor advances past the remote rev
+                            // without accepting it, so without a durable record a
+                            // deferred remote edit would be lost (2026-06-02).
                             if (isFileDoc(remoteDoc) && isFileDoc(localDoc)) {
                                 if (remoteDoc.deleted === true && localDoc.deleted !== true) {
                                     // remote-delete vs local-edit (#3).
@@ -322,6 +323,13 @@ export class PullWriter {
                                     // modal / restart would drop the remote edit.
                                     pendingConflictAdd.push({
                                         id: remoteDoc._id, kind: "local-delete-vs-remote-edit",
+                                    });
+                                    this.emittedConflicts.add(remoteDoc._id);
+                                } else if (localDoc.deleted !== true && remoteDoc.deleted !== true) {
+                                    // edit-vs-edit: both alive. The remote rev is
+                                    // NOT accepted here; re-fetched on drain.
+                                    pendingConflictAdd.push({
+                                        id: remoteDoc._id, kind: "edit-vs-edit",
                                     });
                                     this.emittedConflicts.add(remoteDoc._id);
                                 }
@@ -453,6 +461,37 @@ export class PullWriter {
                 }
                 this.emittedConflicts.add(id);
                 logDebug(`  ⚡ ${path} (pending-conflict re-presented: local-deleted vs remote-edit)`);
+                this.deps.events.emit("concurrent", { filePath: path, localDoc, remoteDoc });
+                continue;
+            }
+
+            if (entry.kind === "edit-vs-edit") {
+                // Both sides were concurrent ALIVE edits. The remote rev was
+                // NOT accepted into LocalDB (defer/keep-local leaves it remote-
+                // only), so re-fetch it to re-present. Moot if the local side
+                // vanished/deleted, the remote went away, or the divergence has
+                // since resolved (no longer concurrent — let the normal pull
+                // path converge it and drop the durable record).
+                if (!localDoc || !isFileDoc(localDoc) || localDoc.deleted) {
+                    await clearPendingConflict(this.deps.localDb, id);
+                    continue;
+                }
+                const remoteDoc = await this.deps.getRemoteDoc(id);
+                if (!remoteDoc || !isFileDoc(remoteDoc) || remoteDoc.deleted) {
+                    await clearPendingConflict(this.deps.localDb, id);
+                    continue;
+                }
+                const resolver = this.deps.getConflictResolver();
+                const verdict = resolver
+                    ? await resolver.resolveOnPull(localDoc, remoteDoc)
+                    : "concurrent";
+                if (verdict !== "concurrent") {
+                    await clearPendingConflict(this.deps.localDb, id);
+                    continue;
+                }
+                await this.deps.ensureChunks(remoteDoc);
+                this.emittedConflicts.add(id);
+                logDebug(`  ⚡ ${path} (pending-conflict re-presented: edit-vs-edit)`);
                 this.deps.events.emit("concurrent", { filePath: path, localDoc, remoteDoc });
                 continue;
             }

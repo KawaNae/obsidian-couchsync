@@ -6,6 +6,10 @@ import { FakeModalPresenter } from "./helpers/fake-modal-presenter.ts";
 import { makeSettings } from "./helpers/settings-factory.ts";
 import { makeFileId } from "../src/types/doc-id.ts";
 import { splitIntoChunks } from "../src/db/chunker.ts";
+import {
+    pendingConflictKey,
+    loadAllPendingConflict,
+} from "../src/db/sync/pending-conflict.ts";
 import type { FileDoc, CouchSyncDoc, ChunkDoc } from "../src/types.ts";
 
 let counter = 0;
@@ -103,6 +107,9 @@ describe("ConflictOrchestrator", () => {
             historyCapture: historyCapture as any,
             dbToFile: async (doc: FileDoc) => { dbToFileCalls.push(doc); return { applied: true }; },
             getSettings: () => settings,
+            // Drain on the next macrotask so single-conflict tests don't wait
+            // the production debounce; a synchronous burst still coalesces.
+            batchDebounceMs: 0,
         });
         orch.register();
         return orch;
@@ -180,6 +187,60 @@ describe("ConflictOrchestrator", () => {
         expect(modal.conflictCalls.filter((c) => c.filePath === "a.md").length).toBeGreaterThanOrEqual(2);
     });
 
+    it("defer applies nothing and KEEPS the durable pending-conflict record", async () => {
+        const replicator = makeReplicator();
+        createOrchestrator(replicator);
+
+        const localDoc = await seedFileDoc(db, "a.md", "local text", { "dev-A": 2 });
+        const remoteDoc = await seedFileDoc(db, "a.md", "remote text", { "dev-B": 1 });
+
+        // The pull writer persisted this edit-vs-edit conflict (Invariant B).
+        await db.runWriteTx({
+            meta: [{
+                op: "put",
+                key: pendingConflictKey(makeFileId("a.md")),
+                value: { addedAt: Date.now(), kind: "edit-vs-edit" },
+            }],
+        });
+
+        // User closes the modal without choosing (× / Esc / Later) → defer.
+        modal.conflictResponses.push({ choice: "defer", dismissed: false });
+        await replicator.fireConcurrent("a.md", localDoc, remoteDoc);
+
+        // NOTHING applied: no vault write, no history, no vclock change.
+        expect(dbToFileCalls).toHaveLength(0);
+        expect(saveConflictCalls).toHaveLength(0);
+        const result = await db.get(makeFileId("a.md")) as FileDoc;
+        expect(result.vclock).toEqual({ "dev-B": 1 }); // unchanged from last seed
+
+        // The durable record SURVIVES so the pull drain re-presents it.
+        const pending = await loadAllPendingConflict(db as any);
+        expect(pending).toHaveLength(1);
+        expect(pending[0].entry.kind).toBe("edit-vs-edit");
+    });
+
+    it("keep-local CLEARS the durable pending-conflict record", async () => {
+        const replicator = makeReplicator();
+        createOrchestrator(replicator);
+
+        const localDoc = await seedFileDoc(db, "a.md", "local text", { "dev-A": 2 });
+        const remoteDoc = await seedFileDoc(db, "a.md", "remote text", { "dev-B": 1 });
+        await db.runWriteTx({
+            meta: [{
+                op: "put",
+                key: pendingConflictKey(makeFileId("a.md")),
+                value: { addedAt: Date.now(), kind: "edit-vs-edit" },
+            }],
+        });
+
+        modal.conflictResponses.push({ choice: "keep-local", dismissed: false });
+        await replicator.fireConcurrent("a.md", localDoc, remoteDoc);
+
+        // Resolved → durable record dropped.
+        const pending = await loadAllPendingConflict(db as any);
+        expect(pending).toHaveLength(0);
+    });
+
     it("auto-dismiss does not apply choice", async () => {
         const replicator = makeReplicator();
         createOrchestrator(replicator);
@@ -202,6 +263,86 @@ describe("ConflictOrchestrator", () => {
         // No choice applied, no history saved
         expect(dbToFileCalls).toHaveLength(0);
         expect(saveConflictCalls).toHaveLength(0);
+    });
+
+    it("batches ≥ threshold conflicts into a SINGLE modal (no stacking)", async () => {
+        const replicator = makeReplicator();
+        // Lower the threshold so the test stays small.
+        const historyCapture = { saveConflict: async (...a: any[]) => { saveConflictCalls.push(a); } };
+        const orch = new ConflictOrchestrator({
+            modal, localDb: db as any, replicator: replicator as any,
+            historyCapture: historyCapture as any,
+            dbToFile: async (doc: FileDoc) => { dbToFileCalls.push(doc); return { applied: true }; },
+            getSettings: () => settings,
+            batchDebounceMs: 0,
+            batchThreshold: 3,
+        });
+        orch.register();
+
+        // Seed 4 concurrent file conflicts.
+        const docs: Array<{ local: FileDoc; remote: FileDoc; path: string }> = [];
+        for (let i = 0; i < 4; i++) {
+            const path = `n${i}.md`;
+            const local = await seedFileDoc(db, path, `local ${i}`, { "dev-A": 2 });
+            const remote = await seedFileDoc(db, path, `remote ${i}`, { "dev-B": 1 });
+            docs.push({ local, remote, path });
+        }
+
+        // Batch decision: take all remote (with confirm).
+        modal.batchResponses.push({ kind: "all-take-remote" });
+        modal.confirmResponses.push(true);
+
+        // Fire all 4 in a synchronous burst (as emitConcurrent does).
+        await Promise.all(docs.map((d) =>
+            replicator.fireConcurrent(d.path, d.local, d.remote)));
+
+        // Exactly ONE batch modal, ZERO individual modals.
+        expect(modal.batchCalls).toHaveLength(1);
+        expect(modal.batchCalls[0]).toHaveLength(4);
+        expect(modal.conflictCalls).toHaveLength(0);
+        // Destructive bulk gated behind a confirm.
+        expect(modal.confirmCalls).toHaveLength(1);
+        // All 4 applied take-remote (dbToFile called per item).
+        expect(dbToFileCalls).toHaveLength(4);
+    });
+
+    it("batch all-defer applies nothing and keeps every durable record", async () => {
+        const replicator = makeReplicator();
+        const historyCapture = { saveConflict: async (...a: any[]) => { saveConflictCalls.push(a); } };
+        const orch = new ConflictOrchestrator({
+            modal, localDb: db as any, replicator: replicator as any,
+            historyCapture: historyCapture as any,
+            dbToFile: async (doc: FileDoc) => { dbToFileCalls.push(doc); return { applied: true }; },
+            getSettings: () => settings,
+            batchDebounceMs: 0,
+            batchThreshold: 3,
+        });
+        orch.register();
+
+        const docs: Array<{ local: FileDoc; remote: FileDoc; path: string }> = [];
+        for (let i = 0; i < 4; i++) {
+            const path = `d${i}.md`;
+            const local = await seedFileDoc(db, path, `local ${i}`, { "dev-A": 2 });
+            const remote = await seedFileDoc(db, path, `remote ${i}`, { "dev-B": 1 });
+            await db.runWriteTx({
+                meta: [{
+                    op: "put", key: pendingConflictKey(makeFileId(path)),
+                    value: { addedAt: Date.now(), kind: "edit-vs-edit" },
+                }],
+            });
+            docs.push({ local, remote, path });
+        }
+        modal.batchResponses.push({ kind: "all-defer" });
+        // Fire all 4 in a synchronous burst so they coalesce into one batch.
+        await Promise.all(docs.map((d) =>
+            replicator.fireConcurrent(d.path, d.local, d.remote)));
+
+        expect(modal.batchCalls).toHaveLength(1);
+        expect(dbToFileCalls).toHaveLength(0);
+        expect(saveConflictCalls).toHaveLength(0);
+        // Every durable record survives → re-presented next session.
+        const pending = await loadAllPendingConflict(db as any);
+        expect(pending).toHaveLength(4);
     });
 
     it("non-FileDoc conflict merges vclocks and keeps local", async () => {

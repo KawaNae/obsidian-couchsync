@@ -1,7 +1,10 @@
 import { App, Modal, Setting } from "obsidian";
 import { buildSideBySide } from "./diff-utils.ts";
+import type { ConflictChoice } from "../types/modal-presenter.ts";
 
-export type ConflictChoice = "keep-local" | "take-remote";
+// Re-export so existing importers of `ConflictChoice` from this module keep
+// working; the canonical definition lives in types/modal-presenter.ts.
+export type { ConflictChoice };
 
 /**
  * Side-by-side diff modal for concurrent conflict resolution.
@@ -68,13 +71,27 @@ export class ConflictModal extends Modal {
                         this.resolve("take-remote");
                         this.close();
                     }),
+            )
+            .addButton((btn) =>
+                btn
+                    .setButtonText("Later")
+                    .onClick(() => {
+                        // Explicit defer: same as closing without choosing.
+                        this.resolved = true;
+                        this.resolve("defer");
+                        this.close();
+                    }),
             );
     }
 
     onClose(): void {
         if (!this.resolved) {
-            // Closed without choosing → default to keep-local (safe)
-            this.resolve("keep-local");
+            // Closed without choosing (× / Esc / click-outside) → DEFER, not
+            // keep-local. Deferring applies nothing and keeps the conflict for
+            // next session. Defaulting to keep-local here let closing a stale
+            // device's conflict overwrite newer remote content (the 2026-06-02
+            // data-loss incident).
+            this.resolve("defer");
         }
         this.contentEl.empty();
     }
@@ -91,7 +108,7 @@ export class ConflictModal extends Modal {
         this.wasDismissed = true;
         if (!this.resolved) {
             this.resolved = true;
-            this.resolve("keep-local"); // value unused — caller checks wasDismissed
+            this.resolve("defer"); // value unused — caller checks wasDismissed
         }
         this.close();
     }

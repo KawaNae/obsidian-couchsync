@@ -10,8 +10,11 @@ import type { App } from "obsidian";
 import type {
     IModalPresenter,
     ConflictModalResult,
+    ConflictBatchItem,
+    BatchDecision,
 } from "../types/modal-presenter.ts";
 import { ConflictModal } from "../ui/conflict-modal.ts";
+import { ConflictBatchModal } from "../ui/conflict-batch-modal.ts";
 import { ConfirmModal } from "../ui/confirm-modal.ts";
 
 export class ObsidianModalPresenter implements IModalPresenter {
@@ -31,6 +34,11 @@ export class ObsidianModalPresenter implements IModalPresenter {
             result,
             dismiss: () => modal.dismiss(),
         };
+    }
+
+    showConflictBatchModal(items: ConflictBatchItem[]): Promise<BatchDecision> {
+        const modal = new ConflictBatchModal(this.app, items);
+        return modal.waitForResult();
     }
 
     async showConfirmModal(

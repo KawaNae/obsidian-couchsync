@@ -328,6 +328,15 @@ export class VaultSync {
         if (existingStat && existingStat.size === fileDoc.size) {
             const ids = await this.localChunkIds(vaultPath);
             if (VaultSync.chunksEqual(ids, fileDoc.chunks)) {
+                // Content already on disk. Establish the integration baseline
+                // so a later reconcile classifies this path as identical and
+                // never re-pushes it with a self-vclock stamp. Skipping this
+                // was the root gap behind the 2026-06-02 re-clone incident: a
+                // re-clone left already-identical files with NO lastSynced,
+                // opening a window where the path could be pushed/stamped —
+                // turning the author's next edit into a false concurrent.
+                // Invariant 3: chunks-equal ⇒ fileDoc is the vclock authority.
+                await this.establishBaseline(vaultPath, fileDoc);
                 return { applied: true }; // identical content
             }
         }
@@ -416,25 +425,50 @@ export class VaultSync {
             return result;
         }
 
-        const clock = { ...(fileDoc.vclock ?? {}) };
         // Persist the integration point in the docs store's meta so it
-        // lives in the same IDB as the FileDoc itself. Pure meta write —
-        // no CAS needed, so pass a fixed tx rather than a builder.
-        await this.db.runWriteTx({
-            vclocks: [{
-                path: vaultPath, op: "set", clock,
-                chunks: fileDoc.chunks, size: fileDoc.size,
-            }],
-        });
-        this.lastSynced.set(toPathKey(vaultPath), {
-            vclock: clock,
-            chunks: fileDoc.chunks,
-            size: fileDoc.size,
-        });
+        // lives in the same IDB as the FileDoc itself.
+        await this.establishBaseline(vaultPath, fileDoc);
 
         // History capture is now owned by VaultWriter (it knows when
         // the content has actually landed in the editor/disk).
         return { applied: true };
+    }
+
+    /**
+     * Establish (or refresh) the per-path integration baseline `lastSynced`
+     * to the FileDoc's vclock + content fingerprint. Invariant 3: chunks-equal
+     * means the FileDoc is the canonical vclock authority for this path, so we
+     * adopt `fileDoc.vclock` outright (no merge). Pure meta write — no CAS
+     * needed. No-op when already aligned, to keep the pull/clone hot path cheap.
+     *
+     * This is the single sink for "I integrated this FileDoc's content here":
+     * the normal dbToFile write path, the already-on-disk early-return, and
+     * `adoptDocVclock` all funnel through it so the baseline can never be left
+     * unset after a successful integration (the 2026-06-02 re-clone gap).
+     */
+    private async establishBaseline(path: string, fileDoc: FileDoc): Promise<void> {
+        const key = toPathKey(path);
+        const prev = this.lastSynced.get(key);
+        const docVC = fileDoc.vclock ?? {};
+        const aligned =
+            prev !== undefined &&
+            prev.chunks !== undefined &&
+            prev.size === fileDoc.size &&
+            compareVC(prev.vclock, docVC) === "equal" &&
+            VaultSync.chunksEqual(prev.chunks, fileDoc.chunks);
+        if (aligned) return;
+        const clock = { ...docVC };
+        await this.db.runWriteTx({
+            vclocks: [{
+                path, op: "set", clock,
+                chunks: fileDoc.chunks, size: fileDoc.size,
+            }],
+        });
+        this.lastSynced.set(key, {
+            vclock: clock,
+            chunks: fileDoc.chunks,
+            size: fileDoc.size,
+        });
     }
 
     /**
@@ -486,21 +520,9 @@ export class VaultSync {
      * `vclock-only-drift` forever (the phantom-loop bug shape).
      */
     async adoptDocVclock(path: string, fileDoc: FileDoc): Promise<void> {
-        const key = toPathKey(path);
-        const before = this.lastSynced.get(key)?.vclock ?? {};
-        const docVC = fileDoc.vclock ?? {};
-        await this.db.runWriteTx({
-            vclocks: [{
-                path, op: "set", clock: docVC,
-                chunks: fileDoc.chunks, size: fileDoc.size,
-            }],
-        });
-        this.lastSynced.set(key, {
-            vclock: docVC,
-            chunks: fileDoc.chunks,
-            size: fileDoc.size,
-        });
-        logDebug(`adoptDocVclock: ${path} ${JSON.stringify(before)} → ${JSON.stringify(docVC)}`);
+        const before = this.lastSynced.get(toPathKey(path))?.vclock ?? {};
+        await this.establishBaseline(path, fileDoc);
+        logDebug(`adoptDocVclock: ${path} ${JSON.stringify(before)} → ${JSON.stringify(fileDoc.vclock ?? {})}`);
     }
 
     /**

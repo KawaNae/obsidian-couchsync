@@ -283,6 +283,37 @@
     text-align: center;
 }
 
+/* ─── Batch conflict modal ───────────────────────────── */
+
+.cs-conflict-batch-modal {
+    width: 80vw;
+    max-width: 900px;
+}
+
+.cs-conflict-batch-list {
+    max-height: 30vh;
+    overflow-y: auto;
+    margin: 0.5em 0;
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 4px;
+    padding: 0.25em 0.5em;
+}
+
+.cs-conflict-batch-list li {
+    font-size: var(--font-ui-small);
+    word-break: break-all;
+}
+
+.cs-conflict-batch-preview {
+    max-height: 40vh;
+    overflow: auto;
+    margin-bottom: 0.5em;
+}
+
+.cs-conflict-batch-preview .diff-compare-container {
+    height: 35vh;
+}
+
 /* ─── Side-by-side diff modal ────────────────────────── */
 
 .diff-history-compare-modal {

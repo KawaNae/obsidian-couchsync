@@ -7,6 +7,8 @@ import type {
     IModalPresenter,
     ConflictChoice,
     ConflictModalResult,
+    ConflictBatchItem,
+    BatchDecision,
 } from "../../src/types/modal-presenter.ts";
 
 export class FakeModalPresenter implements IModalPresenter {
@@ -14,11 +16,15 @@ export class FakeModalPresenter implements IModalPresenter {
     conflictResponses: ConflictModalResult[] = [];
     /** Queue of responses for showConfirmModal. */
     confirmResponses: boolean[] = [];
+    /** Queue of responses for showConflictBatchModal. */
+    batchResponses: BatchDecision[] = [];
 
     /** Record of all conflict modals shown (for assertions). */
     conflictCalls: Array<{ filePath: string; localText: string; remoteText: string }> = [];
     /** Record of all confirm modals shown (for assertions). */
     confirmCalls: Array<{ title: string; message: string }> = [];
+    /** Record of all batch modals shown (for assertions). */
+    batchCalls: ConflictBatchItem[][] = [];
 
     /** Dismiss callbacks for currently open conflict modals. */
     private openDismiss = new Map<string, () => void>();
@@ -52,6 +58,11 @@ export class FakeModalPresenter implements IModalPresenter {
         }
 
         return { result, dismiss };
+    }
+
+    async showConflictBatchModal(items: ConflictBatchItem[]): Promise<BatchDecision> {
+        this.batchCalls.push(items);
+        return this.batchResponses.shift() ?? { kind: "dismissed" };
     }
 
     async showConfirmModal(

@@ -35,7 +35,14 @@ export type PendingConflictKind =
     /** The mirror: the local copy is a soft-delete tombstone and the pulled
      *  remote doc is a concurrent ALIVE edit (#7). Re-presented by re-fetching
      *  the remote edit, since the surviving local side is the tombstone. */
-    | "local-delete-vs-remote-edit";
+    | "local-delete-vs-remote-edit"
+    /** Both sides are concurrent ALIVE edits. Persisted so the user can DEFER
+     *  the conflict (× = 保留) without losing the remote edit: the pull cursor
+     *  advances past the remote rev without accepting it, so re-presentation
+     *  re-fetches the remote doc (`getRemoteDoc`) and re-validates it.
+     *  Pre-defer this was not persisted because keep-local kept the remote rev
+     *  retrievable; defer broke that assumption (2026-06-02 incident). */
+    | "edit-vs-edit";
 
 export interface PendingConflictEntry {
     addedAt: number;
@@ -93,7 +100,11 @@ export async function clearPendingConflict(db: LocalDB, docId: string): Promise<
 function parseEntry(raw: unknown): PendingConflictEntry | null {
     if (!raw || typeof raw !== "object") return null;
     const r = raw as Partial<PendingConflictEntry>;
-    if (r.kind !== "pull-delete-vs-edit" && r.kind !== "local-delete-vs-remote-edit") {
+    if (
+        r.kind !== "pull-delete-vs-edit" &&
+        r.kind !== "local-delete-vs-remote-edit" &&
+        r.kind !== "edit-vs-edit"
+    ) {
         return null;
     }
     const addedAt = typeof r.addedAt === "number" ? r.addedAt : 0;
