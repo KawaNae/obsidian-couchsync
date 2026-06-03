@@ -10,7 +10,15 @@
  * the structural root cause of "step stuck at 0" in v0.15.1~v0.19.0.
  */
 
-const DEFAULT_DELAYS_MS: readonly number[] = [2_000, 5_000, 10_000, 20_000, 30_000];
+/** Fibonacci retry cadence (ms). Tuned for mobile: a fast first retry is
+ *  critical for data safety — the sooner a resumed device reconnects, the
+ *  sooner local edits flush and remote edits land. Starting at 1s (instead
+ *  of the old 2s) and growing gently (1,1,2,3,5,8,13,21) keeps the
+ *  transient-blip recovery near-instant while still backing off for a
+ *  genuinely down server. Capped at 21s by `nextDelay()`'s clamp. */
+const DEFAULT_DELAYS_MS: readonly number[] = [
+    1_000, 1_000, 2_000, 3_000, 5_000, 8_000, 13_000, 21_000,
+];
 
 export class BackoffSchedule {
     private step = 0;

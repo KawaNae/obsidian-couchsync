@@ -38,19 +38,25 @@ describe("BackoffSchedule", () => {
         expect(b.nextDelay()).toBe(2_000);
     });
 
-    it("uses the production default table when no delays supplied", () => {
+    it("uses the production default Fibonacci table when no delays supplied", () => {
         const b = new BackoffSchedule();
+        expect(b.nextDelay()).toBe(1_000);
+        b.recordFailure();
+        expect(b.nextDelay()).toBe(1_000);
+        b.recordFailure();
         expect(b.nextDelay()).toBe(2_000);
+        b.recordFailure();
+        expect(b.nextDelay()).toBe(3_000);
         b.recordFailure();
         expect(b.nextDelay()).toBe(5_000);
         b.recordFailure();
-        expect(b.nextDelay()).toBe(10_000);
+        expect(b.nextDelay()).toBe(8_000);
         b.recordFailure();
-        expect(b.nextDelay()).toBe(20_000);
+        expect(b.nextDelay()).toBe(13_000);
         b.recordFailure();
-        expect(b.nextDelay()).toBe(30_000);
+        expect(b.nextDelay()).toBe(21_000);
         b.recordFailure();
-        expect(b.nextDelay()).toBe(30_000);
+        expect(b.nextDelay()).toBe(21_000);
     });
 
     it("throws if constructed with an empty delay table", () => {

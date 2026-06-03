@@ -47,7 +47,7 @@ describe("SyncEngine retry supervisor", () => {
         const a = h.addDevice("dev-A");
         const backoff = (a.engine as any).backoff;
         expect(backoff.currentStep).toBe(0);
-        expect(backoff.nextDelay()).toBe(2_000);
+        expect(backoff.nextDelay()).toBe(1_000);
     });
 
     it("successful catchup leaves backoff step at 0 (I3)", async () => {
@@ -104,6 +104,36 @@ describe("SyncEngine retry supervisor", () => {
         const secondTimer = (a.engine as any).retryTimer;
         expect(secondTimer).not.toBeNull();
         expect(secondTimer).not.toBe(firstTimer);
+    });
+
+    it("first retry after a fresh error fires at the 1s Fibonacci head, not 5s (resume-recovery fix)", async () => {
+        // Regression for the schedule-before-record ordering bug: enterError
+        // must schedule the retry using the step-0 delay (1s) BEFORE advancing
+        // the backoff. Recording first skipped delays[0] and made the first
+        // mobile-resume retry land at 5s, delaying recovery (and flush of
+        // local edits) on every app foreground.
+        h = createSyncHarness();
+        const a = h.addDevice("dev-A");
+
+        const realSetTimeout = globalThis.setTimeout;
+        const scheduled: number[] = [];
+        (globalThis as any).setTimeout = ((fn: any, ms?: number) => {
+            scheduled.push(ms ?? 0);
+            // Hand back a real (far-future, no-op) handle so stopRetryTimer /
+            // stop() can clear it; never actually fire the retry here.
+            return realSetTimeout(() => {}, 1_000_000);
+        }) as any;
+        try {
+            (a.engine as any).enterError({ kind: "network", message: "down" });
+        } finally {
+            (globalThis as any).setTimeout = realSetTimeout;
+        }
+
+        expect(scheduled).toContain(1_000);
+        expect(scheduled).not.toContain(5_000);
+        // The failure was still recorded — step advanced exactly one.
+        expect((a.engine as any).backoff.currentStep).toBe(1);
+        a.engine.stop();
     });
 
     it("enterError(auth) stops the retry timer and raises the auth latch (I5)", async () => {

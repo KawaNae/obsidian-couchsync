@@ -2,6 +2,32 @@
 
 All notable changes to obsidian-couchsync.
 
+## 0.28.1
+
+Faster mobile-resume recovery. On returning to the foreground, a mobile
+device probes the server to revive the sync socket; if the OS hasn't
+restored the network stack yet, that probe fails fast and the engine
+correctly enters `error` — but the *first* retry was landing at 5s instead
+of the intended fast head, delaying recovery (and the flush of local edits)
+on every resume.
+
+### Fixed
+
+- **First reconnect retry now fires at 1s, not 5s.** `enterError` recorded
+  the failure *before* reading the backoff delay, so the first retry consumed
+  `delays[1]` and skipped the fast head entirely. Scheduling now reads the
+  current step's delay before advancing, so the first retry lands at the
+  table head as intended. The `error` state is still surfaced (accurate
+  status reporting); only the recovery latency changed (~5184ms → ~1032ms,
+  measured on an Android emulator with the network cut at resume).
+
+### Changed
+
+- **Retry backoff is now a Fibonacci cadence: 1s, 1s, 2s, 3s, 5s, 8s, 13s,
+  21s** (was 2s, 5s, 10s, 20s, 30s). Tuned for mobile data safety — a gentle
+  early ramp keeps transient-blip recovery near-instant while still backing
+  off for a genuinely unreachable server.
+
 ## 0.28.0
 
 A first-principles redesign of the conflict subsystem, prompted by a

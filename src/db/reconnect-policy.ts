@@ -67,7 +67,7 @@ export type ReconnectReason =
     /** Dedicated backoff retry tick from the hard-error recovery timer.
      *  Bypasses the 5s cool-down because the backoff schedule itself
      *  controls cadence — the cool-down would block the fast first
-     *  retries (2s, 5s) that make transient failures feel transparent. */
+     *  retries (1s, 1s, 2s…) that make transient failures feel transparent. */
     | "retry-backoff";
 
 /**

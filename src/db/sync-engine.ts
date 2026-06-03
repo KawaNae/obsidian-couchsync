@@ -538,8 +538,14 @@ export class SyncEngine {
             return;
         }
 
-        this.backoff.recordFailure();
+        // Order matters: schedule the retry at the *current* step's delay
+        // FIRST, then record the failure to advance the step. Recording
+        // first would consume delays[0] (the 1s first retry) before it is
+        // ever read, making the first retry delays[1] instead — the
+        // 5s-late mobile-resume recovery bug. Keeping schedule-before-record
+        // makes the first retry land at 1s as the Fibonacci table intends.
         this.scheduleNextAttempt();
+        this.backoff.recordFailure();
     }
 
     /**
