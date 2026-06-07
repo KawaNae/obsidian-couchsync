@@ -35,6 +35,7 @@ import type {
     SyncErrorDetail,
 } from "./reconnect-policy.ts";
 import { logDebug, logInfo, logWarn, logError, notify } from "../ui/log.ts";
+import { runPushBackfill } from "./sync/push-backfill.ts";
 import { EnvListeners } from "./env-listeners.ts";
 import { DbError } from "./write-transaction.ts";
 import { AuthGate } from "./sync/auth-gate.ts";
@@ -825,7 +826,42 @@ export class SyncEngine {
         await session.warmup();
         if (session.disposed) return;
 
+        // One-time push-backfill sweep: re-enqueue docs the pre-2026-06-07
+        // cursor race skipped (permanently unpushed tombstones). Best-effort
+        // — a failure (offline mid-sweep, abort) leaves the flag unset and
+        // the next session retries. Runs after catchup/warmup so the local
+        // and remote FileDoc views are both fresh.
+        try {
+            // Enqueued ids are picked up by the live push loop's next 2 s
+            // poll (it re-reads the persisted unpushed-set every cycle).
+            await runPushBackfill({
+                localDb: this.localDb,
+                remote: session.client,
+                signal: session.signal,
+            });
+        } catch (e: any) {
+            logWarn(`CouchSync: push backfill failed (will retry next session): ${e?.message ?? e}`);
+        }
+        if (session.disposed) return;
+
         session.startLive();
+    }
+
+    /**
+     * Manual-command entry for the push-backfill sweep (flag ignored, so
+     * "Verify consistency and repair" can re-check at any time). Returns
+     * null when no live session is available to reach remote.
+     */
+    async runPushBackfillNow(): Promise<{ enqueued: number } | null> {
+        const session = this.session;
+        if (!session || session.disposed) return null;
+        const r = await runPushBackfill({
+            localDb: this.localDb,
+            remote: session.client,
+            signal: session.signal,
+            force: true,
+        });
+        return { enqueued: r.enqueued };
     }
 
     /**

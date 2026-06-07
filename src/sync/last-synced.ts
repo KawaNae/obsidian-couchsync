@@ -13,11 +13,22 @@ import type { VectorClock } from "./vector-clock.ts";
  * `vclock`; the consumers (compareFileToDoc, reconciler divergent check)
  * treat undefined chunks/size as "skip the divergent-edit guard for
  * this path until the next push/pull rewrites it in the full shape".
+ *
+ * `deleted` (Invariant 7 — deletion is an integration event): set when the
+ * last integrated doc state for this path was a tombstone. The fingerprint
+ * is normalized to `chunks: [], size: 0` on write. Without this flag a
+ * deletion erased the baseline entirely, which destroyed the causal anchor
+ * the recreate-after-delete path needs (the 2026-06-07 W24 stuck-push bug).
+ * A deleted baseline shares the lifetime of the tombstone doc itself —
+ * neither is pruned today; a future tombstone GC must issue the matching
+ * `vclocks: [{path, op: "delete"}]` in the same sweep. `op: "delete"` is
+ * reserved for "no doc exists at all" (no causal information to keep).
  */
 export interface LastSynced {
     vclock: VectorClock;
     chunks?: string[];
     size?: number;
+    deleted?: true;
 }
 
 /** Parse a raw on-disk meta value into a `LastSynced`. Accepts both the
@@ -25,8 +36,13 @@ export interface LastSynced {
  *  shape (any object whose keys are device IDs, no `vclock` key). */
 export function parseStoredLastSynced(value: unknown): LastSynced {
     if (value && typeof value === "object" && "vclock" in (value as object)) {
-        const v = value as { vclock: VectorClock; chunks?: string[]; size?: number };
-        return { vclock: v.vclock, chunks: v.chunks, size: v.size };
+        const v = value as {
+            vclock: VectorClock; chunks?: string[]; size?: number; deleted?: boolean;
+        };
+        return {
+            vclock: v.vclock, chunks: v.chunks, size: v.size,
+            ...(v.deleted === true ? { deleted: true as const } : {}),
+        };
     }
     // Legacy raw VectorClock — treat the whole object as the vclock.
     return { vclock: (value ?? {}) as VectorClock };

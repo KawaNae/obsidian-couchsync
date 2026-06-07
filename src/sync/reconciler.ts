@@ -307,8 +307,24 @@ export class Reconciler {
             // so the Case E / Case C deletion branches still observe it.
             const doc = aliveDocs[0] ?? docs[0];
 
-            // Case E: vault and DB both empty (or DB tombstone) → no-op
-            if (!file && (!doc || doc.deleted)) continue;
+            // Case E: vault and DB both empty (or DB tombstone) → no-op,
+            // plus baseline hygiene: a tombstone whose baseline is still the
+            // old alive entry (pre-Invariant-7 pull-applied deletions) is
+            // upgraded to the deleted baseline so a later remote recreate
+            // classifies as a restore instead of a false conflict.
+            if (!file && (!doc || doc.deleted)) {
+                if (doc?.deleted) {
+                    const ls = this.vaultSync.getLastSynced(filePathFromId(doc._id));
+                    if (ls && !ls.deleted) {
+                        await this.tryStep(filePathFromId(doc._id), "baseline-align",
+                            async (): Promise<void> => {
+                                await this.vaultSync.dbToFile(doc);
+                            },
+                            mode);
+                    }
+                }
+                continue;
+            }
 
             // Display path: prefer the vault's case (current truth) when both
             // exist; fall back to the DB doc's stored path otherwise.
@@ -316,8 +332,74 @@ export class Reconciler {
 
             // Case C: vault has it, DB doesn't (or DB tombstone)
             if (file && (!doc || doc.deleted)) {
-                if (await this.tryStep(displayPath, "push", () => this.vaultSync.fileToDb(file.path), mode)) {
-                    report.pushed.push(displayPath);
+                if (!doc) {
+                    // No doc at all — plain new-file push.
+                    if (await this.tryStep(displayPath, "push", () => this.vaultSync.fileToDb(file.path), mode)) {
+                        report.pushed.push(displayPath);
+                    }
+                    continue;
+                }
+                // DB tombstone under a vault file (Invariant 7). The old code
+                // blind-forwarded to fileToDb, whose divergent guard skipped
+                // every relation except local-edit — the W24 wedged-path shape.
+                // Route through the classifier and dispatch each verdict to
+                // its real action instead.
+                let relation: SyncRelation;
+                try {
+                    relation = await this.vaultSync.classifyFileVsDoc(doc, file.path, file.stat.size);
+                } catch (e) {
+                    logError(`CouchSync: reconcile classify (tombstone) failed for ${displayPath}: ${e?.message ?? e}`);
+                    continue;
+                }
+                switch (relation) {
+                    case "local-edit":
+                        // Deleted baseline matches the tombstone — the file is
+                        // a legitimate recreate. fileToDb increments past the
+                        // tombstone's vclock (recreate push).
+                        if (await this.tryStep(displayPath, "push", () => this.vaultSync.fileToDb(file.path), mode)) {
+                            report.pushed.push(displayPath);
+                        }
+                        break;
+                    case "remote-edit":
+                        // Alive baseline still matches the disk content — the
+                        // deletion simply hasn't been applied to disk yet.
+                        // dbToFile's tombstone branch deletes the file and
+                        // establishes the deleted baseline; it reads no chunks,
+                        // so no ensureChunks / applyRemoteToVault detour.
+                        if (await this.tryStep(displayPath, "delete-apply",
+                            async (): Promise<void> => { await this.vaultSync.dbToFile(doc); },
+                            mode)) {
+                            report.deleted.push(displayPath);
+                        }
+                        break;
+                    case "true-divergent":
+                        // No baseline explains the file over the tombstone
+                        // (the wedged W24 state itself, or a recreate raced by
+                        // another device's re-delete). Neither silent restore
+                        // (H-1 data-loss shape) nor silent skip (W24 shape) —
+                        // the user arbitrates.
+                        if (this.conflictOrchestrator) {
+                            if (await this.tryStep(displayPath, "conflict-recreate",
+                                () => this.conflictOrchestrator!.handleDivergentRecreate(file.path, doc),
+                                mode)) {
+                                report.pushed.push(displayPath);
+                            }
+                        } else {
+                            logWarn(
+                                `CouchSync: divergent recreate on ${displayPath} — no conflict ` +
+                                `orchestrator wired; leaving untouched (re-detected next reconcile).`,
+                            );
+                        }
+                        break;
+                    default:
+                        // identical / vclock-only-drift / legacy-skip cannot be
+                        // produced for alive-file × tombstone input (Invariant 7
+                        // makes contentEqual false and legacy baselines refine
+                        // to true-divergent). Guard for visibility.
+                        logError(
+                            `CouchSync: unexpected relation '${relation}' for tombstone reconcile of ${displayPath}`,
+                        );
+                        break;
                 }
                 continue;
             }
@@ -337,6 +419,44 @@ export class Reconciler {
             //      bug). Demoted to legacy / first-run / no-lastSynced fallback.
             if (!file && doc && !doc.deleted) {
                 const lastSynced = this.vaultSync.getLastSynced(displayPath);
+                if (lastSynced?.deleted) {
+                    // Deleted baseline (Invariant 7): we integrated a deletion
+                    // of this path, and the alive doc tells us what happened
+                    // next on the causal axis.
+                    const rel = compareVC(doc.vclock ?? {}, lastSynced.vclock);
+                    if (rel === "dominates") {
+                        // Another device legitimately recreated the path after
+                        // the deletion we integrated — restore it. Before the
+                        // deleted baseline existed, the stale alive baseline
+                        // made this a false divergent-local-delete conflict.
+                        const r = await this.applyRemoteToVault(displayPath, doc, "restore", mode);
+                        if (r === "applied") report.restored.push(displayPath);
+                        else if (r === "quarantined") report.quarantined.push(displayPath);
+                    } else if (rel === "concurrent") {
+                        // Recreate raced our deletion — deletion vs recreate
+                        // conflict, same modal as divergent-local-delete.
+                        if (this.conflictOrchestrator) {
+                            if (await this.tryStep(displayPath, "conflict-delete",
+                                () => this.conflictOrchestrator!.handleDivergentLocalDelete(displayPath, doc),
+                                mode)) {
+                                report.deleted.push(displayPath);
+                            }
+                        } else {
+                            const r = await this.applyRemoteToVault(displayPath, doc, "restore", mode);
+                            if (r === "applied") report.restored.push(displayPath);
+                            else if (r === "quarantined") report.quarantined.push(displayPath);
+                        }
+                    } else {
+                        // equal/dominated: an alive doc at-or-below the
+                        // integrated tombstone is stale bookkeeping (the
+                        // tombstone replaced it) — re-propagate the deletion.
+                        if (await this.tryStep(displayPath, "delete",
+                            () => this.vaultSync.markDeleted(displayPath), mode)) {
+                            report.deleted.push(displayPath);
+                        }
+                    }
+                    continue;
+                }
                 if (lastSynced) {
                     const rel = compareVC(doc.vclock ?? {}, lastSynced.vclock);
                     if (rel === "dominates") {

@@ -13,6 +13,25 @@ interface FileEntry {
 export class FakeVaultIO implements IVaultIO {
     files = new Map<string, FileEntry>();
 
+    /** When true, path lookups fold case (Windows/macOS semantics): an
+     *  exact-key miss falls back to a case-insensitive match, and creating
+     *  over an existing case-variant overwrites THAT entry (the on-disk
+     *  case is owned by whoever created the file first). */
+    constructor(private opts: { caseInsensitive?: boolean } = {}) {}
+
+    /** Resolve `path` to the stored map key (exact first; case-folded when
+     *  caseInsensitive). Returns null when nothing matches. */
+    private resolveKey(path: string): string | null {
+        if (this.files.has(path)) return path;
+        if (this.opts.caseInsensitive) {
+            const folded = path.toLowerCase();
+            for (const key of this.files.keys()) {
+                if (key.toLowerCase() === folded) return key;
+            }
+        }
+        return null;
+    }
+
     // ── helpers for test setup ──────────────────────────
 
     /** Seed a file with string content. */
@@ -40,19 +59,28 @@ export class FakeVaultIO implements IVaultIO {
     // ── IVaultIO implementation ─────────────────────────
 
     async readBinary(path: string): Promise<ArrayBuffer> {
-        const entry = this.files.get(path);
+        const key = this.resolveKey(path);
+        const entry = key !== null ? this.files.get(key) : undefined;
         if (!entry) throw new Error(`File not found: ${path}`);
         return entry.data;
     }
 
     async writeBinary(path: string, data: ArrayBuffer): Promise<void> {
-        const entry = this.files.get(path);
+        const key = this.resolveKey(path);
+        const entry = key !== null ? this.files.get(key) : undefined;
         if (!entry) throw new Error(`File not found: ${path}`);
         entry.data = data;
         entry.stat = { ...entry.stat, mtime: Date.now(), size: data.byteLength };
     }
 
     async createBinary(path: string, data: ArrayBuffer): Promise<void> {
+        const existingKey = this.resolveKey(path);
+        if (existingKey !== null) {
+            // Case-insensitive FS: creating over a case-variant writes the
+            // existing physical file — its on-disk case is preserved.
+            await this.writeBinary(existingKey, data);
+            return;
+        }
         const now = Date.now();
         this.files.set(path, {
             data,
@@ -61,15 +89,17 @@ export class FakeVaultIO implements IVaultIO {
     }
 
     async delete(path: string): Promise<void> {
-        this.files.delete(path);
+        const key = this.resolveKey(path);
+        if (key !== null) this.files.delete(key);
     }
 
     async exists(path: string): Promise<boolean> {
-        return this.files.has(path);
+        return this.resolveKey(path) !== null;
     }
 
     async stat(path: string): Promise<FileStat | null> {
-        const entry = this.files.get(path);
+        const key = this.resolveKey(path);
+        const entry = key !== null ? this.files.get(key) : undefined;
         return entry ? { ...entry.stat } : null;
     }
 

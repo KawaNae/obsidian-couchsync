@@ -54,6 +54,9 @@ function attachPullWriter(opts: {
     /** Probe for an unpushed local edit (hard-delete path, #del-1). Defaults
      *  to "no unpushed" so a tombstone applies durably. */
     probeUnpushed?: (path: string) => Promise<boolean>;
+    /** Override the chunk-fetch callback (defaults to no-op). Tests that
+     *  assert WHICH docs get their chunks ensured pass a recorder. */
+    ensureChunks?: (doc: FileDoc) => Promise<void>;
 }): WriterRig {
     const events = new SyncEvents();
     const echoes = new EchoTracker();
@@ -66,7 +69,7 @@ function attachPullWriter(opts: {
         echoes,
         checkpoints,
         getConflictResolver: () => resolver,
-        ensureChunks: async () => {},
+        ensureChunks: opts.ensureChunks ?? (async () => {}),
         getRemoteDoc: opts.getRemoteDoc ?? (async () => null),
         applyPullWrite: async (doc) => {
             if (!callback) return { applied: true };
@@ -1105,6 +1108,41 @@ describe("PullWriter integration", () => {
             // Take-remote → resurrected, no conflict persisted.
             expect(applied.pendingConflictAdd).toEqual([]);
             await expectDb(b.db).toHaveFileDoc("notes/res.md").withVclock({ "dev-B": 1, "dev-A": 1 });
+        });
+    });
+
+    // ── tombstone chunk-fetch skip ────────────────────────
+    // Tombstone fingerprints are NOT normalized (markDeleted retains the
+    // deleted content's chunks — Invariant 7), but applying a deletion never
+    // reads chunk bodies. Fetching them wasted bandwidth on dead content
+    // that the next chunk GC dropped again (GC pins via live docs only).
+    describe("tombstone chunk-fetch skip", () => {
+        it("does not ensure chunks for a pulled soft-delete tombstone; live docs still fetch", async () => {
+            h = createSyncHarness();
+            const b = h.addDevice("dev-B");
+            await seedLocalFileDoc(b, "dead.md", { A: 1 });
+            await seedLocalFileDoc(b, "live.md", { A: 1 });
+            // markDeleted-shape tombstone: chunks retained from the deleted content.
+            const tomb = makeRemoteFileDoc("dead.md", { A: 2 }, {
+                deleted: true, chunks: [makeChunkId("aaaa1111aaaa1111")], size: 4,
+            });
+            const edit = makeRemoteFileDoc("live.md", { A: 2 }, {
+                chunks: [makeChunkId("cccc3333cccc3333")], size: 4,
+            });
+
+            const ensured: string[] = [];
+            const rig = attachPullWriter({
+                device: b, withResolver: true,
+                ensureChunks: async (doc) => { ensured.push(doc._id); },
+            });
+            await rig.writer.apply(makeChangesResult([
+                { id: tomb._id, seq: "1", doc: tomb },
+                { id: edit._id, seq: "2", doc: edit },
+            ], "2"));
+
+            // Only the live doc fetched chunks; the tombstone applied without.
+            expect(ensured).toEqual([edit._id]);
+            await expectDb(b.db).toHaveFileDoc("dead.md").withVclock({ A: 2 });
         });
     });
 });

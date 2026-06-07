@@ -347,6 +347,32 @@ describe("HistoryCapture", () => {
 
             expect(storage.renames).toEqual([{ oldPath: "old.md", newPath: "new.md" }]);
         });
+
+        it("re-targets a pending debounce capture at the new path", async () => {
+            capture.start();
+            vault.addFile("old.md", "v1");
+            events.emit("modify", "old.md", stat);
+            // Rename fires while the debounce timer is still armed.
+            await vault.delete("old.md");
+            vault.addFile("new.md", "v1");
+            events.emit("rename", "new.md", "old.md", stat);
+
+            await vi.advanceTimersByTimeAsync(1000);
+
+            // The capture lands at the NEW path — not lost to a
+            // "File not found" against the old one.
+            expect(storage.diffs).toHaveLength(1);
+            expect(storage.diffs[0].filePath).toBe("new.md");
+        });
+
+        it("carries the rate-limit window across the rename", async () => {
+            capture.start();
+            const t = Date.now();
+            (capture as any).lastCaptureTime.set("old.md", t);
+            events.emit("rename", "new.md", "old.md", stat);
+            expect((capture as any).lastCaptureTime.get("new.md")).toBe(t);
+            expect((capture as any).lastCaptureTime.has("old.md")).toBe(false);
+        });
     });
 
     // ── saveConflict ────────────────────────────────────
@@ -366,6 +392,55 @@ describe("HistoryCapture", () => {
             expect(storage.diffs).toHaveLength(1);
             expect(storage.diffs[0].conflict).toBe(true);
             expect(storage.snapshots.get("a.md")?.content).toBe("REMOTE");
+        });
+
+        it("diff failure does NOT throw and still advances the snapshot", async () => {
+            // A saveConflict throw is treated by the orchestrator as an
+            // APPLY failure (clearDurable skipped → ghost re-presentation),
+            // so diff-stage errors must be swallowed while the baseline
+            // advances (incident 2026-06-04 cascade shape).
+            storage.saveDiff = async () => { throw new Error("URI malformed"); };
+            await expect(
+                capture.saveConflict("a.md", "LOCAL", "REMOTE", "remote"),
+            ).resolves.toBeUndefined();
+            expect(storage.snapshots.get("a.md")?.content).toBe("REMOTE");
+        });
+    });
+
+    // ── record-keeping advances on diff failure ─────────
+
+    describe("capture failure containment (incident 2026-06-04)", () => {
+        it("saveDiff throw: snapshot and rate-limit still advance (no cascade)", async () => {
+            capture.start();
+            vault.addFile("a.md", "v1");
+            storage.snapshots.set("a.md", { filePath: "a.md", content: "v0", lastModified: 1 });
+            let failures = 0;
+            storage.saveDiff = async () => { failures++; throw new Error("URI malformed"); };
+
+            events.emit("modify", "a.md", stat);
+            await vi.advanceTimersByTimeAsync(1000);
+
+            expect(failures).toBe(1);
+            // Snapshot advanced to current content → the next capture diffs
+            // from fresh state instead of re-deriving the same failing diff.
+            expect(storage.snapshots.get("a.md")?.content).toBe("v1");
+            expect((capture as any).lastCaptureTime.has("a.md")).toBe(true);
+
+            // Next edit: snapshot is current, so the same failure does not
+            // re-fire for unchanged content.
+            events.emit("modify", "a.md", stat);
+            await vi.advanceTimersByTimeAsync(1000);
+            expect(failures).toBe(1); // content == snapshot → early return
+        });
+
+        it("content-read failure does NOT advance the snapshot", async () => {
+            capture.start();
+            storage.snapshots.set("a.md", { filePath: "a.md", content: "v0", lastModified: 1 });
+            // No file in vault → cachedRead throws → nothing to base an
+            // advance on; baseline must stay put for a later retry.
+            events.emit("modify", "a.md", stat);
+            await vi.advanceTimersByTimeAsync(1000);
+            expect(storage.snapshots.get("a.md")?.content).toBe("v0");
         });
     });
 });

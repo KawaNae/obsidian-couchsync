@@ -378,7 +378,10 @@ export class DexieStore<T extends { _id: string; _rev?: string } = any>
                     if (v.op === "set") {
                         await this.db.meta.put({
                             key,
-                            value: { vclock: v.clock, chunks: v.chunks, size: v.size },
+                            value: {
+                                vclock: v.clock, chunks: v.chunks, size: v.size,
+                                ...(v.deleted === true ? { deleted: true } : {}),
+                            },
                         });
                     } else {
                         await this.db.meta.delete(key);
@@ -425,8 +428,25 @@ export class DexieStore<T extends { _id: string; _rev?: string } = any>
             seq: stored._localSeq ?? 0,
             doc: opts?.include_docs ? stripInternal<T>(stored) : undefined,
         }));
-        const seqMeta = await this.db.meta.get("_update_seq");
-        const lastSeq = (seqMeta?.value as number) ?? 0;
+        // CURSOR TRUTH: `last_seq` claims "every row at or below this seq has
+        // been enumerated", so it must be derived from the rows actually
+        // returned — NOT from `_update_seq`. The old implementation read
+        // `_update_seq` in a separate IDB transaction; a write committing
+        // between the row query and that read produced a last_seq covering a
+        // row that was never enumerated. The push pipeline commits last_seq
+        // as its cursor, so the skipped row (a tombstone, in the 2026-06-03
+        // search1.jpeg incident) became permanently unpushable — no changes
+        // row, no unpushed-set entry, no log. Deriving last_seq from
+        // max(rows._localSeq) makes the race structurally impossible: all
+        // rows of one tx share one _localSeq and `toArray()` is a single
+        // snapshot read, so a tx is visible all-or-nothing.
+        //
+        // Note: the cursor may lag `_update_seq` permanently when the newest
+        // writes are meta-only or physical deletes. That is harmless — the
+        // enumeration is an index range scan, not a replay from the cursor.
+        const lastSeq = rows.length > 0
+            ? rows[rows.length - 1]._localSeq ?? sinceNum
+            : sinceNum;
         return { results, last_seq: lastSeq };
     }
 

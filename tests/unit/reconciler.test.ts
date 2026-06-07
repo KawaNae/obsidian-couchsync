@@ -276,12 +276,51 @@ describe("Reconciler", () => {
             expect(h.vaultSync.fileToDbCalls).toEqual(["new.md"]);
         });
 
-        it("resurrects when DB has tombstone", async () => {
+        // Invariant 7: a vault file over a DB tombstone routes through the
+        // classifier instead of a blind fileToDb (whose divergent guard
+        // skipped every relation except local-edit — the W24 wedged path).
+        it("recreate-pushes over a tombstone when classifier says local-edit", async () => {
             const h = setup([makeFile("a.md", 1000)]);
             h.db.fileDocs.set("a.md", makeDoc("a.md", { deleted: true }));
+            h.vaultSync.compareResults.set("a.md", "local-edit");
             const r = await h.reconciler.reconcile("manual");
             expect(r.pushed).toEqual(["a.md"]);
             expect(h.vaultSync.fileToDbCalls).toEqual(["a.md"]);
+        });
+
+        it("applies the pending deletion when classifier says remote-edit", async () => {
+            const h = setup([makeFile("a.md", 1000)]);
+            h.db.fileDocs.set("a.md", makeDoc("a.md", { deleted: true }));
+            h.vaultSync.compareResults.set("a.md", "remote-edit");
+            const r = await h.reconciler.reconcile("manual");
+            expect(r.deleted).toEqual(["a.md"]);
+            expect(h.vaultSync.dbToFileCalls).toEqual(["a.md"]);
+            expect(h.vaultSync.fileToDbCalls).toEqual([]);
+        });
+
+        it("routes true-divergent (the W24 wedged state) to handleDivergentRecreate", async () => {
+            const h = setup([makeFile("a.md", 1000)]);
+            h.db.fileDocs.set("a.md", makeDoc("a.md", { deleted: true }));
+            h.vaultSync.compareResults.set("a.md", "true-divergent");
+            const recreateCalls: string[] = [];
+            h.reconciler.setConflictOrchestrator({
+                handleDivergentRecreate: async (path: string) => { recreateCalls.push(path); },
+            } as any);
+            const r = await h.reconciler.reconcile("manual");
+            expect(recreateCalls).toEqual(["a.md"]);
+            expect(r.pushed).toEqual(["a.md"]);
+            expect(h.vaultSync.fileToDbCalls).toEqual([]);
+        });
+
+        it("leaves true-divergent untouched without an orchestrator (no silent restore/delete)", async () => {
+            const h = setup([makeFile("a.md", 1000)]);
+            h.db.fileDocs.set("a.md", makeDoc("a.md", { deleted: true }));
+            h.vaultSync.compareResults.set("a.md", "true-divergent");
+            const r = await h.reconciler.reconcile("manual");
+            expect(r.pushed).toEqual([]);
+            expect(r.deleted).toEqual([]);
+            expect(h.vaultSync.fileToDbCalls).toEqual([]);
+            expect(h.vaultSync.dbToFileCalls).toEqual([]);
         });
     });
 

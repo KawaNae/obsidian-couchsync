@@ -556,7 +556,17 @@ export class PullWriter {
                     if (!isFileDoc(doc)) continue;
                     const path = filePathFromId(doc._id);
                     try {
-                        await this.deps.ensureChunks(doc);
+                        // Tombstones skip the chunk fetch: their fingerprint
+                        // is NOT normalized (markDeleted retains the deleted
+                        // content's chunks — Invariant 7), but applying a
+                        // deletion never reads chunk bodies (dbToFile's
+                        // tombstone branch). Fetching them wastes bandwidth
+                        // on dead content that the next chunk GC drops again
+                        // (GC pins via live docs only) — a fetch→GC churn
+                        // loop on re-clone/repair paths.
+                        if (!doc.deleted) {
+                            await this.deps.ensureChunks(doc);
+                        }
                         const result = await this.deps.applyPullWrite(doc);
                         if (result.applied === true) {
                             logDebug(`  ← ${path} (take-remote)`);

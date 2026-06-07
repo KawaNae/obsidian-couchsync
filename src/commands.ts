@@ -41,6 +41,18 @@ export function registerCommands(plugin: CouchSyncPlugin): void {
                     } catch (e: any) {
                         logWarn(`CouchSync: verify pull failed, continuing with local view: ${e?.message ?? e}`);
                     }
+                    // Push-backfill: re-enqueue docs a pre-fix push cursor
+                    // skipped (permanently unpushed tombstones). Manual path
+                    // ignores the one-time startup flag.
+                    progress.update("Checking for cursor-skipped docs...");
+                    try {
+                        const bf = await plugin.replicator.runPushBackfillNow();
+                        if (bf && bf.enqueued > 0) {
+                            notify(`CouchSync: re-enqueued ${bf.enqueued} doc(s) the push cursor had skipped.`);
+                        }
+                    } catch (e: any) {
+                        logWarn(`CouchSync: push backfill failed during verify: ${e?.message ?? e}`);
+                    }
                 }
                 progress.update("Reconciling...");
                 const report = await plugin.reconciler.reconcile("manual", { mode: "report" });

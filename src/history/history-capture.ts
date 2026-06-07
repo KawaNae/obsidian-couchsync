@@ -41,8 +41,38 @@ export class HistoryCapture {
 
         this.eventRefs.push(
             this.events.on("rename", (path, oldPath) => {
+                // Re-target pending capture work at the new path (symmetric
+                // with the delete handler's cleanup). Leaving old-path timers
+                // armed made them fire against a path that no longer exists
+                // ("File not found" → that revision silently lost), and a
+                // stale pendingQueue entry had the same fate after resume.
+                let hadPending = false;
+                const timer = this.debounceTimers.get(oldPath);
+                if (timer) {
+                    clearTimeout(timer);
+                    this.debounceTimers.delete(oldPath);
+                    hadPending = true;
+                }
+                const pending = this.pendingCapture.get(oldPath);
+                if (pending) {
+                    clearTimeout(pending);
+                    this.pendingCapture.delete(oldPath);
+                    hadPending = true;
+                }
+                const qIdx = this.pendingQueue.indexOf(oldPath);
+                if (qIdx >= 0) {
+                    this.pendingQueue.splice(qIdx, 1);
+                    hadPending = true;
+                }
+                // Carry the rate-limit window across the rename so a rename
+                // mid-burst doesn't grant a free immediate capture.
+                const lastTime = this.lastCaptureTime.get(oldPath);
                 this.lastCaptureTime.delete(oldPath);
-                this.storage.renamePath(oldPath, path);
+                if (lastTime !== undefined) this.lastCaptureTime.set(path, lastTime);
+                this.storage.renamePath(oldPath, path).catch((e: any) =>
+                    logError(`CouchSync: history renamePath failed ${oldPath} → ${path}: ${e?.message ?? e}`),
+                );
+                if (hadPending && this.isTargetPath(path)) this.scheduleCapture(path);
             }),
         );
 
@@ -95,11 +125,25 @@ export class HistoryCapture {
     ): Promise<void> {
         const winnerContent = winner === "local" ? localContent : remoteContent;
         const loserContent = winner === "local" ? remoteContent : localContent;
-        const patch = this.diffEngine.computePatch(winnerContent, loserContent);
-        const hash = await hashString(winnerContent);
-        const { added, removed } = this.diffEngine.computeLineDiff(winnerContent, loserContent);
-        await this.storage.saveDiff(filePath, patch, hash, added, removed, true);
-        // Update snapshot to winner content so subsequent diffs have correct baseline.
+        // Record-keeping must advance even when the diff fails (the same
+        // principle as Invariant 7's "deletion is an integration event"):
+        // callers (ConflictOrchestrator) treat a saveConflict throw as an
+        // APPLY failure — applyBatchChoice skips clearDurable (ghost
+        // re-presentation of an already-applied conflict) and processSingle
+        // emits a false "keeping local version" notice. A failed diff loses
+        // one history entry; it must not corrupt conflict resolution. So:
+        // swallow diff-stage errors, always advance the snapshot baseline.
+        try {
+            const patch = this.diffEngine.computePatch(winnerContent, loserContent);
+            const hash = await hashString(winnerContent);
+            const { added, removed } = this.diffEngine.computeLineDiff(winnerContent, loserContent);
+            await this.storage.saveDiff(filePath, patch, hash, added, removed, true);
+        } catch (e: any) {
+            logError(`CouchSync: Failed to record conflict history for ${filePath}: ${e?.message ?? e}`);
+        }
+        // Update snapshot to winner content so subsequent diffs have correct
+        // baseline — unconditionally, or the stale snapshot reproduces the
+        // same failure on every later capture (the 2026-06-04 cascade).
         await this.storage.saveSnapshot(filePath, winnerContent);
     }
 
@@ -197,15 +241,27 @@ export class HistoryCapture {
             const prevContent = snapshot?.content ?? "";
             if (prevContent === currentContent) return;
 
-            const patches = this.diffEngine.computePatch(prevContent, currentContent);
-            const baseHash = await hashString(prevContent);
-            const { added, removed } = this.diffEngine.computeLineDiff(prevContent, currentContent);
-            await this.storage.saveDiff(path, patches, baseHash, added, removed, false, source);
-
+            // Once we hold the current content, record-keeping must advance
+            // even if the diff stage fails: leaving the snapshot stale made
+            // every subsequent capture re-derive the SAME failing diff (the
+            // 2026-06-04 "URI malformed" cascade — 13 consecutive failures),
+            // and the un-advanced lastCaptureTime disabled the rate-limit on
+            // top. A failed diff costs one history entry; a stale snapshot
+            // costs the whole chain.
+            try {
+                const patches = this.diffEngine.computePatch(prevContent, currentContent);
+                const baseHash = await hashString(prevContent);
+                const { added, removed } = this.diffEngine.computeLineDiff(prevContent, currentContent);
+                await this.storage.saveDiff(path, patches, baseHash, added, removed, false, source);
+                logDebug(`History captured for ${path} (${source})`);
+            } catch (e: any) {
+                logError(`CouchSync: Failed to capture history: ${e?.message ?? e}`);
+            }
             await this.storage.saveSnapshot(path, currentContent);
             this.lastCaptureTime.set(path, Date.now());
-            logDebug(`History captured for ${path} (${source})`);
         } catch (e) {
+            // Content acquisition (or snapshot bookkeeping) failed — there is
+            // no basis to advance the baseline. Next event retries.
             logError(`CouchSync: Failed to capture history: ${e?.message ?? e}`);
         }
     }

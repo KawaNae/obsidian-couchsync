@@ -362,7 +362,7 @@ export function hasDivergence(d: FileDocDivergence): boolean {
 
 // ── Paging iterators ────────────────────────────────────────────────
 
-async function* pagedRemoteFileDocs(
+export async function* pagedRemoteFileDocs(
     remote: ICouchClient,
     pageSize: number,
     signal?: AbortSignal,

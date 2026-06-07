@@ -598,6 +598,54 @@ describe("DexieStore", () => {
         });
     });
 
+    // ── changes: cursor truth ───────────────────────────
+
+    describe("changes (cursor truth)", () => {
+        it("last_seq equals the max enumerated row seq, not _update_seq", async () => {
+            await put(store, makeFile("a.md"));
+            await put(store, makeFile("b.md"));
+            const r = await store.changes(0);
+            expect(r.results).toHaveLength(2);
+            const maxRowSeq = Math.max(...r.results.map((row) => row.seq));
+            expect(r.last_seq).toBe(maxRowSeq);
+        });
+
+        it("echoes `since` when no rows are enumerated", async () => {
+            await put(store, makeFile("a.md"));
+            const first = await store.changes(0);
+            const cursor = first.last_seq as number;
+            const r = await store.changes(cursor);
+            expect(r.results).toHaveLength(0);
+            expect(r.last_seq).toBe(cursor);
+        });
+
+        it("meta-only writes do not advance last_seq past enumerated rows", async () => {
+            await put(store, makeFile("a.md"));
+            const first = await store.changes(0);
+            const cursor = first.last_seq as number;
+            // A meta-only write bumps _update_seq but adds no doc row. The
+            // old implementation leaked that bump into last_seq; the cursor
+            // must NOT advance past the rows actually returned.
+            await store.runWriteTx({
+                meta: [{ op: "put", key: "_test/meta-only", value: 1 }],
+            });
+            const r = await store.changes(cursor);
+            expect(r.results).toHaveLength(0);
+            expect(r.last_seq).toBe(cursor);
+        });
+
+        it("a row committed after enumeration is never covered by last_seq (lost-update race shape)", async () => {
+            await put(store, makeFile("a.md"));
+            const r1 = await store.changes(0);
+            // Simulate the race: a tombstone-bearing tx commits AFTER the
+            // row query of the previous cycle. With last_seq derived from
+            // enumerated rows, the next cycle MUST enumerate it.
+            await put(store, makeFile("late.md"));
+            const r2 = await store.changes(r1.last_seq);
+            expect(r2.results.map((row) => row.id)).toContain(makeFileId("late.md"));
+        });
+    });
+
     // ── lifecycle ───────────────────────────────────────
 
     describe("lifecycle", () => {

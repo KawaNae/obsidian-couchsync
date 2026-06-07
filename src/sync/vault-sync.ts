@@ -14,7 +14,7 @@ import { chunkListsEqual } from "./chunk-equality.ts";
 import { makeFileId, filePathFromId } from "../types/doc-id.ts";
 import { toPathKey, parentDir, type PathKey } from "../utils/path.ts";
 import { logDebug, logWarn } from "../ui/log.ts";
-import { DbError } from "../db/write-transaction.ts";
+import { DbError, type VclockUpdate } from "../db/write-transaction.ts";
 
 /**
  * Subset of ChangeTracker that EditorAwareVaultWriter needs.
@@ -193,7 +193,13 @@ export class VaultSync {
             await this.db.runWriteBuilder(
                 async (snap) => {
                     const existing = (await snap.get(fileId)) as FileDoc | null;
-                    if (existing && VaultSync.chunksEqual(existing.chunks, chunkIds)) {
+                    // The chunksEqual short-circuit must not match a tombstone:
+                    // markDeleted spreads the prior doc, so a tombstone retains
+                    // the chunks of the content it deleted. Recreating the file
+                    // with identical content would otherwise return here and
+                    // leave the doc deleted forever (Invariant 7).
+                    if (existing && !existing.deleted &&
+                        VaultSync.chunksEqual(existing.chunks, chunkIds)) {
                         return null; // already on disk
                     }
                     // CLASSIFIER: do not duplicate inline. The push-side
@@ -212,9 +218,11 @@ export class VaultSync {
                             leftVC: lastSynced?.vclock ?? {},
                             leftChunks: chunkIds,
                             leftSize: fileStat.size,
+                            leftVCAttributed: true,
                             rightVC: existingVC,
                             rightChunks: existing.chunks,
                             rightSize: existing.size,
+                            rightDeleted: existing.deleted === true,
                             lastSynced,
                         });
                         if (relation === "remote-edit" || relation === "true-divergent") {
@@ -320,6 +328,14 @@ export class VaultSync {
                     );
                 }
             }
+            // Invariant 7: integrating a deletion establishes the deleted
+            // baseline — symmetric with the push side (markDeleted). Without
+            // this, a pull-applied deletion left a stale alive baseline that
+            // turned a later legitimate remote recreate into a false
+            // divergent-local-delete conflict. Applies to the sibling-skip
+            // branch too: the tombstone is integrated (bookkeeping advances),
+            // only the disk side was skipped.
+            await this.establishBaseline(vaultPath, fileDoc);
             return { applied: true };
         }
 
@@ -450,8 +466,22 @@ export class VaultSync {
         const key = toPathKey(path);
         const prev = this.lastSynced.get(key);
         const docVC = fileDoc.vclock ?? {};
+        if (fileDoc.deleted) {
+            // Invariant 7: integrating a tombstone establishes a *deleted*
+            // baseline with a normalized fingerprint (tombstones in the wild
+            // carry non-normalized chunks — markDeleted spreads the prior
+            // doc — so we never copy fileDoc.chunks here).
+            const aligned =
+                prev !== undefined &&
+                prev.deleted === true &&
+                compareVC(prev.vclock, docVC) === "equal";
+            if (aligned) return;
+            await this.db.runWriteTx(this.deletedBaselineTx(path, docVC));
+            return;
+        }
         const aligned =
             prev !== undefined &&
+            prev.deleted !== true &&
             prev.chunks !== undefined &&
             prev.size === fileDoc.size &&
             compareVC(prev.vclock, docVC) === "equal" &&
@@ -468,6 +498,40 @@ export class VaultSync {
             vclock: clock,
             chunks: fileDoc.chunks,
             size: fileDoc.size,
+        });
+    }
+
+    /**
+     * Build the `{vclocks, onCommit}` fragment that records "I integrated a
+     * deletion of `path` at `tombstoneVC`" (Invariant 7). The fingerprint is
+     * normalized to `chunks: [], size: 0` regardless of what the tombstone
+     * doc itself carries. Shared by markDeleted / forceMarkDeleted /
+     * establishBaseline so every deletion-integration sink writes the same
+     * shape.
+     */
+    private deletedBaselineTx(path: string, tombstoneVC: VectorClock): {
+        vclocks: VclockUpdate[];
+        onCommit: () => void;
+    } {
+        return {
+            vclocks: [VaultSync.deletedBaselineRow(path, tombstoneVC)],
+            onCommit: () => this.applyDeletedBaseline(path, tombstoneVC),
+        };
+    }
+
+    /** The VclockUpdate row of a deleted baseline — composable into larger
+     *  transactions (handleRename writes it alongside the new path's alive
+     *  baseline in ONE tx). */
+    private static deletedBaselineRow(path: string, tombstoneVC: VectorClock): VclockUpdate {
+        return {
+            path, op: "set", clock: { ...tombstoneVC }, chunks: [], size: 0, deleted: true,
+        };
+    }
+
+    /** In-memory counterpart of `deletedBaselineRow` for onCommit hooks. */
+    private applyDeletedBaseline(path: string, tombstoneVC: VectorClock): void {
+        this.lastSynced.set(toPathKey(path), {
+            vclock: { ...tombstoneVC }, chunks: [], size: 0, deleted: true,
         });
     }
 
@@ -490,9 +554,13 @@ export class VaultSync {
             leftVC: lastSynced?.vclock ?? {},
             leftChunks: diskChunks,
             leftSize: fileSize,
+            // left = a disk file: always alive, vclock borrowed from the
+            // integration baseline.
+            leftVCAttributed: true,
             rightVC: fileDoc.vclock ?? {},
             rightChunks: fileDoc.chunks,
             rightSize: fileDoc.size,
+            rightDeleted: fileDoc.deleted === true,
             lastSynced,
         });
     }
@@ -624,11 +692,18 @@ export class VaultSync {
             await this.db.runWriteBuilder(
                 async (snap) => {
                     const existing = (await snap.get(fileId)) as FileDoc | null;
-                    if (!existing || existing.deleted) {
+                    if (!existing) {
+                        // No doc = no causal information to keep (Invariant 7:
+                        // `op:"delete"` is reserved for exactly this case).
                         return {
                             vclocks: [{ path, op: "delete" }],
                             onCommit: () => { this.lastSynced.delete(toPathKey(path)); },
                         };
+                    }
+                    if (existing.deleted) {
+                        // Already a tombstone — align the deleted baseline to
+                        // it (Invariant 7) instead of erasing the entry.
+                        return this.deletedBaselineTx(path, existing.vclock ?? {});
                     }
                     // Divergent guard: same shape as fileToDb. A delete during
                     // pending pull integration would produce a phantom tombstone
@@ -660,8 +735,10 @@ export class VaultSync {
                             } as unknown as CouchSyncDoc,
                             expectedVclock: existing.vclock,
                         }],
-                        vclocks: [{ path, op: "delete" }],
-                        onCommit: () => { this.lastSynced.delete(toPathKey(path)); },
+                        // Invariant 7: deletion is an integration event — keep
+                        // the baseline (deleted, normalized fingerprint), do
+                        // not erase it. Erasing was the W24 stuck-push bug.
+                        ...this.deletedBaselineTx(path, newVclock),
                     };
                 },
                 { maxAttempts: CAS_MAX_ATTEMPTS },
@@ -803,11 +880,16 @@ export class VaultSync {
             await this.db.runWriteBuilder(
                 async (snap) => {
                     const existing = (await snap.get(fileId)) as FileDoc | null;
-                    if (!existing || existing.deleted) {
+                    if (!existing) {
                         return {
                             vclocks: [{ path, op: "delete" }],
                             onCommit: () => { this.lastSynced.delete(toPathKey(path)); },
                         };
+                    }
+                    if (existing.deleted) {
+                        // Already a tombstone — align the deleted baseline
+                        // (Invariant 7) instead of erasing the entry.
+                        return this.deletedBaselineTx(path, existing.vclock ?? {});
                     }
                     const merged = mergeVC(baselineVclock, existing.vclock ?? {});
                     const newVclock = incrementVC(merged, deviceId);
@@ -821,8 +903,7 @@ export class VaultSync {
                             } as unknown as CouchSyncDoc,
                             expectedVclock: existing.vclock,
                         }],
-                        vclocks: [{ path, op: "delete" }],
-                        onCommit: () => { this.lastSynced.delete(toPathKey(path)); },
+                        ...this.deletedBaselineTx(path, newVclock),
                     };
                 },
                 { maxAttempts: CAS_MAX_ATTEMPTS },
@@ -859,6 +940,13 @@ export class VaultSync {
     async hasUnpushedChanges(path: string): Promise<boolean> {
         if (this.pendingProbe?.hasPending(path)) return true;
         const ls = this.lastSynced.get(toPathKey(path));
+        if (ls?.deleted) {
+            // Deleted baseline (Invariant 7): any file on disk is a recreate
+            // that hasn't been pushed yet. The explicit check matters for the
+            // empty-file recreate, whose fingerprint (chunks [], size 0)
+            // coincides with the normalized deleted fingerprint below.
+            return (await this.vault.stat(path)) != null;
+        }
         if (!ls || ls.chunks === undefined || ls.size === undefined) {
             // Legacy baseline (pre-{chunks,size} extension). The old code
             // returned false unconditionally here — which let a remote
@@ -891,9 +979,199 @@ export class VaultSync {
         return !chunkListsEqual(diskChunks, ls.chunks);
     }
 
+    /**
+     * Rename is a SINGLE integration event carrying the file's continuity —
+     * one WriteTransaction (one `_localSeq`) commits the new doc, the old
+     * tombstone, and both baselines. The old desugaring into
+     * `fileToDb(new) + markDeleted(old)` destroyed that continuity and made
+     * case-only / NFC renames permanently revert:
+     *   1. fileToDb minted the new doc at `{self:1}` (old vclock discarded)
+     *      and clobbered the SHARED PathKey baseline (toPathKey folds
+     *      case/NFC, so `Note.md` and `note.md` share one entry);
+     *   2. markDeleted's divergent guard then saw the old doc dominate the
+     *      clobbered baseline → false "pending pull integration" → no
+     *      tombstone;
+     *   3. reconcile Case F picked the old doc (causal dominator) as
+     *      canonical and physically reverted the rename — every retry hit
+     *      the same loop.
+     *
+     * Vclock design — `newVC ≻ tombVC` strictly (NOT equal): on a
+     * case-insensitive receiver where the new doc lands first, applying the
+     * tombstone deletes the single physical file and sets the shared
+     * baseline to deleted@tombVC. The next reconcile Case D compares the
+     * alive doc against that baseline: `equal` re-propagates the DELETION
+     * (rename converges to fleet-wide file loss), while `dominates`
+     * restores the file under the new case (one delete→restore churn,
+     * correct convergence). The strict domination is load-bearing.
+     */
     async handleRename(newPath: string, oldPath: string): Promise<void> {
-        await this.fileToDb(newPath);
-        await this.markDeleted(oldPath);
+        if (newPath === oldPath) {
+            // Not a rename (defensive — Obsidian shouldn't emit this). The
+            // tx below would write two docs under ONE _id (new doc + its own
+            // tombstone, last-write-wins) and silently delete the file.
+            await this.fileToDb(newPath);
+            return;
+        }
+        const oldFileId = makeFileId(oldPath);
+        const newFileId = makeFileId(newPath);
+        const deviceId = this.getSettings().deviceId;
+        const oldKey = toPathKey(oldPath);
+        const newKey = toPathKey(newPath);
+        const samePathKey = oldKey === newKey;
+
+        const fileStat = await this.vault.stat(newPath);
+        if (!fileStat) return; // re-renamed/deleted already — later events own it
+        // Re-chunk from disk: an edit raced into the rename window must not
+        // be lost by reusing the old doc's chunks.
+        const content = await this.vault.readBinary(newPath);
+        const chunks = await splitIntoChunks(content, this.hasher);
+        const chunkIds = chunks.map((c) => c._id);
+
+        try {
+            await this.db.runWriteBuilder(
+                async (snap) => {
+                    const oldDoc = (await snap.get(oldFileId)) as FileDoc | null;
+                    const existingNew = (await snap.get(newFileId)) as FileDoc | null;
+
+                    // Guard A — unintegrated remote state at the NEW path: an
+                    // alive doc the baseline does not explain must not be
+                    // silently overwritten (same fail-closed stance as
+                    // fileToDb's divergent guard). Reconcile/conflict owns it.
+                    if (existingNew && !existingNew.deleted) {
+                        const lsNew = this.lastSynced.get(newKey);
+                        const newDocVC = existingNew.vclock ?? {};
+                        const unexplained = lsNew
+                            ? compareVC(newDocVC, lsNew.vclock) === "dominates"
+                            : Object.keys(newDocVC).length > 0;
+                        if (unexplained) {
+                            logWarn(
+                                `handleRename: skipping ${oldPath} → ${newPath} — unintegrated ` +
+                                `doc at new path (observed=${JSON.stringify(newDocVC)})`,
+                            );
+                            return null;
+                        }
+                    }
+
+                    // Causal base: the old doc's identity, merged with any
+                    // prior doc at the new id (tombstone from an earlier
+                    // delete, or an integrated alive doc) so the rename
+                    // dominates everything it replaces.
+                    const base = mergeVC(oldDoc?.vclock ?? {}, existingNew?.vclock ?? {});
+
+                    // Guard B — old doc divergent (markDeleted's shape): a
+                    // rename during pending pull integration must not mint a
+                    // tombstone that stealth-deletes the other device's edit.
+                    // Degrade: commit only the new path (the rename's create
+                    // side); Case D later arbitrates the old path's deletion.
+                    const lsOld = this.lastSynced.get(oldKey);
+                    const oldVC = oldDoc?.vclock ?? {};
+                    const oldDivergent = oldDoc && !oldDoc.deleted && (
+                        lsOld
+                            ? compareVC(oldVC, lsOld.vclock) === "dominates"
+                            : Object.keys(oldVC).length > 0
+                    );
+                    if (oldDivergent && samePathKey) {
+                        // The shared baseline cannot represent both states —
+                        // leave everything to reconcile (Case F arbitrates).
+                        logWarn(
+                            `handleRename: skipping case-variant rename ${oldPath} → ${newPath} — ` +
+                            `old doc has pending pull integration (observed=${JSON.stringify(oldVC)})`,
+                        );
+                        return null;
+                    }
+
+                    const renameOld = oldDoc && !oldDoc.deleted && !oldDivergent;
+                    const tombVC = renameOld ? incrementVC(base, deviceId) : base;
+                    const newVC = incrementVC(
+                        renameOld ? tombVC : (oldDivergent ? (existingNew?.vclock ?? {}) : base),
+                        deviceId,
+                    );
+
+                    const newDoc: FileDoc = {
+                        _id: newFileId,
+                        schemaVersion: FILE_SCHEMA_VERSION,
+                        type: "file",
+                        chunks: chunkIds,
+                        mtime: fileStat.mtime,
+                        ctime: fileStat.ctime,
+                        size: fileStat.size,
+                        vclock: newVC,
+                    };
+
+                    const docs: Array<{ doc: CouchSyncDoc; expectedVclock?: VectorClock }> = [{
+                        doc: newDoc as unknown as CouchSyncDoc,
+                        expectedVclock: existingNew?.vclock ?? {},
+                    }];
+                    if (renameOld) {
+                        docs.push({
+                            doc: {
+                                ...oldDoc,
+                                deleted: true,
+                                mtime: Date.now(),
+                                vclock: tombVC,
+                            } as unknown as CouchSyncDoc,
+                            expectedVclock: oldDoc.vclock,
+                        });
+                    }
+
+                    // Baselines. CASE-VARIANT PITFALL: with samePathKey both
+                    // paths share ONE meta key (`_local/vclock/<toPathKey>`),
+                    // and the persistence layer applies vclock rows in order
+                    // (last-write-wins) — writing the old path's deleted
+                    // baseline after the new path's alive one would erase it.
+                    // Same PathKey ⇒ exactly one row: the alive baseline.
+                    const vclocks: VclockUpdate[] = [{
+                        path: newPath, op: "set", clock: newVC,
+                        chunks: chunkIds, size: fileStat.size,
+                    }];
+                    if (!samePathKey) {
+                        if (renameOld) {
+                            vclocks.push(VaultSync.deletedBaselineRow(oldPath, tombVC));
+                        } else if (oldDoc?.deleted) {
+                            vclocks.push(VaultSync.deletedBaselineRow(oldPath, oldDoc.vclock ?? {}));
+                        } else if (!oldDoc) {
+                            // No doc = no causal information to keep.
+                            vclocks.push({ path: oldPath, op: "delete" });
+                        }
+                        // oldDivergent: leave the old baseline untouched —
+                        // Case D arbitrates with the original integration state.
+                    }
+
+                    if (oldDivergent) {
+                        logWarn(
+                            `handleRename: ${oldPath} has pending pull integration — committing ` +
+                            `new path only (old path left to reconcile)`,
+                        );
+                    }
+
+                    return {
+                        chunks: chunks as unknown as CouchSyncDoc[],
+                        docs,
+                        vclocks,
+                        onCommit: () => {
+                            this.lastSynced.set(newKey, {
+                                vclock: newVC,
+                                chunks: chunkIds,
+                                size: fileStat.size,
+                            });
+                            if (!samePathKey) {
+                                if (renameOld) {
+                                    this.applyDeletedBaseline(oldPath, tombVC);
+                                } else if (oldDoc?.deleted) {
+                                    this.applyDeletedBaseline(oldPath, oldDoc.vclock ?? {});
+                                } else if (!oldDoc) {
+                                    this.lastSynced.delete(oldKey);
+                                }
+                            }
+                        },
+                    };
+                },
+                { maxAttempts: CAS_MAX_ATTEMPTS },
+            );
+        } catch (e) {
+            this.surfaceWriteError(e, `handleRename ${oldPath} → ${newPath}`);
+            throw e;
+        }
     }
 
     /**

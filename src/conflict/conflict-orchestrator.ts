@@ -75,8 +75,11 @@ interface QueuedConflict {
  *   - `handleDivergentLocalDelete` from Reconciler — vault file removed
  *     by user while LocalDB doc was advanced by a pull (Regression B
  *     path)
+ *   - `handleDivergentRecreate` from Reconciler — vault file present over
+ *     a LocalDB tombstone with no explaining baseline (Invariant 7,
+ *     recreate-after-delete with lost causal anchor)
  *
- * All three funnel through the same modal pipeline; only the apply
+ * All entries funnel through the same modal pipeline; only the apply
  * callbacks differ.
  */
 export class ConflictOrchestrator {
@@ -432,6 +435,61 @@ export class ConflictOrchestrator {
                 }
             },
             applyKeepLocal: () => this.deps.vaultSync.forceMarkDeleted(filePath, remoteDoc.vclock ?? {}),
+            clearDurable: async () => {},
+            waiters: [],
+        });
+    }
+
+    /**
+     * Reconciler entry — a vault file exists over a LocalDB tombstone with
+     * no baseline explaining it (classifier `true-divergent` with
+     * `rightDeleted`, Invariant 7). Mirror image of
+     * `handleDivergentLocalDelete`: there the file is gone and the doc is
+     * alive; here the file is present and the doc is deleted. Neither
+     * silent outcome is safe — restoring would resurrect a deletion (the
+     * H-1 data-loss shape), skipping would wedge the path unpushable (the
+     * W24 bug shape) — so the user arbitrates.
+     *
+     * Invariant 6 note: `tombstoneDoc` is the committed LocalDB tombstone
+     * (markDeleted- or buildAcceptedTombstone-origin, real vclock). The
+     * fake `vclock: {}` carrier built by `handlePulledDeletion` is never
+     * committed, so it cannot reach this path; and `forceLocalEdit` merges
+     * `existing.vclock` inside its snapshot anyway — two independent
+     * layers against a placeholder seed.
+     */
+    async handleDivergentRecreate(filePath: string, tombstoneDoc: FileDoc): Promise<void> {
+        if (this.inFlightConflicts.has(filePath) || this.queue.has(filePath)) return;
+        let localBuf: ArrayBuffer;
+        try {
+            localBuf = await this.deps.vault.readBinary(filePath);
+        } catch (e: any) {
+            logError(
+                `Divergent-recreate resolution error for ${filePath.split("/").pop()}: ${e?.message ?? e}`,
+            );
+            notify(
+                `CouchSync: divergent recreate on ${filePath.split("/").pop()} — left untouched due to error.`,
+                10000,
+            );
+            return;
+        }
+        await this.enqueue({
+            filePath,
+            localBuf,
+            remoteBuf: EMPTY_BUF,
+            applyTakeRemote: async () => {
+                // Accept the deletion: remove the recreated file from disk and
+                // establish the deleted baseline (dbToFile tombstone branch).
+                const writeResult = await this.deps.dbToFile(tombstoneDoc);
+                if (writeResult.applied === false) {
+                    logWarn(
+                        `Divergent-recreate take-remote: vault write skipped: ` +
+                        `${filePath.split("/").pop()} (${writeResult.reason})`,
+                    );
+                }
+            },
+            // Keep the recreated file: commit it over the tombstone with a
+            // vclock that dominates it, so the recreate replicates everywhere.
+            applyKeepLocal: () => this.deps.vaultSync.forceLocalEdit(filePath, tombstoneDoc.vclock ?? {}),
             clearDurable: async () => {},
             waiters: [],
         });

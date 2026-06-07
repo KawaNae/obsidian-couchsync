@@ -68,7 +68,13 @@ export type MetaWrite =
     | { op: "delete"; key: string };
 
 export type VclockUpdate =
-    | { path: string; op: "set"; clock: VectorClock; chunks: string[]; size: number }
+    | {
+        path: string; op: "set"; clock: VectorClock; chunks: string[]; size: number;
+        /** Invariant 7: the integrated doc state was a tombstone (chunks/size
+         *  carry the normalized `[]`/0 fingerprint). `op: "delete"` is
+         *  reserved for "no doc exists at all". */
+        deleted?: true;
+    }
     | { path: string; op: "delete" };
 
 /**

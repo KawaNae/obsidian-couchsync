@@ -164,10 +164,15 @@ describe("regression: divergent user-delete", () => {
         await vault.delete(path);
         await vs.markDeleted(path);
 
-        // markDeleted committed the tombstone; lastSynced cleared.
+        // markDeleted committed the tombstone and established the deleted
+        // baseline (Invariant 7: deletion is an integration event — the
+        // baseline is kept, not erased, so a later recreate keeps its
+        // causal anchor).
         const doc = await db.get(makeFileId(path)) as FileDoc;
         expect(doc.deleted).toBe(true);
-        expect(vs.getLastSynced(path)).toBeUndefined();
+        expect(vs.getLastSynced(path)).toEqual({
+            vclock: doc.vclock, chunks: [], size: 0, deleted: true,
+        });
 
         // Reconcile is a no-op for this path (Case E).
         await reconciler.reconcile("paused");

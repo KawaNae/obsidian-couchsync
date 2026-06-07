@@ -298,4 +298,132 @@ describe("classifySyncRelation", () => {
             }))).toBe("identical");
         });
     });
+
+    // ── Invariant 7: the deleted axis ───────────────────────
+    // A tombstone's fingerprint is NOT normalized (markDeleted retains the
+    // deleted content's chunks), so the deleted flag — not the chunks —
+    // carries the deleted state.
+    describe("deleted axis (Invariant 7)", () => {
+        // The wild tombstone shape: retains the chunks it deleted.
+        const tomb = { rightDeleted: true, rightChunks: C("a"), rightSize: 10 };
+
+        it("deleted×deleted with differing retained chunks → identical (not conflict)", () => {
+            // Local markDeleted-tombstone (chunks retained) vs pulled
+            // buildAcceptedTombstone (chunks []) — same deletion state.
+            expect(classifySyncRelation(input({
+                leftDeleted: true, leftChunks: C("a"), leftSize: 10,
+                rightDeleted: true, rightChunks: C(), rightSize: 0,
+                leftVC: VC({ a: 2 }), rightVC: VC({ a: 2 }),
+            }))).toBe("identical");
+        });
+
+        it("deleted×deleted with vclock drift → vclock-only-drift (concurrent deletions converge)", () => {
+            expect(classifySyncRelation(input({
+                leftDeleted: true, leftChunks: C("a"), leftSize: 10,
+                rightDeleted: true, rightChunks: C(), rightSize: 0,
+                leftVC: VC({ a: 2 }), rightVC: VC({ b: 2 }),
+            }))).toBe("vclock-only-drift");
+        });
+
+        it("alive×deleted with identical chunks is NOT content-equal (no silent resurrect)", () => {
+            // Local tombstone vs remote alive doc sharing the retained
+            // chunks: must fall through to vclock comparison, never
+            // vclock-only-drift → silent-merge.
+            expect(classifySyncRelation(input({
+                leftDeleted: true, leftChunks: C("a"), leftSize: 10,
+                leftVC: VC({ a: 1 }),
+                rightChunks: C("a"), rightSize: 10,
+                rightVC: VC({ a: 1, b: 1 }),
+            }))).toBe("remote-edit"); // legitimate resurrection (pull site, real vclocks)
+        });
+
+        it("recreate over integrated deletion → local-edit (the normal recreate push)", () => {
+            // Vault file over a tombstone whose deletion we integrated:
+            // deleted baseline vclock equals the tombstone vclock.
+            expect(classifySyncRelation(input({
+                ...tomb,
+                leftVCAttributed: true,
+                leftVC: VC({ m: 2 }), rightVC: VC({ m: 2 }),
+                leftChunks: C("new"), leftSize: 20,
+                lastSynced: { vclock: VC({ m: 2 }), chunks: [], size: 0, deleted: true },
+            }))).toBe("local-edit");
+        });
+
+        it("W24 shape: file over tombstone, NO baseline → true-divergent (was remote-edit = wedged)", () => {
+            expect(classifySyncRelation(input({
+                ...tomb,
+                leftVCAttributed: true,
+                leftVC: VC({}), rightVC: VC({ m: 2 }),
+                leftChunks: C("new"), leftSize: 20,
+            }))).toBe("true-divergent");
+        });
+
+        it("file over tombstone, legacy baseline → true-divergent (safe side)", () => {
+            expect(classifySyncRelation(input({
+                ...tomb,
+                leftVCAttributed: true,
+                leftVC: VC({ m: 1 }), rightVC: VC({ m: 2 }),
+                leftChunks: C("new"), leftSize: 20,
+                lastSynced: { vclock: VC({ m: 1 }) }, // no chunks/size
+            }))).toBe("true-divergent");
+        });
+
+        it("file over tombstone dominating the deleted baseline → true-divergent (re-delete raced recreate)", () => {
+            expect(classifySyncRelation(input({
+                ...tomb,
+                leftVCAttributed: true,
+                rightVC: VC({ m: 2, i: 1 }),
+                leftVC: VC({ m: 2 }),
+                leftChunks: C("new"), leftSize: 20,
+                lastSynced: { vclock: VC({ m: 2 }), chunks: [], size: 0, deleted: true },
+            }))).toBe("true-divergent");
+        });
+
+        it("untouched file under a dominating tombstone → remote-edit (deletion pending disk apply)", () => {
+            expect(classifySyncRelation(input({
+                ...tomb,
+                leftVCAttributed: true,
+                leftVC: VC({ m: 1 }), rightVC: VC({ m: 2 }),
+                leftChunks: C("a"), leftSize: 10,
+                lastSynced: { vclock: VC({ m: 1 }), chunks: C("a"), size: 10 },
+            }))).toBe("remote-edit");
+        });
+
+        it("edited file under a dominating tombstone → true-divergent (delete-vs-edit)", () => {
+            expect(classifySyncRelation(input({
+                ...tomb,
+                leftVCAttributed: true,
+                leftVC: VC({ m: 1 }), rightVC: VC({ m: 2 }),
+                leftChunks: C("edited"), leftSize: 30,
+                lastSynced: { vclock: VC({ m: 1 }), chunks: C("a"), size: 10 },
+            }))).toBe("true-divergent");
+        });
+
+        it("pull site (no attributed vclock): alive doc dominated by tombstone → remote-edit", () => {
+            // resolveOnPull compares two real doc vclocks; a dominating
+            // tombstone is a legitimate deletion to take, baseline or not.
+            expect(classifySyncRelation(input({
+                rightDeleted: true, rightChunks: C(), rightSize: 0,
+                leftVC: VC({ a: 1 }), rightVC: VC({ a: 2 }),
+                leftChunks: C("c"), leftSize: 10,
+            }))).toBe("remote-edit");
+        });
+
+        it("pull site: alive doc concurrent with tombstone → true-divergent (delete-vs-edit modal)", () => {
+            expect(classifySyncRelation(input({
+                rightDeleted: true, rightChunks: C(), rightSize: 0,
+                leftVC: VC({ a: 1 }), rightVC: VC({ b: 2 }),
+                leftChunks: C("c"), leftSize: 10,
+            }))).toBe("true-divergent");
+        });
+
+        it("alive×alive matrix is untouched by the deleted axis defaults", () => {
+            // Omitting leftDeleted/rightDeleted/leftVCAttributed preserves
+            // the legacy chunks-only semantics.
+            expect(classifySyncRelation(input({
+                leftVC: VC({ a: 1 }), rightVC: VC({ a: 2 }),
+                leftChunks: C("old"), rightChunks: C("new"),
+            }))).toBe("remote-edit");
+        });
+    });
 });

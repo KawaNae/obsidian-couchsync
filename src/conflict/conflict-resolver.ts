@@ -50,8 +50,10 @@ export type PullVerdict = "take-remote" | "keep-local" | "concurrent" | "silent-
  * Adapt a doc into the chunks/size fingerprint the classifier expects.
  * v0.26 unifies the shape: FileDoc and ConfigDoc both expose
  * `chunks: string[]` (content-addressed hash list). Pass through
- * directly. Tombstones with `chunks:[]` and `size:0` compare correctly:
- * deleted-vs-deleted is identical, deleted-vs-alive is content-differing.
+ * directly. Tombstone fingerprints are NOT normalized (`markDeleted`
+ * retains the deleted content's chunks); deleted-state comparison is
+ * handled by the classifier's `leftDeleted`/`rightDeleted` axis
+ * (Invariant 7), not by these chunks.
  */
 function asContent(doc: ResolvableDoc): { chunks: readonly string[]; size: number } {
     return { chunks: doc.chunks, size: doc.size };
@@ -97,12 +99,22 @@ export class ConflictResolver {
             leftVC: localVC,
             leftChunks: localContent.chunks,
             leftSize: localContent.size,
+            leftDeleted: localDoc.deleted === true,
             rightVC: remoteVC,
             rightChunks: remoteContent.chunks,
             rightSize: remoteContent.size,
+            rightDeleted: remoteDoc.deleted === true,
             // No `lastSynced` — pull-side replication is independent of
             // vault integration state. Without baseline the classifier
             // never returns `legacy-skip` here.
+            //
+            // Invariant 7 effects at this call site: deleted×deleted is
+            // content-equal regardless of (non-normalized) tombstone chunks,
+            // so concurrent deletions converge silently; deleted×alive is
+            // never content-equal, so a tombstone can no longer
+            // `vclock-only-drift → silent-merge` against an alive doc that
+            // happens to share its retained chunks (the silent-resurrect /
+            // silent-delete shapes).
         });
 
         const vaultPath = extractVaultPath(remoteDoc._id);
