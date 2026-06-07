@@ -43,7 +43,9 @@ del USER, PASS  # only the encoded header is retained from here on
 TOKEN = secrets.token_urlsafe(24)
 ALLOWED_METHODS = {"GET", "HEAD"}
 LISTEN_HOST = "127.0.0.1"
-LISTEN_PORT = int(os.environ.get("BROKER_PORT", "9999"))
+# NOTE: 9999 is inside a Hyper-V/WSL excluded port range (9982-10081) on Windows
+# and fails to bind with WinError 10013. Default to a port outside all ranges.
+LISTEN_PORT = int(os.environ.get("BROKER_PORT", "9876"))
 HOP_BY_HOP = {"connection", "transfer-encoding", "keep-alive", "proxy-authenticate",
               "proxy-authorization", "te", "trailers", "upgrade"}
 
