@@ -2,6 +2,72 @@
 
 All notable changes to obsidian-couchsync.
 
+## 0.28.2
+
+Five structural fixes from a log-driven bug hunt across two real-device
+incident logs. Two of them had been silently losing data propagation in
+production: a deleted-then-recreated note that could never sync again, and
+deletions that never reached other devices and resurrected there.
+
+### Fixed
+
+- **Recreating a deleted note no longer wedges it permanently (Invariant 7:
+  deletion is an integration event).** Deleting a file erased its integration
+  baseline (`lastSynced`), destroying the causal record "this device
+  integrated that deletion". Recreating the same path then made the push
+  guard classify the old tombstone as an unintegrated remote edit — push
+  skipped forever, pull already converged, reconcile re-entered the same
+  guard: no exit (the 2026-06-03 `2026-W24.md` incident, 4 days stuck).
+  Deletion now *establishes* a deleted baseline instead of erasing it, the
+  classifier gained a deleted axis (a tombstone's retained chunks no longer
+  masquerade as live content), and recreate-after-delete pushes cleanly with
+  no modal. Devices already wedged self-heal through a new
+  recreate-vs-deletion conflict prompt on their next reconcile. Three sibling
+  bugs fell to the same axis: recreating with *identical* content no longer
+  short-circuits into a dead tombstone, a tombstone can no longer
+  silent-merge-resurrect against a live doc sharing its retained chunks, and
+  a pull-applied deletion no longer leaves a stale alive baseline that turned
+  a later legitimate recreate into a false conflict.
+- **Deletions can no longer be permanently skipped by the push cursor (lost-
+  update race).** `changes()` read its cursor bound (`_update_seq`) in a
+  separate transaction from the row query; a write committing in between was
+  covered by the cursor but never enumerated. Edits self-heal on the next
+  keystroke — a skipped *tombstone* never gets another vault event, so the
+  deletion silently stopped propagating and the file resurrected on every
+  other device (the 2026-06-03 `search1.jpeg` incident: 2 of 15 batch-deleted
+  images lost their tombstone push). The cursor now derives from the rows
+  actually enumerated, making the race structurally impossible. A one-time
+  **push-backfill sweep** at session start (also wired into "Verify
+  consistency and repair") re-enqueues docs already stranded behind the
+  cursor — it found and repaired 4 stranded tombstones on the dev vault
+  alone.
+- **Case-only and NFC/NFD renames no longer revert forever.** `Note.md →
+  note.md` desugared into create+delete: the create minted a fresh vclock
+  (discarding the file's causal history) and clobbered the shared
+  case-folded baseline, the delete's divergent guard then misfired (no
+  tombstone), and reconcile picked the *old* doc as canonical — physically
+  reverting the rename on every retry. Rename is now a single atomic
+  write transaction: the new doc inherits the old causality and strictly
+  dominates the old path's tombstone (strictness is load-bearing — equal
+  clocks would converge to fleet-wide deletion on case-insensitive
+  receivers), and the shared-PathKey baseline keeps exactly the alive entry.
+- **Editing near emoji no longer silently loses history.** diff-match-patch
+  splits diffs at UTF-16 code-unit boundaries, so edits around emoji that
+  share a surrogate half (🍅→🍆) produced lone-surrogate segments whose
+  serialization throws `URIError: URI malformed` — the capture was dropped,
+  and the stale snapshot reproduced the same failure on every subsequent
+  edit of that file (13 consecutive losses in one incident log). Diff
+  boundaries are now snapped to code-point boundaries before serialization
+  (patch format unchanged, old history remains readable), and history
+  bookkeeping advances even when a capture fails, so one lost diff can no
+  longer cascade. Conflict-history recording is non-throwing for the same
+  reason — a failed diff no longer ghost-re-presents an already-resolved
+  conflict.
+- **Pulled tombstones no longer fetch their dead content's chunks.** A
+  tombstone retains the chunks of the content it deleted; applying a
+  deletion never reads them, but the pull path fetched them anyway — wasted
+  bandwidth that the next chunk GC dropped again.
+
 ## 0.28.1
 
 Faster mobile-resume recovery. On returning to the foreground, a mobile
