@@ -2,6 +2,56 @@
 
 All notable changes to obsidian-couchsync.
 
+## 0.28.3
+
+A connection-recovery overhaul plus the trust-boundary and retry-cadence
+fixes surfaced by a production-log review across four real devices. The
+headline: on mobile, sync could silently stay dead after the app launched
+during a brief network blip, and every wake from a long sleep popped a
+spurious "Server unreachable" notice even though sync recovered a second
+later. Both are gone. All fixes ship as one release; no schema change, no
+re-Init required.
+
+### Fixed
+
+- **Sync no longer stays permanently dead when the app loads during a network
+  blip (mobile cold-start).** The encryption-agreement check ran as an
+  unsupervised gate before sync started; if its first network call failed
+  (common right after a tablet/phone wakes, before the network stack is
+  ready) it gave up with no retry, leaving sync silently off until a manual
+  reload. Two mobile devices hit this in production. The check is now a single
+  supervised step inside the sync session, so a transient failure retries and
+  auto-recovers the moment the network returns.
+- **No more spurious "Server unreachable" notifications on resume.** A request
+  frozen by a background suspend aborts on wake; that abort was misread as the
+  server being down, firing a Notice and bouncing a healthy session through an
+  error state. Suspend-frozen aborts are now told apart from genuine timeouts
+  (by elapsed wall-clock) and handled silently, and only user-actionable
+  errors raise a Notice now — transient blips show in the status bar only.
+- **A malicious or compromised server can no longer write outside the vault.**
+  Paths from remote documents were applied without validation; on a
+  plaintext vault a crafted id (`../…`, absolute, drive-letter, backslash)
+  could escape the vault sandbox on write *or* delete. All remote-applied
+  paths are now validated at the write boundary, independent of encryption.
+- **Pull now honours the same max-file-size ceiling as push.** An oversized
+  document from another device (or a hostile server) is skipped instead of
+  being assembled wholesale in memory.
+- **Push no longer busy-spins on `404` / transient encryption errors.** Those
+  paths retried with no delay until the 10 s escalation tore the session down;
+  they now back off like the pull loop, saving mobile battery and bandwidth.
+- **A stalled reconnect can no longer hang forever.** A health-check watchdog
+  re-kicks recovery if it ever finds the engine stuck with nothing in flight,
+  while leaving genuinely terminal states (auth, migration, encryption pause)
+  alone.
+
+### Added
+
+- **Device specs in the log-export frontmatter.** Exports now record CPU core
+  count, JS-heap usage/limit, RAM, CPU model, and architecture (best-effort,
+  platform-dependent) to help diagnose memory-pressure and OOM-class issues.
+  The `os` field also reports a real value on mobile (e.g. `android 17`) — it
+  was previously always `unknown` off the desktop.
+
 ## 0.28.2
 
 Five structural fixes from a log-driven bug hunt across two real-device

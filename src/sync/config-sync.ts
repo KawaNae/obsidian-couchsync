@@ -31,6 +31,7 @@ import type { ICouchClient } from "../db/interfaces.ts";
 import { makeCouchClient } from "../db/couch-client.ts";
 import type { CryptoProvider } from "../db/crypto-provider.ts";
 import { logError, logWarn } from "../ui/log.ts";
+import { unsafeVaultPathReason } from "../utils/path.ts";
 import * as remoteCouch from "../db/remote-couch.ts";
 import {
     ConfigOperation,
@@ -729,6 +730,14 @@ export class ConfigSync {
         for (let i = 0; i < docs.length; i++) {
             const doc = docs[i];
             const path = configPathFromId(doc._id);
+            // Trust boundary (#3): config paths are written via the adapter
+            // (mkdir + writeBinary) with no index mediation — the most direct
+            // traversal vector. Reject vault-escaping paths before ensureDir.
+            const pathViolation = unsafeVaultPathReason(path);
+            if (pathViolation) {
+                logWarn(`CouchSync: rejecting unsafe remote config path "${path}" — ${pathViolation}`);
+                continue;
+            }
             if (this.skipPaths.has(path)) continue;
             try {
                 onProgress?.(path, i + 1, docs.length);
@@ -748,6 +757,19 @@ export class ConfigSync {
                     logWarn(
                         `CouchSync: Skipping config write ${path} \u2014 ` +
                         `missing ${missing.length} chunk(s): ${missing.slice(0, 3).join(", ")}`,
+                    );
+                    continue;
+                }
+                // Size ceiling (#4) before assembleChunks allocates the full
+                // buffer — symmetric to the push scan's MAX_CONFIG_SIZE gate.
+                const sizeBytes = chunks.reduce(
+                    (n, c) => n + (c.content instanceof Uint8Array ? c.content.length : 0), 0,
+                );
+                if (sizeBytes > ConfigSync.MAX_CONFIG_SIZE) {
+                    logWarn(
+                        `CouchSync: Skipping config write ${path} — ` +
+                        `${(sizeBytes / (1024 * 1024)).toFixed(1)} MB exceeds ` +
+                        `${ConfigSync.MAX_CONFIG_SIZE / (1024 * 1024)} MB config limit`,
                     );
                     continue;
                 }

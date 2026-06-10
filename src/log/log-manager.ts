@@ -27,6 +27,7 @@ import {
     formatLogExport,
     buildExportFileName,
     type ExportMeta,
+    type DeviceInfo,
 } from "./markdown-formatter.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { IVaultIO } from "../types/vault-io.ts";
@@ -58,6 +59,9 @@ export interface LogManagerDeps {
     getObsidianVersion: () => string;
     getPlatform: () => { os: string; isMobile: boolean };
     getSyncDiagnostics: () => SyncDiagnostics;
+    /** Best-effort device specs collected at export time. Optional — when
+     *  absent the export simply omits the `device:` block. */
+    getDeviceInfo?: () => DeviceInfo;
     vault: IVaultIO;
     /** Defaults to `Date.now`; tests override. */
     now?: () => number;
@@ -94,6 +98,7 @@ export class LogManager {
     private readonly getObsidianVersion: () => string;
     private readonly getPlatform: () => { os: string; isMobile: boolean };
     private readonly getSyncDiagnostics: () => SyncDiagnostics;
+    private readonly getDeviceInfo?: () => DeviceInfo;
     private readonly vault: IVaultIO;
     private readonly now: () => number;
     private readonly timer: NonNullable<LogManagerDeps["timer"]>;
@@ -112,6 +117,7 @@ export class LogManager {
         this.getObsidianVersion = deps.getObsidianVersion;
         this.getPlatform = deps.getPlatform;
         this.getSyncDiagnostics = deps.getSyncDiagnostics;
+        this.getDeviceInfo = deps.getDeviceInfo;
         this.vault = deps.vault;
         this.now = deps.now ?? (() => Date.now());
         this.timer = deps.timer ?? {
@@ -201,6 +207,7 @@ export class LogManager {
             platform: this.getPlatform(),
             exportedAt,
             syncState: this.getSyncDiagnostics(),
+            device: this.getDeviceInfo?.(),
         };
         const content = formatLogExport(entries, meta);
 

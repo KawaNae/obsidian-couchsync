@@ -498,23 +498,38 @@ describe("SyncEngine integration", () => {
             a.engine.stop();
         });
 
-        it("checkHealth skips in reconnecting/error states", async () => {
+        it("checkHealth watchdog: kicks a STALLED reconnecting state, leaves a PENDING one alone", async () => {
             h = createSyncHarness();
             const a = h.addDevice("dev-A");
             await a.engine.start();
 
-            const spy = vi.spyOn(h.couch, "info");
-            const baseline = spy.mock.calls.length;
+            const reconnectSpy = vi
+                .spyOn(a.engine as any, "requestReconnect")
+                .mockResolvedValue(undefined);
 
+            // Stalled recovery: "reconnecting" with no in-flight reconnect and
+            // no retry/transient timer (the openSession dispose-race hole that
+            // stranded a real device). The watchdog must kick a fresh attempt.
+            (a.engine as any).reconnectInFlight = null;
+            (a.engine as any).retryTimer = null;
+            (a.engine as any).transientTimer = null;
             (a.engine as any).setState("reconnecting");
+            const before = reconnectSpy.mock.calls.length;
             await (a.engine as any).checkHealth();
-            expect(spy.mock.calls.length).toBe(baseline);
+            expect(reconnectSpy.mock.calls.length).toBeGreaterThan(before);
 
-            (a.engine as any).enterError({ kind: "network", message: "down" });
-            const baselineAfter = spy.mock.calls.length;
+            // Pending recovery: a scheduled retry timer is driving it forward —
+            // the watchdog must NOT interfere (no double-driving).
+            reconnectSpy.mockClear();
+            (a.engine as any).reconnectInFlight = null;
+            (a.engine as any).transientTimer = null;
+            (a.engine as any).retryTimer = setTimeout(() => {}, 100000);
+            (a.engine as any).setState("error");
             await (a.engine as any).checkHealth();
-            expect(spy.mock.calls.length).toBe(baselineAfter);
-            spy.mockRestore();
+            expect(reconnectSpy.mock.calls.length).toBe(0);
+
+            clearTimeout((a.engine as any).retryTimer);
+            reconnectSpy.mockRestore();
             a.engine.stop();
         });
 

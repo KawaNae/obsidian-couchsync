@@ -83,6 +83,14 @@ type PushStage = "changes" | "pushDocs" | "checkpoint-save" | "idle";
 
 const PUSH_POLL_INTERVAL_MS = 2000;
 
+/** Backoff bounds for transient push errors (404 / retriable
+ *  EncryptionError). Mirrors the pull loop's PULL_RETRY_MIN/MAX so both
+ *  pipelines throttle transient failures identically — without this the
+ *  transient `continue` paths skip the loop-tail delay and busy-spin
+ *  until the 10s transient-escalation timer tears the session down. */
+const PUSH_RETRY_MIN_MS = 2_000;
+const PUSH_RETRY_MAX_MS = 30_000;
+
 /** After this many consecutive race-stale cycles we re-classify the
  *  entry as divergent so the orchestrator gets a shot at it. The
  *  retry-budget exists to bound the silent-retry window — without it a
@@ -164,6 +172,11 @@ export class PushPipeline {
     /** Latch so we capture full stack for the first unexpected push error
      *  in a session. Repeated occurrences log only the message. */
     private stackCaptured = false;
+    /** Exponential backoff for transient push errors. Reset to MIN after
+     *  every clean cycle; doubled (capped at MAX) on each transient error
+     *  so a persistently-404ing remote isn't hammered. Symmetric to the
+     *  pull pipeline's `retryMs`. */
+    private retryMs = PUSH_RETRY_MIN_MS;
 
     constructor(private deps: PushPipelineDeps) {}
 
@@ -260,6 +273,9 @@ export class PushPipeline {
                 try {
                     stage = "changes";
                     await this.runOnce(cycle.signal, () => { stage = "pushDocs"; });
+                    // Clean cycle: reset the transient backoff so the next
+                    // 404/EncryptionError starts again at PUSH_RETRY_MIN_MS.
+                    this.retryMs = PUSH_RETRY_MIN_MS;
                 } catch (e: any) {
                     // halt-class DbError (degraded / quota) must surface
                     // even when dispose() raced ahead of us — otherwise
@@ -282,12 +298,16 @@ export class PushPipeline {
                     if (isAbortError(e) || this.deps.visibility.isHidden()) continue;
                     if (e instanceof EncryptionError) {
                         this.deps.onTransientError(e);
+                        await this.deps.delay(this.retryMs);
+                        this.retryMs = Math.min(this.retryMs * 2, PUSH_RETRY_MAX_MS);
                         continue;
                     }
                     {
                         const detail = classifyError(e);
                         if (detail.kind === "not-found") {
                             this.deps.onTransientError(e);
+                            await this.deps.delay(this.retryMs);
+                            this.retryMs = Math.min(this.retryMs * 2, PUSH_RETRY_MAX_MS);
                             continue;
                         }
                     }
@@ -756,6 +776,7 @@ export class PushPipeline {
                     this.deps.events.emit("error", {
                         message:
                             "Some documents were denied — check CouchDB _security permissions.",
+                        kind: "auth",
                     });
                 }
             } else if (res.error === "conflict") {

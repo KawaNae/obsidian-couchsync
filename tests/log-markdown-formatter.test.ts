@@ -101,6 +101,53 @@ sync_state:
         expect(out.includes("remote_seq:")).toBe(false);
     });
 
+    it("omits the device block entirely when device is absent (back-compat)", () => {
+        const out = formatLogExport([], META);
+        expect(out.includes("device:")).toBe(false);
+    });
+
+    it("renders a full desktop device block", () => {
+        const out = formatLogExport([], {
+            ...META,
+            device: {
+                cpuCores: 16,
+                userAgent: "obsidian/1.6.7",
+                jsHeapUsedMb: 55,
+                jsHeapLimitMb: 4096,
+                deviceMemoryGb: 8,
+                cpuModel: "AMD Ryzen 7 9800X3D",
+                totalRamGb: 61.6,
+                freeRamGb: 33.2,
+                arch: "x64",
+                osRelease: "10.0.26200",
+            },
+        });
+        expect(out).toContain("device:");
+        expect(out).toContain("  cpu_cores: 16");
+        expect(out).toContain("  js_heap_limit_mb: 4096");
+        expect(out).toContain("  total_ram_gb: 61.6");
+        expect(out).toContain("  cpu_model: 'AMD Ryzen 7 9800X3D'");
+        expect(out).toContain("  os_release: '10.0.26200'");
+    });
+
+    it("emits only the fields present (iOS: cores + UA, no heap/deviceMemory)", () => {
+        const out = formatLogExport([], {
+            ...META,
+            device: { cpuCores: 6, userAgent: "iPadOS WebKit" },
+        });
+        expect(out).toContain("  cpu_cores: 6");
+        expect(out).toContain("  user_agent: 'iPadOS WebKit'");
+        // Absent platform-asymmetric fields must not appear (not "unknown").
+        expect(out.includes("js_heap_limit_mb")).toBe(false);
+        expect(out.includes("device_memory_gb")).toBe(false);
+        expect(out.includes("cpu_model")).toBe(false);
+    });
+
+    it("omits the device block when the collected object is empty", () => {
+        const out = formatLogExport([], { ...META, device: {} });
+        expect(out.includes("device:")).toBe(false);
+    });
+
     it("escapes deviceId containing single quote", () => {
         const out = formatLogExport([], { ...META, deviceId: "user's-laptop" });
         expect(out.includes("device_id: 'user''s-laptop'")).toBe(true);

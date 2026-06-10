@@ -123,6 +123,20 @@ export class SyncEngine {
     /** Current live session. null when disconnected, in error, or
      *  between restart() teardown and the next openSession(). */
     private session: SyncSession | null = null;
+    /** Synchronous dedup latch for openSession. The encryption gate now runs
+     *  (and awaits) BEFORE the session is registered, so `if (this.session)`
+     *  alone no longer dedupes concurrent openSession calls across that await
+     *  — this latch closes the window. */
+    private openingSession = false;
+    /** Bumped at the start of every teardown() (and thus every stop(), which
+     *  routes through teardown). openSession captures it before the encryption
+     *  gate await and re-checks after: a mismatch means a stop/teardown/unload
+     *  raced in WHILE the gate held no registered session, so the post-gate
+     *  continuation must abort rather than resurrect a session on a
+     *  torn-down / closing engine. Restores the lifecycle protection the old
+     *  `session.disposed` early-returns gave before the gate moved ahead of
+     *  session registration. */
+    private lifecycleGeneration = 0;
 
     // ── Diagnostics ───────────────────────────────────────
 
@@ -165,7 +179,7 @@ export class SyncEngine {
     private readonly envListeners = new EnvListeners({
         getState: () => this.state,
         setState: (s) => this.setState(s),
-        emitError: (m) => this.events.emit("error", { message: m }),
+        emitError: (m) => this.events.emit("error", { message: m, kind: "network" }),
         requestReconnect: (r) => this.requestReconnect(r),
         fireReconnectHandlers: () => this.events.emit("reconnect"),
         isMobile: this.isMobile,
@@ -510,7 +524,7 @@ export class SyncEngine {
     private enterError(detail: SyncErrorDetail): void {
         this.stopTransientTimer();
         this.setState("error", detail);
-        this.events.emit("error", { message: detail.message });
+        this.events.emit("error", { message: detail.message, kind: detail.kind });
 
         if (detail.kind === "auth") {
             // Auth is user-gated. Raise the latch, tear down, and leave
@@ -521,12 +535,13 @@ export class SyncEngine {
             return;
         }
 
-        if (detail.kind === "schema-mismatch") {
-            // Remote carries a doc shape this build can't read. Retrying
-            // the pull would loop forever against the same batch, so this
-            // is terminal: surface the migration instruction, halt retries,
-            // and tear down. A fresh start() (post re-init) clears it.
-            notify(detail.message, 15000);
+        if (detail.kind === "schema-mismatch" || detail.kind === "encryption-paused") {
+            // Terminal, user-actionable. schema-mismatch = remote doc shape
+            // this build can't read; encryption-paused = remote encryption
+            // state needs Init/Clone or a passphrase (#1c). Retrying loops
+            // forever against the same remote, so halt retries and tear down.
+            // The host surfaces the Notice via the "error" event emitted
+            // above — single notify authority (#1d). A fresh start() clears it.
             this.stopRetryTimer();
             void this.teardown();
             return;
@@ -659,6 +674,10 @@ export class SyncEngine {
     // ── Internal: Session lifecycle ───────────────────────
 
     private async teardown(rc = 0): Promise<void> {
+        // Advance the lifecycle generation synchronously, before the first
+        // await, so an in-flight openSession encryption gate can detect that a
+        // teardown/stop superseded it (see openSession).
+        this.lifecycleGeneration++;
         const tag = rc > 0 ? `[rc#${rc}] ` : "";
         const old = this.session;
         this.session = null;
@@ -697,7 +716,7 @@ export class SyncEngine {
      */
     private async openSession(rc = 0): Promise<void> {
         const tag = rc > 0 ? `[rc#${rc}] ` : "";
-        if (this.session) return;
+        if (this.session || this.openingSession) return;
         // Provisioning gate (Invariant: a vault sync session exists only when
         // the vault is fully provisioned). connectionState === "syncing" is the
         // single authoritative signal that Init/Clone committed and the codec
@@ -714,10 +733,54 @@ export class SyncEngine {
         if (this.auth.isBlocked()) return;
         if (this.degraded) return;
 
-        // Register the session synchronously so concurrent start() /
-        // openSession() calls are deduped by the `if (this.session)`
-        // guard above before they reach any await.
-        const client = this.makeVaultClient();
+        // Encryption gate (#1c): unlock the vault crypto provider BEFORE
+        // building the vault client. `makeVaultClient` (wrapVaultClient)
+        // refuses to build when the vault is encrypted but no provider is
+        // unlocked, so the gate must precede it — otherwise a reconnect after
+        // a startup that never unlocked (e.g. first openSession failed
+        // offline) throws uncaught here and strands the engine in
+        // "reconnecting" with no retry. Running it inside openSession means a
+        // transient fetch failure routes to enterError → retry and
+        // auto-recovers when the network returns (the #1 root cause); a
+        // user-actionable state pauses via the encryption-paused terminal
+        // kind. The `openingSession` latch above dedupes across this await.
+        //  `lifecycleGeneration` detects a stop()/teardown()/unload racing in
+        //  during the gate — without a registered session those callers are
+        //  blind to this open, so we re-check and bail instead of resurrecting
+        //  a session on a torn-down / closing engine.
+        const gen = this.lifecycleGeneration;
+        this.openingSession = true;
+        try {
+            if (this.preCatchupCheck) {
+                await this.preCatchupCheck(new AbortController().signal);
+            }
+        } catch (e) {
+            this.openingSession = false;
+            // Superseded by a stop/teardown during the gate — don't re-arm the
+            // retry timer stop() just cleared (it would reconnect into a
+            // closing localDb).
+            if (this.lifecycleGeneration !== gen) return;
+            this.enterError(classifyError(e));
+            return;
+        }
+        this.openingSession = false;
+        // A stop()/teardown()/unload landed while the gate held no session —
+        // abort before building the client/session so ensureHealthy/catchup/
+        // startLive never run on a torn-down engine or closed DB.
+        if (this.lifecycleGeneration !== gen) return;
+
+        // Register the session synchronously (post-gate) so concurrent
+        // start() / openSession() calls are deduped by the `if (this.session)`
+        // guard above before they reach any further await.
+        let client: ICouchClient;
+        try {
+            client = this.makeVaultClient();
+        } catch (e) {
+            // Defensive: the gate above should have unlocked the provider, but
+            // any build failure must route to the supervisor, never escape.
+            this.enterError(classifyError(e));
+            return;
+        }
         const epoch = ++this.sessionEpoch;
         const session = new SyncSession({
             epoch,
@@ -775,17 +838,8 @@ export class SyncEngine {
         if (session.disposed) return;
         logDebug(`${tag}openSession: checkpoints.load done in ${Date.now() - checkpointsStart}ms`);
 
-        if (this.preCatchupCheck) {
-            try {
-                await this.preCatchupCheck(session.signal);
-            } catch (e) {
-                if (session.disposed) return;
-                this.session = null;
-                this.enterError(classifyError(e));
-                return;
-            }
-            if (session.disposed) return;
-        }
+        // (Encryption gate already ran before the vault client was built — see
+        // the top of openSession. #1c)
 
         // Catchup = actual data transfer → syncing.
         this.setState("syncing");
@@ -891,10 +945,43 @@ export class SyncEngine {
 
     // ── Internal: Stall detection ──────────────────────────
 
+    /** True when the engine sits in a terminal, user-actionable error that
+     *  intentionally carries no retry timer — the watchdog must leave these
+     *  alone. Mirrors the terminal branches in enterError(). */
+    private isTerminalErrorState(): boolean {
+        if (this.state !== "error" || !this.lastErrorDetail) return false;
+        const k = this.lastErrorDetail.kind;
+        return k === "auth" || k === "schema-mismatch" || k === "encryption-paused";
+    }
+
     private async checkHealth(): Promise<void> {
         if (this.auth.isBlocked()) return;
 
-        if (this.state === "reconnecting" || this.state === "error") return;
+        if (this.state === "reconnecting" || this.state === "error") {
+            // Watchdog: the recovery invariant is that "reconnecting"/"error"
+            // always has either a reconnect in flight or a pending retry/
+            // transient timer driving it forward. If none holds, recovery has
+            // stalled (e.g. an openSession early-return on a dispose race) —
+            // kick a fresh attempt so the engine self-heals within one health
+            // interval instead of hanging in "reconnecting" forever.
+            //
+            // CRUCIAL exclusion: terminal error kinds (schema-mismatch,
+            // encryption-paused) deliberately have NO retry timer — they halt
+            // until the user acts / re-Inits. The watchdog must NOT resurrect
+            // them, or it would re-toast the migration/pause Notice and probe
+            // the server every health interval forever. (auth is already
+            // excluded by the isBlocked() guard above.)
+            if (!this.reconnectInFlight && !this.retryTimer && !this.transientTimer
+                && !this.degraded && !this.isTerminalErrorState()) {
+                logDebug("health: recovery stalled (no in-flight reconnect / retry) — kicking reconnect");
+                try {
+                    await this.requestReconnect("periodic-tick");
+                } catch (e: any) {
+                    logError(`CouchSync: Health check error: ${e?.message ?? e}`);
+                }
+            }
+            return;
+        }
 
         if (this.state === "disconnected") {
             try {
@@ -979,6 +1066,7 @@ export class SyncEngine {
     private async verifyReachable(rc = 0, reason: ReconnectReason = "periodic-tick"): Promise<boolean> {
         const tag = rc > 0 ? `[rc#${rc}] ` : "";
         let err: string | null = null;
+        let errName: string | null = null;
         const session = this.session;
         const t0 = Date.now();
         const via = session ? "session-client" : "probe-client";
@@ -994,6 +1082,7 @@ export class SyncEngine {
                     await session.client.info(timeoutCtl.signal);
                 } catch (e: any) {
                     err = e?.message || "Connection failed";
+                    errName = e?.name ?? null;
                 }
             } else {
                 try {
@@ -1001,15 +1090,37 @@ export class SyncEngine {
                     await probe.info(timeoutCtl.signal);
                 } catch (e: any) {
                     err = e?.message || "Connection failed";
+                    errName = e?.name ?? null;
                 }
             }
         } finally {
             clearTimeout(timer);
         }
-        logDebug(`${tag}verify: info() via ${via} returned in ${Date.now() - t0}ms (err=${err ?? "none"})`);
+        const elapsed = Date.now() - t0;
+        logDebug(`${tag}verify: info() via ${via} returned in ${elapsed}ms (err=${err ?? "none"})`);
         if (err) {
-            const detail = classifyError({ message: err });
-            if (detail.kind === "unknown") {
+            const detail = classifyError({ message: err, name: errName });
+            // Suspend-frozen verify (#6/#7): the request was aborted, but the
+            // elapsed wall-clock is far beyond what our own `timeoutMs` timer
+            // could have produced — the process was frozen in mobile
+            // background and the OS tore the socket on resume. This proves
+            // nothing about reachability. Treat as inconclusive: do NOT enter
+            // a hard error (that caused the spurious "Server unreachable"
+            // toast and the connected→error churn). Stay reconnecting and
+            // schedule a silent re-verify, which settles now that we've woken.
+            if (detail.kind === "aborted" && elapsed > timeoutMs * 2) {
+                logDebug(
+                    `${tag}verify: inconclusive suspend-abort ` +
+                    `(elapsed ${elapsed}ms ≫ timeout ${timeoutMs}ms) — silent re-verify`,
+                );
+                if (this.state !== "error") this.setState("reconnecting");
+                this.scheduleNextAttempt();
+                return false;
+            }
+            // A genuine timeout (our own abort fired at ~timeoutMs) or any
+            // other transient: surface as network so the status bar shows it,
+            // but no toast (the host filters transient kinds). (#1d)
+            if (detail.kind === "unknown" || detail.kind === "aborted") {
                 detail.kind = "network";
                 detail.message = `Server unreachable: ${err}`;
             }

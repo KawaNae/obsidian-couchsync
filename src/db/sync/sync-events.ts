@@ -33,13 +33,18 @@
 
 import { logError } from "../../ui/log.ts";
 import type { CouchSyncDoc } from "../../types.ts";
-import type { SyncState } from "../reconnect-policy.ts";
+import type { SyncState, SyncErrorKind } from "../reconnect-policy.ts";
 
 // ── Event payloads ───────────────────────────────────────
 
 export interface SyncEventMap {
     "state-change": { state: SyncState };
-    error: { message: string };
+    /** `kind` lets the host decide whether to surface a Notice: only
+     *  user-actionable kinds (auth / schema-mismatch / encryption-paused)
+     *  warrant a toast. Transient kinds (network / timeout / aborted /
+     *  server / not-found) auto-recover and are shown via the status bar
+     *  only — toasting every blip was the resume-notification noise. (#6) */
+    error: { message: string; kind: SyncErrorKind };
     paused: void;
     reconnect: void;
     concurrent: {

@@ -37,6 +37,16 @@ export function classifyError(err: unknown): SyncErrorDetail {
         };
     }
 
+    // Encryption-agreement pause (#1c): the supervised preCatchupCheck found
+    // a user-actionable encryption state (server downgrade, cross-device
+    // mismatch, pre-v2 legacy meta, or wrong passphrase) and set
+    // connectionState back to "tested". Terminal — retrying loops against
+    // the same remote — so map to a kind the engine halts on and the host
+    // surfaces once.
+    if (e?.encryptionPaused === true) {
+        return { kind: "encryption-paused", message: rawMessage };
+    }
+
     // A non-retriable EncryptionError is a policy/security violation — a
     // cipherVersion downgrade-gate breach or an encBody id/path HMAC mismatch.
     // Like a schema mismatch, retrying never succeeds, so it maps to the same
@@ -45,6 +55,18 @@ export function classifyError(err: unknown): SyncErrorDetail {
     // and stays transient. (#enc-1)
     if (err instanceof EncryptionError && err.retriable === false) {
         return { kind: "schema-mismatch", message: rawMessage };
+    }
+
+    // AbortError — the request was cancelled, NOT proven unreachable. This
+    // fires both when our OWN verify timeout aborts (server genuinely slow)
+    // AND when a mobile background-suspend froze the in-flight request and
+    // the OS tore it down on resume. The two are indistinguishable here, so
+    // this stays a neutral "aborted" kind; verifyReachable disambiguates via
+    // elapsed wall-clock (suspend ⇒ elapsed ≫ timeout) before deciding
+    // whether to enter a hard error. Mislabeling it "Server unreachable"
+    // was the source of the spurious resume notifications. (#6)
+    if (e?.name === "AbortError" || /operation was aborted|\baborted\b/i.test(rawMessage)) {
+        return { kind: "aborted", code, message: rawMessage };
     }
 
     if (code === 401 || code === 403) {

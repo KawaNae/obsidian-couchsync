@@ -12,7 +12,7 @@ import type { LastSynced } from "./last-synced.ts";
 import { classifySyncRelation, type SyncRelation } from "./classify-sync-relation.ts";
 import { chunkListsEqual } from "./chunk-equality.ts";
 import { makeFileId, filePathFromId } from "../types/doc-id.ts";
-import { toPathKey, parentDir, type PathKey } from "../utils/path.ts";
+import { toPathKey, parentDir, unsafeVaultPathReason, type PathKey } from "../utils/path.ts";
 import { logDebug, logWarn } from "../ui/log.ts";
 import { DbError, type VclockUpdate } from "../db/write-transaction.ts";
 
@@ -295,6 +295,17 @@ export class VaultSync {
     async dbToFile(fileDoc: FileDoc): Promise<WriteResult> {
         const vaultPath = filePathFromId(fileDoc._id);
 
+        // Trust boundary (#3): the path is server-controlled on a plaintext
+        // vault. Reject anything that could escape the vault sandbox BEFORE
+        // any FS write OR delete — the tombstone branch below bypasses
+        // shouldSync, so this gate must precede it to also cover
+        // delete-via-traversal.
+        const pathViolation = unsafeVaultPathReason(vaultPath);
+        if (pathViolation) {
+            logWarn(`dbToFile: rejecting unsafe remote path "${vaultPath}" — ${pathViolation}`);
+            return { applied: false, reason: "unsafe-path" };
+        }
+
         // Deletion tombstones pass through the filter — deletions are always applied.
         if (!fileDoc.deleted && !this.shouldSync(vaultPath)) {
             logDebug(`dbToFile: skipped filtered path ${vaultPath}`);
@@ -377,6 +388,19 @@ export class VaultSync {
             throw new Error(
                 `Missing ${missing.length} chunk(s) for ${vaultPath}: ${missing.join(", ")}`,
             );
+        }
+
+        // Pull-side size ceiling (#4), symmetric to the push guard in
+        // fileToDb. joinChunks allocates one buffer the size of the whole
+        // file, so bound it BEFORE the join — an untrusted server otherwise
+        // forces unbounded allocation, and a legitimately oversized file
+        // from a higher-limit device is skipped + surfaced like on push.
+        const sizeMB =
+            orderedChunks.reduce((n, c) => n + c.content.length, 0) / (1024 * 1024);
+        const maxFileSizeMB = this.getSettings().maxFileSizeMB;
+        if (sizeMB > maxFileSizeMB) {
+            await this.recordSkipped(vaultPath, sizeMB, maxFileSizeMB);
+            return { applied: false, reason: "exceeds-max-size" };
         }
 
         const content = joinChunks(orderedChunks);

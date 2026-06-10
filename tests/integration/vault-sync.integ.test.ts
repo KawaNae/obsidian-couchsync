@@ -179,6 +179,47 @@ describe("VaultSync", () => {
             expect(vault.files.has("a.md")).toBe(false);
         });
 
+        it("rejects a remote path that escapes the vault (#3 traversal)", async () => {
+            vault.addFile("seed.md", "payload");
+            await vs.fileToDb("seed.md");
+            const seed = await db.get(makeFileId("seed.md")) as FileDoc;
+
+            // Server-controlled _id with a parent-traversal path (the
+            // plaintext-vault attack vector). Reuse the valid chunks so only
+            // the path is hostile.
+            const evil = { ...seed, _id: makeFileId("../evil.md") } as FileDoc;
+            const res = await vs.dbToFile(evil);
+
+            expect(res).toEqual({ applied: false, reason: "unsafe-path" });
+            expect(vault.files.has("../evil.md")).toBe(false);
+        });
+
+        it("rejects a tombstone whose path escapes the vault (#3 delete-via-traversal)", async () => {
+            vault.addFile("seed.md", "payload");
+            await vs.fileToDb("seed.md");
+            const seed = await db.get(makeFileId("seed.md")) as FileDoc;
+
+            // The tombstone branch bypasses shouldSync, so the path gate must
+            // precede it — a hostile tombstone must not delete outside the vault.
+            const evilDel = { ...seed, _id: makeFileId("../victim.md"), deleted: true } as FileDoc;
+            const res = await vs.dbToFile(evilDel);
+
+            expect(res).toEqual({ applied: false, reason: "unsafe-path" });
+        });
+
+        it("skips pull when total chunk size exceeds maxFileSizeMB (#4, symmetric to push)", async () => {
+            vault.addFile("big.md", "y".repeat(4000));
+            await vs.fileToDb("big.md");
+            vault.files.delete("big.md");
+            const doc = await db.get(makeFileId("big.md")) as FileDoc;
+
+            settings.maxFileSizeMB = 0.001; // ~1 KB, below the ~4 KB content
+            const res = await vs.dbToFile(doc);
+
+            expect(res).toEqual({ applied: false, reason: "exceeds-max-size" });
+            expect(vault.files.has("big.md")).toBe(false);
+        });
+
         it("skips write when vault content already matches", async () => {
             vault.addFile("a.md", "same");
             await vs.fileToDb("a.md");

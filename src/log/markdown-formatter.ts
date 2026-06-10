@@ -29,6 +29,30 @@ export interface ExportMeta {
         lastPushedSeq?: number;
         remoteSeq?: string;
     };
+    /** Best-effort device specs at export time. Every field is optional and
+     *  platform-asymmetric (Node `os` is desktop-only; performance.memory and
+     *  deviceMemory are absent on iOS WebKit). Absent fields are omitted from
+     *  the frontmatter rather than written as "unknown". */
+    device?: DeviceInfo;
+}
+
+export interface DeviceInfo {
+    /** navigator.hardwareConcurrency — logical CPU cores. All platforms. */
+    cpuCores?: number;
+    /** navigator.userAgent — OS/version/model hints. All platforms. */
+    userAgent?: string;
+    /** performance.memory JS heap (MB). Desktop + Android; absent on iOS. The
+     *  limit is the load-bearing one for diagnosing OOM-class kills. */
+    jsHeapUsedMb?: number;
+    jsHeapLimitMb?: number;
+    /** navigator.deviceMemory (GB, coarse/capped). Desktop + Android; absent on iOS. */
+    deviceMemoryGb?: number;
+    /** Node `os` — desktop (Electron) only. */
+    cpuModel?: string;
+    totalRamGb?: number;
+    freeRamGb?: number;
+    arch?: string;
+    osRelease?: string;
 }
 
 const LEVEL_KEYS: readonly LogLevel[] = ["debug", "info", "warn", "error"];
@@ -84,8 +108,35 @@ function formatFrontmatter(entries: PersistedLogEntry[], meta: ExportMeta): stri
     if (meta.syncState.remoteSeq !== undefined) {
         lines.push(`  remote_seq: ${yamlScalar(meta.syncState.remoteSeq)}`);
     }
+    appendDeviceBlock(lines, meta.device);
     lines.push("---");
     return lines.join("\n");
+}
+
+/** Render the `device:` block, emitting only the fields that were actually
+ *  collected (platform-asymmetric). Omitted entirely when nothing is known. */
+function appendDeviceBlock(lines: string[], device: DeviceInfo | undefined): void {
+    if (!device) return;
+    const num: Array<[string, number | undefined]> = [
+        ["cpu_cores", device.cpuCores],
+        ["js_heap_used_mb", device.jsHeapUsedMb],
+        ["js_heap_limit_mb", device.jsHeapLimitMb],
+        ["device_memory_gb", device.deviceMemoryGb],
+        ["total_ram_gb", device.totalRamGb],
+        ["free_ram_gb", device.freeRamGb],
+    ];
+    const str: Array<[string, string | undefined]> = [
+        ["user_agent", device.userAgent],
+        ["cpu_model", device.cpuModel],
+        ["arch", device.arch],
+        ["os_release", device.osRelease],
+    ];
+    const body: string[] = [];
+    for (const [k, v] of num) if (v !== undefined && Number.isFinite(v)) body.push(`  ${k}: ${v}`);
+    for (const [k, v] of str) if (v !== undefined && v !== "") body.push(`  ${k}: ${yamlScalar(v)}`);
+    if (body.length === 0) return;
+    lines.push("device:");
+    lines.push(...body);
 }
 
 function formatBody(entries: PersistedLogEntry[]): string {

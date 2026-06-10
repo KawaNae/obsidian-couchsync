@@ -74,4 +74,22 @@ describe("classifyError", () => {
         // Default retriable flag is true.
         expect(classifyError(new EncryptionError("boom", new Error("cause"))).kind).toBe("unknown");
     });
+
+    it("AbortError → aborted (inconclusive, not network) (#6)", () => {
+        // An abort proves nothing about reachability — it fires both for our
+        // own verify timeout AND a mobile suspend-frozen request. Must NOT be
+        // mislabeled network/unknown; verifyReachable disambiguates via elapsed.
+        expect(classifyError({ name: "AbortError", message: "The operation was aborted." }).kind)
+            .toBe("aborted");
+        expect(classifyError({ message: "The operation was aborted." }).kind).toBe("aborted");
+        const e = new Error("aborted"); e.name = "AbortError";
+        expect(classifyError(e).kind).toBe("aborted");
+    });
+
+    it("encryptionPaused marker → encryption-paused (terminal, #1c)", () => {
+        const e = Object.assign(new Error("Sync paused — wrong passphrase"), { encryptionPaused: true });
+        const d = classifyError(e);
+        expect(d.kind).toBe("encryption-paused");
+        expect(d.message).toMatch(/passphrase/);
+    });
 });

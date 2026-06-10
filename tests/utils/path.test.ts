@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { toPathKey } from "../../src/utils/path.ts";
+import { toPathKey, unsafeVaultPathReason } from "../../src/utils/path.ts";
 import { VCLOCK_KEY_PREFIX, vclockMetaKey } from "../../src/db/dexie-store.ts";
 
 describe("toPathKey", () => {
@@ -26,6 +26,40 @@ describe("toPathKey", () => {
     it("is idempotent", () => {
         const once = toPathKey("Foo/Bar.md");
         expect(toPathKey(once)).toBe(once);
+    });
+});
+
+describe("unsafeVaultPathReason — remote path trust boundary (#3)", () => {
+    it("accepts ordinary vault-relative paths", () => {
+        expect(unsafeVaultPathReason("Notes/agents.md")).toBeNull();
+        expect(unsafeVaultPathReason("a/b/c.md")).toBeNull();
+        expect(unsafeVaultPathReason("file.md")).toBeNull();
+        // Leading "." (hidden / .obsidian config) is in-vault, not escape.
+        expect(unsafeVaultPathReason(".obsidian/plugins/x/data.json")).toBeNull();
+        // Dot-containing names that are NOT exactly ".." are legitimate.
+        expect(unsafeVaultPathReason("...rc.md")).toBeNull();
+        expect(unsafeVaultPathReason("a/..foo/b.md")).toBeNull();
+    });
+
+    it("rejects parent-directory traversal", () => {
+        expect(unsafeVaultPathReason("../evil.md")).toMatch(/traversal/);
+        expect(unsafeVaultPathReason("a/../../etc/passwd")).toMatch(/traversal/);
+        expect(unsafeVaultPathReason("../../.bashrc")).toMatch(/traversal/);
+    });
+
+    it("rejects absolute paths and drive letters", () => {
+        expect(unsafeVaultPathReason("/etc/passwd")).toMatch(/absolute/);
+        expect(unsafeVaultPathReason("C:/Users/Public/x")).toMatch(/drive/);
+        expect(unsafeVaultPathReason("c:\\x")).toBeTruthy();
+    });
+
+    it("rejects backslash separators (Windows / UNC)", () => {
+        expect(unsafeVaultPathReason("..\\..\\x")).toMatch(/backslash/);
+        expect(unsafeVaultPathReason("a\\b")).toMatch(/backslash/);
+    });
+
+    it("rejects empty paths", () => {
+        expect(unsafeVaultPathReason("")).toMatch(/empty/);
     });
 });
 

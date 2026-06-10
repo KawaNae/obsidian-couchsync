@@ -23,6 +23,7 @@ import { HistoryCapture } from "./history/history-capture.ts";
 import { HistoryManager } from "./history/history-manager.ts";
 import { LogStorage } from "./log/log-storage.ts";
 import { LogManager } from "./log/log-manager.ts";
+import type { DeviceInfo } from "./log/markdown-formatter.ts";
 import { DiffHistoryView, VIEW_TYPE_DIFF_HISTORY } from "./ui/history-view.ts";
 import { LogView, VIEW_TYPE_LOG } from "./ui/log-view.ts";
 import { migrateSettings } from "./settings-migration.ts";
@@ -175,6 +176,182 @@ export default class CouchSyncPlugin extends Plugin {
             return true;
         }
         return false;
+    }
+
+    /** Cross-platform OS label for the log frontmatter. Desktop uses Node
+     *  `process.platform` (win32/darwin/linux); mobile has no Node, so derive
+     *  from Obsidian `Platform` + the userAgent version (the old code emitted
+     *  a useless "unknown" on every mobile export). */
+    private deriveOsLabel(): string {
+        if (typeof process !== "undefined" && process.platform) return process.platform;
+        const ua = typeof navigator !== "undefined" ? navigator.userAgent : "";
+        if (Platform.isAndroidApp) {
+            const m = /Android (\d+(?:\.\d+)?)/.exec(ua);
+            return m ? `android ${m[1]}` : "android";
+        }
+        if (Platform.isIosApp) {
+            const base = Platform.isTablet ? "ipados" : "ios";
+            const m = /OS (\d+(?:_\d+)*)/.exec(ua); // "CPU OS 17_4 like Mac OS X"
+            return m ? `${base} ${m[1].replace(/_/g, ".")}` : base;
+        }
+        return "unknown";
+    }
+
+    /** Best-effort device specs for the log frontmatter. Every field is
+     *  collected defensively and platform-asymmetric (Node `os` is desktop
+     *  only via `window.require`, kept off esbuild's static path; deviceMemory
+     *  and performance.memory are absent on iOS WebKit). Missing fields are
+     *  simply omitted from the export. */
+    private collectDeviceInfo(): DeviceInfo {
+        const d: DeviceInfo = {};
+        try {
+            if (typeof navigator !== "undefined") {
+                if (typeof navigator.hardwareConcurrency === "number") {
+                    d.cpuCores = navigator.hardwareConcurrency;
+                }
+                if (navigator.userAgent) d.userAgent = navigator.userAgent;
+                const dm = (navigator as any).deviceMemory;
+                if (typeof dm === "number") d.deviceMemoryGb = dm;
+            }
+        } catch { /* best effort */ }
+        try {
+            const pm = typeof performance !== "undefined" ? (performance as any).memory : undefined;
+            if (pm) {
+                if (typeof pm.usedJSHeapSize === "number") {
+                    d.jsHeapUsedMb = Math.round(pm.usedJSHeapSize / 1048576);
+                }
+                if (typeof pm.jsHeapSizeLimit === "number") {
+                    d.jsHeapLimitMb = Math.round(pm.jsHeapSizeLimit / 1048576);
+                }
+            }
+        } catch { /* best effort */ }
+        try {
+            // Desktop (Electron) only. `window.require` keeps the node builtin
+            // off esbuild's browser-target static analysis; undefined on mobile.
+            const req = typeof window !== "undefined" ? (window as any).require : undefined;
+            if (typeof req === "function") {
+                const os = req("os");
+                d.arch = os.arch();
+                d.osRelease = os.release();
+                const cpus = os.cpus();
+                if (cpus?.length) {
+                    d.cpuCores = cpus.length;
+                    const model = (cpus[0]?.model ?? "").trim();
+                    if (model) d.cpuModel = model;
+                }
+                d.totalRamGb = Math.round((os.totalmem() / 1073741824) * 10) / 10;
+                d.freeRamGb = Math.round((os.freemem() / 1073741824) * 10) / 10;
+            }
+        } catch { /* best effort */ }
+        return d;
+    }
+
+    /**
+     * The single, supervised encryption-agreement gate (#1c). Passed to
+     * SyncEngine as `preCatchupCheck`, so it runs inside openSession before
+     * catchup — and crucially, under the engine's retry supervision.
+     *
+     * Outcomes:
+     *   - agreed-encrypted/plaintext → unlock the vault crypto provider
+     *     (once; cached in `vaultCryptoProvider`), ratchet the cipher floor,
+     *     reconcile the compression flag. Returns normally → catchup proceeds.
+     *   - transient network/abort while checking → throws the raw error,
+     *     which openSession routes to `enterError` → retry-backoff. The
+     *     network's return auto-recovers it (this is the #1 fix: the old
+     *     onload gate dead-`return`ed here and never retried).
+     *   - user-actionable state (server downgrade, cross-device mismatch,
+     *     pre-v2 legacy meta, wrong passphrase) → `encryptionPause()` sets
+     *     connectionState back to "tested" and throws an `encryptionPaused`
+     *     error → terminal kind (no retry), surfaced once by the host.
+     */
+    private async reconcileEncryptionAgreement(_signal: AbortSignal): Promise<void> {
+        const raw = makeCouchClient(
+            this.settings.couchdbUri, this.settings.couchdbDbName,
+            this.settings.couchdbUser, this.settings.couchdbPassword,
+        );
+        const agreement = await checkEncryptionAgreement(
+            raw, this.settings.encryptionEnabled,
+            VAULT_META_DOC_ID, this.settings.vaultCipherVersion,
+        );
+
+        if (agreement.status === "cipher-downgrade-detected") {
+            this.encryptionMismatch = agreement;
+            throw await this.encryptionPause(
+                "CouchSync: vault encryption was downgraded on the server " +
+                `(cipherVersion below this device's floor ${agreement.localFloor}). ` +
+                "Sync paused — verify the server has not been tampered with.",
+            );
+        }
+
+        if (agreement.status === "agreed-encrypted") {
+            if (!this.vaultCryptoProvider) {
+                let passphrase = this.settings.encryptionPassphrase;
+                if (!passphrase) {
+                    const modal = new PassphraseModal(this.app, false);
+                    passphrase = await modal.waitForResult() ?? "";
+                    if (!passphrase) {
+                        throw await this.encryptionPause(
+                            "CouchSync: passphrase required. Sync paused.",
+                        );
+                    }
+                }
+                const result = await unlockVaultMeta(agreement.meta as VaultMetaDoc, passphrase);
+                if (!result) {
+                    this.settings.encryptionPassphrase = "";
+                    await this.saveSettings();
+                    throw await this.encryptionPause(
+                        "CouchSync: wrong passphrase. Sync paused.",
+                    );
+                }
+                if (!this.settings.encryptionPassphrase) {
+                    this.settings.encryptionPassphrase = passphrase;
+                    await this.saveSettings();
+                }
+                this.vaultCryptoProvider = result.crypto;
+                // TOFU: anchor / ratchet the local cipherVersion floor.
+                const cv = agreement.meta.encryption.enabled
+                    ? agreement.meta.encryption.cipherVersion : 0;
+                if (this.ratchetVaultCipherFloor(cv)) await this.saveSettings();
+                // wrapVaultClient picks up the new provider on next invocation.
+            }
+        } else if (agreement.status === "remote-encrypted"
+            || agreement.status === "remote-plaintext") {
+            this.encryptionMismatch = agreement;
+            throw await this.encryptionPause(
+                "CouchSync: encryption state changed by another device. " +
+                "Open Settings → Vault Sync to re-run Init or Clone.",
+            );
+        } else if (agreement.status === "legacy-meta-only") {
+            // Pre-v2 `encryption:meta` doc found but no v2 `vault:meta`.
+            throw await this.encryptionPause(
+                "CouchSync: this vault was set up with a pre-v2 build. " +
+                "Open Settings → Vault Sync and re-run Init or Clone to migrate.",
+            );
+        }
+
+        // Compression flag is server-of-record — reconcile so the decorator
+        // stack is identical across devices.
+        const remoteMeta = (agreement.status === "agreed-encrypted"
+            || agreement.status === "agreed-plaintext") ? agreement.meta : null;
+        if (remoteMeta
+            && this.settings.compressionEnabled !== remoteMeta.compression.enabled) {
+            this.settings.compressionEnabled = remoteMeta.compression.enabled;
+            await this.saveSettings();
+        }
+        if (agreement.status === "agreed-encrypted" || agreement.status === "agreed-plaintext") {
+            this.encryptionMismatch = undefined;
+        }
+    }
+
+    /** Pause sync for a user-actionable encryption state: persist the
+     *  "tested" connectionState (so the next onload won't auto-sync and the
+     *  settings tab shows the re-Init affordance) and return a terminal
+     *  `encryptionPaused` error for the caller to throw. The host toasts the
+     *  message once via the "error" event (#1d). */
+    private async encryptionPause(message: string): Promise<Error> {
+        this.settings.connectionState = "tested";
+        await this.saveSettings();
+        return Object.assign(new Error(message), { encryptionPaused: true });
     }
 
     /** Config-DB equivalent of `ratchetVaultCipherFloor`. Public so the
@@ -345,45 +522,7 @@ export default class CouchSyncPlugin extends Plugin {
             Platform.isMobile,
             this.auth,
             encClientFactory,
-            async (_signal) => {
-                const raw = makeCouchClient(
-                    this.settings.couchdbUri, this.settings.couchdbDbName,
-                    this.settings.couchdbUser, this.settings.couchdbPassword,
-                );
-                const agreement = await checkEncryptionAgreement(
-                    raw, this.settings.encryptionEnabled,
-                    VAULT_META_DOC_ID, this.settings.vaultCipherVersion,
-                );
-                if (agreement.status === "cipher-downgrade-detected") {
-                    // Server tried to lower the vault's cipherVersion below this
-                    // device's TOFU floor — refuse to flow data (#1/#3).
-                    this.encryptionMismatch = agreement;
-                    this.settings.connectionState = "tested";
-                    await this.saveSettings();
-                    notify(
-                        "CouchSync: vault encryption was downgraded on the server " +
-                        `(cipherVersion below this device's floor ${agreement.localFloor}). ` +
-                        "Sync paused — verify the server has not been tampered with.",
-                        15000,
-                    );
-                    throw new Error(
-                        `cipherVersion downgrade detected (floor ${agreement.localFloor})`,
-                    );
-                }
-                if (agreement.status === "remote-encrypted"
-                    || agreement.status === "remote-plaintext") {
-                    this.encryptionMismatch = agreement;
-                    this.settings.connectionState = "tested";
-                    await this.saveSettings();
-                    notify(
-                        "CouchSync: encryption state changed by another device. " +
-                        "Open Settings → Vault Sync to re-run Init or Clone.",
-                        15000,
-                    );
-                    throw new Error(`Encryption state mismatch: ${agreement.status}`);
-                }
-                this.encryptionMismatch = undefined;
-            },
+            (signal) => this.reconcileEncryptionAgreement(signal),
         );
         // Verify pulled chunk bodies hash to their content-addressed id
         // (the inverse of the mint in splitIntoChunks). Reads the live
@@ -447,7 +586,22 @@ export default class CouchSyncPlugin extends Plugin {
             () => this.replicator.getLastErrorDetail(),
         );
         this.replicator.events.on("state-change", ({ state }) => this.statusBar.update(state));
-        this.replicator.events.on("error", ({ message }) => notify(message, 8000));
+        // Single notify authority (#1d). Only user-actionable errors warrant
+        // a Notice; transient kinds (network / timeout / aborted / server /
+        // not-found) auto-recover and are shown via the status bar alone —
+        // toasting every blip was the spurious resume-notification noise
+        // (#6). encryption-paused additionally re-runs the onload reconcile,
+        // preserving the local-state pass the old onload gate did on pause.
+        this.replicator.events.on("error", ({ message, kind }) => {
+            const userActionable =
+                kind === "auth" || kind === "schema-mismatch" || kind === "encryption-paused";
+            if (userActionable) {
+                notify(message, kind === "auth" ? 8000 : 15000);
+            }
+            if (kind === "encryption-paused") {
+                this.fireReconcile("onload");
+            }
+        });
         // Local DB handle is poisoned (typically iOS WebKit IDB after a
         // long suspend — only a page reload reseats the IDB connection).
         // Surface a sticky Notice with a "Reload now" button that fires
@@ -486,9 +640,10 @@ export default class CouchSyncPlugin extends Plugin {
             getPluginVersion: () => this.manifest.version,
             getObsidianVersion: () => apiVersion,
             getPlatform: () => ({
-                os: typeof process !== "undefined" && process.platform ? process.platform : "unknown",
+                os: this.deriveOsLabel(),
                 isMobile: Platform.isMobile,
             }),
+            getDeviceInfo: () => this.collectDeviceInfo(),
             getSyncDiagnostics: () => {
                 const snap = this.replicator.getDiagnosticsSnapshot();
                 return {
@@ -767,105 +922,16 @@ export default class CouchSyncPlugin extends Plugin {
                 );
             }
 
-            // E2E encryption: reconcile local state with remote.
-            if (this.settings.connectionState === "syncing" && this.settings.deviceId) {
-                try {
-                    const rawClient = makeCouchClient(
-                        this.settings.couchdbUri,
-                        this.settings.couchdbDbName,
-                        this.settings.couchdbUser,
-                        this.settings.couchdbPassword,
-                    );
-                    const agreement = await checkEncryptionAgreement(
-                        rawClient, this.settings.encryptionEnabled,
-                        VAULT_META_DOC_ID, this.settings.vaultCipherVersion,
-                    );
-                    if (agreement.status === "cipher-downgrade-detected") {
-                        this.encryptionMismatch = agreement;
-                        this.settings.connectionState = "tested";
-                        await this.saveSettings();
-                        notify(
-                            "CouchSync: vault encryption was downgraded on the server " +
-                            `(cipherVersion below floor ${agreement.localFloor}). Sync paused.`,
-                            15000,
-                        );
-                        this.fireReconcile("onload");
-                        return;
-                    } else if (agreement.status === "agreed-encrypted") {
-                        if (!this.vaultCryptoProvider) {
-                            let passphrase = this.settings.encryptionPassphrase;
-                            if (!passphrase) {
-                                const modal = new PassphraseModal(this.app, false);
-                                passphrase = await modal.waitForResult() ?? "";
-                                if (!passphrase) {
-                                    notify("CouchSync: passphrase required. Sync paused.", 8000);
-                                    return;
-                                }
-                            }
-                            const result = await unlockVaultMeta(
-                                agreement.meta as VaultMetaDoc, passphrase,
-                            );
-                            if (!result) {
-                                this.settings.encryptionPassphrase = "";
-                                await this.saveSettings();
-                                notify("CouchSync: wrong passphrase. Sync paused.", 8000);
-                                return;
-                            }
-                            if (!this.settings.encryptionPassphrase) {
-                                this.settings.encryptionPassphrase = passphrase;
-                                await this.saveSettings();
-                            }
-                            this.vaultCryptoProvider = result.crypto;
-                            // TOFU: anchor / ratchet the local cipherVersion floor.
-                            const cv = agreement.meta.encryption.enabled
-                                ? agreement.meta.encryption.cipherVersion : 0;
-                            if (this.ratchetVaultCipherFloor(cv)) await this.saveSettings();
-                            // wrapVaultClient picks up the new provider on
-                            // next invocation — no mutable setter needed.
-                        }
-                    } else if (agreement.status === "remote-encrypted"
-                        || agreement.status === "remote-plaintext") {
-                        this.encryptionMismatch = agreement;
-                        this.settings.connectionState = "tested";
-                        await this.saveSettings();
-                        notify(
-                            "CouchSync: encryption state changed by another device. " +
-                            "Open Settings → Vault Sync to re-run Init or Clone.",
-                            15000,
-                        );
-                        this.fireReconcile("onload");
-                        return;
-                    } else if (agreement.status === "legacy-meta-only") {
-                        // Pre-v2 `encryption:meta` doc found but no v2
-                        // `vault:meta`. The user must re-run Init/Clone
-                        // following the v2 migration procedure.
-                        this.settings.connectionState = "tested";
-                        await this.saveSettings();
-                        notify(
-                            "CouchSync: this vault was set up with a pre-v2 build. " +
-                            "Open Settings → Vault Sync and re-run Init or Clone to migrate.",
-                            15000,
-                        );
-                        this.fireReconcile("onload");
-                        return;
-                    }
-                    // Compression flag is server-of-record. Reconcile the
-                    // local setting with whatever vault:meta says so the
-                    // decorator stack is identical across devices.
-                    const remoteMeta = (agreement.status === "agreed-encrypted"
-                        || agreement.status === "agreed-plaintext")
-                        ? agreement.meta : null;
-                    if (remoteMeta
-                        && this.settings.compressionEnabled !== remoteMeta.compression.enabled) {
-                        this.settings.compressionEnabled = remoteMeta.compression.enabled;
-                        await this.saveSettings();
-                    }
-                    // "agreed-plaintext" / "agreed-encrypted" — proceed normally
-                } catch (e: any) {
-                    logError(`CouchSync: encryption check failed: ${e?.message ?? e}`);
-                    return;
-                }
-            }
+            // E2E encryption agreement + passphrase unlock now runs inside the
+            // SyncEngine session as the supervised preCatchupCheck
+            // (`reconcileEncryptionAgreement`), NOT as an unsupervised onload
+            // gate. The old gate's catch `return`ed on a transient fetch
+            // failure and left sync permanently dead until a manual reload
+            // (#1). Funnelling the single gate through openSession means a
+            // network blip now throws into the retry loop and auto-recovers
+            // when the network returns; user-actionable states pause via the
+            // encryption-paused terminal kind. So onload just starts the
+            // engine — start() → openSession → preCatchupCheck does the rest.
 
             // Load vclock cache BEFORE reconciler or changeTracker run.
             // Without this, compareFileToDoc() misclassifies local edits

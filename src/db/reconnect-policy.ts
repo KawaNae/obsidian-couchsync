@@ -29,7 +29,9 @@ export type SyncErrorKind =
     | "timeout"   // catchup idle timeout, request timeout
     | "server"    // 5xx
     | "not-found" // 404 — DB deleted / recreated by another device
+    | "aborted"   // request cancelled (our timeout OR mobile suspend-freeze) — inconclusive, NOT proven unreachable
     | "schema-mismatch" // remote doc shape this build can't read — terminal, no retry
+    | "encryption-paused" // remote encryption state needs user action (downgrade / mismatch / legacy / wrong passphrase) — terminal, no retry
     | "unknown";
 
 export interface SyncErrorDetail {
