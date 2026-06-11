@@ -1,5 +1,6 @@
 import type { IVaultIO, VaultFile } from "../types/vault-io.ts";
 import type { LocalDB, VaultManifest } from "../db/local-db.ts";
+import { docsSigEquals } from "../db/dexie-store.ts";
 import type { VaultSync } from "./vault-sync.ts";
 import type { SyncRelation } from "./classify-sync-relation.ts";
 import type { CouchSyncSettings } from "../settings.ts";
@@ -116,8 +117,11 @@ export function totalDiscrepancies(report: ReconcileReport): number {
  * completion, replicator pause, and the manual verify-consistency command.
  *
  * Cost is near-zero on the steady-state hot path: combining the cursor's
- * mtime threshold, manifest path equality, and local update_seq check
- * lets the fast-path return without ever calling allFileDocs().
+ * mtime threshold, manifest path equality, and the docs change signature
+ * lets the fast-path return without ever calling allFileDocs(). The
+ * signature (see `DocsChangeSignature`) tracks the docs row set only —
+ * checkpoint/vclock/manifest bookkeeping, including this reconciler's
+ * own cursor writes, cannot invalidate the fast path.
  */
 export class Reconciler {
     private currentRun: Promise<ReconcileReport> | null = null;
@@ -234,15 +238,15 @@ export class Reconciler {
             const hasMtimeChanges = vaultFiles.some((f) => f.stat.mtime > threshold);
             const manifestMatchesVault =
                 manifestPaths !== null && setEquals(manifestPaths, vaultPathSet);
-            const currentSeq = (await this.localDb.info()).updateSeq;
-            const dbUnchanged = cursor?.lastSeenUpdateSeq !== undefined &&
-                cursor.lastSeenUpdateSeq === currentSeq;
+            const currentSig = await this.localDb.docsChangeSignature();
+            const dbUnchanged = docsSigEquals(cursor?.lastSeenDocsSig, currentSig);
             // Invariant S7: never let the short-circuit hide a collision. Two
             // vault files folding to one PathKey (a case-sensitive FS holding
             // both `scripts/X` and `Scripts/X` — the incident source) must take
             // the slow path so Case F runs. DB-side-only duplicates always
-            // arrive via a pull, which bumps the seq → `dbUnchanged` is false,
-            // so they already force the slow path.
+            // arrive via a pull, which writes docs rows and moves the
+            // signature → `dbUnchanged` is false, so they already force the
+            // slow path.
             const vaultHasDup = vaultPathSet.size !== vaultFiles.length;
 
             if (cursor && !hasMtimeChanges && manifestMatchesVault && dbUnchanged
@@ -250,7 +254,7 @@ export class Reconciler {
                 await this.localDb.putScanCursor({
                     lastScanStartedAt: startedAt,
                     lastScanCompletedAt: Date.now(),
-                    lastSeenUpdateSeq: currentSeq,
+                    lastSeenDocsSig: currentSig,
                 });
                 report.shortCircuited = true;
                 return report;
@@ -270,7 +274,10 @@ export class Reconciler {
         // the shadow and hide the collision; the array form makes a >1-occupant
         // PathKey a first-class, detectable state resolved by Case F.
         const vaultByPath = groupByPathKey(vaultFiles, (f) => f.path);
-        const seqBeforeScan = (await this.localDb.info()).updateSeq;
+        // Captured BEFORE allFileDocs(): concurrent writes landing during
+        // the scan — including this run's own fileToDb/markDeleted commits —
+        // stay "unseen", so the next reconcile conservatively re-scans them.
+        const sigBeforeScan = await this.localDb.docsChangeSignature();
         const dbDocs = await this.localDb.allFileDocs();
         const dbByPath = groupByPathKey(dbDocs, (d) => filePathFromId(d._id));
         const allPaths = new Set<PathKey>([
@@ -597,7 +604,7 @@ export class Reconciler {
             await this.localDb.putScanCursor({
                 lastScanStartedAt: startedAt,
                 lastScanCompletedAt: Date.now(),
-                lastSeenUpdateSeq: seqBeforeScan,
+                lastSeenDocsSig: sigBeforeScan,
             });
         } else if (mode === "apply") {
             logDebug("reconcile: skipped manifest/cursor persist (shutting down)");

@@ -6,7 +6,12 @@ import type {
     LocalChangesResult,
     ListIdsRange,
 } from "./interfaces.ts";
-import { DexieStore, VCLOCK_KEY_PREFIX, vclockMetaKey } from "./dexie-store.ts";
+import {
+    DexieStore,
+    VCLOCK_KEY_PREFIX,
+    vclockMetaKey,
+    type DocsChangeSignature,
+} from "./dexie-store.ts";
 import type { WriteTransaction, WriteBuilder } from "./write-transaction.ts";
 import type { VectorClock } from "../sync/vector-clock.ts";
 import { parseStoredLastSynced, type LastSynced } from "../sync/last-synced.ts";
@@ -25,9 +30,15 @@ import { HandleGuard } from "./handle-guard.ts";
 export interface ScanCursor {
     lastScanStartedAt: number;
     lastScanCompletedAt: number;
-    /** Update seq seen at the end of the last scan. Reconciler uses
-     *  this for an O(1) "did anything change in the DB?" check. */
-    lastSeenUpdateSeq?: string | number;
+    /** Docs change signature seen at the last scan. Reconciler uses
+     *  this for an O(1) "did any docs row change?" check. Unlike the
+     *  retired `lastSeenUpdateSeq` (the all-writes `_update_seq`
+     *  counter), this is immune to bookkeeping writes — checkpoints,
+     *  vclocks, the manifest and this cursor itself don't invalidate
+     *  it. Cursors persisted before this field existed simply lack it,
+     *  which reads as "unknown" → one slow scan → re-persisted in the
+     *  new shape. */
+    lastSeenDocsSig?: DocsChangeSignature;
 }
 
 /**
@@ -164,6 +175,10 @@ export class LocalDB implements IDocStore<CouchSyncDoc> {
 
     async info(): Promise<{ updateSeq: number | string }> {
         return this.runDocsOp((s) => s.info(), "info");
+    }
+
+    async docsChangeSignature(): Promise<DocsChangeSignature> {
+        return this.runDocsOp((s) => s.docsChangeSignature(), "docsChangeSignature");
     }
 
     async changes(
@@ -333,7 +348,9 @@ export class LocalDB implements IDocStore<CouchSyncDoc> {
         return {
             lastScanStartedAt: doc.lastScanStartedAt ?? 0,
             lastScanCompletedAt: doc.lastScanCompletedAt ?? 0,
-            lastSeenUpdateSeq: doc.lastSeenUpdateSeq,
+            // Pre-signature cursors carried `lastSeenUpdateSeq` instead;
+            // dropping it here reads as sig-unknown → one slow scan.
+            lastSeenDocsSig: doc.lastSeenDocsSig,
         };
     }
 

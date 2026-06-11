@@ -164,19 +164,20 @@ describe("PullPipeline integration", () => {
             expect(any.rows.length).toBe(0);
         });
 
-        it("advances remoteSeq even when the empty batch is the first batch", async () => {
-            // Empty remote: PullPipeline calls Checkpoints.saveEmptyPullBatch
-            // which both updates in-memory remoteSeq and persists it.
+        it("a first empty batch at seq 0 writes nothing (cursor unchanged no-op)", async () => {
+            // Empty remote at seq 0: the in-memory remoteSeq already starts
+            // at 0, so saveEmptyPullBatch's no-op guard skips the write tx
+            // entirely. A null META row is equivalent — Checkpoints.load()
+            // reads `remote ?? 0`.
             h = createSyncHarness();
             const b = h.addDevice("dev-B");
             const rig = attachPullPipeline({ device: b, couch: h.couch });
 
             await rig.pipeline.runCatchup();
 
-            // Couch has seq=0 → remoteSeq is set to 0 (still falsy but
-            // no exception thrown). The persisted META row reflects this.
             const persisted = await b.db.getMeta<number | string>("_sync/remote-seq");
-            expect(persisted).toBe(0);
+            expect(persisted).toBeNull();
+            expect(rig.checkpoints.getRemoteSeq()).toBe(0);
         });
     });
 

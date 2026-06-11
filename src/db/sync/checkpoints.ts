@@ -162,6 +162,14 @@ export class Checkpoints {
         nextRemoteSeq: number | string,
         pendingConflictAdd?: Array<{ id: string; kind: PendingConflictKind }>,
     ): Promise<void> {
+        // No-op guard (symmetric to commitPendingApply): a cycle that
+        // proves "cursor unchanged AND nothing to record" writes nothing.
+        // Sound because the in-memory seq only moves via load() (disk
+        // truth) or a committed tx's onCommit — memory == disk holds, so
+        // skipping the identical-value put can never lose a persist.
+        // Without this, every catchup on an idle remote issued a write tx.
+        if ((pendingConflictAdd?.length ?? 0) === 0
+            && nextRemoteSeq === this.remoteSeq) return;
         const meta: MetaWrite[] = [
             { op: "put", key: META_REMOTE_SEQ, value: nextRemoteSeq },
         ];
@@ -184,12 +192,15 @@ export class Checkpoints {
      * Commit one push-pipeline cycle: advance `lastPushedSeq` and update
      * the unpushed-id set in a single atomic tx. Cursor advance is
      * unconditional — the set carries any ids that need to be retried.
+     * The only cycles that skip the write are those provably without
+     * state change: cursor value identical AND zero set mutations (the
+     * idle 2s poll). Anything else commits.
      *
      * Without this pairing a crash between cursor write and set write
      * would leak the old silent-loss path (cursor moved past an id that
      * never made the retry set). Bundling them keeps the post-refactor
      * invariant: "an id is unpushed iff its meta entry exists, and the
-     * cursor reflects every cycle that did or did not cover it."
+     * cursor reflects every cycle that changed state."
      *
      * `unpushedAdd` and `unpushedRemove` may overlap (same id seen as
      * resolved earlier in the cycle and re-flagged at the end); the
@@ -201,6 +212,14 @@ export class Checkpoints {
         unpushedAdd: Array<{ id: string; reason: UnpushedReason; attempts: number }>;
         unpushedRemove: string[];
     }): Promise<void> {
+        // No-op guard — see saveEmptyPullBatch for the soundness argument
+        // (memory == disk invariant). The idle push poll hits this every
+        // cycle; without it the loop wrote one no-op tx per 2s, wearing
+        // mobile flash AND perpetually invalidating any consumer of the
+        // all-writes `_update_seq` counter.
+        if (params.unpushedAdd.length === 0
+            && params.unpushedRemove.length === 0
+            && params.nextPushSeq === this.lastPushedSeq) return;
         const meta: MetaWrite[] = [
             { op: "put", key: META_PUSH_SEQ, value: params.nextPushSeq },
         ];

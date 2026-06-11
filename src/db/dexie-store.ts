@@ -66,6 +66,41 @@ export interface LocalMeta {
     value: any;
 }
 
+// ── Docs change signature ───────────────────────────────
+
+/**
+ * Compact fingerprint of the `docs` table's row set. Unlike
+ * `_update_seq` (which counts EVERY write tx, including meta-only
+ * bookkeeping like checkpoints, vclocks and the vault manifest), this
+ * signature moves iff a docs row was inserted, updated or deleted:
+ *
+ *   - insert/update (tombstones included) stamp a fresh `_localSeq`
+ *     from the strictly-monotonic tx counter → `maxDocSeq` advances
+ *   - a pure delete shrinks `docCount` (and possibly `maxDocSeq`)
+ *   - insert+delete in one tx still advances `maxDocSeq` (the insert
+ *     carries the new seq)
+ *   - meta-table writes leave both fields untouched — by design; the
+ *     FileDoc/chunk row set is unchanged, so consumers (Reconciler's
+ *     fast-path) must not be invalidated by bookkeeping
+ *
+ * False positives are possible (chunk GC deletes orphan rows the
+ * Reconciler doesn't care about) and accepted — they cost one slow
+ * scan, never a missed change.
+ */
+export interface DocsChangeSignature {
+    maxDocSeq: number;
+    docCount: number;
+}
+
+export function docsSigEquals(
+    a: DocsChangeSignature | undefined,
+    b: DocsChangeSignature,
+): boolean {
+    return a !== undefined
+        && a.maxDocSeq === b.maxDocSeq
+        && a.docCount === b.docCount;
+}
+
 // ── Per-path vclock meta key convention ─────────────────
 
 /** Prefix for `_local/vclock/<path>` entries written by `runWrite`. */
@@ -418,11 +453,13 @@ export class DexieStore<T extends { _id: string; _rev?: string } = any>
     ): Promise<LocalChangesResult<T>> {
         const sinceNum =
             typeof since === "string" ? parseInt(since, 10) || 0 : (since ?? 0);
+        // Dexie index range queries return rows in index order (ascending
+        // `_localSeq`) — same guarantee `listIds` relies on for `_id`. No
+        // re-sort needed.
         const rows = await this.db.docs
             .where("_localSeq")
             .above(sinceNum)
             .toArray();
-        rows.sort((a, b) => (a._localSeq ?? 0) - (b._localSeq ?? 0));
         const results = rows.map((stored) => ({
             id: stored._id,
             seq: stored._localSeq ?? 0,
@@ -509,6 +546,31 @@ export class DexieStore<T extends { _id: string; _rev?: string } = any>
         const count = await this.db.docs.count();
         const seqMeta = await this.db.meta.get("_update_seq");
         return { updateSeq: seqMeta?.value ?? count };
+    }
+
+    /**
+     * See `DocsChangeSignature` for the contract. Both fields are read
+     * inside one read tx — two independent reads could be torn by a
+     * write tx committing in between, yielding a (maxDocSeq, docCount)
+     * pair that never existed as a real state.
+     *
+     * Implementation notes:
+     *   - `.keys()` instead of `.last()`: the highest-seq row is almost
+     *     always the most recent pull/push ChunkDoc (~100 KiB body);
+     *     reading just the index key skips deserialising it.
+     *   - Legacy rows written before schema v2 lack `_localSeq` and are
+     *     absent from the index. That is sound: any change to such a row
+     *     stamps a fresh seq, which is what the signature must observe.
+     */
+    async docsChangeSignature(): Promise<DocsChangeSignature> {
+        return this.db.transaction("r", this.db.docs, async () => {
+            const keys = await this.db.docs
+                .orderBy("_localSeq").reverse().limit(1).keys();
+            return {
+                maxDocSeq: (keys[0] as number | undefined) ?? 0,
+                docCount: await this.db.docs.count(),
+            };
+        });
     }
 
     async close(): Promise<void> {

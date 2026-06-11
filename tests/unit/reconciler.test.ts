@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { Reconciler, totalDiscrepancies } from "../../src/sync/reconciler.ts";
 import type { ScanCursor, VaultManifest } from "../../src/db/local-db.ts";
+import type { DocsChangeSignature } from "../../src/db/dexie-store.ts";
 import type { FileDoc } from "../../src/types.ts";
 import { makeFileId, filePathFromId } from "../../src/types/doc-id.ts";
 import type { LastSynced } from "../../src/sync/last-synced.ts";
@@ -50,7 +51,7 @@ class FakeLocalDb {
     cursor: ScanCursor | null = null;
     manifest: VaultManifest | null = null;
     fileDocs = new Map<string, FileDoc>();
-    private updateSeq = 0;
+    private docsSig: DocsChangeSignature = { maxDocSeq: 0, docCount: 0 };
 
     async getScanCursor() { return this.cursor; }
     async putScanCursor(c: ScanCursor) { this.cursor = { ...c }; }
@@ -58,10 +59,20 @@ class FakeLocalDb {
     async putVaultManifest(m: VaultManifest) { this.manifest = { paths: [...m.paths], updatedAt: m.updatedAt }; }
     async allFileDocs(): Promise<FileDoc[]> { return [...this.fileDocs.values()]; }
     async getFileDoc(path: string) { return this.fileDocs.get(path) ?? null; }
-    /** Bump the simulated update_seq. Tests can call this to mimic
-     *  external writes that the Reconciler short-circuit must notice. */
-    bumpSeq() { this.updateSeq++; }
-    async info() { return { updateSeq: this.updateSeq }; }
+    /** Mimic a docs-row write (a pull/push landing a FileDoc or chunk) —
+     *  the only kind of write the Reconciler short-circuit must notice.
+     *  Meta-only bookkeeping (checkpoints, vclocks) leaves the signature
+     *  untouched by construction; that property is covered by the
+     *  dexie-store signature tests against the real store. */
+    bumpDocsSig() {
+        this.docsSig = {
+            maxDocSeq: this.docsSig.maxDocSeq + 1,
+            docCount: this.docsSig.docCount,
+        };
+    }
+    async docsChangeSignature(): Promise<DocsChangeSignature> {
+        return { ...this.docsSig };
+    }
 }
 
 // PR3: classifier returns 6 states; the legacy 3-state alias is kept
@@ -467,7 +478,7 @@ describe("Reconciler", () => {
             h.db.cursor = {
                 lastScanStartedAt: Date.now(),
                 lastScanCompletedAt: Date.now(),
-                lastSeenUpdateSeq: 0,
+                lastSeenDocsSig: { maxDocSeq: 0, docCount: 0 },
             };
             h.db.manifest = { paths: ["a.md"], updatedAt: 0 };
 
@@ -478,21 +489,42 @@ describe("Reconciler", () => {
             expect(h.vaultSync.fileToDbCalls).toEqual([]);
         });
 
-        it("does not short-circuit when DB update_seq has advanced", async () => {
+        it("does not short-circuit when a docs row changed", async () => {
             const h = setup([makeFile("a.md", 1000)]);
             h.db.fileDocs.set("a.md", makeDoc("a.md"));
             h.db.cursor = {
                 lastScanStartedAt: Date.now(),
                 lastScanCompletedAt: Date.now(),
-                lastSeenUpdateSeq: 0,
+                lastSeenDocsSig: { maxDocSeq: 0, docCount: 0 },
             };
             h.db.manifest = { paths: ["a.md"], updatedAt: 0 };
             h.vaultSync.compareResults.set("a.md", "identical");
-            h.db.bumpSeq();
+            h.db.bumpDocsSig();
 
             const r = await h.reconciler.reconcile("paused");
             expect(r.shortCircuited).toBe(false);
             expect(r.inSync).toBe(1);
+        });
+
+        it("does not short-circuit when the cursor predates the signature (legacy cursor)", async () => {
+            const h = setup([makeFile("a.md", 1000)]);
+            h.db.fileDocs.set("a.md", makeDoc("a.md"));
+            // A cursor persisted by a pre-signature build has no
+            // lastSeenDocsSig — must read as "unknown" → slow path once.
+            h.db.cursor = {
+                lastScanStartedAt: Date.now(),
+                lastScanCompletedAt: Date.now(),
+            };
+            h.db.manifest = { paths: ["a.md"], updatedAt: 0 };
+            h.vaultSync.compareResults.set("a.md", "identical");
+
+            const r = await h.reconciler.reconcile("paused");
+            expect(r.shortCircuited).toBe(false);
+            // The slow scan re-persists the cursor in the new shape, so
+            // the immediate next run short-circuits.
+            expect(h.db.cursor?.lastSeenDocsSig).toEqual({ maxDocSeq: 0, docCount: 0 });
+            const r2 = await h.reconciler.reconcile("paused");
+            expect(r2.shortCircuited).toBe(true);
         });
 
         it("does not short-circuit when manifest doesn't match vault (delete pending)", async () => {
@@ -501,7 +533,7 @@ describe("Reconciler", () => {
             h.db.cursor = {
                 lastScanStartedAt: Date.now() + 60_000,
                 lastScanCompletedAt: Date.now() + 60_000,
-                lastSeenUpdateSeq: 0,
+                lastSeenDocsSig: { maxDocSeq: 0, docCount: 0 },
             };
             h.db.manifest = { paths: ["a.md"], updatedAt: 0 };
 
@@ -752,7 +784,11 @@ describe("Reconciler", () => {
             h.db.fileDocs.set("Scripts/X", makeDoc("Scripts/X", { vclock: { [OTHER]: 1, [SELF]: 1 } }));
             h.db.fileDocs.set("scripts/X", makeDoc("scripts/X", { vclock: { [OTHER]: 1 } }));
             h.db.manifest = { paths: ["scripts/X", "Scripts/X"], updatedAt: 0 };
-            h.db.cursor = { lastScanStartedAt: 10_000, lastScanCompletedAt: 10_000, lastSeenUpdateSeq: 0 };
+            h.db.cursor = {
+                lastScanStartedAt: 10_000,
+                lastScanCompletedAt: 10_000,
+                lastSeenDocsSig: { maxDocSeq: 0, docCount: 0 },
+            };
 
             const r = await h.reconciler.reconcile("onload");
 

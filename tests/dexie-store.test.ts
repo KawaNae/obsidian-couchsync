@@ -579,6 +579,71 @@ describe("DexieStore", () => {
             await store.runWriteTx({ meta: [{ op: "delete", key: "k" }] });
             expect(await store.getMeta("k")).toBeNull();
         });
+    });
+
+    // ── docsChangeSignature ─────────────────────────────
+
+    describe("docsChangeSignature", () => {
+        it("is {0,0} on an empty store", async () => {
+            expect(await store.docsChangeSignature())
+                .toEqual({ maxDocSeq: 0, docCount: 0 });
+        });
+
+        it("moves on a docs insert and again on an update", async () => {
+            await put(store, makeFile("a.md"));
+            const afterInsert = await store.docsChangeSignature();
+            expect(afterInsert.docCount).toBe(1);
+            expect(afterInsert.maxDocSeq).toBeGreaterThan(0);
+
+            await put(store, makeFile("a.md", { A: 2 }));
+            const afterUpdate = await store.docsChangeSignature();
+            expect(afterUpdate.docCount).toBe(1);
+            expect(afterUpdate.maxDocSeq).toBeGreaterThan(afterInsert.maxDocSeq);
+        });
+
+        it("is UNCHANGED by meta-only writes (checkpoints, vclocks, manifest)", async () => {
+            await put(store, makeFile("a.md"));
+            const before = await store.docsChangeSignature();
+
+            // The bookkeeping mix that used to kill the Reconciler
+            // fast-path: checkpoint puts + per-path vclock entries.
+            await store.runWriteTx({
+                meta: [{ op: "put", key: "_sync/push-seq", value: 99 }],
+            });
+            await store.runWriteTx({
+                meta: [{ op: "put", key: "_sync/remote-seq", value: "12" }],
+                vclocks: [{ path: "a.md", op: "set", clock: { A: 1 }, chunks: [], size: 0 }],
+            });
+
+            expect(await store.docsChangeSignature()).toEqual(before);
+            // Sanity: the all-writes counter DID move — that asymmetry is
+            // the whole point of the signature.
+            expect((await store.info()).updateSeq).not.toBe(before.maxDocSeq);
+        });
+
+        it("moves on a pure delete (docCount shrinks)", async () => {
+            await put(store, makeFile("a.md"));
+            await put(store, makeFile("b.md"));
+            const before = await store.docsChangeSignature();
+
+            await store.runWriteTx({ deletes: [makeFileId("a.md")] });
+            const after = await store.docsChangeSignature();
+            expect(after.docCount).toBe(before.docCount - 1);
+            expect(after).not.toEqual(before);
+        });
+
+        it("moves on insert+delete in one tx (net count zero)", async () => {
+            await put(store, makeFile("a.md"));
+            const before = await store.docsChangeSignature();
+
+            await store.runWriteTx({
+                docs: [{ doc: makeFile("b.md") }],
+                deletes: [makeFileId("a.md")],
+            });
+            const after = await store.docsChangeSignature();
+            expect(after.docCount).toBe(before.docCount);
+            expect(after.maxDocSeq).toBeGreaterThan(before.maxDocSeq);
+        });
 
         it("getMetaByPrefix returns all matching entries", async () => {
             await store.runWriteTx({

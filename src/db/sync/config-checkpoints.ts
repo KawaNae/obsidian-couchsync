@@ -82,6 +82,12 @@ export class ConfigCheckpoints {
      * cursor change to disk.
      */
     async saveEmptyPullBatch(nextPullSeq: number | string): Promise<void> {
+        // No-op guard, symmetric to the vault-side Checkpoints. Sound
+        // because every `pullSeq` mutation is disk-coupled: load() reads
+        // disk, and both commit paths (commitPullBatch, the tx below, the
+        // pull-writer's batch tx) assign it inside onCommit of a tx that
+        // persists the same value — memory == disk always holds here.
+        if (nextPullSeq === this.pullSeq) return;
         await this.db.runWriteTx({
             meta: [{ op: "put", key: META_CONFIG_PULL_SEQ, value: nextPullSeq }],
             onCommit: () => { this.pullSeq = nextPullSeq; },

@@ -217,6 +217,32 @@ describe("Checkpoints", () => {
             await expect(cp.saveEmptyPullBatch("77")).rejects.toThrow(/simulated/);
             expect(cp.getRemoteSeq()).toBe(10);
         });
+
+        it("writes nothing when the cursor is unchanged and no conflicts (no-op guard)", async () => {
+            const localDb = makeLocalDb();
+            const cp = new Checkpoints(localDb);
+            cp.setRemoteSeq("42");
+
+            await cp.saveEmptyPullBatch("42");
+
+            expect(localDb.runWriteTx).not.toHaveBeenCalled();
+            expect(cp.getRemoteSeq()).toBe("42");
+        });
+
+        it("still writes when the cursor is unchanged but a conflict must persist", async () => {
+            const localDb = makeLocalDb();
+            const cp = new Checkpoints(localDb);
+            cp.setRemoteSeq("42");
+
+            await cp.saveEmptyPullBatch("42", [
+                { id: "file:a.md", kind: "pull-delete-vs-edit" },
+            ]);
+
+            expect(localDb.runWriteTx).toHaveBeenCalledTimes(1);
+            expect(localDb._meta["_sync/pending-conflict/file:a.md"]).toMatchObject({
+                kind: "pull-delete-vs-edit",
+            });
+        });
     });
 
     describe("commitPushCycle", () => {
@@ -251,7 +277,7 @@ describe("Checkpoints", () => {
             expect(localDb.runWriteTx).toHaveBeenCalledTimes(1);
         });
 
-        it("advance is unconditional even with empty add/remove", async () => {
+        it("a forward cursor move commits even with empty add/remove", async () => {
             const localDb = makeLocalDb();
             const cp = new Checkpoints(localDb);
             cp.setLastPushedSeq(0);
@@ -264,6 +290,35 @@ describe("Checkpoints", () => {
 
             expect(cp.getLastPushedSeq()).toBe(17);
             expect(localDb._meta["_sync/push-seq"]).toBe(17);
+        });
+
+        it("writes nothing when cursor and set are both unchanged (idle poll no-op)", async () => {
+            const localDb = makeLocalDb();
+            const cp = new Checkpoints(localDb);
+            cp.setLastPushedSeq(17);
+
+            await cp.commitPushCycle({
+                nextPushSeq: 17,
+                unpushedAdd: [],
+                unpushedRemove: [],
+            });
+
+            expect(localDb.runWriteTx).not.toHaveBeenCalled();
+            expect(cp.getLastPushedSeq()).toBe(17);
+        });
+
+        it("still writes when the cursor is unchanged but the set mutates", async () => {
+            const localDb = makeLocalDb();
+            const cp = new Checkpoints(localDb);
+            cp.setLastPushedSeq(17);
+
+            await cp.commitPushCycle({
+                nextPushSeq: 17,
+                unpushedAdd: [],
+                unpushedRemove: ["file:zombie.md"],
+            });
+
+            expect(localDb.runWriteTx).toHaveBeenCalledTimes(1);
         });
 
         it("removes are applied before adds (in-cycle re-flag wins)", async () => {
