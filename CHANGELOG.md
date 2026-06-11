@@ -2,7 +2,50 @@
 
 All notable changes to obsidian-couchsync.
 
-## 0.28.3
+## 0.28.4
+
+An efficiency release built from a measured investigation on three real
+devices. The headline: the reconciler's fast-path had been structurally
+dead — every reconcile (every mobile foreground resume) re-read and
+re-hashed the entire vault, measured at 4.1 s for a 287-file vault on
+Android. After this release the same reconcile takes milliseconds, the
+idle write churn is gone, and push traffic shrinks ~25% on encrypted
+vaults. No schema change, no re-Init required.
+
+### Performance
+
+- **Reconcile fast-path actually fires now (measured 4 059 ms → 13–18 ms on
+  Android, back-to-back).** The "did the DB change?" check compared against
+  `_update_seq`, a counter bumped by EVERY write — including the push loop's
+  own no-op checkpoint commit every 2 s poll and each catchup's identical
+  cursor re-write. The check now uses a docs-only change signature
+  (`{maxDocSeq, docCount}`) that bookkeeping writes cannot move, and
+  checkpoint commits that provably change nothing write nothing (killing
+  ~30 no-op IndexedDB transactions per minute of idle mobile flash wear).
+- **Slow-path scans no longer re-hash unchanged files (measured 4 159 ms →
+  62 ms full-vault on Android).** The integration baseline now records the
+  disk mtime observed at integration; an exact `(mtime, size)` stat match
+  reuses the stored chunk fingerprint instead of re-reading and re-hashing
+  the file. The trust model is the same one the vault-wide mtime threshold
+  has always used; destructive-judgment paths still hash for real.
+- **Push request bodies are gzip-compressed (~25% less upload on encrypted
+  vaults).** Chunk uploads ride inside JSON as base64 (+33% on the wire);
+  transport-level gzip recovers nearly all of it (measured ×1.33 → ×1.005),
+  mirroring the pull direction where the server compresses responses.
+  Requires `content-encoding` in the CouchDB `cors.headers` allow-list —
+  without it the client logs once and falls back to uncompressed
+  automatically (see below).
+
+### Fixed
+
+- **A server that rejects compressed requests cannot stall push.** Found
+  live during release verification: `Content-Encoding` is not a
+  CORS-safelisted header, so it triggers a preflight that a default CouchDB
+  CORS config rejects — fetch fails before any HTTP exchange. A compressed
+  request failing at the network layer (or with HTTP 415) is now retried
+  uncompressed once and compression latches off for the session; if the
+  uncompressed probe also fails the latch is restored, so a genuine outage
+  can't permanently disable compression.
 
 A connection-recovery overhaul plus the trust-boundary and retry-cadence
 fixes surfaced by a production-log review across four real devices. The
