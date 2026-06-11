@@ -171,7 +171,7 @@ describe("regression: re-clone false-divergent (incident 2026-06-02)", () => {
 
         // Classifier verdict: with the baseline at v0 (matching disk), a
         // dominating remote is a pure remote-edit, never true-divergent.
-        const relation = await vs.classifyFileVsDoc(v1Doc, path, (await vault.stat(path))!.size);
+        const relation = await vs.classifyFileVsDoc(v1Doc, path, (await vault.stat(path))!);
         expect(relation).toBe("remote-edit");
 
         await reconciler.reconcile("paused");

@@ -105,15 +105,15 @@ describe("regression: phantom lastSynced rollback (PR-F)", () => {
         // lastSynced dominates fileDoc — the loop trigger condition).
         const stat = (await vault.stat(path))!;
         const fileDoc = (await db.get(makeFileId(path))) as FileDoc;
-        const relation = await vs.classifyFileVsDoc(fileDoc, path, stat.size);
+        const relation = await vs.classifyFileVsDoc(fileDoc, path, stat);
         expect(relation).toBe("vclock-only-drift");
 
         // Spy on adoptDocVclock to count fires across reconciles.
         let adoptFires = 0;
         const original = vs.adoptDocVclock.bind(vs);
-        vs.adoptDocVclock = async (p: string, doc: FileDoc) => {
+        vs.adoptDocVclock = async (p: string, doc: FileDoc, s?: { mtime: number; size: number }) => {
             adoptFires++;
-            return original(p, doc);
+            return original(p, doc, s);
         };
 
         const reconciler = new Reconciler(
@@ -150,7 +150,7 @@ describe("regression: phantom lastSynced rollback (PR-F)", () => {
         expect(adoptFires).toBe(0);
         expect(r2.inSync).toBe(1);
 
-        const finalRelation = await vs.classifyFileVsDoc(afterFileDoc, path, stat.size);
+        const finalRelation = await vs.classifyFileVsDoc(afterFileDoc, path, stat);
         expect(finalRelation).toBe("identical");
     });
 });

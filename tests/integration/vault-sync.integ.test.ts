@@ -244,7 +244,7 @@ describe("VaultSync", () => {
 
             const doc = await db.get(makeFileId("a.md")) as FileDoc;
             const stat = (await vault.stat("a.md"))!;
-            const result = await vs.classifyFileVsDoc(doc, "a.md", stat.size);
+            const result = await vs.classifyFileVsDoc(doc, "a.md", stat);
             expect(result).toBe("identical");
         });
 
@@ -257,7 +257,7 @@ describe("VaultSync", () => {
             vault.addFile("a.md", "v2-local-edit", { size: 999 });
 
             const doc = await db.get(makeFileId("a.md")) as FileDoc;
-            const result = await vs.classifyFileVsDoc(doc, "a.md", 999);
+            const result = await vs.classifyFileVsDoc(doc, "a.md", (await vault.stat("a.md"))!);
             expect(result).toBe("local-edit");
         });
 
@@ -273,11 +273,130 @@ describe("VaultSync", () => {
 
             // Vault has different content from both lastSynced and remote.
             vault.addFile("a.md", "v1-but-different", { size: 777 });
-            const result = await vs.classifyFileVsDoc(updated as FileDoc, "a.md", 777);
+            const result = await vs.classifyFileVsDoc(updated as FileDoc, "a.md", (await vault.stat("a.md"))!);
             // PR3 classifier detects "right dominates AND left drifted from
             // baseline" → true-divergent (instead of legacy remote-pending
             // which had a separate divergent-edit guard).
             expect(result).toBe("true-divergent");
+        });
+    });
+
+    // ── diskChunkIds stat cache (lastSynced.mtime) ──────
+
+    describe("diskChunkIds stat cache", () => {
+        function countReads(): () => number {
+            let reads = 0;
+            const orig = vault.readBinary.bind(vault);
+            vault.readBinary = async (p: string) => { reads++; return orig(p); };
+            return () => reads;
+        }
+
+        it("classifyFileVsDoc serves the fingerprint from cache when (mtime,size) matches", async () => {
+            vault.addFile("c.md", "cached", { mtime: 7000 });
+            await vs.fileToDb("c.md"); // stamps lastSynced.mtime = 7000
+
+            const doc = await db.get(makeFileId("c.md")) as FileDoc;
+            const reads = countReads();
+            const result = await vs.classifyFileVsDoc(doc, "c.md", { mtime: 7000, size: 6 });
+            expect(result).toBe("identical");
+            expect(reads()).toBe(0);
+        });
+
+        it("re-hashes when the stat mtime differs from the stamp", async () => {
+            vault.addFile("c.md", "cached", { mtime: 7000 });
+            await vs.fileToDb("c.md");
+
+            const doc = await db.get(makeFileId("c.md")) as FileDoc;
+            const reads = countReads();
+            const result = await vs.classifyFileVsDoc(doc, "c.md", { mtime: 8000, size: 6 });
+            expect(result).toBe("identical"); // content really is unchanged
+            expect(reads()).toBe(1);
+        });
+
+        it("re-hashes when the baseline has no mtime stamp (legacy entry)", async () => {
+            vault.addFile("c.md", "cached", { mtime: 7000 });
+            await vs.fileToDb("c.md");
+            // Rewrite the baseline WITHOUT mtime — the pre-stamp shape.
+            const doc = await db.get(makeFileId("c.md")) as FileDoc;
+            await db.runWriteTx({
+                vclocks: [{
+                    path: "c.md", op: "set", clock: doc.vclock,
+                    chunks: doc.chunks, size: doc.size,
+                }],
+            });
+            await vs.loadLastSyncedVclocks();
+
+            const reads = countReads();
+            const result = await vs.classifyFileVsDoc(doc, "c.md", { mtime: 7000, size: 6 });
+            expect(result).toBe("identical");
+            expect(reads()).toBe(1);
+        });
+
+        it("alignLastSyncedToDoc warms up a missing stamp (stamped-mtime), then settles", async () => {
+            vault.addFile("c.md", "cached", { mtime: 7000 });
+            await vs.fileToDb("c.md");
+            const doc = await db.get(makeFileId("c.md")) as FileDoc;
+            // Strip the stamp to simulate a pre-mtime vault.
+            await db.runWriteTx({
+                vclocks: [{
+                    path: "c.md", op: "set", clock: doc.vclock,
+                    chunks: doc.chunks, size: doc.size,
+                }],
+            });
+            await vs.loadLastSyncedVclocks();
+
+            const first = await vs.alignLastSyncedToDoc("c.md", doc, { mtime: 7000, size: 6 });
+            expect(first).toBe("stamped-mtime");
+            const second = await vs.alignLastSyncedToDoc("c.md", doc, { mtime: 7000, size: 6 });
+            expect(second).toBe("already-aligned");
+            // The stamp survives a reload (persisted, not memory-only).
+            await vs.loadLastSyncedVclocks();
+            expect(vs.getLastSynced("c.md")?.mtime).toBe(7000);
+        });
+
+        it("alignLastSyncedToDoc skips the stamp when the stat size mismatches the doc", async () => {
+            vault.addFile("c.md", "cached", { mtime: 7000 });
+            await vs.fileToDb("c.md");
+            const doc = await db.get(makeFileId("c.md")) as FileDoc;
+            await db.runWriteTx({
+                vclocks: [{
+                    path: "c.md", op: "set", clock: doc.vclock,
+                    chunks: doc.chunks, size: doc.size,
+                }],
+            });
+            await vs.loadLastSyncedVclocks();
+
+            // A stat whose size disagrees with the doc does not describe the
+            // integrated content (unflushed editor buffer) — no stamp.
+            const r = await vs.alignLastSyncedToDoc("c.md", doc, { mtime: 9000, size: 999 });
+            expect(r).toBe("already-aligned");
+            expect(vs.getLastSynced("c.md")?.mtime).toBeUndefined();
+        });
+
+        it("dbToFile stamps the post-write disk mtime", async () => {
+            const remote: FileDoc = {
+                _id: makeFileId("pulled.md"),
+                type: "file",
+                chunks: [],
+                mtime: 123, // sender's mtime — must NOT end up in the stamp
+                ctime: 123,
+                size: 0,
+                vclock: { "dev-B": 1 },
+            };
+            // Build the real chunks for some content.
+            vault.addFile("seed.md", "from remote");
+            await vs.fileToDb("seed.md");
+            const seed = await db.get(makeFileId("seed.md")) as FileDoc;
+            const pulled = { ...remote, chunks: seed.chunks, size: seed.size };
+            await db.runWriteTx({ docs: [{ doc: pulled as any }] });
+
+            const res = await vs.dbToFile(pulled);
+            expect(res.applied).toBe(true);
+
+            const stat = (await vault.stat("pulled.md"))!;
+            const ls = vs.getLastSynced("pulled.md")!;
+            expect(ls.mtime).toBe(stat.mtime);
+            expect(ls.mtime).not.toBe(123);
         });
     });
 

@@ -70,6 +70,10 @@ export type MetaWrite =
 export type VclockUpdate =
     | {
         path: string; op: "set"; clock: VectorClock; chunks: string[]; size: number;
+        /** Disk mtime observed at integration on THIS device (never the
+         *  sender's FileDoc.mtime). See `LastSynced.mtime` for the trust
+         *  model. Omitted when no fresh stat was at hand → cache miss. */
+        mtime?: number;
         /** Invariant 7: the integrated doc state was a tombstone (chunks/size
          *  carry the normalized `[]`/0 fingerprint). `op: "delete"` is
          *  reserved for "no doc exists at all". */

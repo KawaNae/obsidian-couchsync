@@ -23,11 +23,23 @@ import type { VectorClock } from "./vector-clock.ts";
  * neither is pruned today; a future tombstone GC must issue the matching
  * `vclocks: [{path, op: "delete"}]` in the same sweep. `op: "delete"` is
  * reserved for "no doc exists at all" (no causal information to keep).
+ *
+ * `mtime` is the disk mtime THIS DEVICE observed at integration — never
+ * `FileDoc.mtime`, which is the sender's mtime and meaningless against
+ * the local filesystem. An exact `(mtime, size)` stat match is treated as
+ * evidence that `chunks` is still a valid fingerprint of the disk
+ * content, letting hot paths skip readBinary + re-hash. This trust model
+ * is the same one the reconcile fast-path already applies vault-wide via
+ * its mtime threshold; consumers needing a stronger guarantee (the
+ * destructive-judgment oracle `hasUnpushedChanges`) must hash for real.
+ * Entries written before this field carry undefined → cache miss → the
+ * next integration (or a reconcile align) stamps it.
  */
 export interface LastSynced {
     vclock: VectorClock;
     chunks?: string[];
     size?: number;
+    mtime?: number;
     deleted?: true;
 }
 
@@ -37,10 +49,11 @@ export interface LastSynced {
 export function parseStoredLastSynced(value: unknown): LastSynced {
     if (value && typeof value === "object" && "vclock" in (value as object)) {
         const v = value as {
-            vclock: VectorClock; chunks?: string[]; size?: number; deleted?: boolean;
+            vclock: VectorClock; chunks?: string[]; size?: number;
+            mtime?: number; deleted?: boolean;
         };
         return {
-            vclock: v.vclock, chunks: v.chunks, size: v.size,
+            vclock: v.vclock, chunks: v.chunks, size: v.size, mtime: v.mtime,
             ...(v.deleted === true ? { deleted: true as const } : {}),
         };
     }

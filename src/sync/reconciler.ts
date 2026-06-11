@@ -353,7 +353,7 @@ export class Reconciler {
                 // its real action instead.
                 let relation: SyncRelation;
                 try {
-                    relation = await this.vaultSync.classifyFileVsDoc(doc, file.path, file.stat.size);
+                    relation = await this.vaultSync.classifyFileVsDoc(doc, file.path, file.stat);
                 } catch (e) {
                     logError(`CouchSync: reconcile classify (tombstone) failed for ${displayPath}: ${e?.message ?? e}`);
                     continue;
@@ -517,7 +517,7 @@ export class Reconciler {
             if (file && doc && !doc.deleted) {
                 let relation: SyncRelation;
                 try {
-                    relation = await this.vaultSync.classifyFileVsDoc(doc, file.path, file.stat.size);
+                    relation = await this.vaultSync.classifyFileVsDoc(doc, file.path, file.stat);
                 } catch (e) {
                     logError(`CouchSync: reconcile classify failed for ${displayPath}: ${e?.message ?? e}`);
                     continue;
@@ -531,7 +531,7 @@ export class Reconciler {
                         // when invariant 1 has been violated.
                         await this.tryStep(displayPath, "align",
                             async (): Promise<void> => {
-                                await this.vaultSync.alignLastSyncedToDoc(file.path, doc);
+                                await this.vaultSync.alignLastSyncedToDoc(file.path, doc, file.stat);
                             },
                             mode);
                         break;
@@ -543,7 +543,7 @@ export class Reconciler {
                         // and the 2026-05-10 phantom-loop shape
                         // (project_phantom_lastsynced_stamp.md).
                         if (await this.tryStep(displayPath, "vclock-adopt",
-                            () => this.vaultSync.adoptDocVclock(file.path, doc), mode)) {
+                            () => this.vaultSync.adoptDocVclock(file.path, doc, file.stat), mode)) {
                             report.inSync++;
                         }
                         break;

@@ -271,15 +271,21 @@ export class VaultSync {
                             doc: newDoc as unknown as CouchSyncDoc,
                             expectedVclock: existing?.vclock ?? {},
                         }],
+                        // mtime from the pre-read stat: if the file changed
+                        // between stat and readBinary, the recorded mtime is
+                        // older than the content → next stat differs → cache
+                        // miss → re-hash. Always the safe direction.
                         vclocks: [{
                             path, op: "set", clock: newVclock,
                             chunks: chunkIds, size: fileStat.size,
+                            mtime: fileStat.mtime,
                         }],
                         onCommit: () => {
                             this.lastSynced.set(toPathKey(path), {
                                 vclock: newVclock,
                                 chunks: chunkIds,
                                 size: fileStat.size,
+                                mtime: fileStat.mtime,
                             });
                         },
                     };
@@ -353,7 +359,7 @@ export class VaultSync {
         const existingStat = await this.vault.stat(vaultPath);
 
         if (existingStat && existingStat.size === fileDoc.size) {
-            const ids = await this.localChunkIds(vaultPath);
+            const ids = await this.diskChunkIds(vaultPath, existingStat);
             if (VaultSync.chunksEqual(ids, fileDoc.chunks)) {
                 // Content already on disk. Establish the integration baseline
                 // so a later reconcile classifies this path as identical and
@@ -363,7 +369,7 @@ export class VaultSync {
                 // opening a window where the path could be pushed/stamped —
                 // turning the author's next edit into a false concurrent.
                 // Invariant 3: chunks-equal ⇒ fileDoc is the vclock authority.
-                await this.establishBaseline(vaultPath, fileDoc);
+                await this.establishBaseline(vaultPath, fileDoc, existingStat);
                 return { applied: true }; // identical content
             }
         }
@@ -410,6 +416,10 @@ export class VaultSync {
         // yet); for existing files applyRemoteContent picks the right
         // strategy (CM dispatch, defer-on-composing, or fallback).
         let result: WriteResult;
+        // The path the bytes actually landed under (createFile may resolve
+        // the parent dir to an existing folder's case). Same PathKey as
+        // vaultPath, but stat() needs the on-disk spelling.
+        let writtenPath = vaultPath;
         if (existingStat) {
             result = await this.vaultWriter.applyRemoteContent(vaultPath, content);
         } else {
@@ -451,6 +461,7 @@ export class VaultSync {
             const basename = vaultPath.slice(vaultPath.lastIndexOf("/") + 1);
             const writePath = resolvedDir ? `${resolvedDir}/${basename}` : vaultPath;
             await this.vaultWriter.createFile(writePath, content);
+            writtenPath = writePath;
             result = { applied: true };
         }
 
@@ -466,8 +477,13 @@ export class VaultSync {
         }
 
         // Persist the integration point in the docs store's meta so it
-        // lives in the same IDB as the FileDoc itself.
-        await this.establishBaseline(vaultPath, fileDoc);
+        // lives in the same IDB as the FileDoc itself. The post-write stat
+        // feeds the mtime stamp; if the editor-aware write hasn't flushed
+        // to disk yet the size won't match fileDoc.size and
+        // establishBaseline skips the stamp (cache miss → re-hash later —
+        // the safe direction).
+        const postStat = await this.vault.stat(writtenPath);
+        await this.establishBaseline(vaultPath, fileDoc, postStat ?? undefined);
 
         // History capture is now owned by VaultWriter (it knows when
         // the content has actually landed in the editor/disk).
@@ -485,8 +501,21 @@ export class VaultSync {
      * the normal dbToFile write path, the already-on-disk early-return, and
      * `adoptDocVclock` all funnel through it so the baseline can never be left
      * unset after a successful integration (the 2026-06-02 re-clone gap).
+     *
+     * `diskStat`, when provided AND matching `fileDoc.size`, stamps
+     * `lastSynced.mtime` (the stat-cache key for `diskChunkIds`). A
+     * size mismatch means the stat does not describe the integrated
+     * content (e.g. an editor buffer not yet flushed) — skip the stamp;
+     * the next reconcile align warms it up. When the baseline is already
+     * aligned but the mtime stamp is missing or different, we still
+     * write — that promotion is how a pre-mtime vault warms up during
+     * its first slow scan.
      */
-    private async establishBaseline(path: string, fileDoc: FileDoc): Promise<void> {
+    private async establishBaseline(
+        path: string,
+        fileDoc: FileDoc,
+        diskStat?: { mtime: number; size: number },
+    ): Promise<void> {
         const key = toPathKey(path);
         const prev = this.lastSynced.get(key);
         const docVC = fileDoc.vclock ?? {};
@@ -503,26 +532,35 @@ export class VaultSync {
             await this.db.runWriteTx(this.deletedBaselineTx(path, docVC));
             return;
         }
+        const mtime = diskStat !== undefined && diskStat.size === fileDoc.size
+            ? diskStat.mtime
+            : undefined;
         const aligned =
             prev !== undefined &&
             prev.deleted !== true &&
             prev.chunks !== undefined &&
             prev.size === fileDoc.size &&
             compareVC(prev.vclock, docVC) === "equal" &&
-            VaultSync.chunksEqual(prev.chunks, fileDoc.chunks);
+            VaultSync.chunksEqual(prev.chunks, fileDoc.chunks) &&
+            (mtime === undefined || prev.mtime === mtime);
         if (aligned) return;
         const clock = { ...docVC };
+        // A rewrite without a fresh stat drops any prior mtime — the old
+        // stamp described the old content and must not survive it.
+        const entry: LastSynced = {
+            vclock: clock,
+            chunks: fileDoc.chunks,
+            size: fileDoc.size,
+            ...(mtime !== undefined ? { mtime } : {}),
+        };
         await this.db.runWriteTx({
             vclocks: [{
                 path, op: "set", clock,
                 chunks: fileDoc.chunks, size: fileDoc.size,
+                ...(mtime !== undefined ? { mtime } : {}),
             }],
         });
-        this.lastSynced.set(key, {
-            vclock: clock,
-            chunks: fileDoc.chunks,
-            size: fileDoc.size,
-        });
+        this.lastSynced.set(key, entry);
     }
 
     /**
@@ -566,18 +604,23 @@ export class VaultSync {
      * source of truth). Do not duplicate the chunks/vclock matrix logic
      * here — extend the classifier instead.
      *
-     * Step 1 — read disk chunks/size.
+     * Step 1 — fingerprint the disk content (`diskChunkIds`: stat-cache
+     *          hit via `lastSynced.mtime`, or read + hash).
      * Step 2 — call `classifySyncRelation` with vault as left (using
      *          `lastSynced.vclock` as the disk's attributed vclock) and
      *          FileDoc as right.
      */
-    async classifyFileVsDoc(fileDoc: FileDoc, filePath: string, fileSize: number): Promise<SyncRelation> {
+    async classifyFileVsDoc(
+        fileDoc: FileDoc,
+        filePath: string,
+        fileStat: { mtime: number; size: number },
+    ): Promise<SyncRelation> {
         const lastSynced = this.lastSynced.get(toPathKey(filePathFromId(fileDoc._id)));
-        const diskChunks = await this.localChunkIds(filePath);
+        const diskChunks = await this.diskChunkIds(filePath, fileStat);
         return classifySyncRelation({
             leftVC: lastSynced?.vclock ?? {},
             leftChunks: diskChunks,
-            leftSize: fileSize,
+            leftSize: fileStat.size,
             // left = a disk file: always alive, vclock borrowed from the
             // integration baseline.
             leftVCAttributed: true,
@@ -611,9 +654,13 @@ export class VaultSync {
      * produces a `lastSynced > fileDoc` state that re-triggers
      * `vclock-only-drift` forever (the phantom-loop bug shape).
      */
-    async adoptDocVclock(path: string, fileDoc: FileDoc): Promise<void> {
+    async adoptDocVclock(
+        path: string,
+        fileDoc: FileDoc,
+        diskStat?: { mtime: number; size: number },
+    ): Promise<void> {
         const before = this.lastSynced.get(toPathKey(path))?.vclock ?? {};
-        await this.establishBaseline(path, fileDoc);
+        await this.establishBaseline(path, fileDoc, diskStat);
         logDebug(`adoptDocVclock: ${path} ${JSON.stringify(before)} → ${JSON.stringify(fileDoc.vclock ?? {})}`);
     }
 
@@ -634,28 +681,43 @@ export class VaultSync {
      *     can drift from disk. When classifier returns `identical`, we know
      *     disk chunks == fileDoc.chunks; if lastSynced disagrees, align it.
      *
+     *   - **Mtime warm-up** (`stamped-mtime`): the entry is fully aligned
+     *     but lacks the stat-cache stamp (pre-mtime vault, or the stat
+     *     changed via a content-identical rewrite). Stamping here is what
+     *     makes the FIRST slow scan after upgrade pay the hash cost once
+     *     and every later scan hit the `diskChunkIds` cache.
+     *
      * Returns the action taken so callers / tests can observe.
      */
     async alignLastSyncedToDoc(
         path: string,
         fileDoc: FileDoc,
-    ): Promise<"already-aligned" | "upgraded-legacy" | "recovered-stale"> {
+        diskStat?: { mtime: number; size: number },
+    ): Promise<"already-aligned" | "upgraded-legacy" | "recovered-stale" | "stamped-mtime"> {
         const key = toPathKey(path);
         const existing = this.lastSynced.get(key);
         const docVC = fileDoc.vclock ?? {};
+        // The caller (reconciler, classifier verdict "identical") has just
+        // confirmed disk content == fileDoc.chunks, so a same-size stat
+        // describes exactly that content — safe to stamp as cache key.
+        const mtime = diskStat !== undefined && diskStat.size === fileDoc.size
+            ? diskStat.mtime
+            : undefined;
+        const mtimeRow = mtime !== undefined ? { mtime } : {};
 
         if (!existing) {
             // No baseline at all — establish one from the FileDoc.
             await this.db.runWriteTx({
                 vclocks: [{
                     path, op: "set", clock: docVC,
-                    chunks: fileDoc.chunks, size: fileDoc.size,
+                    chunks: fileDoc.chunks, size: fileDoc.size, ...mtimeRow,
                 }],
             });
             this.lastSynced.set(key, {
                 vclock: docVC,
                 chunks: fileDoc.chunks,
                 size: fileDoc.size,
+                ...mtimeRow,
             });
             return "upgraded-legacy";
         }
@@ -667,11 +729,12 @@ export class VaultSync {
                 vclock: existing.vclock,
                 chunks: fileDoc.chunks,
                 size: fileDoc.size,
+                ...mtimeRow,
             };
             await this.db.runWriteTx({
                 vclocks: [{
                     path, op: "set", clock: upgraded.vclock,
-                    chunks: fileDoc.chunks, size: fileDoc.size,
+                    chunks: fileDoc.chunks, size: fileDoc.size, ...mtimeRow,
                 }],
             });
             this.lastSynced.set(key, upgraded);
@@ -684,7 +747,26 @@ export class VaultSync {
         const aligned =
             existing.size === fileDoc.size &&
             chunkListsEqual(existing.chunks!, fileDoc.chunks);
-        if (aligned) return "already-aligned";
+        if (aligned) {
+            // No stamp for a deleted baseline (an empty file can content-
+            // match one) — diskChunkIds never serves from deleted entries,
+            // and the row below would drop the `deleted` flag.
+            if (mtime === undefined || existing.mtime === mtime
+                || existing.deleted === true) {
+                return "already-aligned";
+            }
+            // Content-aligned but the stat-cache stamp is absent or stale —
+            // write only to warm it up.
+            const stamped: LastSynced = { ...existing, mtime };
+            await this.db.runWriteTx({
+                vclocks: [{
+                    path, op: "set", clock: stamped.vclock,
+                    chunks: fileDoc.chunks, size: fileDoc.size, mtime,
+                }],
+            });
+            this.lastSynced.set(key, stamped);
+            return "stamped-mtime";
+        }
 
         // Stale-bookkeeping: lastSynced drifted from the integrated content.
         // The classifier has just confirmed disk == fileDoc, so it's safe
@@ -693,11 +775,12 @@ export class VaultSync {
             vclock: existing.vclock,
             chunks: fileDoc.chunks,
             size: fileDoc.size,
+            ...mtimeRow,
         };
         await this.db.runWriteTx({
             vclocks: [{
                 path, op: "set", clock: realigned.vclock,
-                chunks: fileDoc.chunks, size: fileDoc.size,
+                chunks: fileDoc.chunks, size: fileDoc.size, ...mtimeRow,
             }],
         });
         this.lastSynced.set(key, realigned);
@@ -870,15 +953,21 @@ export class VaultSync {
                             doc: newDoc as unknown as CouchSyncDoc,
                             expectedVclock: existing?.vclock ?? {},
                         }],
+                        // mtime from the pre-read stat: if the file changed
+                        // between stat and readBinary, the recorded mtime is
+                        // older than the content → next stat differs → cache
+                        // miss → re-hash. Always the safe direction.
                         vclocks: [{
                             path, op: "set", clock: newVclock,
                             chunks: chunkIds, size: fileStat.size,
+                            mtime: fileStat.mtime,
                         }],
                         onCommit: () => {
                             this.lastSynced.set(toPathKey(path), {
                                 vclock: newVclock,
                                 chunks: chunkIds,
                                 size: fileStat.size,
+                                mtime: fileStat.mtime,
                             });
                         },
                     };
@@ -999,6 +1088,11 @@ export class VaultSync {
             return false;
         }
         if (stat.size !== ls.size) return true;
+        // Deliberately localChunkIds, NOT diskChunkIds: this oracle guards
+        // destructive judgments (Invariant 4 — delete-vs-edit, Case F),
+        // where the stat-cache's mtime trust model is too weak. Always
+        // hash the real disk content; the call is rare (conflict /
+        // collision paths only), so the cost is acceptable.
         const diskChunks = await this.localChunkIds(path);
         return !chunkListsEqual(diskChunks, ls.chunks);
     }
@@ -1147,6 +1241,7 @@ export class VaultSync {
                     const vclocks: VclockUpdate[] = [{
                         path: newPath, op: "set", clock: newVC,
                         chunks: chunkIds, size: fileStat.size,
+                        mtime: fileStat.mtime,
                     }];
                     if (!samePathKey) {
                         if (renameOld) {
@@ -1177,6 +1272,7 @@ export class VaultSync {
                                 vclock: newVC,
                                 chunks: chunkIds,
                                 size: fileStat.size,
+                                mtime: fileStat.mtime,
                             });
                             if (!samePathKey) {
                                 if (renameOld) {
@@ -1335,6 +1431,37 @@ export class VaultSync {
         const content = await this.vault.readBinary(path);
         const chunks = await splitIntoChunks(content, this.hasher);
         return chunks.map((c) => c._id);
+    }
+
+    /**
+     * Disk content fingerprint with the lastSynced stat cache: when the
+     * baseline's `(mtime, size)` exactly matches the file's current stat,
+     * `lastSynced.chunks` is returned as the disk fingerprint without
+     * reading or hashing the file (see `LastSynced.mtime` for the trust
+     * model). Any mismatch — or a baseline without mtime/chunks, or a
+     * deleted baseline — falls back to readBinary + splitIntoChunks.
+     *
+     * This is the reconcile slow-path hot spot: without the cache every
+     * scan re-hashed the whole vault (measured 14.5 ms/file on Android).
+     * NOT used by `hasUnpushedChanges` — that oracle guards destructive
+     * judgments and must hash for real.
+     */
+    private async diskChunkIds(
+        path: string,
+        stat: { mtime: number; size: number },
+    ): Promise<string[]> {
+        const ls = this.lastSynced.get(toPathKey(path));
+        if (
+            ls !== undefined
+            && ls.deleted !== true
+            && ls.chunks !== undefined
+            && ls.mtime !== undefined
+            && ls.mtime === stat.mtime
+            && ls.size === stat.size
+        ) {
+            return ls.chunks;
+        }
+        return this.localChunkIds(path);
     }
 
     private static chunksEqual(a: string[], b: string[]): boolean {

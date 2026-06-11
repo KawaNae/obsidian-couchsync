@@ -405,8 +405,9 @@ export class DexieStore<T extends { _id: string; _rev?: string } = any>
             }
 
             // 4. per-path lastSynced meta updates.
-            //    Payload shape: { vclock, chunks, size }. Legacy entries on
-            //    disk (raw VectorClock) are migrated transparently on read.
+            //    Payload shape: { vclock, chunks, size, mtime? }. Legacy
+            //    entries on disk (raw VectorClock) are migrated
+            //    transparently on read.
             if (tx.vclocks && tx.vclocks.length > 0) {
                 for (const v of tx.vclocks) {
                     const key = vclockMetaKey(v.path);
@@ -415,6 +416,7 @@ export class DexieStore<T extends { _id: string; _rev?: string } = any>
                             key,
                             value: {
                                 vclock: v.clock, chunks: v.chunks, size: v.size,
+                                ...(v.mtime !== undefined ? { mtime: v.mtime } : {}),
                                 ...(v.deleted === true ? { deleted: true } : {}),
                             },
                         });

@@ -115,7 +115,7 @@ describe("regression: PR3 classifier reconcile dispatch", () => {
             docs: [{ doc: driftedDoc as unknown as CouchSyncDoc }],
         });
 
-        const relation = await vs.classifyFileVsDoc(driftedDoc, path, stat.size);
+        const relation = await vs.classifyFileVsDoc(driftedDoc, path, stat);
         expect(relation).toBe("vclock-only-drift");
 
         // Reconciler exercise: silent merge updates lastSynced.vclock and
@@ -168,7 +168,7 @@ describe("regression: PR3 classifier reconcile dispatch", () => {
         // User edited the vault to a third state (drift from baseline).
         vault.addFile(path, "v_user user diverged", { size: 21 });
 
-        const relation = await vs.classifyFileVsDoc(remoteDoc, path, 21);
+        const relation = await vs.classifyFileVsDoc(remoteDoc, path, (await vault.stat(path))!);
         expect(relation).toBe("true-divergent");
 
         const fakeOrch = makeFakeOrchestrator();
@@ -200,7 +200,7 @@ describe("regression: PR3 classifier reconcile dispatch", () => {
         vault.addFile(path, "v1 user edit", { size: 12 });
 
         const doc = (await db.get(makeFileId(path))) as FileDoc;
-        const relation = await vs.classifyFileVsDoc(doc, path, 12);
+        const relation = await vs.classifyFileVsDoc(doc, path, (await vault.stat(path))!);
         expect(relation).toBe("local-edit");
 
         const reconciler = new Reconciler(

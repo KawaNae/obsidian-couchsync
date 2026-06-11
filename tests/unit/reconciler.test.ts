@@ -101,9 +101,9 @@ interface FakeVaultSync {
     markDeleted(path: string): Promise<void>;
     applyRemoteDeletion(path: string): Promise<void>;
     hasUnpushedChanges(path: string): Promise<boolean>;
-    classifyFileVsDoc(doc: FileDoc, path: string, size: number): Promise<ClassifyResult>;
-    adoptDocVclock(path: string, doc: FileDoc): Promise<void>;
-    alignLastSyncedToDoc(path: string, doc: FileDoc): Promise<"already-aligned" | "upgraded-legacy" | "recovered-stale">;
+    classifyFileVsDoc(doc: FileDoc, path: string, stat: { mtime: number; size: number }): Promise<ClassifyResult>;
+    adoptDocVclock(path: string, doc: FileDoc, stat?: { mtime: number; size: number }): Promise<void>;
+    alignLastSyncedToDoc(path: string, doc: FileDoc, stat?: { mtime: number; size: number }): Promise<"already-aligned" | "upgraded-legacy" | "recovered-stale" | "stamped-mtime">;
     /** Per-path integration baseline. Empty by default (legacy paths);
      *  tests populate it to exercise the lastSynced-primary Case D logic. */
     lastSyncedMap: Map<string, LastSynced>;
@@ -139,7 +139,7 @@ function makeVaultSync(): FakeVaultSync {
             this.markDeletedCalls.push(path);
         },
         async hasUnpushedChanges(path) { return this.unpushed.has(path); },
-        async classifyFileVsDoc(doc, _path, _size) {
+        async classifyFileVsDoc(doc, _path, _stat) {
             // Fake honours compareResults keyed by vault path — extract
             // from the prefixed _id to match how tests register overrides.
             const key = filePathFromId(doc._id);
@@ -149,10 +149,10 @@ function makeVaultSync(): FakeVaultSync {
             }
             return override;
         },
-        async adoptDocVclock(path, _doc) {
+        async adoptDocVclock(path, _doc, _stat) {
             this.adoptVclockCalls.push(path);
         },
-        async alignLastSyncedToDoc(path, _doc) {
+        async alignLastSyncedToDoc(path, _doc, _stat) {
             this.alignCalls.push(path);
             return "already-aligned" as const;
         },
