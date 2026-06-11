@@ -136,6 +136,88 @@ describe("CouchClient", () => {
         });
     });
 
+    describe("request-body gzip (transport symmetry)", () => {
+        /** A doc list whose JSON body comfortably exceeds the 1 KiB
+         *  compression threshold. */
+        function bigDocs() {
+            return Array.from({ length: 20 }, (_, i) => ({
+                _id: `file:notes/long-name-${i}.md`,
+                type: "file",
+                chunks: Array.from({ length: 10 }, (_, j) => `chunk:x64:deadbeef${i}-${j}`),
+                vclock: { "device-alpha": i, "device-beta": i + 1 },
+            }));
+        }
+
+        async function gunzipToJson(buf: ArrayBuffer): Promise<any> {
+            const ds = new DecompressionStream("gzip");
+            const stream = new Blob([buf]).stream().pipeThrough(ds);
+            return JSON.parse(await new Response(stream).text());
+        }
+
+        it("gzips a large POST body and sets Content-Encoding", async () => {
+            fetchMock.mockResolvedValueOnce(jsonResponse([]));
+            const docs = bigDocs();
+
+            await client().bulkDocs(docs);
+
+            const [, init] = fetchMock.mock.calls[0];
+            expect(init.headers["Content-Encoding"]).toBe("gzip");
+            expect(typeof init.body).not.toBe("string");
+            const roundTripped = await gunzipToJson(init.body);
+            expect(roundTripped).toEqual({ docs });
+        });
+
+        it("leaves small bodies uncompressed", async () => {
+            fetchMock.mockResolvedValueOnce(jsonResponse([]));
+
+            await client().bulkDocs([{ _id: "a", type: "file" }]);
+
+            const [, init] = fetchMock.mock.calls[0];
+            expect(typeof init.body).toBe("string");
+            expect(init.headers?.["Content-Encoding"]).toBeUndefined();
+        });
+
+        it("on 415 retries uncompressed once and latches off for the instance", async () => {
+            const c = client();
+            fetchMock
+                .mockResolvedValueOnce(errorResponse(415, "Unsupported Media Type"))
+                .mockResolvedValueOnce(jsonResponse([]))
+                .mockResolvedValueOnce(jsonResponse([]));
+            const docs = bigDocs();
+
+            await c.bulkDocs(docs);
+
+            expect(fetchMock).toHaveBeenCalledTimes(2);
+            const retryInit = fetchMock.mock.calls[1][1];
+            expect(typeof retryInit.body).toBe("string");
+            expect(JSON.parse(retryInit.body)).toEqual({ docs });
+            expect(retryInit.headers?.["Content-Encoding"]).toBeUndefined();
+
+            // Latch: the next large push skips compression up front.
+            await c.bulkDocs(docs);
+            const nextInit = fetchMock.mock.calls[2][1];
+            expect(typeof nextInit.body).toBe("string");
+        });
+
+        it("does not retry non-415 errors", async () => {
+            fetchMock.mockResolvedValueOnce(errorResponse(401, "Unauthorized"));
+
+            const err: any = await client().bulkDocs(bigDocs()).catch((e) => e);
+            expect(err.status).toBe(401);
+            expect(fetchMock).toHaveBeenCalledTimes(1);
+        });
+
+        it("honours an external abort on the compressed path", async () => {
+            const ctrl = new AbortController();
+            ctrl.abort();
+
+            await expect(
+                client().bulkDocs(bigDocs(), ctrl.signal),
+            ).rejects.toMatchObject({ name: "AbortError" });
+            expect(fetchMock).not.toHaveBeenCalled();
+        });
+    });
+
     describe("allDocs()", () => {
         it("uses query params for range queries", async () => {
             fetchMock.mockResolvedValueOnce(jsonResponse({ rows: [] }));

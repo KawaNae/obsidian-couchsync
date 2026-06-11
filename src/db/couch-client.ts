@@ -22,9 +22,23 @@ import type {
     AttachmentBlob,
 } from "./interfaces.ts";
 import { arrayBufferToBase64 } from "./chunker.ts";
+import { gzipCompress } from "./gzip.ts";
+import { logWarn } from "../ui/log.ts";
 
 /** Default per-request timeout (ms). Longpoll has its own. */
 const DEFAULT_TIMEOUT_MS = 30_000;
+
+/** Request bodies above this size are gzip-compressed on the wire
+ *  (`Content-Encoding: gzip`). Below it the compression overhead isn't
+ *  worth a few hundred saved bytes. Transport-level symmetry with the
+ *  pull direction (server gzips responses, fetch decodes them
+ *  transparently): here the client gzips requests and CouchDB decodes
+ *  them transparently. Distinct from the content-layer codecs
+ *  (CompressingCouchClient / encBody gzip): those compress the payload
+ *  bytes *inside* the envelope; this recovers what the JSON+base64
+ *  wire format inflates around them — measured ~25% of push bytes on
+ *  an encrypted vault (base64 ×1.33 → ×1.005 after gzip). */
+const GZIP_REQUEST_THRESHOLD_BYTES = 1024;
 
 /** Per-chunk stale threshold for streamed body reads. While bytes are
  *  arriving, the request can take arbitrarily long; only sustained
@@ -90,6 +104,14 @@ export class CouchClient implements ICouchClient {
      *  `null` until the first pull-side chunk arrives. */
     private lastPullBodyChunkAt: number | null = null;
 
+    /** Request-body gzip latch. CouchDB (1.1+) transparently decodes
+     *  `Content-Encoding: gzip` requests; a server that doesn't answers
+     *  415, which drops this latch for the instance's lifetime and the
+     *  request is retried uncompressed once. `withTimeout()` siblings
+     *  start fresh — worst case one extra 415 round-trip per derived
+     *  client, which only short-lived probe clients ever pay. */
+    private gzipRequestBody = true;
+
     constructor(opts: CouchClientOpts) {
         // Normalise: strip trailing slash so path concatenation is clean.
         this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
@@ -150,6 +172,36 @@ export class CouchClient implements ICouchClient {
         // touch the network — matches how native fetch() behaves.
         if (externalSignal?.aborted) throw makeAbortError();
 
+        // Transport gzip (push symmetry — see GZIP_REQUEST_THRESHOLD_BYTES).
+        // Built into a separate init so the 415 fallback can re-send the
+        // caller's original, untouched request. Compression happens BEFORE
+        // any timer is armed so its CPU time never eats into the network
+        // timeout budget.
+        let effectiveInit = init;
+        let compressedSent = false;
+        const method = (init.method ?? "GET").toUpperCase();
+        if (
+            this.gzipRequestBody
+            && typeof init.body === "string"
+            && (method === "POST" || method === "PUT")
+        ) {
+            const raw = new TextEncoder().encode(init.body);
+            if (raw.length > GZIP_REQUEST_THRESHOLD_BYTES) {
+                const gz = await gzipCompress(raw);
+                effectiveInit = {
+                    ...init,
+                    // Exact-range ArrayBuffer copy: BodyInit doesn't accept
+                    // the generic Uint8Array view type directly.
+                    body: gz.buffer.slice(gz.byteOffset, gz.byteOffset + gz.byteLength) as ArrayBuffer,
+                    headers: {
+                        ...((init.headers as Record<string, string>) ?? {}),
+                        "Content-Encoding": "gzip",
+                    },
+                };
+                compressedSent = true;
+            }
+        }
+
         const url = `${this.baseUrl}${path}`;
         const controller = new AbortController();
         const headerTimeout = abortMs ?? this.timeoutMs;
@@ -186,8 +238,8 @@ export class CouchClient implements ICouchClient {
 
         try {
             const res = await fetch(url, {
-                ...init,
-                headers: { ...this.headers, ...((init.headers as Record<string, string>) ?? {}) },
+                ...effectiveInit,
+                headers: { ...this.headers, ...((effectiveInit.headers as Record<string, string>) ?? {}) },
                 signal: controller.signal,
             });
 
@@ -196,6 +248,17 @@ export class CouchClient implements ICouchClient {
 
             if (!res.ok) {
                 const body = await res.text().catch(() => "");
+                if (res.status === 415 && compressedSent && this.gzipRequestBody) {
+                    // Server can't decode gzip request bodies. Drop the
+                    // latch and re-send the original request once;
+                    // every later request skips compression up front.
+                    this.gzipRequestBody = false;
+                    logWarn(
+                        "CouchSync: server rejected gzip request body (415) — " +
+                        "falling back to uncompressed requests for this session",
+                    );
+                    return await this.request<T>(path, init, opts);
+                }
                 const err: any = new Error(
                     `CouchDB ${res.status}: ${body || res.statusText}`,
                 );
