@@ -207,6 +207,48 @@ describe("CouchClient", () => {
             expect(fetchMock).toHaveBeenCalledTimes(1);
         });
 
+        it("on a network-layer rejection (CORS preflight) retries uncompressed and latches off", async () => {
+            // Content-Encoding is not CORS-safelisted: a server without it
+            // in cors.headers kills the request before any HTTP exchange —
+            // fetch throws TypeError instead of returning a status.
+            const c = client();
+            fetchMock
+                .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+                .mockResolvedValueOnce(jsonResponse([]))
+                .mockResolvedValueOnce(jsonResponse([]));
+            const docs = bigDocs();
+
+            await c.bulkDocs(docs);
+
+            expect(fetchMock).toHaveBeenCalledTimes(2);
+            const retryInit = fetchMock.mock.calls[1][1];
+            expect(typeof retryInit.body).toBe("string");
+            expect(retryInit.headers?.["Content-Encoding"]).toBeUndefined();
+
+            // Latch: later pushes skip compression up front.
+            await c.bulkDocs(docs);
+            expect(typeof fetchMock.mock.calls[2][1].body).toBe("string");
+        });
+
+        it("restores the latch when the uncompressed probe also fails (genuine outage)", async () => {
+            const c = client();
+            fetchMock
+                .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+                .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+                .mockResolvedValueOnce(jsonResponse([]));
+            const docs = bigDocs();
+
+            const err: any = await c.bulkDocs(docs).catch((e) => e);
+            expect(err).toBeInstanceOf(TypeError);
+            expect(fetchMock).toHaveBeenCalledTimes(2);
+
+            // Latch restored: the next push compresses again.
+            await c.bulkDocs(docs);
+            const nextInit = fetchMock.mock.calls[2][1];
+            expect(typeof nextInit.body).not.toBe("string");
+            expect(nextInit.headers["Content-Encoding"]).toBe("gzip");
+        });
+
         it("honours an external abort on the compressed path", async () => {
             const ctrl = new AbortController();
             ctrl.abort();

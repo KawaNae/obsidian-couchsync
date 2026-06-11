@@ -104,12 +104,19 @@ export class CouchClient implements ICouchClient {
      *  `null` until the first pull-side chunk arrives. */
     private lastPullBodyChunkAt: number | null = null;
 
-    /** Request-body gzip latch. CouchDB (1.1+) transparently decodes
-     *  `Content-Encoding: gzip` requests; a server that doesn't answers
-     *  415, which drops this latch for the instance's lifetime and the
-     *  request is retried uncompressed once. `withTimeout()` siblings
-     *  start fresh — worst case one extra 415 round-trip per derived
-     *  client, which only short-lived probe clients ever pay. */
+    /** Request-body gzip latch. Two ways a server rejects compressed
+     *  requests, both retried uncompressed once and latched off:
+     *    - HTTP 415: the server can't decode gzip bodies.
+     *    - Network-layer failure (fetch TypeError): `Content-Encoding`
+     *      is NOT a CORS-safelisted request header, so it triggers a
+     *      preflight — a CouchDB whose `cors.headers` doesn't include
+     *      `content-encoding` rejects it and fetch throws before any
+     *      HTTP exchange. (Add it server-side to enable compression.)
+     *  The network case keeps the latch off only if the uncompressed
+     *  retry succeeds — otherwise it was a genuine outage, and the
+     *  latch is restored so a transient blip can't permanently disable
+     *  compression. `withTimeout()` siblings start fresh — worst case
+     *  one extra rejected round-trip per derived client. */
     private gzipRequestBody = true;
 
     constructor(opts: CouchClientOpts) {
@@ -318,6 +325,31 @@ export class CouchClient implements ICouchClient {
                 const err: any = new Error(`CouchDB request timed out after ${headerTimeout}ms`);
                 err.status = 0;
                 throw err;
+            }
+            // Compressed request died at the network layer (fetch
+            // TypeError — no HTTP exchange happened). Typical cause: the
+            // Content-Encoding header forced a CORS preflight the server
+            // rejects (see the latch doc). Indistinguishable up front
+            // from a genuine outage, so probe with the original
+            // uncompressed request: success → the compression was the
+            // problem, latch stays off; failure → real outage, restore
+            // the latch and surface the ORIGINAL error.
+            if (compressedSent && this.gzipRequestBody && e instanceof TypeError) {
+                this.gzipRequestBody = false;
+                let result: T;
+                try {
+                    result = await this.request<T>(path, init, opts);
+                } catch {
+                    this.gzipRequestBody = true;
+                    throw e;
+                }
+                logWarn(
+                    "CouchSync: compressed request rejected at network layer " +
+                    "(CORS preflight?) — falling back to uncompressed requests " +
+                    "for this session. Add 'content-encoding' to CouchDB " +
+                    "cors.headers to enable push compression.",
+                );
+                return result;
             }
             throw e;
         } finally {
