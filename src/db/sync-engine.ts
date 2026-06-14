@@ -75,18 +75,38 @@ const TRANSPORT_GRACE_MS = 30_000;
  *  to a hard `error`. The live session may self-heal inside this window. */
 const TRANSIENT_ESCALATION_MS = 10_000;
 
-/** Upper bound on `info()` during verifyReachable. The default HTTP
+/** Total budget for verifyReachable — how long we keep retrying fresh
+ *  probes before concluding the server is unreachable. The default HTTP
  *  timeout is 30s — too long for a reachability probe.
  *
- *  - `app-resume` / `network-online` use 15s because the mobile network
- *    stack often takes several seconds to come back after suspend
- *    (2026-04-22 main vault log: 5001ms abort followed by 18s recovery
- *    via retry-backoff). A longer ceiling on these reasons absorbs the
- *    slow-revival case in one round-trip.
+ *  This is the *outer* of two timescales (see VERIFY_ATTEMPT_TIMEOUT_MS
+ *  for the inner per-attempt patience). They are deliberately separate:
+ *
+ *  - `app-resume` / `network-online` use a 15s budget because the mobile
+ *    network stack often takes several seconds to come back after suspend.
+ *    Slow revival is absorbed by *re-issuing short probes* across the
+ *    budget — NOT by waiting out one long probe. (2026-06-14 main-vault
+ *    iPad logs: the first post-resume `info()` rode a suspend-killed
+ *    socket and hung the full 15s ceiling — err=aborted — while a fresh
+ *    probe ~1s later returned in 28-311ms. A single long ceiling does not
+ *    absorb revival; it just squats on a dead socket.)
  *  - All other reasons (retry-backoff, periodic-tick, etc.) stay at 5s.
  */
 const VERIFY_REACHABLE_TIMEOUT_FAST_MS = 5_000;
 const VERIFY_REACHABLE_TIMEOUT_RESUME_MS = 15_000;
+
+/** Per-attempt patience: how long one `info()` probe may run before we
+ *  abandon it and issue a fresh one within the budget. Observed healthy
+ *  probes returned in ≤2072ms, so 3s never falsely abandons a live-but-slow
+ *  network; a suspend-killed socket hangs far past this, so it is reliably
+ *  cut loose and re-probed. */
+const VERIFY_ATTEMPT_TIMEOUT_MS = 3_000;
+
+/** Minimum spacing between probe *starts*. When a probe fails fast (e.g.
+ *  "Load failed" while the network is momentarily down), this prevents a
+ *  tight fetch busy-loop. Matches the empirical ~1s gap after which a
+ *  re-issued probe succeeded in the iPad logs. */
+const VERIFY_ATTEMPT_MIN_SPACING_MS = 1_000;
 
 /** Pick the verify-reachable timeout for a reconnect reason. Exported
  *  for unit testing — production calls go through `verifyReachable`. */
@@ -1065,71 +1085,118 @@ export class SyncEngine {
 
     private async verifyReachable(rc = 0, reason: ReconnectReason = "periodic-tick"): Promise<boolean> {
         const tag = rc > 0 ? `[rc#${rc}] ` : "";
+        const session = this.session;
+        const via = session ? "session-client" : "probe-client";
+        // The probe client. Each info() issues a fresh fetch, so re-invoking
+        // it escapes a suspend-killed socket that a single long probe would
+        // squat on (2026-06-14 iPad logs: first post-resume probe hung 15s,
+        // a re-issued one returned in tens of ms).
+        const client = session ? session.client : this.clientFactory(this.getSettings());
+
+        // Two timescales: an outer budget (how long we keep trying) and an
+        // inner per-attempt timeout (when to abandon one stuck probe and
+        // re-issue a fresh one). See the constant comments above.
+        const budget = verifyTimeoutMs(reason);
+        const t0 = Date.now();
+        const deadline = t0 + budget;
         let err: string | null = null;
         let errName: string | null = null;
-        const session = this.session;
-        const t0 = Date.now();
-        const via = session ? "session-client" : "probe-client";
-        // Reason-aware probe ceiling: app-resume / network-online get
-        // a longer budget for mobile network revival; faster reasons
-        // stay at 5s so a hung socket can't block the reconnect chain.
-        const timeoutMs = verifyTimeoutMs(reason);
-        const timeoutCtl = new AbortController();
-        const timer = setTimeout(() => timeoutCtl.abort(), timeoutMs);
-        try {
-            if (session) {
-                try {
-                    await session.client.info(timeoutCtl.signal);
-                } catch (e: any) {
-                    err = e?.message || "Connection failed";
-                    errName = e?.name ?? null;
-                }
-            } else {
-                try {
-                    const probe = this.clientFactory(this.getSettings());
-                    await probe.info(timeoutCtl.signal);
-                } catch (e: any) {
-                    err = e?.message || "Connection failed";
-                    errName = e?.name ?? null;
-                }
+        let errStatus: number | undefined;
+        let attempt = 0;
+
+        while (Date.now() < deadline) {
+            attempt++;
+            const attemptStart = Date.now();
+            const perAttempt = Math.min(VERIFY_ATTEMPT_TIMEOUT_MS, deadline - attemptStart);
+            const ctl = new AbortController();
+            const timer = setTimeout(() => ctl.abort(), perAttempt);
+            err = null;
+            errName = null;
+            errStatus = undefined;
+            try {
+                await client.info(ctl.signal);
+            } catch (e: any) {
+                err = e?.message || "Connection failed";
+                errName = e?.name ?? null;
+                errStatus = typeof e?.status === "number" ? e.status : undefined;
+            } finally {
+                clearTimeout(timer);
             }
-        } finally {
-            clearTimeout(timer);
-        }
-        const elapsed = Date.now() - t0;
-        logDebug(`${tag}verify: info() via ${via} returned in ${elapsed}ms (err=${err ?? "none"})`);
-        if (err) {
-            const detail = classifyError({ message: err, name: errName });
-            // Suspend-frozen verify (#6/#7): the request was aborted, but the
-            // elapsed wall-clock is far beyond what our own `timeoutMs` timer
-            // could have produced — the process was frozen in mobile
-            // background and the OS tore the socket on resume. This proves
-            // nothing about reachability. Treat as inconclusive: do NOT enter
-            // a hard error (that caused the spurious "Server unreachable"
+            const attemptElapsed = Date.now() - attemptStart;
+            logDebug(
+                `${tag}verify attempt ${attempt}: info() via ${via} ` +
+                `returned in ${attemptElapsed}ms (err=${err ?? "none"})`,
+            );
+
+            if (!err) {
+                logDebug(
+                    `${tag}verify: reachable after ${attempt} attempt(s) in ${Date.now() - t0}ms`,
+                );
+                return true;
+            }
+
+            const detail = classifyError({ message: err, name: errName, status: errStatus });
+
+            // Suspend-frozen verify (#6/#7): the probe was aborted, but this
+            // single attempt's wall-clock is far beyond what its own
+            // per-attempt timer could have produced — the process was frozen
+            // in mobile background and the OS tore the socket on resume. This
+            // proves nothing about reachability. Treat as inconclusive: do NOT
+            // enter a hard error (that caused the spurious "Server unreachable"
             // toast and the connected→error churn). Stay reconnecting and
             // schedule a silent re-verify, which settles now that we've woken.
-            if (detail.kind === "aborted" && elapsed > timeoutMs * 2) {
+            if (detail.kind === "aborted" && attemptElapsed > VERIFY_ATTEMPT_TIMEOUT_MS * 2) {
                 logDebug(
                     `${tag}verify: inconclusive suspend-abort ` +
-                    `(elapsed ${elapsed}ms ≫ timeout ${timeoutMs}ms) — silent re-verify`,
+                    `(attempt ${attemptElapsed}ms ≫ per-attempt ${VERIFY_ATTEMPT_TIMEOUT_MS}ms) — silent re-verify`,
                 );
                 if (this.state !== "error") this.setState("reconnecting");
                 this.scheduleNextAttempt();
                 return false;
             }
-            // A genuine timeout (our own abort fired at ~timeoutMs) or any
-            // other transient: surface as network so the status bar shows it,
-            // but no toast (the host filters transient kinds). (#1d)
-            if (detail.kind === "unknown" || detail.kind === "aborted") {
-                detail.kind = "network";
-                detail.message = `Server unreachable: ${err}`;
+
+            // Definitive outcomes — the server answered (auth / not-found /
+            // server) or it's a terminal condition (schema-mismatch /
+            // encryption-paused). Re-probing cannot change these, so bail to
+            // enterError at once (preserving the original prompt surfacing;
+            // the outer backoff loop owns any retry of server-side errors).
+            if (
+                detail.kind === "auth" ||
+                detail.kind === "schema-mismatch" ||
+                detail.kind === "encryption-paused" ||
+                detail.kind === "not-found" ||
+                detail.kind === "server"
+            ) {
+                if (this.state !== "error") this.enterError(detail);
+                return false;
             }
-            if (this.state !== "error") {
-                this.enterError(detail);
+
+            // Otherwise (network / timeout / our-own-abort / unknown): a
+            // connectivity failure that a fresh probe within budget may clear.
+            // If the probe failed fast, space the next start so we don't hammer
+            // fetch in a tight loop.
+            const remaining = deadline - Date.now();
+            if (remaining > 0) {
+                const spacing = VERIFY_ATTEMPT_MIN_SPACING_MS - attemptElapsed;
+                if (spacing > 0) {
+                    await new Promise((r) => setTimeout(r, Math.min(spacing, remaining)));
+                }
             }
-            return false;
         }
-        return true;
+
+        // Budget exhausted without a reachable probe: genuinely unreachable.
+        // Surface as network so the status bar shows it, but no toast (the
+        // host filters transient kinds). (#1d)
+        const detail = classifyError({ message: err ?? "timeout", name: errName, status: errStatus });
+        if (detail.kind === "unknown" || detail.kind === "aborted") {
+            detail.kind = "network";
+            detail.message = `Server unreachable: ${err ?? "timeout"}`;
+        }
+        logDebug(`${tag}verify: unreachable after ${attempt} attempt(s) in ${Date.now() - t0}ms`);
+        if (this.state !== "error") {
+            this.enterError(detail);
+        }
+        return false;
     }
 
     // ── Internal: Helpers ─────────────────────────────────

@@ -142,20 +142,22 @@ describe("SyncEngine retry supervisor", () => {
         await a.engine.start();
         expect(a.engine.getState()).toBe("connected");
 
-        // Stub the live session's reachability probe to reject like a
-        // suspend-frozen request (AbortError), and fake the wall-clock so the
-        // measured elapsed dwarfs the app-resume timeout (15s) — the signature
-        // of a background freeze rather than a genuine 15s timeout.
-        (a.engine as any).session.client.info = () =>
-            Promise.reject(Object.assign(new Error("The operation was aborted."), { name: "AbortError" }));
-        const realNow = Date.now;
-        let calls = 0;
-        Date.now = () => (calls++ === 0 ? 1_000_000 : 1_000_000 + 10_000_000);
+        // A single probe whose wall-clock dwarfs the per-attempt timeout is the
+        // signature of a background freeze (the OS froze the process mid-fetch),
+        // not a genuine timeout. Model it with fake timers: the probe rejects
+        // AbortError after 10s of wall-clock have elapsed within one attempt.
+        vi.useFakeTimers();
         try {
+            (a.engine as any).session.client.info = () => {
+                vi.setSystemTime(Date.now() + 10_000);
+                return Promise.reject(
+                    Object.assign(new Error("The operation was aborted."), { name: "AbortError" }),
+                );
+            };
             const ok = await (a.engine as any).verifyReachable(1, "app-resume");
             expect(ok).toBe(false);
         } finally {
-            Date.now = realNow;
+            vi.useRealTimers();
         }
 
         // The key invariant: a suspend-abort must NOT enter the hard error
@@ -167,25 +169,133 @@ describe("SyncEngine retry supervisor", () => {
         a.engine.stop();
     });
 
-    it("verify: a genuine timeout (elapsed ≈ timeout) still enters error (#1b contrast)", async () => {
+    it("verify: every probe failing until budget exhaustion enters a network error (#1b contrast)", async () => {
         h = createSyncHarness();
         const a = h.addDevice("dev-A");
         await a.engine.start();
 
-        (a.engine as any).session.client.info = () =>
-            Promise.reject(Object.assign(new Error("The operation was aborted."), { name: "AbortError" }));
-        const realNow = Date.now;
-        let calls = 0;
-        // Elapsed ≈ the app-resume timeout → our own timer fired, server is
-        // genuinely unreachable. Must surface as a hard (network) error.
-        Date.now = () => (calls++ === 0 ? 1_000_000 : 1_000_000 + 15_010);
+        vi.useFakeTimers();
+        let attempts = 0;
         try {
+            (a.engine as any).session.client.info = () => {
+                attempts++;
+                // Each probe is aborted at the 3s per-attempt ceiling — a
+                // genuinely unreachable server, not a freeze (elapsed ≈ ceiling).
+                vi.setSystemTime(Date.now() + 3_000);
+                return Promise.reject(
+                    Object.assign(new Error("The operation was aborted."), { name: "AbortError" }),
+                );
+            };
             await (a.engine as any).verifyReachable(1, "app-resume");
         } finally {
-            Date.now = realNow;
+            vi.useRealTimers();
         }
+        // 15s budget / 3s per attempt → 5 probes, then a hard network error.
+        expect(attempts).toBe(5);
         expect(a.engine.getState()).toBe("error");
         expect((a.engine as any).lastErrorDetail?.kind).toBe("network");
+        a.engine.stop();
+    });
+
+    it("verify: abandons a stuck probe and succeeds on a fresh re-probe (dead-socket recovery)", async () => {
+        h = createSyncHarness();
+        const a = h.addDevice("dev-A");
+        await a.engine.start();
+
+        vi.useFakeTimers();
+        let attempts = 0;
+        let result: boolean | undefined;
+        try {
+            (a.engine as any).session.client.info = () => {
+                attempts++;
+                if (attempts === 1) {
+                    // First probe rides the suspend-killed socket: aborted at
+                    // the 3s ceiling (elapsed ≈ ceiling, so NOT a freeze).
+                    vi.setSystemTime(Date.now() + 3_000);
+                    return Promise.reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+                }
+                // Fresh probe connects immediately.
+                return Promise.resolve({ db_name: "fake", doc_count: 0, update_seq: 0 });
+            };
+            result = await (a.engine as any).verifyReachable(1, "app-resume");
+        } finally {
+            vi.useRealTimers();
+        }
+        expect(attempts).toBe(2);
+        expect(result).toBe(true);
+        expect(a.engine.getState()).not.toBe("error");
+        a.engine.stop();
+    });
+
+    it("verify: a live-but-slow probe under the per-attempt ceiling succeeds in one attempt (no regression)", async () => {
+        h = createSyncHarness();
+        const a = h.addDevice("dev-A");
+        await a.engine.start();
+
+        vi.useFakeTimers();
+        let attempts = 0;
+        let result: boolean | undefined;
+        try {
+            (a.engine as any).session.client.info = () => {
+                attempts++;
+                // 2s — slower than typical but well under the 3s ceiling, so it
+                // must NOT be falsely abandoned.
+                vi.setSystemTime(Date.now() + 2_000);
+                return Promise.resolve({ db_name: "fake", doc_count: 0, update_seq: 0 });
+            };
+            result = await (a.engine as any).verifyReachable(1, "app-resume");
+        } finally {
+            vi.useRealTimers();
+        }
+        expect(attempts).toBe(1);
+        expect(result).toBe(true);
+        a.engine.stop();
+    });
+
+    it("verify: fast-failing probes are spaced, bounding the attempt count within budget", async () => {
+        h = createSyncHarness();
+        const a = h.addDevice("dev-A");
+        await a.engine.start();
+
+        vi.useFakeTimers();
+        let attempts = 0;
+        try {
+            (a.engine as any).session.client.info = () => {
+                attempts++;
+                // Network momentarily down: fetch rejects instantly.
+                return Promise.reject(new Error("Failed to fetch"));
+            };
+            const p = (a.engine as any).verifyReachable(1, "app-resume");
+            // Drive the ~1s inter-probe spacing across the whole 15s budget.
+            await vi.advanceTimersByTimeAsync(15_000);
+            await p;
+        } finally {
+            vi.useRealTimers();
+        }
+        // ~1 probe/second over 15s — bounded, NOT a tight fetch busy-loop.
+        expect(attempts).toBeGreaterThan(10);
+        expect(attempts).toBeLessThanOrEqual(16);
+        expect(a.engine.getState()).toBe("error");
+        expect((a.engine as any).lastErrorDetail?.kind).toBe("network");
+        a.engine.stop();
+    });
+
+    it("verify: a server-answered failure (auth) bails immediately without re-probing", async () => {
+        h = createSyncHarness();
+        const a = h.addDevice("dev-A");
+        await a.engine.start();
+
+        let attempts = 0;
+        (a.engine as any).session.client.info = () => {
+            attempts++;
+            return Promise.reject(Object.assign(new Error("unauthorized"), { status: 401 }));
+        };
+        const result = await (a.engine as any).verifyReachable(1, "app-resume");
+        expect(attempts).toBe(1);
+        expect(result).toBe(false);
+        // auth is terminal — re-probing can't help, and the latch must respond.
+        expect(a.engine.getState()).toBe("error");
+        expect((a.engine as any).lastErrorDetail?.kind).toBe("auth");
         a.engine.stop();
     });
 
@@ -370,16 +480,20 @@ describe("SyncEngine retry supervisor", () => {
         a.engine.stop();
     });
 
-    it("verifyReachable aborts info() after 5 seconds when the call hangs", async () => {
+    it("verifyReachable re-probes hanging calls within the budget, then gives up (real timers)", async () => {
         h = createSyncHarness();
         const a = h.addDevice("dev-A");
         await a.engine.start();
 
-        // Replace session.client.info() with one that hangs forever unless
-        // its signal is aborted. The engine must abort it after ~5s.
+        // Replace session.client.info() with one that hangs forever unless its
+        // signal is aborted. With the default reason (periodic-tick → 5s
+        // budget), the engine abandons each stuck probe at the 3s per-attempt
+        // ceiling and re-issues a fresh one, giving up when the budget runs out.
         const session = (a.engine as any).session;
+        let attempts = 0;
         let gotSignal: AbortSignal | undefined;
         session.client.info = (signal?: AbortSignal) => {
+            attempts++;
             gotSignal = signal;
             return new Promise((_resolve, reject) => {
                 signal?.addEventListener("abort", () => {
@@ -394,10 +508,11 @@ describe("SyncEngine retry supervisor", () => {
         const result = await (a.engine as any).verifyReachable(99);
         const elapsed = Date.now() - t0;
 
-        // The hang was aborted — verify returned false with err != null.
         expect(result).toBe(false);
         expect(gotSignal).toBeDefined();
-        // Tolerate ±1s jitter; test must not wait the default 30s.
+        // Re-probed rather than waiting out one long call.
+        expect(attempts).toBeGreaterThanOrEqual(2);
+        // Total bounded by the ~5s budget; must not wait the default 30s.
         expect(elapsed).toBeLessThan(7_000);
         expect(elapsed).toBeGreaterThan(3_500);
         a.engine.stop();
