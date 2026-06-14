@@ -24,7 +24,7 @@
  * either the saved `couchdbConfigDbName` is empty (disabled) or it's
  * set (ready).
  */
-import { type App, Notice, Setting, type ButtonComponent } from "obsidian";
+import { type App, Notice, Platform, Setting, type ButtonComponent } from "obsidian";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { ConfigSync } from "../sync/config-sync.ts";
 import type { SyncEngine } from "../db/sync-engine.ts";
@@ -450,6 +450,20 @@ export class ConfigSyncTab {
                 "device-local — they are not themselves synced.",
             cls: "setting-item-description",
         });
+        el.createEl("p", {
+            text: "The tree lists config present on THIS device; the per-unit " +
+                "defaults also govern plugins, themes and snippets that arrive " +
+                "from other devices.",
+            cls: "setting-item-description",
+        });
+        if (Platform.isMobile) {
+            const note = el.createEl("p", {
+                text: "On this mobile device, desktop-only plugins are never " +
+                    "received — their settings stay on desktop even when selected.",
+                cls: "setting-item-description",
+            });
+            note.style.color = "var(--text-accent)";
+        }
 
         new Setting(el)
             .setName("Don't sync plugin code (JavaScript)")
