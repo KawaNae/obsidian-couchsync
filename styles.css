@@ -204,6 +204,14 @@
     color: var(--text-faint);
 }
 
+/* Provenance tag: where a config row currently lives (synced / local only /
+   on server) plus any receive-gate hint. Muted so the path stays primary. */
+.cs-prov {
+    margin-left: 8px;
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
 /* ─── Mobile Status (fixed to editor bottom-left) ────────── */
 
 .cs-mobile-status {

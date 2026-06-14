@@ -870,6 +870,27 @@ export class ConfigSync {
         });
     }
 
+    /** Quiet remote config path list for the settings filter tree's "on
+     *  server" provenance. Unlike listRemotePaths it does NOT run inside a
+     *  ConfigOperation epoch — no ProgressNotice (the tree fetches this on
+     *  every render) and no inflight-op lock (so it never collides with a
+     *  live sync). Only doc ids are read (allDocs), never bodies, so no
+     *  decryption is needed; config doc ids are plaintext `config:<path>`.
+     *  Best-effort: callers treat a throw as "remote unknown" and fall back
+     *  to the local-only view. */
+    async listRemoteConfigPathsQuiet(): Promise<string[]> {
+        const client = this.makeConfigClient();
+        if (!client) return [];
+        const ids = await remoteCouch.listRemoteByPrefix(
+            client.withTimeout(CONFIG_TIMEOUTS.reachability),
+            DOC_ID.CONFIG,
+            new AbortController().signal,
+        );
+        return ids
+            .map(configPathFromId)
+            .filter((p) => p.startsWith(".obsidian/"));
+    }
+
     /** List installed plugin folder paths (fallback when remote unavailable) */
     async listPluginFolders(): Promise<string[]> {
         const folders: string[] = [];

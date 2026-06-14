@@ -91,6 +91,17 @@ interface Draft {
     db: string;
 }
 
+/** One filter-tree row: a classified config path plus where it currently
+ *  exists — on THIS device (`local`), on the remote config DB (`remote`),
+ *  or both. The union of the two sources is what the tree renders, so the
+ *  user can see config that lives only on the server (e.g. a plugin's
+ *  settings they haven't installed yet) and not just their local files. */
+interface TreeItem {
+    c: ClassifiedPath;
+    local: boolean;
+    remote: boolean;
+}
+
 export class ConfigSyncTab {
     private draft: Draft;
     private testPassed = false;
@@ -99,6 +110,12 @@ export class ConfigSyncTab {
     private testBtn: ButtonComponent | null = null;
     private applyBtn: ButtonComponent | null = null;
     private applyDesc: HTMLElement | null = null;
+
+    /** Short-lived cache of the remote config path list so re-rendering the
+     *  tree (every settings refresh, incl. after each checkbox toggle) does
+     *  not re-hit the network each time. */
+    private remoteCache: { paths: string[]; ok: boolean; at: number } | null = null;
+    private static readonly REMOTE_TTL_MS = 30_000;
 
     constructor(private deps: ConfigSyncTabDeps) {
         this.draft = this.savedToDraft();
@@ -495,9 +512,9 @@ export class ConfigSyncTab {
     }
 
     private async populateFilterTree(treeEl: HTMLElement): Promise<void> {
-        let paths: string[];
+        let localPaths: string[];
         try {
-            paths = await this.deps.configSync.listLocalConfigPaths();
+            localPaths = await this.deps.configSync.listLocalConfigPaths();
         } catch (e: any) {
             treeEl.empty();
             treeEl.createEl("p", {
@@ -506,15 +523,41 @@ export class ConfigSyncTab {
             });
             return;
         }
+
+        // Remote is best-effort: the tree still works offline, just without
+        // the "on server" provenance. A short TTL cache keeps checkbox
+        // toggles (which re-render the whole tab) from re-hitting the network.
+        const { paths: remotePaths, ok: remoteOk } = await this.fetchRemotePathsCached();
+
         treeEl.empty();
         const policy = this.deps.getSettings().configSyncPolicy;
 
-        const byUnit = new Map<ConfigUnit, ClassifiedPath[]>();
-        for (const p of paths) {
-            const c = classifyConfigPath(p);
+        // Merge local ∪ remote, tagging each path with where it lives.
+        const prov = new Map<string, { local: boolean; remote: boolean }>();
+        for (const p of localPaths) prov.set(p, { local: true, remote: false });
+        for (const p of remotePaths) {
+            const e = prov.get(p);
+            if (e) e.remote = true;
+            else prov.set(p, { local: false, remote: true });
+        }
+
+        const byUnit = new Map<ConfigUnit, TreeItem[]>();
+        for (const [path, pr] of prov) {
+            const c = classifyConfigPath(path);
             const arr = byUnit.get(c.unit) ?? [];
-            arr.push(c);
+            arr.push({ c, local: pr.local, remote: pr.remote });
             byUnit.set(c.unit, arr);
+        }
+        for (const arr of byUnit.values()) {
+            arr.sort((a, b) => a.c.path.localeCompare(b.c.path));
+        }
+
+        if (!remoteOk) {
+            treeEl.createEl("p", {
+                text: "Server not reachable — showing this device's config only " +
+                    "(no “on server” status).",
+                cls: "setting-item-description",
+            });
         }
 
         treeEl.createEl("h5", { text: "Portable settings" });
@@ -535,10 +578,30 @@ export class ConfigSyncTab {
         }
     }
 
+    /** Fetch the remote config path list, memoised for a short TTL. Returns
+     *  `ok: false` (and an empty list) when the remote is unreachable, so the
+     *  tree degrades to a local-only view instead of failing. */
+    private async fetchRemotePathsCached(): Promise<{ paths: string[]; ok: boolean }> {
+        const now = Date.now();
+        if (this.remoteCache && now - this.remoteCache.at < ConfigSyncTab.REMOTE_TTL_MS) {
+            return { paths: this.remoteCache.paths, ok: this.remoteCache.ok };
+        }
+        let paths: string[] = [];
+        let ok = false;
+        try {
+            paths = await this.deps.configSync.listRemoteConfigPathsQuiet();
+            ok = true;
+        } catch {
+            // Offline / unreachable / auth — fall back to local-only.
+        }
+        this.remoteCache = { paths, ok, at: now };
+        return { paths, ok };
+    }
+
     private renderUnit(
         parent: HTMLElement,
         unit: ConfigUnit,
-        items: ClassifiedPath[],
+        items: TreeItem[],
         policy: ConfigSyncPolicy,
     ): void {
         const locked = policy.blockPluginCode && unit === "install-state";
@@ -547,20 +610,27 @@ export class ConfigSyncTab {
         const groupCb = summary.createEl("input", { cls: "cs-unit-group" }) as HTMLInputElement;
         groupCb.type = "checkbox";
 
-        const effs = items.map((c) => sendDecision(policy, c));
+        const effs = items.map((it) => sendDecision(policy, it.c));
         const allOn = effs.length > 0 && effs.every(Boolean);
         const anyOn = effs.some(Boolean);
         groupCb.checked = items.length > 0 ? allOn : (policy.unitDefaults[unit] ?? false);
         groupCb.indeterminate = anyOn && !allOn;
         groupCb.disabled = locked;
+        // Count shows the union size, calling out items that exist only on the
+        // server (not yet on this device) so the "+N on server" is visible
+        // without expanding the group.
+        const serverOnly = items.filter((it) => it.remote && !it.local).length;
+        const count = serverOnly > 0
+            ? `${items.length}, +${serverOnly} on server`
+            : `${items.length}`;
         summary.createSpan({
-            text: ` ${UNIT_LABELS[unit]} (${items.length})${locked ? " — locked by JS safety" : ""}`,
+            text: ` ${UNIT_LABELS[unit]} (${count})${locked ? " — locked by JS safety" : ""}`,
         });
 
         groupCb.addEventListener("change", async () => {
             const on = groupCb.checked;
             const overrides = { ...policy.overrides };
-            for (const c of items) delete overrides[c.path];
+            for (const it of items) delete overrides[it.c.path];
             await this.updatePolicy({
                 unitDefaults: { ...policy.unitDefaults, [unit]: on },
                 overrides,
@@ -569,7 +639,8 @@ export class ConfigSyncTab {
         });
 
         const list = details.createDiv({ cls: "cs-unit-children" });
-        for (const c of items) {
+        for (const it of items) {
+            const c = it.c;
             const row = list.createDiv({ cls: "cs-unit-child" });
             const cb = row.createEl("input") as HTMLInputElement;
             cb.type = "checkbox";
@@ -578,6 +649,17 @@ export class ConfigSyncTab {
             row.createSpan({
                 text: ` ${c.path.replace(".obsidian/", "")}${c.isPluginCode ? " ⚠️" : ""}`,
             });
+            // Provenance + receive-gate hint. "on server" items that a gate
+            // would block on this device explain why (e.g. the plugin isn't
+            // installed here yet).
+            let prov: string;
+            if (it.local && it.remote) prov = "synced";
+            else if (it.local) prov = "local only";
+            else prov = "on server";
+            if (!it.local && c.unit === "community-settings") {
+                prov += " — install the plugin to receive";
+            }
+            row.createSpan({ cls: "cs-prov", text: prov });
             cb.addEventListener("change", async () => {
                 const overrides = { ...policy.overrides };
                 const unitDef = policy.unitDefaults[c.unit] ?? false;
