@@ -2,6 +2,70 @@
 
 All notable changes to obsidian-couchsync.
 
+## 0.29.0
+
+Three structural changes: a first-principles redesign of config sync that
+closes a plaintext-config code-execution surface, a content-truthful
+convergence rule that ends a class of silent non-propagation, and a
+two-timescale reconnect probe that fixes slow mobile resume recovery.
+
+### Security
+
+- **Config sync now filters by meaning-unit with a send/receive policy that
+  structurally excludes executable code on receive.** The old
+  `configSyncPaths` string list governed only the receive side; a
+  compromised or malicious remote could push plugin/JS code that a
+  receiving device wrote into `.obsidian` and Obsidian then executed. The
+  new policy classifies each config path into a meaning-unit and projects
+  it through two gates — `receiveDecision = sendDecision && gates`, with the
+  receive projection a strict subset of send. Install-state (plugin
+  `main.js`/`manifest.json`/`styles.css`, any `.js`/`.mjs`/`.cjs`) defaults
+  off and is hard-locked off in both directions by `blockPluginCode`, which
+  migration forces on. A desktop-only platform gate (judged against the
+  local on-disk manifest, never a remote-supplied one) keeps desktop-only
+  units off mobile. Path classification is case-strict on the safe side, so
+  case/prefix/depth tricks cannot promote code into a default-on unit.
+
+### Reliability
+
+- **Content-truthful convergence — no more silent equal-vclock overwrites.**
+  A converge/skip decision now requires the vclock, the chunk list, AND the
+  deleted flag to all match; a vclock tie with differing content surfaces as
+  a true-divergent conflict instead of being dropped. Applied symmetrically
+  across vault and config, pull and push, behind a single shared
+  chunk-equality comparator. The seq-regression self-heal threads a
+  `recreateAuthority` signal into the classifier so a remote-recreate
+  re-pull (e.g. an encryption Init that rotates the HMAC key and changes
+  chunk ids for identical content) resolves an exact vclock tie to
+  take-remote instead of flooding false concurrent conflicts.
+- **Config setup is split into Init and Push.** Init wipes structure and
+  pins `config:meta` only (no content seed); Push is the filter-governed
+  seed. A checkpoint `load()` fix (meta-absent now resets the cursor to 0,
+  symmetric with the vault side) stops an Init-then-push from skipping the
+  seed. The settings tab reflects the new flow (Setup: Init / Sync: Filter →
+  Push → Pull & Reload) and the filter tree shows the local ∪ remote unit
+  set with provenance.
+
+- **App-resume recovery no longer stalls on a suspend-killed socket
+  (measured ~16s → ~3.5s worst case on iPad).** `verifyReachable` issued one
+  `info()` through the session's keep-alive socket, which iOS tears down
+  during background suspend; that fetch hung the full 15s reachability
+  budget while the network was healthy (a fresh probe ~1s later returned in
+  tens of ms). The probe now separates the total budget from a 3s
+  per-attempt timeout: a stuck probe is abandoned and a fresh fetch
+  re-issued within budget, with 1s spacing to avoid a busy loop. Healthy
+  probes (observed ≤2s) are unaffected. Server-answered failures bail
+  immediately and 401s are now classified correctly.
+
+### Migration
+
+- Existing `configSyncPaths` settings migrate to the new policy on the safe
+  side (`blockPluginCode` forced on), with a one-time notice. A legacy empty
+  `configSyncPaths` (which meant "receive nothing") maps to the default
+  policy with portable settings on, so a previously-dormant receiver begins
+  syncing portable (non-executable, gated) config on the next manual Pull.
+  No schema change to vault documents; no re-Init required.
+
 ## 0.28.4
 
 An efficiency release built from a measured investigation on three real
