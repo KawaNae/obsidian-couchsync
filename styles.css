@@ -150,32 +150,58 @@
 
 /* ─── Config Sync Suggestions ─────────────────────────────── */
 
-.cs-suggest-list {
-    max-height: 200px;
-    overflow-y: auto;
+/* ─── Config Sync filter tree (meaning-unit policy) ───────── */
+
+.cs-config-tree {
     border: 1px solid var(--background-modifier-border);
     border-radius: 4px;
     margin: 4px 0 8px;
-    padding: 4px;
+    padding: 6px 8px;
 }
 
-.cs-suggest-header {
-    font-size: 11px;
+.cs-config-tree h5 {
+    margin: 8px 0 4px;
+    font-size: 12px;
     color: var(--text-muted);
-    padding: 4px 8px 2px;
-    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
 }
 
-.cs-suggest-item {
-    padding: 4px 8px;
+.cs-config-tree details.cs-unit {
+    margin: 2px 0;
+}
+
+.cs-config-tree summary {
     cursor: pointer;
-    border-radius: 3px;
+    padding: 2px 0;
+    font-size: 13px;
+    list-style-position: inside;
+}
+
+.cs-config-tree summary input.cs-unit-group {
+    vertical-align: middle;
+    margin-right: 2px;
+}
+
+.cs-unit-children {
+    margin: 2px 0 4px 20px;
+    border-left: 2px solid var(--background-modifier-border);
+    padding-left: 8px;
+}
+
+.cs-unit-child {
+    padding: 1px 0;
     font-size: 12px;
     font-family: var(--font-monospace);
 }
 
-.cs-suggest-item:hover {
-    background: var(--background-modifier-hover);
+.cs-unit-child input {
+    vertical-align: middle;
+    margin-right: 4px;
+}
+
+.cs-unit-child input:disabled + span {
+    color: var(--text-faint);
 }
 
 /* ─── Mobile Status (fixed to editor bottom-left) ────────── */

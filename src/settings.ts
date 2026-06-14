@@ -1,3 +1,6 @@
+import type { ConfigSyncPolicy } from "./sync/config-policy/policy.ts";
+import { defaultConfigSyncPolicy } from "./sync/config-policy/policy.ts";
+
 /** Keep only the N most recent previous device IDs. */
 export const MAX_PREVIOUS_DEVICE_IDS = 10;
 
@@ -46,7 +49,14 @@ export interface CouchSyncSettings {
     syncFilter: string;
     syncIgnore: string;
     maxFileSizeMB: number;
-    configSyncPaths: string[];
+    /** Config-sync filter: a single meaning-unit policy enforced symmetrically
+     *  on send (scan) and receive (write). Replaces the legacy
+     *  `configSyncPaths: string[]` receive-only allowlist (migrated in
+     *  settings-migration). Device-local — never synced. */
+    configSyncPolicy: ConfigSyncPolicy;
+    /** Set true by the legacy→policy migration; the host shows a one-time
+     *  notice on next load and clears it. */
+    configSyncPolicyMigrated?: boolean;
 
     // Sync timing
     syncDebounceMs: number;
@@ -153,7 +163,7 @@ export const DEFAULT_SETTINGS: CouchSyncSettings = {
     syncFilter: "",
     syncIgnore: "",
     maxFileSizeMB: 50,
-    configSyncPaths: [],
+    configSyncPolicy: defaultConfigSyncPolicy(),
 
     syncDebounceMs: 2000,
     syncMinIntervalMs: 0,

@@ -12,6 +12,7 @@ import { logDebug, logInfo, logWarn, logError } from "../src/ui/log.ts";
 import { LogStorage } from "../src/log/log-storage.ts";
 import { LogManager, AVG_ENTRY_BYTES } from "../src/log/log-manager.ts";
 import type { CouchSyncSettings } from "../src/settings.ts";
+import { defaultConfigSyncPolicy } from "../src/sync/config-policy/policy.ts";
 import type { IVaultIO, FileStat, VaultFile } from "../src/types/vault-io.ts";
 
 function uniqueVaultName(): string {
@@ -59,7 +60,7 @@ function makeSettings(overrides: Partial<CouchSyncSettings> = {}): CouchSyncSett
         syncFilter: "",
         syncIgnore: "",
         maxFileSizeMB: 50,
-        configSyncPaths: [],
+        configSyncPolicy: defaultConfigSyncPolicy(),
         syncDebounceMs: 2000,
         syncMinIntervalMs: 0,
         historyRetentionDays: 30,

@@ -569,6 +569,9 @@ export default class CouchSyncPlugin extends Plugin {
                 ownDataJsonPath: this.manifest.dir
                     ? `${this.manifest.dir}/data.json`
                     : `${this.app.vault.configDir}/plugins/${this.manifest.id}/data.json`,
+                // Receive-side platform gate: don't materialise desktop-only
+                // plugins on a mobile device. Mirrors the getPlatform wiring.
+                getIsMobile: () => Platform.isMobile,
                 persistConfigSettingUp: async (active) => {
                     this.settings.configSettingUp = active;
                     await this.saveSettings();
@@ -724,6 +727,21 @@ export default class CouchSyncPlugin extends Plugin {
             }
             this.compositionTracker.start();
             this.compositionGate.start();
+
+            // One-time notice after the legacy configSyncPaths → configSyncPolicy
+            // migration. Surfaces the safe-side behaviour change (plugin code is
+            // no longer synced) so it isn't silent. Cleared immediately so it
+            // shows once.
+            if (this.settings.configSyncPolicyMigrated) {
+                this.settings.configSyncPolicyMigrated = false;
+                await this.saveSettings();
+                new Notice(
+                    "CouchSync: Config sync filtering was upgraded to a " +
+                    "meaning-based model. Plugin executable code is no longer " +
+                    "synced by default (safety). Review Settings → Config Sync.",
+                    12000,
+                );
+            }
 
             // E2E encryption: derive **both** cryptoProviders FIRST,
             // before the legacy guard. The recovery action the legacy

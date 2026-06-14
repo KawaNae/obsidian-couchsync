@@ -32,6 +32,13 @@ import { makeCouchClient } from "../db/couch-client.ts";
 import type { CryptoProvider } from "../db/crypto-provider.ts";
 import { logError, logWarn } from "../ui/log.ts";
 import { unsafeVaultPathReason } from "../utils/path.ts";
+import { classifyConfigPath } from "./config-policy/classify.ts";
+import {
+    sendDecision,
+    receiveDecision,
+    type ReceiveContext,
+} from "./config-policy/policy.ts";
+import { readLocalIsDesktopOnly } from "./config-policy/manifest.ts";
 import * as remoteCouch from "../db/remote-couch.ts";
 import {
     ConfigOperation,
@@ -116,6 +123,10 @@ export interface ConfigSyncOptions {
      *  saves; the dirty gate compares the live codec against it. Omitted in
      *  tests that don't exercise the dirty gate. */
     persistConfigCodecApplied?: (fingerprint: string) => Promise<void>;
+    /** Is this device mobile? Drives the receive-side desktop-only gate
+     *  (`write`). Production passes `() => Platform.isMobile`; tests inject a
+     *  fake. Omitted → treated as desktop (gate never fires). */
+    getIsMobile?: () => boolean;
 }
 
 export class ConfigSync {
@@ -190,6 +201,7 @@ export class ConfigSync {
     private readonly rawClientFactory?: (settings: CouchSyncSettings) => ICouchClient | null;
     private readonly persistConfigSettingUp?: (active: boolean) => Promise<void>;
     private readonly persistConfigCodecApplied?: (fingerprint: string) => Promise<void>;
+    private readonly getIsMobile: () => boolean;
 
     constructor(
         private vault: IVaultIO,
@@ -213,6 +225,7 @@ export class ConfigSync {
         this.rawClientFactory = opts.rawClientFactory;
         this.persistConfigSettingUp = opts.persistConfigSettingUp;
         this.persistConfigCodecApplied = opts.persistConfigCodecApplied;
+        this.getIsMobile = opts.getIsMobile ?? (() => false);
         this.skipPaths = new Set([opts.ownDataJsonPath ?? ConfigSync.DEFAULT_OWN_DATA_PATH]);
     }
 
@@ -365,7 +378,7 @@ export class ConfigSync {
         encryption: boolean;
         passphrase?: string;
         compression: boolean;
-    }): Promise<number> {
+    }): Promise<void> {
         const db = this.requireConfigDb();
         return this.runOperation("Config Init", async (ctx, progress) => {
             const setup = new ConfigSetupService(
@@ -374,7 +387,6 @@ export class ConfigSync {
                 {
                     clearLastSynced: () => this.lastSynced?.clear(),
                     invalidateCheckpoints: () => { this.checkpointsLoaded = false; },
-                    scan: (cb) => this.scan(cb),
                     onCryptoProviderReady: (crypto) => {
                         this.onConfigCryptoChange?.(crypto);
                     },
@@ -389,23 +401,20 @@ export class ConfigSync {
                         this.persistConfigSettingUp?.(active) ?? Promise.resolve(),
                     recordCodecApplied: (fp) =>
                         this.persistConfigCodecApplied?.(fp) ?? Promise.resolve(),
-                    makeEncryptingClient: () => {
-                        const c = this.makeConfigClient();
-                        if (!c) throw new Error("ConfigSync: config client unavailable for push");
-                        return c;
-                    },
                 },
             );
-            const result = await setup.init(
+            await setup.init(
                 ctx.client,
                 ctx.signal,
                 (msg) => progress.update(msg),
                 opts,
             );
+            // Init is structural: the remote now holds only config:meta (an
+            // empty config DB). Seeding is the user's next, filter-governed
+            // Push — say so rather than reporting a (now always zero) count.
             progress.done(
-                `Config init: scanned ${result.scanned} file(s), pushed ${result.pushed}.`,
+                "Config DB reset. Now run Push to send this device's config to the remote.",
             );
-            return result.scanned;
         }, { rawClient: true });
     }
 
@@ -459,7 +468,7 @@ export class ConfigSync {
         });
     }
 
-    /** Pull: incremental `_changes`-based delta + write configSyncPaths to filesystem.
+    /** Pull: incremental `_changes`-based delta + write the policy-selected config to filesystem.
      *
      *  Replaces the snapshot-style pullByPrefix in PR3 of the diff-sync plan.
      *  Concurrent edits are surfaced AFTER the batch commit (informational),
@@ -617,6 +626,13 @@ export class ConfigSync {
             const fileName = file.split("/").pop() ?? "";
             if (ConfigSync.SKIP_FILES.has(fileName)) continue;
             if (this.skipPaths.has(file)) continue;
+            // Policy SEND projection. Excluded files never enter the local
+            // config DB, so they never reach the push pipeline's changes feed
+            // — the lastPushSeq cursor stays consistent without the pipeline
+            // knowing anything about the policy (it remains a pure transport).
+            if (!sendDecision(this.getSettings().configSyncPolicy, classifyConfigPath(file))) {
+                continue;
+            }
 
             try {
                 onProgress?.(file, i + 1, files.length);
@@ -688,7 +704,9 @@ export class ConfigSync {
     }
 
 
-    /** Write config docs to filesystem, filtered by configSyncPaths.
+    /** Write config docs to filesystem, filtered by the policy RECEIVE
+     *  projection (`receiveDecision`): the meaning-unit selection narrowed by
+     *  this device's platform + which plugins are installed locally.
      *
      *  v0.26 chunking: assembles each config file's binary content by
      *  fetching the referenced ChunkDocs from the config DB and joining
@@ -700,30 +718,26 @@ export class ConfigSync {
     async write(onProgress?: (path: string, index: number, total: number) => void): Promise<number> {
         const db = this.requireConfigDb();
         this.assertConfigReady();
-        const paths = this.getSettings().configSyncPaths;
-        if (paths.length === 0) return 0;
+        const policy = this.getSettings().configSyncPolicy;
+        // Build the receive-side context once per write (not per doc): this
+        // device's platform + which plugins are installed locally + their
+        // local desktop-only flags. These are the receiver-only inputs the
+        // sender cannot know \u2014 see receiveDecision.
+        const ctx = await this.buildReceiveContext();
 
+        // Enumerate every config doc and apply the policy RECEIVE projection
+        // (replaces the legacy per-path/prefix configSyncPaths lookup).
+        const result = await db.allDocs({
+            startkey: DOC_ID.CONFIG,
+            endkey: DOC_ID.CONFIG + "\ufff0",
+            include_docs: true,
+        });
         const docs: ConfigDoc[] = [];
-        for (const p of paths) {
-            if (p.endsWith("/")) {
-                // Prefix-range scan for everything under the folder.
-                const prefix = makeConfigId(p.replace(/\/$/, "") + "/");
-                const result = await db.allDocs({
-                    startkey: prefix,
-                    endkey: prefix + "\ufff0",
-                    include_docs: true,
-                });
-                for (const row of result.rows) {
-                    if (!row.doc) continue;
-                    const doc = row.doc as unknown as ConfigDoc;
-                    if (doc.type !== "config") continue;
-                    if (doc.deleted) continue;
-                    docs.push(doc);
-                }
-            } else {
-                const doc = await db.get(makeConfigId(p)) as ConfigDoc | null;
-                if (doc && doc.type === "config" && !doc.deleted) docs.push(doc);
-            }
+        for (const row of result.rows) {
+            if (!row.doc) continue;
+            const doc = row.doc as unknown as ConfigDoc;
+            if (doc.type !== "config" || doc.deleted) continue;
+            docs.push(doc);
         }
 
         let count = 0;
@@ -739,6 +753,9 @@ export class ConfigSync {
                 continue;
             }
             if (this.skipPaths.has(path)) continue;
+            // Policy RECEIVE projection = SEND projection ∩ receiver gates
+            // (local plugin presence / platform). receive ⊆ send.
+            if (!receiveDecision(policy, classifyConfigPath(path), ctx)) continue;
             try {
                 onProgress?.(path, i + 1, docs.length);
                 const chunks = await db.getChunks(doc.chunks);
@@ -786,6 +803,32 @@ export class ConfigSync {
             }
         }
         return count;
+    }
+
+    /** Build the per-write receive context: this device's platform + the set
+     *  of locally-installed plugin folders + their local desktop-only flags.
+     *  The plugins folder is listed once; each present plugin's local manifest
+     *  is read only on mobile, where the desktop-only gate can fire. */
+    private async buildReceiveContext(): Promise<ReceiveContext> {
+        const isMobile = this.getIsMobile();
+        const present = new Set<string>();
+        try {
+            const listing = await this.vault.list(".obsidian/plugins");
+            for (const folder of listing.folders) present.add(folder);
+        } catch {
+            // No plugins dir (vault with no plugins) — empty set is correct.
+        }
+        const desktopOnly = new Map<string, boolean | undefined>();
+        if (isMobile) {
+            for (const dir of present) {
+                desktopOnly.set(dir, await readLocalIsDesktopOnly(this.vault, dir));
+            }
+        }
+        return {
+            isMobile,
+            pluginPresent: (dir) => present.has(dir),
+            isDesktopOnly: (dir) => desktopOnly.get(dir),
+        };
     }
 
     /** Order the fetched chunks by the ConfigDoc.chunks reference list
@@ -842,6 +885,22 @@ export class ConfigSync {
             logWarn(`CouchSync: listPluginFolders failed: ${e?.message ?? e}`);
         }
         return folders.sort();
+    }
+
+    /** List all local `.obsidian/` config file paths for the settings tree
+     *  UI, applying the same physical exclusions as `scan` (SKIP_FILES /
+     *  SKIP_DIRS via listFilesRecursive, and the own-data.json skipPaths).
+     *  Policy is NOT applied here — the UI shows every selectable path and
+     *  reflects the policy decision per node itself. */
+    async listLocalConfigPaths(): Promise<string[]> {
+        const files: string[] = [];
+        await this.listFilesRecursive(".obsidian", files);
+        return files
+            .filter((f) => {
+                const name = f.split("/").pop() ?? "";
+                return !ConfigSync.SKIP_FILES.has(name) && !this.skipPaths.has(f);
+            })
+            .sort();
     }
 
     getCommonConfigPaths(): string[] {

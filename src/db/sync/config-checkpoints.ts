@@ -39,8 +39,15 @@ export class ConfigCheckpoints {
     async load(): Promise<void> {
         const pull = await this.db.getMeta<number | string>(META_CONFIG_PULL_SEQ);
         const push = await this.db.getMeta<number | string>(META_CONFIG_PUSH_SEQ);
-        if (pull !== null) this.pullSeq = pull;
-        if (push !== null) this.pushSeq = push;
+        // Authoritative reload: load() reflects disk truth, so an ABSENT
+        // checkpoint resets the in-memory cursor to 0 rather than keeping a
+        // stale value. This matters when the same long-lived instance is
+        // reloaded after a Config Init destroyed the DB (invalidateCheckpoints
+        // → load): the post-Init push must enumerate from 0 and re-seed, not
+        // skip from the pre-Init cursor. Symmetric with vault-side Checkpoints
+        // (`remote ?? 0`).
+        this.pullSeq = pull ?? 0;
+        this.pushSeq = push ?? 0;
         logDebug(
             `config-checkpoints loaded: pullSeq=${this.pullSeq} pushSeq=${this.pushSeq}`,
         );

@@ -17,7 +17,6 @@
 import "fake-indexeddb/auto";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { ConfigSync } from "../../src/sync/config-sync.ts";
-import { ConfigSetupService, type ConfigSetupHostHooks } from "../../src/sync/config-setup.ts";
 import { ConfigLocalDB } from "../../src/db/config-local-db.ts";
 import { AuthGate } from "../../src/db/sync/auth-gate.ts";
 import { ALWAYS_VISIBLE } from "../../src/db/visibility-gate.ts";
@@ -100,7 +99,7 @@ describe("ConfigSetupService — clean-slate init (PR5)", () => {
             .toBeLessThan(ensureSpy.mock.invocationCallOrder[0]);
     });
 
-    it("init resets the local DB so previously stored docs are gone", async () => {
+    it("init resets the local DB; a subsequent push re-seeds it from the vault", async () => {
         // Pre-seed local with a stale doc.
         await db.runWriteTx({
             docs: [{ doc: {
@@ -112,9 +111,13 @@ describe("ConfigSetupService — clean-slate init (PR5)", () => {
         });
         vault.addFile(".obsidian/a.json", `{}`);
 
+        // Init is structural — it wipes, it does not seed.
         await cs.init({encryption:false,compression:false});
+        expect(await db.get(makeConfigId(".obsidian/stale.json"))).toBeNull();
+        expect(await db.get(makeConfigId(".obsidian/a.json"))).toBeNull();
 
-        // Stale doc gone, only the new scan result is present.
+        // Push scans the current vault into the (now empty) local DB.
+        await cs.push();
         expect(await db.get(makeConfigId(".obsidian/stale.json"))).toBeNull();
         expect(await db.get(makeConfigId(".obsidian/a.json"))).not.toBeNull();
     });
@@ -176,6 +179,7 @@ describe("ConfigSetupService — clean-slate init (PR5)", () => {
 
         vault.addFile(".obsidian/app.json", `{"theme":"dark"}`);
         await cs.init({encryption:false,compression:false});
+        await cs.push();
 
         const fresh = await remote.getDoc<any>(id);
         expect(fresh).not.toBeNull();
@@ -258,6 +262,8 @@ describe("ConfigSetupService — setup atomicity (#err-9)", () => {
         const bulkSpy = vi.spyOn(remote, "bulkDocs");
 
         await cs.init({ encryption: false, compression: false });
+        // Init pins meta only; Push seeds the real config doc afterwards.
+        await cs.push();
 
         // The config:meta crypto root must be the FIRST bulkDocs call — nothing
         // (no config doc) lands on the freshly-recreated remote before it.
@@ -321,77 +327,16 @@ describe("ConfigSetupService — setup atomicity (#err-9)", () => {
         );
         vault.addFile(".obsidian/a.json", "{}");
 
-        const n = await cs2.init({ encryption: true, passphrase: "test-pass-123", compression: false });
+        await cs2.init({ encryption: true, passphrase: "test-pass-123", compression: false });
 
-        expect(n).toBeGreaterThanOrEqual(0);
         expect(providerReady).toBe(true);
     });
 });
 
-describe("ConfigSetupService — fail-closed encrypting client (L-1)", () => {
-    let vault: FakeVaultIO;
-    let db: ConfigLocalDB;
-    let settings: ReturnType<typeof makeSettings>;
-    let remote: FakeCouchClient;
-
-    beforeEach(() => {
-        vault = new FakeVaultIO();
-        db = new ConfigLocalDB(uniqueName());
-        db.open();
-        settings = makeSettings({
-            deviceId: "dev-A",
-            couchdbUri: "http://localhost:5984",
-            couchdbConfigDbName: "config-test",
-        });
-        remote = new FakeCouchClient();
-    });
-
-    afterEach(async () => {
-        await db.destroy().catch(() => {});
-    });
-
-    /** Minimal host hooks; `makeEncryptingClient` is opt-in per test so we can
-     *  exercise the fail-closed branch. `scan` is stubbed (returns 0) — the DB
-     *  destroy/meta-push/push-pipeline path is what we're exercising. */
-    function hostHooks(extra: Partial<ConfigSetupHostHooks> = {}): ConfigSetupHostHooks {
-        return {
-            clearLastSynced: () => {},
-            invalidateCheckpoints: () => {},
-            scan: async () => 0,
-            onCryptoProviderReady: () => {},
-            makeRawConfigClient: () => asCouchClient(remote),
-            ...extra,
-        };
-    }
-
-    it("refuses an encrypted init when makeEncryptingClient is missing (no plaintext fallback)", async () => {
-        // No makeEncryptingClient hook → an encrypted push must throw rather
-        // than silently degrade to the raw (plaintext) init-time client.
-        const setup = new ConfigSetupService(db, () => settings, hostHooks());
-        await expect(
-            setup.init(asCouchClient(remote), new AbortController().signal, () => {}, {
-                encryption: true, passphrase: "secret", compression: false,
-            }),
-        ).rejects.toThrow(/encrypting client/i);
-    });
-
-    it("allows a plaintext init to fall back to the raw client (no hook required)", async () => {
-        const setup = new ConfigSetupService(db, () => settings, hostHooks());
-        await expect(
-            setup.init(asCouchClient(remote), new AbortController().signal, () => {}, {
-                encryption: false, compression: false,
-            }),
-        ).resolves.toBeTruthy();
-    });
-
-    it("uses the encrypting client for an encrypted init when the hook is wired", async () => {
-        let used = false;
-        const setup = new ConfigSetupService(db, () => settings, hostHooks({
-            makeEncryptingClient: () => { used = true; return asCouchClient(remote); },
-        }));
-        await setup.init(asCouchClient(remote), new AbortController().signal, () => {}, {
-            encryption: true, passphrase: "secret", compression: false,
-        });
-        expect(used).toBe(true);
-    });
-});
+// NOTE: The "fail-closed encrypting client (L-1)" describe block was removed
+// when Init was split from Push. Init no longer pushes content, so it never
+// builds an encrypting client — there is no init-time plaintext-into-encrypted
+// branch left to guard. The equivalent protection now lives where the content
+// push actually happens: `wrapConfigClient` is fail-closed (encryption on +
+// no provider ⇒ throw) and `assertConfigReady` blocks push/pull when the codec
+// drifted from the Init-applied baseline (see config-sync.test.ts).

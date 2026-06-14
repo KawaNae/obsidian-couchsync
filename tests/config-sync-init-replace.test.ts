@@ -1,7 +1,12 @@
 /**
- * Integration test for ConfigSync.init() — verifies that init truly
- * replaces the remote state with the current local vault scan, NOT
- * just additively pushes.
+ * Integration test for ConfigSync.init() + push() — verifies that init
+ * truly replaces the remote state (a destructive wipe), and the following
+ * push seeds it from the current local vault scan, NOT just additively.
+ *
+ * Init is structural (wipe + crypto root); push() is the filter-governed
+ * seed. The end-to-end "remote == current vault, stale files gone" property
+ * the original wipe-and-replace test asserted is now produced by the
+ * init → push pair.
  *
  * The bug this guards against: prior to v0.20.6, `pushDocs(deletedIds
  * ∪ currentIds)` silently skipped any id whose local doc had been
@@ -86,13 +91,14 @@ describe("ConfigSync.init() — wipe-and-replace remote", () => {
         await db.destroy().catch(() => {});
     });
 
-    it("first init: pushes scanned config docs to an empty remote", async () => {
+    it("init + push: seeds scanned config docs onto an empty remote", async () => {
         vault.addFile(".obsidian/app.json", `{"theme":"dark"}`);
         vault.addFile(".obsidian/hotkeys.json", `{}`);
 
-        const scanned = await cs.init(PLAIN_INIT_OPTS);
+        await cs.init(PLAIN_INIT_OPTS);
+        const pushed = await cs.push();
 
-        expect(scanned).toBe(2);
+        expect(pushed).toBe(2);
         const allRows = await remote.allDocs<any>({
             startkey: "config:",
             endkey: "config:￰",
@@ -107,17 +113,19 @@ describe("ConfigSync.init() — wipe-and-replace remote", () => {
         ].sort());
     });
 
-    it("second init after vault deletion: tombstones the removed file on remote", async () => {
-        // First init: 2 files on vault → both pushed.
+    it("second init + push after vault deletion: the removed file is gone from remote", async () => {
+        // First init + push: 2 files on vault → both seeded.
         vault.addFile(".obsidian/app.json", `{}`);
         vault.addFile(".obsidian/hotkeys.json", `{}`);
         await cs.init(PLAIN_INIT_OPTS);
+        await cs.push();
 
         // User removes hotkeys.json from .obsidian/.
         await vault.delete(".obsidian/hotkeys.json");
 
-        // Second init: should tombstone hotkeys on remote.
+        // Second init wipes the remote; push re-seeds only the surviving file.
         await cs.init(PLAIN_INIT_OPTS);
+        await cs.push();
 
         const allRows = await remote.allDocs<any>({
             startkey: "config:",
@@ -130,10 +138,11 @@ describe("ConfigSync.init() — wipe-and-replace remote", () => {
         expect(liveIds).toEqual([makeConfigId(".obsidian/app.json")]);
     });
 
-    it("re-init with same vault state is idempotent (remote unchanged)", async () => {
+    it("re-init + push with same vault state is idempotent (remote unchanged)", async () => {
         vault.addFile(".obsidian/app.json", `{}`);
         vault.addFile(".obsidian/hotkeys.json", `{}`);
         await cs.init(PLAIN_INIT_OPTS);
+        await cs.push();
         const before = (await remote.allDocs<any>({
             startkey: "config:",
             endkey: "config:￰",
@@ -143,6 +152,7 @@ describe("ConfigSync.init() — wipe-and-replace remote", () => {
             .map((r) => r.id).sort();
 
         await cs.init(PLAIN_INIT_OPTS);
+        await cs.push();
 
         const after = (await remote.allDocs<any>({
             startkey: "config:",
@@ -154,7 +164,7 @@ describe("ConfigSync.init() — wipe-and-replace remote", () => {
         expect(after).toEqual(before);
     });
 
-    it("init wipes local DB before scanning (stale local docs do not survive)", async () => {
+    it("init wipes local DB; push re-scans (stale local docs do not survive)", async () => {
         // Pre-seed local DB with a stale doc that no longer corresponds
         // to a vault file.
         await db.runWriteTx({
@@ -170,8 +180,9 @@ describe("ConfigSync.init() — wipe-and-replace remote", () => {
         // Scan only sees app.json.
         vault.addFile(".obsidian/app.json", `{}`);
         await cs.init(PLAIN_INIT_OPTS);
+        await cs.push();
 
-        // After init, local DB only has app.json.
+        // After init's wipe + push's re-scan, local DB only has app.json.
         const localIds = (await db.allConfigDocs()).map((d) => d._id);
         expect(localIds).toEqual([makeConfigId(".obsidian/app.json")]);
     });

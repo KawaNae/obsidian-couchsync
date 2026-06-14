@@ -8,8 +8,11 @@
  *   Step 1: Connection — pick the config database name. URI / user /
  *           password are inherited from Vault Sync (1 CouchDB server),
  *           shown read-only here. Test → Apply confirms the choice.
- *   Step 2: Operations — Init & Push, Push, Pull & Reload, and the
- *           configSyncPaths editor (Add path with smart suggestions).
+ *   Step 2: Setup (Init) — reset the shared config DB. Structural only,
+ *           run once per device pool; it does not send content.
+ *   Step 3: Sync — the meaning-unit filter (what this device syncs, by
+ *           meaning), then Push (send) and Pull & Reload (receive+apply).
+ *           The same filter governs both directions (receive ⊆ send).
  *
  * Step 1 is gated on Vault Sync being at least "tested": you can't
  * point at a config DB if there's no vault server settled yet.
@@ -28,8 +31,35 @@ import type { SyncEngine } from "../db/sync-engine.ts";
 import type { AuthGate } from "../db/sync/auth-gate.ts";
 import type { VaultRemoteOps } from "../db/sync/vault-remote-ops.ts";
 import type { IModalPresenter } from "../types/modal-presenter.ts";
-import { logWarn } from "../ui/log.ts";
 import { addPasswordToggle } from "./vault-sync-tab.ts";
+import {
+    classifyConfigPath,
+    type ClassifiedPath,
+    type ConfigUnit,
+} from "../sync/config-policy/classify.ts";
+import {
+    sendDecision,
+    type ConfigSyncPolicy,
+} from "../sync/config-policy/policy.ts";
+
+/** Display labels for meaning units in the filter tree. */
+const UNIT_LABELS: Record<ConfigUnit, string> = {
+    "app-behavior": "App settings (app / appearance / hotkeys)",
+    "core-settings": "Core plugin settings",
+    "community-settings": "Community plugin settings (data.json)",
+    "theme-css": "Themes (CSS)",
+    snippets: "Snippets (CSS)",
+    "enabled-list": "Enabled-plugin lists",
+    "install-state": "Community plugin code (main.js / manifest)",
+    layout: "Layout (workspace)",
+    other: "Other",
+};
+
+const PORTABLE_UNITS: ConfigUnit[] = [
+    "app-behavior", "theme-css", "snippets",
+    "core-settings", "community-settings",
+];
+const INSTALL_UNITS: ConfigUnit[] = ["install-state", "enabled-list"];
 import {
     resolveConfigCodec,
     isInheritingConfigEncryption,
@@ -305,17 +335,22 @@ export class ConfigSyncTab {
         }
 
         new Setting(el)
-            .setName("Init & Push")
-            .setDesc("Delete remote config DB, re-scan .obsidian/, push all to remote. Run once per device pool.")
+            .setName("Init")
+            .setDesc(
+                "Reset the shared config database: wipe remote + local and " +
+                "establish the encryption root. Run once per device pool, then " +
+                "use Push (below) to send this device's config.",
+            )
             .addButton((btn) =>
-                btn.setButtonText("Init & Push").setWarning()
+                btn.setButtonText("Init").setWarning()
                     .setDisabled(!configEnabled)
                     .onClick(async () => {
                         const ok = await this.deps.modalPresenter.showConfirmModal(
-                            "Init & Push",
-                            "Delete the existing config DB and re-scan .obsidian/? " +
-                                "This cannot be undone.",
-                            "Init & Push",
+                            "Init",
+                            "Delete the existing remote config DB and reset to an " +
+                                "empty database? You'll send this device's config " +
+                                "with Push afterwards. This cannot be undone.",
+                            "Init",
                             true,
                         );
                         if (!ok) return;
@@ -334,7 +369,7 @@ export class ConfigSyncTab {
                                 await this.deps.ratchetConfigCipherFloor(3);
                             }
                         } catch { /* handled */ }
-                        btn.setButtonText("Init & Push");
+                        btn.setButtonText("Init");
                         btn.setDisabled(false);
                     })
             );
@@ -354,9 +389,13 @@ export class ConfigSyncTab {
             });
         }
 
+        // ── Filter (meaning-unit policy tree) — the "what", shown first
+        //    since it governs both Push and Pull below. ────────
+        this.renderFilterTree(el, configEnabled);
+
         new Setting(el)
             .setName("Push")
-            .setDesc("Scan .obsidian/ and push changes to remote.")
+            .setDesc("Scan .obsidian/ and push the selected units to remote.")
             .addButton((btn) =>
                 btn.setButtonText("Push ↑")
                     .setDisabled(!configEnabled)
@@ -369,75 +408,10 @@ export class ConfigSyncTab {
                     })
             );
 
-        // ── Filter (configSyncPaths) ────────────────────────
-        el.createEl("h4", { text: "Filter" });
-        el.createEl("p", {
-            text: "Pull writes only the paths below to this device.",
-            cls: "setting-item-description",
-        });
-
-        const paths = settings.configSyncPaths;
-        for (const path of paths) {
-            new Setting(el)
-                .setName(path)
-                .addButton((btn) =>
-                    btn
-                        .setButtonText("×")
-                        .setWarning()
-                        .setDisabled(!configEnabled)
-                        .onClick(async () => {
-                            const updated = settings.configSyncPaths.filter((p) => p !== path);
-                            await this.deps.updateSettings({ configSyncPaths: updated });
-                            this.deps.refresh();
-                        })
-                );
-        }
-
-        const addPathContainer = el.createDiv();
-        const addSetting = new Setting(addPathContainer).setName("Add path");
-
-        let inputValue = "";
-        const suggestionsEl = addPathContainer.createDiv({ cls: "cs-suggest-list" });
-        suggestionsEl.style.display = "none";
-
-        addSetting.addText((text) => {
-            text.setPlaceholder(".obsidian/plugins/my-plugin/");
-            text.setDisabled(!configEnabled);
-            text.inputEl.addEventListener("focus", () => {
-                if (!configEnabled) return;
-                loadSuggestions(suggestionsEl, this.deps);
-            });
-            text.inputEl.addEventListener("input", () => {
-                inputValue = text.inputEl.value;
-                filterSuggestions(suggestionsEl, inputValue);
-            });
-            text.onChange((value) => {
-                inputValue = value;
-            });
-        });
-
-        addSetting.addButton((btn) =>
-            btn.setButtonText("+ Add")
-                .setDisabled(!configEnabled)
-                .onClick(async () => {
-                    if (!inputValue.trim()) return;
-                    const trimmed = inputValue.trim();
-                    if (settings.configSyncPaths.includes(trimmed)) {
-                        new Notice("Path already added.");
-                        return;
-                    }
-                    const updated = [...settings.configSyncPaths, trimmed];
-                    await this.deps.updateSettings({ configSyncPaths: updated });
-                    this.deps.refresh();
-                })
-        );
-
         new Setting(el)
             .setName("Pull & Reload")
             .setDesc(
-                configEnabled
-                    ? `Pull config from remote, write ${paths.length} path(s), then reload Obsidian.`
-                    : "Pull config from remote, write configured path(s), then reload Obsidian.",
+                "Pull config from remote, write the selected units to this device, then reload Obsidian.",
             )
             .addButton((btn) =>
                 btn.setButtonText("Pull & Reload ↓")
@@ -457,6 +431,148 @@ export class ConfigSyncTab {
                         }
                     })
             );
+    }
+
+    // ── Filter tree (meaning-unit policy) ───────────────
+
+    private async updatePolicy(patch: Partial<ConfigSyncPolicy>): Promise<void> {
+        const cur = this.deps.getSettings().configSyncPolicy;
+        await this.deps.updateSettings({ configSyncPolicy: { ...cur, ...patch } });
+    }
+
+    private renderFilterTree(el: HTMLElement, configEnabled: boolean): void {
+        const policy = this.deps.getSettings().configSyncPolicy;
+
+        el.createEl("h4", { text: "Filter" });
+        el.createEl("p", {
+            text: "Choose what this device syncs, by meaning. The same selection " +
+                "applies on push (send) and pull (write). These settings are " +
+                "device-local — they are not themselves synced.",
+            cls: "setting-item-description",
+        });
+
+        new Setting(el)
+            .setName("Don't sync plugin code (JavaScript)")
+            .setDesc(
+                "Safety interlock: never send or receive plugin main.js / manifest. " +
+                "Stops a malicious server from running code on your devices, and " +
+                "auto-applies to plugins you install later. Install plugins per " +
+                "device via the plugin manager.",
+            )
+            .addToggle((t) =>
+                t.setValue(policy.blockPluginCode)
+                    .setDisabled(!configEnabled)
+                    .onChange(async (v) => {
+                        await this.updatePolicy({ blockPluginCode: v });
+                        this.deps.refresh();
+                    }),
+            );
+
+        const treeEl = el.createDiv({ cls: "cs-config-tree" });
+        if (!configEnabled) {
+            treeEl.createEl("p", {
+                text: "Complete Step 2 and Step 3 first.",
+                cls: "setting-item-description",
+            });
+            return;
+        }
+        treeEl.createEl("p", { text: "Loading config tree…", cls: "setting-item-description" });
+        void this.populateFilterTree(treeEl);
+    }
+
+    private async populateFilterTree(treeEl: HTMLElement): Promise<void> {
+        let paths: string[];
+        try {
+            paths = await this.deps.configSync.listLocalConfigPaths();
+        } catch (e: any) {
+            treeEl.empty();
+            treeEl.createEl("p", {
+                text: `Failed to list config: ${e?.message ?? e}`,
+                cls: "setting-item-description mod-warning",
+            });
+            return;
+        }
+        treeEl.empty();
+        const policy = this.deps.getSettings().configSyncPolicy;
+
+        const byUnit = new Map<ConfigUnit, ClassifiedPath[]>();
+        for (const p of paths) {
+            const c = classifyConfigPath(p);
+            const arr = byUnit.get(c.unit) ?? [];
+            arr.push(c);
+            byUnit.set(c.unit, arr);
+        }
+
+        treeEl.createEl("h5", { text: "Portable settings" });
+        for (const unit of PORTABLE_UNITS) {
+            this.renderUnit(treeEl, unit, byUnit.get(unit) ?? [], policy);
+        }
+        treeEl.createEl("h5", { text: "Installation state (device / version-specific, default off)" });
+        for (const unit of INSTALL_UNITS) {
+            this.renderUnit(treeEl, unit, byUnit.get(unit) ?? [], policy);
+        }
+
+        const layout = byUnit.get("layout") ?? [];
+        if (layout.length > 0) {
+            treeEl.createEl("p", {
+                text: `Always excluded: ${layout.length} workspace/layout file(s).`,
+                cls: "setting-item-description",
+            });
+        }
+    }
+
+    private renderUnit(
+        parent: HTMLElement,
+        unit: ConfigUnit,
+        items: ClassifiedPath[],
+        policy: ConfigSyncPolicy,
+    ): void {
+        const locked = policy.blockPluginCode && unit === "install-state";
+        const details = parent.createEl("details", { cls: "cs-unit" });
+        const summary = details.createEl("summary");
+        const groupCb = summary.createEl("input", { cls: "cs-unit-group" }) as HTMLInputElement;
+        groupCb.type = "checkbox";
+
+        const effs = items.map((c) => sendDecision(policy, c));
+        const allOn = effs.length > 0 && effs.every(Boolean);
+        const anyOn = effs.some(Boolean);
+        groupCb.checked = items.length > 0 ? allOn : (policy.unitDefaults[unit] ?? false);
+        groupCb.indeterminate = anyOn && !allOn;
+        groupCb.disabled = locked;
+        summary.createSpan({
+            text: ` ${UNIT_LABELS[unit]} (${items.length})${locked ? " — locked by JS safety" : ""}`,
+        });
+
+        groupCb.addEventListener("change", async () => {
+            const on = groupCb.checked;
+            const overrides = { ...policy.overrides };
+            for (const c of items) delete overrides[c.path];
+            await this.updatePolicy({
+                unitDefaults: { ...policy.unitDefaults, [unit]: on },
+                overrides,
+            });
+            this.deps.refresh();
+        });
+
+        const list = details.createDiv({ cls: "cs-unit-children" });
+        for (const c of items) {
+            const row = list.createDiv({ cls: "cs-unit-child" });
+            const cb = row.createEl("input") as HTMLInputElement;
+            cb.type = "checkbox";
+            cb.checked = sendDecision(policy, c);
+            cb.disabled = locked;
+            row.createSpan({
+                text: ` ${c.path.replace(".obsidian/", "")}${c.isPluginCode ? " ⚠️" : ""}`,
+            });
+            cb.addEventListener("change", async () => {
+                const overrides = { ...policy.overrides };
+                const unitDef = policy.unitDefaults[c.unit] ?? false;
+                if (cb.checked === unitDef) delete overrides[c.path];
+                else overrides[c.path] = cb.checked;
+                await this.updatePolicy({ overrides });
+                this.deps.refresh();
+            });
+        }
     }
 
     private renderField(
@@ -528,125 +644,3 @@ export class ConfigSyncTab {
     }
 }
 
-// ── Suggestion list (migrated from files-tab.ts) ────────
-
-const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
-let cachedRemotePaths: { files: string[]; folders: string[]; fetchedAt: number } | null = null;
-
-function groupPaths(paths: string[]): { files: string[]; folders: string[] } {
-    const files: string[] = [];
-    const folderSet = new Set<string>();
-    for (const path of paths) {
-        const segments = path.split("/");
-        for (let depth = 1; depth < segments.length; depth++) {
-            folderSet.add(segments.slice(0, depth).join("/") + "/");
-        }
-        if (segments.length <= 2) {
-            files.push(path);
-        }
-    }
-    return { files: files.sort(), folders: [...folderSet].sort() };
-}
-
-async function loadSuggestions(suggestionsEl: HTMLElement, deps: ConfigSyncTabDeps): Promise<void> {
-    suggestionsEl.empty();
-    suggestionsEl.style.display = "block";
-    const currentPaths = new Set(deps.getSettings().configSyncPaths);
-
-    const cacheExpired = cachedRemotePaths && Date.now() - cachedRemotePaths.fetchedAt > CACHE_TTL_MS;
-    if (cacheExpired) cachedRemotePaths = null;
-
-    if (!cachedRemotePaths && !deps.auth.isBlocked()) {
-        try {
-            const rawPaths = await deps.configSync.listRemotePaths();
-            cachedRemotePaths = { ...groupPaths(rawPaths), fetchedAt: Date.now() };
-        } catch (e: any) {
-            if (e?.status === 401 || e?.status === 403) {
-                deps.auth.raise(e.status, e.message ?? "Auth failed");
-            }
-            cachedRemotePaths = null;
-        }
-    }
-
-    if (cachedRemotePaths) {
-        renderRemoteSuggestions(suggestionsEl, cachedRemotePaths, currentPaths, deps);
-    } else {
-        await renderLocalFallback(suggestionsEl, currentPaths, deps);
-    }
-}
-
-function renderRemoteSuggestions(
-    el: HTMLElement,
-    remote: { files: string[]; folders: string[] },
-    currentPaths: Set<string>,
-    deps: ConfigSyncTabDeps,
-): void {
-    if (remote.files.length === 0 && remote.folders.length === 0) {
-        el.createEl("div", {
-            text: "No config found on remote. Run Init & Push first.",
-            cls: "cs-suggest-header",
-        });
-        return;
-    }
-
-    if (remote.files.length > 0) {
-        el.createEl("div", { text: "── Config files ──", cls: "cs-suggest-header" });
-        for (const file of remote.files) {
-            if (currentPaths.has(file)) continue;
-            createSuggestionItem(el, file, deps);
-        }
-    }
-
-    if (remote.folders.length > 0) {
-        el.createEl("div", { text: "── Folders ──", cls: "cs-suggest-header" });
-        for (const folder of remote.folders) {
-            if (currentPaths.has(folder)) continue;
-            createSuggestionItem(el, folder, deps);
-        }
-    }
-}
-
-async function renderLocalFallback(
-    el: HTMLElement,
-    currentPaths: Set<string>,
-    deps: ConfigSyncTabDeps,
-): Promise<void> {
-    el.createEl("div", {
-        text: "── Remote unavailable — showing local ──",
-        cls: "cs-suggest-header",
-    });
-
-    const commonFiles = deps.configSync.getCommonConfigPaths();
-    for (const path of commonFiles) {
-        if (currentPaths.has(path)) continue;
-        createSuggestionItem(el, path, deps);
-    }
-
-    try {
-        const pluginFolders = await deps.configSync.listPluginFolders();
-        for (const folder of pluginFolders) {
-            if (currentPaths.has(folder)) continue;
-            createSuggestionItem(el, folder, deps);
-        }
-    } catch (e: any) { logWarn(`Failed to list plugin folders for suggestions: ${e?.message ?? e}`); }
-}
-
-function createSuggestionItem(container: HTMLElement, path: string, deps: ConfigSyncTabDeps): void {
-    const item = container.createDiv({ cls: "cs-suggest-item", text: path });
-    item.addEventListener("click", async () => {
-        const current = deps.getSettings().configSyncPaths;
-        if (!current.includes(path)) {
-            await deps.updateSettings({ configSyncPaths: [...current, path] });
-            deps.refresh();
-        }
-    });
-}
-
-function filterSuggestions(suggestionsEl: HTMLElement, filter: string): void {
-    const items = suggestionsEl.querySelectorAll(".cs-suggest-item");
-    const lower = filter.toLowerCase();
-    for (let i = 0; i < items.length; i++) {
-        const el = items[i] as HTMLElement;
-        el.style.display = el.textContent?.toLowerCase().includes(lower) ? "" : "none";
-    }
-}

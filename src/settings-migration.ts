@@ -1,3 +1,6 @@
+import { buildPolicyFromLegacyPaths } from "./sync/config-policy/migrate.ts";
+import { normalizeUnitDefaults } from "./sync/config-policy/policy.ts";
+
 /**
  * Migrate legacy settings shapes to the current schema.
  *
@@ -42,4 +45,29 @@ export function migrateSettings(data: Record<string, any>): void {
     // v0.26.2: config-setup atomicity flag (#err-9). Default false is also
     // supplied by DEFAULT_SETTINGS; explicit migration keeps the schema obvious.
     if (data.configSettingUp === undefined) data.configSettingUp = false;
+
+    // configSyncPaths (string[] receive-only allowlist) → configSyncPolicy
+    // (meaning-unit policy, symmetric send/receive). Safe-side: plugin code
+    // stops syncing (blockPluginCode forced true inside the builder). The host
+    // shows a one-time notice (configSyncPolicyMigrated) after this runs.
+    if (data.configSyncPolicy === undefined) {
+        const legacy: string[] = Array.isArray(data.configSyncPaths)
+            ? data.configSyncPaths
+            : [];
+        data.configSyncPolicy = buildPolicyFromLegacyPaths(legacy);
+        data.configSyncPolicyMigrated = true;
+        delete data.configSyncPaths;
+    } else {
+        // Forward-compat: backfill any unit added in a later build so an
+        // older persisted policy still has a decision for it. Idempotent.
+        data.configSyncPolicy.unitDefaults = normalizeUnitDefaults(
+            data.configSyncPolicy.unitDefaults,
+        );
+        if (typeof data.configSyncPolicy.blockPluginCode !== "boolean") {
+            data.configSyncPolicy.blockPluginCode = true;
+        }
+        if (data.configSyncPolicy.overrides === undefined) {
+            data.configSyncPolicy.overrides = {};
+        }
+    }
 }

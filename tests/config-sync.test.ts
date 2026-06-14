@@ -178,14 +178,16 @@ describe("ConfigSync", () => {
             expect(calls[0].total).toBe(2);
         });
 
-        it("recursively lists subdirectories", async () => {
-            vault.addFile(".obsidian/plugins/foo/main.js", "code");
-            vault.addFile(".obsidian/themes/bar/theme.css", "css");
+        it("recurses into subdirectories; SEND filter lands theme CSS, drops plugin code", async () => {
+            vault.addFile(".obsidian/plugins/foo/main.js", "code"); // install-state → filtered
+            vault.addFile(".obsidian/themes/bar/theme.css", "css"); // theme-css → synced
 
             await cs.scan();
 
-            expect(await db.get(makeConfigId(".obsidian/plugins/foo/main.js"))).not.toBeNull();
+            // Recursion reached both subtrees; the policy SEND projection keeps
+            // the theme CSS and drops the plugin executable code (JS safety).
             expect(await db.get(makeConfigId(".obsidian/themes/bar/theme.css"))).not.toBeNull();
+            expect(await db.get(makeConfigId(".obsidian/plugins/foo/main.js"))).toBeNull();
         });
 
         // ── short-circuit: lastSynced cache (PR1, audit 2026-05-08) ──
@@ -267,18 +269,7 @@ describe("ConfigSync", () => {
             });
         }
 
-        it("returns 0 when configSyncPaths is empty", async () => {
-            settings.configSyncPaths = [];
-            await seedConfigDoc(".obsidian/app.json", "{}");
-
-            const count = await cs.write();
-
-            expect(count).toBe(0);
-            expect(vault.files.has(".obsidian/app.json")).toBe(false);
-        });
-
-        it("writes single-path entry to vault", async () => {
-            settings.configSyncPaths = [".obsidian/app.json"];
+        it("writes portable settings (app.json) by default", async () => {
             await seedConfigDoc(".obsidian/app.json", `{"theme":"dark"}`);
 
             const count = await cs.write();
@@ -287,35 +278,76 @@ describe("ConfigSync", () => {
             expect(vault.readText(".obsidian/app.json")).toBe(`{"theme":"dark"}`);
         });
 
-        it("writes all docs under a folder prefix (path ends with /)", async () => {
-            settings.configSyncPaths = [".obsidian/plugins/foo/"];
+        it("does NOT write plugin code (install-state) by default — JS safety", async () => {
             await seedConfigDoc(".obsidian/plugins/foo/main.js", "code-a");
-            await seedConfigDoc(".obsidian/plugins/foo/styles.css", "css-b");
-            await seedConfigDoc(".obsidian/plugins/bar/main.js", "code-c");
+            await seedConfigDoc(".obsidian/plugins/foo/manifest.json", "{}");
 
             const count = await cs.write();
 
-            expect(count).toBe(2);
-            expect(vault.readText(".obsidian/plugins/foo/main.js")).toBe("code-a");
-            expect(vault.readText(".obsidian/plugins/foo/styles.css")).toBe("css-b");
-            expect(vault.files.has(".obsidian/plugins/bar/main.js")).toBe(false);
+            expect(count).toBe(0);
+            expect(vault.files.has(".obsidian/plugins/foo/main.js")).toBe(false);
+            expect(vault.files.has(".obsidian/plugins/foo/manifest.json")).toBe(false);
         });
 
-        it("skips own plugin data.json (SKIP_PATHS)", async () => {
-            settings.configSyncPaths = [".obsidian/plugins/obsidian-couchsync/"];
+        it("writes a plugin's data.json only when the plugin is present locally", async () => {
+            await seedConfigDoc(".obsidian/plugins/foo/data.json", `{"k":1}`);
+
+            // plugin not installed locally → presence gate skips it
+            expect(await cs.write()).toBe(0);
+            expect(vault.files.has(".obsidian/plugins/foo/data.json")).toBe(false);
+
+            // install the plugin locally (folder now exists) → materialised
+            vault.addFile(".obsidian/plugins/foo/manifest.json", `{"id":"foo"}`);
+            const count = await cs.write();
+            expect(count).toBe(1);
+            expect(vault.readText(".obsidian/plugins/foo/data.json")).toBe(`{"k":1}`);
+        });
+
+        it("skips own plugin data.json (SKIP_PATHS) even when present", async () => {
+            vault.addFile(".obsidian/plugins/obsidian-couchsync/manifest.json", "{}");
             await seedConfigDoc(".obsidian/plugins/obsidian-couchsync/data.json", "{}");
-            await seedConfigDoc(".obsidian/plugins/obsidian-couchsync/main.js", "code");
 
             const count = await cs.write();
 
-            // data.json filtered, main.js written
-            expect(count).toBe(1);
+            expect(count).toBe(0);
             expect(vault.files.has(".obsidian/plugins/obsidian-couchsync/data.json")).toBe(false);
-            expect(vault.files.has(".obsidian/plugins/obsidian-couchsync/main.js")).toBe(true);
+        });
+
+        it("an explicit override enables a single main.js when safety is off", async () => {
+            settings.configSyncPolicy = {
+                ...settings.configSyncPolicy,
+                blockPluginCode: false,
+                overrides: { ".obsidian/plugins/foo/main.js": true },
+            };
+            await seedConfigDoc(".obsidian/plugins/foo/main.js", "code");
+
+            const count = await cs.write();
+
+            expect(count).toBe(1);
+            expect(vault.readText(".obsidian/plugins/foo/main.js")).toBe("code");
+        });
+
+        it("does not materialise a desktop-only plugin's data.json on mobile", async () => {
+            const mobileCs = new ConfigSync(
+                vault, modal, db, auth, ALWAYS_VISIBLE, NoopReconnectBridge,
+                () => settings,
+                { getIsMobile: () => true },
+            );
+            // plugin present locally, but its local manifest is desktop-only
+            vault.addFile(".obsidian/plugins/term/manifest.json", `{"id":"term","isDesktopOnly":true}`);
+            await seedConfigDoc(".obsidian/plugins/term/data.json", `{"k":1}`);
+
+            expect(await mobileCs.write()).toBe(0);
+            expect(vault.files.has(".obsidian/plugins/term/data.json")).toBe(false);
+
+            // a non-desktop-only plugin on the same mobile device is fine
+            vault.addFile(".obsidian/plugins/dv/manifest.json", `{"id":"dv","isDesktopOnly":false}`);
+            await seedConfigDoc(".obsidian/plugins/dv/data.json", `{"k":2}`);
+            expect(await mobileCs.write()).toBe(1);
+            expect(vault.readText(".obsidian/plugins/dv/data.json")).toBe(`{"k":2}`);
         });
 
         it("overwrites existing file", async () => {
-            settings.configSyncPaths = [".obsidian/app.json"];
             vault.addFile(".obsidian/app.json", "old");
             await seedConfigDoc(".obsidian/app.json", "new");
 
@@ -324,23 +356,14 @@ describe("ConfigSync", () => {
             expect(vault.readText(".obsidian/app.json")).toBe("new");
         });
 
-        it("silently drops missing single-path entry", async () => {
-            settings.configSyncPaths = [".obsidian/missing.json"];
-
-            const count = await cs.write();
-
-            expect(count).toBe(0);
-        });
-
         it("invokes onProgress for each written entry", async () => {
-            settings.configSyncPaths = [".obsidian/app.json", ".obsidian/hotkeys.json"];
             await seedConfigDoc(".obsidian/app.json", "{}");
             await seedConfigDoc(".obsidian/hotkeys.json", "{}");
 
             const calls: string[] = [];
             await cs.write((path) => calls.push(path));
 
-            expect(calls).toEqual([".obsidian/app.json", ".obsidian/hotkeys.json"]);
+            expect(calls.sort()).toEqual([".obsidian/app.json", ".obsidian/hotkeys.json"]);
         });
     });
 
