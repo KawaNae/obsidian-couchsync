@@ -652,6 +652,42 @@ describe("PushPipeline integration", () => {
             expect(captured!.localDoc.vclock).toEqual({ "dev-B": 2 });
             expect(captured!.remoteDoc.chunks).toEqual(["chunk:remoteX"]);
         });
+
+        it("equal vclock + chunks differ → divergent (concurrent), NOT silent equal-skip", async () => {
+            // Source-side of the 2026-06-14 bug: local has new content at the
+            // SAME {dev-B:1} as a stale remote. The old equal-skip trusted the
+            // vclock proxy and silently dropped the local content; it must now
+            // surface as divergent. (Race-stale pre-seeded at the escalation
+            // threshold so one cycle surfaces the concurrent event — proving it
+            // took the divergent path, not skippedEqual.)
+            h = createSyncHarness();
+            const b = h.addDevice("dev-B");
+            const id = makeFileId("tie.md");
+            await b.db.runWriteTx({ docs: [{ doc: {
+                _id: id, type: "file", chunks: ["chunk:new"],
+                mtime: 2000, ctime: 1000, size: 10, vclock: { "dev-B": 1 },
+            } as unknown as CouchSyncDoc }] });
+            await h.couch.bulkDocs([{
+                _id: id, type: "file", chunks: ["chunk:stale"],
+                mtime: 1000, ctime: 1000, size: 10, vclock: { "dev-B": 1 },
+            } as unknown as CouchSyncDoc]);
+            await b.db.runWriteTx({
+                meta: [{ op: "put", key: unpushedKey(id),
+                    value: { addedAt: 0, reason: "race-stale", attempts: 3 } }],
+            });
+
+            const rig = attachPushPipeline({ device: b, couch: h.couch, runOnce: true });
+            let captured: { localDoc: FileDoc; remoteDoc: FileDoc } | null = null;
+            rig.events.on("concurrent", (p: any) => { captured = p; });
+
+            await rig.pipeline.run();
+
+            // Surfaced as divergent (equal-vclock tie), not a silent equal-skip.
+            expect(captured).not.toBeNull();
+            expect(captured!.localDoc.vclock).toEqual({ "dev-B": 1 });
+            expect(captured!.remoteDoc.vclock).toEqual({ "dev-B": 1 });
+            expect(captured!.remoteDoc.chunks).toEqual(["chunk:stale"]);
+        });
     });
 
     describe("tombstone churn guard (#sync-005)", () => {

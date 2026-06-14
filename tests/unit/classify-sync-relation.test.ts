@@ -153,7 +153,10 @@ describe("classifySyncRelation", () => {
 
     // ── local-edit ────────────────────────────────────────
     describe("local-edit", () => {
-        it("chunks differ + vclock equal → local-edit", () => {
+        it("chunks differ + vclock equal + vault-disk (attributed) → local-edit", () => {
+            // Vault-disk call site: leftVC is the attributed lastSynced.vclock,
+            // not the disk content's own clock, so an equal clock with edited
+            // content is the steady-state "disk edited, vclock not yet bumped".
             expect(classifySyncRelation(input({
                 leftVC: VC({ a: 1 }),
                 rightVC: VC({ a: 1 }),
@@ -161,6 +164,7 @@ describe("classifySyncRelation", () => {
                 rightChunks: C("old"),
                 leftSize: 9,
                 rightSize: 3,
+                leftVCAttributed: true,
             }))).toBe("local-edit");
         });
 
@@ -175,9 +179,10 @@ describe("classifySyncRelation", () => {
             }))).toBe("local-edit");
         });
 
-        it("chunks differ + vclock equal + left matches baseline → still local-edit", () => {
+        it("chunks differ + vclock equal + left matches baseline → still local-edit (vault-disk)", () => {
             // Edge case: user edit hasn't been pushed yet. Baseline matches
-            // disk because lastSynced was set at the same content.
+            // disk because lastSynced was set at the same content. Vault-disk
+            // call site (attributed vclock).
             const lastSynced: LastSynced = {
                 vclock: VC({ a: 1 }),
                 chunks: ["user-edit"],
@@ -191,6 +196,81 @@ describe("classifySyncRelation", () => {
                 leftSize: 9,
                 rightSize: 3,
                 lastSynced,
+                leftVCAttributed: true,
+            }))).toBe("local-edit");
+        });
+    });
+
+    // ── true-divergent (pull-site vclock tie) ──────────────
+    // A PULL call site compares two REAL doc vclocks (leftVCAttributed falsy).
+    // An equal vclock with differing content cannot come from a legit local
+    // edit (that bumps the clock) — it is the Config-Init stale-collision
+    // anomaly (zombie {device:1} vs a freshly-reset {device:1}). It must be
+    // surfaced, not silently kept (the 2026-06-14 non-propagation bug).
+    describe("true-divergent (pull-site vclock tie)", () => {
+        it("chunks differ + vclock equal + pull-site (not attributed) → true-divergent", () => {
+            expect(classifySyncRelation(input({
+                leftVC: VC({ a: 1 }),
+                rightVC: VC({ a: 1 }),
+                leftChunks: C("zombie"),
+                rightChunks: C("fresh-build"),
+                leftSize: 6,
+                rightSize: 11,
+            }))).toBe("true-divergent");
+        });
+
+        it("chunks EQUAL + vclock equal + pull-site → identical (fast-path regression guard)", () => {
+            expect(classifySyncRelation(input({
+                leftVC: VC({ a: 1 }),
+                rightVC: VC({ a: 1 }),
+                leftChunks: C("same"),
+                rightChunks: C("same"),
+                leftSize: 4,
+                rightSize: 4,
+            }))).toBe("identical");
+        });
+
+        it("chunks differ + left dominates + pull-site → local-edit (do NOT over-broaden)", () => {
+            // Only the equal TIE is anomalous; a real dominates is a legit
+            // local-newer state and must stay local-edit/keep-local.
+            expect(classifySyncRelation(input({
+                leftVC: VC({ a: 2 }),
+                rightVC: VC({ a: 1 }),
+                leftChunks: C("local-newer"),
+                rightChunks: C("old"),
+                leftSize: 11,
+                rightSize: 3,
+            }))).toBe("local-edit");
+        });
+
+        it("equal tie + recreateAuthority (Init re-pull) → remote-edit (adopt fresh authority)", () => {
+            // During a config seq-regression re-pull the remote was recreated
+            // by an Init elsewhere; chunk ids rotate with the new key, so the
+            // tie is adopted from remote rather than surfaced. This is the fix
+            // for both the non-propagation bug and the key-rotation flood.
+            expect(classifySyncRelation(input({
+                leftVC: VC({ a: 1 }),
+                rightVC: VC({ a: 1 }),
+                leftChunks: C("old-key-id"),
+                rightChunks: C("new-key-id"),
+                leftSize: 6,
+                rightSize: 6,
+                recreateAuthority: true,
+            }))).toBe("remote-edit");
+        });
+
+        it("equal tie + recreateAuthority but vault-disk (attributed) → still local-edit", () => {
+            // recreateAuthority is a pull-site signal; it must not override the
+            // vault-disk edit-pending case (attributed clock).
+            expect(classifySyncRelation(input({
+                leftVC: VC({ a: 1 }),
+                rightVC: VC({ a: 1 }),
+                leftChunks: C("disk-edit"),
+                rightChunks: C("doc"),
+                leftSize: 9,
+                rightSize: 3,
+                leftVCAttributed: true,
+                recreateAuthority: true,
             }))).toBe("local-edit");
         });
     });
@@ -237,11 +317,13 @@ describe("classifySyncRelation", () => {
                 rightVC: VC({ b: 1 }),
                 lastSynced,
             }))).toBe("vclock-only-drift");
-            // local-edit (vcRel "equal", no baseline check needed)
+            // local-edit (vcRel "equal", no baseline check needed) — vault-disk
+            // call site (attributed); pull-site equal+differ is true-divergent.
             expect(classifySyncRelation(input({
                 leftChunks: C("L"),
                 rightChunks: C("R"),
                 lastSynced,
+                leftVCAttributed: true,
             }))).toBe("local-edit");
         });
     });
@@ -276,6 +358,10 @@ describe("classifySyncRelation", () => {
                 rightChunks: C("NEW-chunk"),
                 rightSize: 77,
                 lastSynced,
+                // Vault-disk classify (compareFileToDoc): leftVC is the
+                // attributed lastSynced.vclock, so equal+differ = disk edit
+                // pending, → local-edit. (A pull-site tie would be true-divergent.)
+                leftVCAttributed: true,
             }))).toBe("local-edit");
         });
 

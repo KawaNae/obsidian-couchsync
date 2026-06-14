@@ -597,7 +597,27 @@ export class PushPipeline {
                 continue;
             }
             if (rel === "equal") {
-                skippedEqual.push(doc._id);
+                // Content-truthful skip: a vclock tie is only "converged" when
+                // chunks AND the deleted flag also match. A tie with differing
+                // content is the Config-Init stale-collision anomaly — the
+                // vclock cannot order the two, so silently dropping the local
+                // content is the non-propagation bug. Surface it as divergent
+                // (concurrent) so the conflict path arbitrates. Symmetric with
+                // the dominates churn guard above and the pull-side truthful
+                // skip.
+                const rDoc = remoteDocMap.get(doc._id);
+                if (rDoc && chunkListsEqual(doc.chunks, rDoc.chunks)
+                    && !!doc.deleted === !!rDoc.deleted) {
+                    skippedEqual.push(doc._id);
+                    continue;
+                }
+                divergent.push({
+                    filePath: filePathFromId(doc._id),
+                    localDoc: doc,
+                    remoteDoc: rDoc ?? doc,
+                    relation: "concurrent",
+                    prevAttempts: prev,
+                });
                 continue;
             }
             // concurrent or dominated → divergent.

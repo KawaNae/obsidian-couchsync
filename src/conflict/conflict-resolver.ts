@@ -81,6 +81,7 @@ export class ConflictResolver {
     async resolveOnPull(
         localDoc: ResolvableDoc | null,
         remoteDoc: ResolvableDoc,
+        opts?: { recreateAuthority?: boolean },
     ): Promise<PullVerdict> {
         // No local version — always take remote.
         if (!localDoc) return "take-remote";
@@ -104,6 +105,9 @@ export class ConflictResolver {
             rightChunks: remoteContent.chunks,
             rightSize: remoteContent.size,
             rightDeleted: remoteDoc.deleted === true,
+            // Config seq-regression re-pull only: adopt the recreated remote
+            // for vclock ties instead of surfacing them (see ClassifyInput).
+            recreateAuthority: opts?.recreateAuthority === true,
             // No `lastSynced` — pull-side replication is independent of
             // vault integration state. Without baseline the classifier
             // never returns `legacy-skip` here.
@@ -121,10 +125,11 @@ export class ConflictResolver {
 
         switch (relation) {
             case "identical":
-                // Same content + same vclock — already converged. Caller
-                // normally short-circuits before reaching here (pull-writer
-                // skips on `compareVC === "equal"`); kept as a safe
-                // fallback.
+                // Same content + same vclock — already converged. Callers
+                // normally short-circuit before reaching here (the pull
+                // writers fast-skip when vclock-equal AND chunks-equal AND
+                // deleted matches = exactly this `identical` case); kept as a
+                // safe fallback.
                 return "keep-local";
 
             case "vclock-only-drift":
@@ -142,8 +147,11 @@ export class ConflictResolver {
                 return "take-remote";
 
             case "local-edit":
-                // Local has newer content (vclock equal/dominates, chunks
-                // differ). Push pending.
+                // Local has newer content: vclock dominates (chunks differ),
+                // or a vault-disk site at an equal vclock (attributed clock,
+                // disk edit pending its bump). A pull-site equal-vclock tie
+                // with differing content is NOT here — the classifier routes
+                // it to true-divergent. Push pending.
                 logDebug(
                     `keep-local (local newer) for ${vaultPath} — local=${formatVC(localVC)} remote=${formatVC(remoteVC)}`,
                 );

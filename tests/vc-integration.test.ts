@@ -128,7 +128,12 @@ describe("VC integration — two peers", () => {
         expect(Object.keys(noVcDoc.vclock).length > 0).toBe(true);
     });
 
-    it("compareVC sanity: equal vclocks with different chunks → keep-local", async () => {
+    it("equal vclocks with different chunks (pull) → concurrent (truthful)", async () => {
+        // Unit-level repro of the 2026-06-14 non-propagation bug. A pull
+        // compares two REAL doc vclocks; an equal clock with differing content
+        // cannot come from a legit local edit (that bumps the clock). It is the
+        // Config-Init stale-collision anomaly and MUST surface as concurrent —
+        // previously this silently returned keep-local, dropping the divergence.
         const local: FileDoc = {
             _id: makeFileId("edge.md"),
             type: "file",
@@ -145,7 +150,27 @@ describe("VC integration — two peers", () => {
 
         const resolver = new ConflictResolver();
         const verdict = await resolver.resolveOnPull(local, remote);
-        expect(verdict).toBe("keep-local");
+        expect(verdict).toBe("concurrent");
+    });
+
+    it("equal vclocks + different chunks + recreateAuthority → take-remote (adopt Init authority)", async () => {
+        // Same tie, but during a config seq-regression re-pull (remote
+        // recreated by Init): the fresh remote is authoritative and chunk ids
+        // rotated with the new key, so adopt remote rather than surface.
+        const local: FileDoc = {
+            _id: makeFileId("edge.md"),
+            type: "file",
+            chunks: ["chunk:A"],
+            mtime: 1,
+            ctime: 1,
+            size: 1,
+            vclock: { X: 1 },
+        };
+        const remote: FileDoc = { ...local, chunks: ["chunk:B"] };
+
+        const resolver = new ConflictResolver();
+        const verdict = await resolver.resolveOnPull(local, remote, { recreateAuthority: true });
+        expect(verdict).toBe("take-remote");
     });
 
     it("VC chain sanity: incrementVC produces strictly dominating clocks", () => {

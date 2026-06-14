@@ -33,6 +33,7 @@ import {
 import { stripRev } from "../../utils/doc.ts";
 import { compareVC, mergeVC, incrementVC, type VectorClock }
     from "../../sync/vector-clock.ts";
+import { chunkListsEqual } from "../../sync/chunk-equality.ts";
 import type {
     BulkDocsResult,
     DocWithAttachments,
@@ -127,6 +128,9 @@ export class ConfigPushPipeline {
         );
         const remoteRevMap = new Map<string, string>();
         const remoteVcMap = new Map<string, VectorClock>();
+        // Full remote doc, so the equal-vclock skip can verify content
+        // (chunks + deleted) rather than trusting the vclock proxy.
+        const remoteDocMap = new Map<string, ConfigDoc>();
         for (const row of remoteRows.rows) {
             if (row.value?.rev && !row.value?.deleted) {
                 remoteRevMap.set(row.id, row.value.rev);
@@ -134,6 +138,7 @@ export class ConfigPushPipeline {
             if (row.doc) {
                 const rdoc = row.doc as ConfigDoc;
                 if (rdoc.vclock) remoteVcMap.set(row.id, rdoc.vclock);
+                remoteDocMap.set(row.id, rdoc);
             }
         }
 
@@ -170,8 +175,22 @@ export class ConfigPushPipeline {
                 continue;
             }
             if (cmp === "equal") {
-                // Already converged — bulkDocs would 409 anyway. Skip.
-                skipped++;
+                // Content-truthful skip: only converged when chunks AND the
+                // deleted flag also match. A vclock tie with differing content
+                // is the Config-Init stale-collision anomaly — surface it as
+                // divergent so the modal arbitrates, rather than silently
+                // dropping the local content (symmetric with the pull-side
+                // truthful skip and the dominates-case churn guard).
+                const rDoc = remoteDocMap.get(doc._id);
+                if (rDoc && chunkListsEqual(doc.chunks, rDoc.chunks)
+                    && !!doc.deleted === !!rDoc.deleted) {
+                    skipped++;
+                    continue;
+                }
+                divergent.push({
+                    path, localVclock: localVc, remoteVclock: remoteVc,
+                    relation: "concurrent",
+                });
                 continue;
             }
             // dominates — push proceeds.

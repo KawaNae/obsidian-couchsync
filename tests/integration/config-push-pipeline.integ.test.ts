@@ -109,6 +109,26 @@ describe("ConfigPushPipeline — incremental push", () => {
         expect(result.stats.divergent).toBe(0);
     });
 
+    it("equal vclock but DIFFERENT content (Init stale-collision) → divergent, NOT silent skip", async () => {
+        // Source-side half of the 2026-06-14 bug: local has new content at the
+        // same {dev-A:1} as a stale remote. The old equal-skip trusted the
+        // vclock proxy and silently dropped the local content. It must now
+        // surface as divergent so nothing is lost.
+        const local = await seedLocalConfig(db, ".obsidian/a.json", "new-build", { "dev-A": 1 });
+        const remoteDoc = await makeRemoteConfigDoc(".obsidian/a.json", "stale-old", { "dev-A": 1 });
+        await remote.bulkDocs([remoteDoc] as unknown as CouchSyncDoc[]);
+
+        const result = await pipeline.run();
+
+        expect(result.stats.skipped).toBe(0);
+        expect(result.divergent).toHaveLength(1);
+        expect(result.divergent[0].relation).toBe("concurrent");
+        expect(result.cursorAdvanced).toBe(false);
+        // Remote unchanged (push held for arbitration, not silently dropped).
+        const stillRemote = await remote.getDoc<ConfigDoc>(local._id);
+        expect(stillRemote!.vclock).toEqual({ "dev-A": 1 });
+    });
+
     it("second run is empty when nothing changed since lastPushSeq", async () => {
         await seedLocalConfig(db, ".obsidian/a.json", "1", { "dev-A": 1 });
         await pipeline.run();

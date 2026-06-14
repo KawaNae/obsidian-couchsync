@@ -199,7 +199,7 @@ export class VaultSync {
                     // with identical content would otherwise return here and
                     // leave the doc deleted forever (Invariant 7).
                     if (existing && !existing.deleted &&
-                        VaultSync.chunksEqual(existing.chunks, chunkIds)) {
+                        chunkListsEqual(existing.chunks, chunkIds)) {
                         return null; // already on disk
                     }
                     // CLASSIFIER: do not duplicate inline. The push-side
@@ -360,7 +360,7 @@ export class VaultSync {
 
         if (existingStat && existingStat.size === fileDoc.size) {
             const ids = await this.diskChunkIds(vaultPath, existingStat);
-            if (VaultSync.chunksEqual(ids, fileDoc.chunks)) {
+            if (chunkListsEqual(ids, fileDoc.chunks)) {
                 // Content already on disk. Establish the integration baseline
                 // so a later reconcile classifies this path as identical and
                 // never re-pushes it with a self-vclock stamp. Skipping this
@@ -541,7 +541,7 @@ export class VaultSync {
             prev.chunks !== undefined &&
             prev.size === fileDoc.size &&
             compareVC(prev.vclock, docVC) === "equal" &&
-            VaultSync.chunksEqual(prev.chunks, fileDoc.chunks) &&
+            chunkListsEqual(prev.chunks, fileDoc.chunks) &&
             (mtime === undefined || prev.mtime === mtime);
         if (aligned) return;
         const clock = { ...docVC };
@@ -1462,10 +1462,6 @@ export class VaultSync {
             return ls.chunks;
         }
         return this.localChunkIds(path);
-    }
-
-    private static chunksEqual(a: string[], b: string[]): boolean {
-        return a.length === b.length && a.every((id, i) => id === b[i]);
     }
 
     private shouldSync(path: string): boolean {

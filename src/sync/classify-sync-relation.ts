@@ -27,8 +27,11 @@
  * - `local-edit`        — chunks differ + left side is at least as
  *                         causally current. Push case.
  * - `true-divergent`    — chunks differ + (vclock concurrent OR right
- *                         dominates AND left has diverged from baseline).
- *                         Genuine conflict requiring user resolution.
+ *                         dominates AND left has diverged from baseline OR a
+ *                         pull-site vclock TIE — equal clocks with differing
+ *                         content, the Config-Init stale-collision shape, only
+ *                         when `leftVCAttributed` is falsy). Genuine conflict
+ *                         requiring user resolution.
  * - `legacy-skip`       — `lastSynced.chunks` is undefined (pre-extension
  *                         meta entry); caller falls back to vclock-only
  *                         logic. PR5 startup sweep will upgrade these.
@@ -174,6 +177,18 @@ export interface ClassifyInput {
      *  unaffected. Pull-writer call sites that don't track integration
      *  state should omit this. */
     lastSynced?: LastSynced;
+    /** True only during a CONFIG pull's seq-regression re-pull (the remote
+     *  config DB was destroyed + recreated by an Init elsewhere — see
+     *  `config-pull-writer` self-heal). In that window the remote is a fresh
+     *  authority and chunk ids are NOT a reliable content fingerprint: an
+     *  encrypted Init rotates the salt → HMAC key, so identical content gets
+     *  different chunk ids while the vclock resets to a colliding `{device:1}`.
+     *  A pull-site vclock tie under recreate is therefore adopted from remote
+     *  (take-remote) rather than surfaced as a conflict — both the
+     *  non-propagation bug and the false-positive concurrent flood resolve.
+     *  Pull call sites that are NOT a recreate re-pull, and all vault/disk
+     *  call sites, omit this (falsy). */
+    recreateAuthority?: boolean;
 }
 
 export function classifySyncRelation(input: ClassifyInput): SyncRelation {
@@ -210,9 +225,36 @@ export function classifySyncRelation(input: ClassifyInput): SyncRelation {
     }
 
     // 5. vcRel is "equal" or "dominates" — left side is at least as causally
-    //    current as right. The only way to land here with chunks differing
-    //    is a local edit that hasn't been pushed yet (or, in the rare PR1
-    //    invariant-violation case, stale-bookkeeping that looks identical).
+    //    current as right, chunks differ.
+    //
+    //    - "dominates" (ANY caller): the left side genuinely advanced its
+    //      clock above right with new content = a local edit not yet pushed.
+    //      → local-edit.
+    //    - "equal" at a VAULT-DISK call site (leftVCAttributed === true): leftVC
+    //      is the attributed `lastSynced.vclock`, NOT the disk content's own
+    //      clock, so an equal clock does NOT imply equal content — this is the
+    //      steady-state "disk edited, vclock not yet bumped" local edit.
+    //      → local-edit.
+    //    - "equal" at a PULL call site (two REAL doc vclocks, leftVCAttributed
+    //      falsy): a vclock TIE with differing content is impossible for a
+    //      legit local edit (it would have bumped the clock above remote). It
+    //      is the Config-Init stale-collision anomaly — a zombie doc left at
+    //      `{device:1}` colliding with a freshly-reset doc at `{device:1}`
+    //      (confirmed on-device 2026-06-14: the first push at vclock {1} did
+    //      not propagate). The vclocks cannot order them, so silently keeping
+    //      either side is the silent-loss / non-propagation bug. Surface it.
+    //      → true-divergent — UNLESS this is a recreate re-pull (see below).
+    if (vcRel === "equal" && input.leftVCAttributed !== true) {
+        // Config seq-regression re-pull: the remote was recreated by an Init
+        // elsewhere. Chunk ids are unreliable across the Init's key rotation
+        // (encrypted: new salt → new HMAC ids for identical content), and the
+        // recreated remote is the authoritative fresh slate, so adopt it
+        // rather than surface every key-rotated doc as a conflict. Only the
+        // exact vclock tie is affected; a genuine peer edit is `dominates`
+        // (kept) or a foreign-device `concurrent` (surfaced), never a tie.
+        if (input.recreateAuthority === true) return "remote-edit";
+        return "true-divergent";
+    }
     return "local-edit";
 }
 

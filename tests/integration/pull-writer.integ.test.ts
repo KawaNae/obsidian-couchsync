@@ -222,6 +222,34 @@ describe("PullWriter integration", () => {
             expect(fired).toContain("test.md");
         });
 
+        it("equal vclock + chunks differ (pull tie) → concurrent, NOT silent converged-skip", async () => {
+            // 2026-06-14 on-device bug: after a Config Init resets vclocks, a
+            // stale local doc collides with a freshly-pushed remote at the SAME
+            // {A:1}. The old convergedSkip trusted the vclock proxy and silently
+            // kept the stale local (the new content never propagated). It must
+            // now fall through to the resolver and surface as concurrent.
+            h = createSyncHarness();
+            const b = h.addDevice("dev-B");
+            const rig = attachPullWriter({ device: b, withResolver: true });
+
+            await seedLocalFileDoc(b, "edge.md", { A: 1 }, ["chunk:zombie"]);
+            const remote = makeRemoteFileDoc("edge.md", { A: 1 }, {
+                chunks: ["chunk:fresh"],
+            });
+
+            const fired: string[] = [];
+            rig.events.on("concurrent", ({ filePath }) => fired.push(filePath));
+
+            await rig.writer.apply(makeChangesResult(
+                [{ id: remote._id, seq: "1", doc: remote }], "1",
+            ));
+
+            // Surfaced (reached the resolver), not silently converged-skipped.
+            expect(fired).toContain("edge.md");
+            // Concurrent keeps local; the stale doc is retained for arbitration.
+            await expectDb(b.db).toHaveFileDoc("edge.md").withVclock({ A: 1 });
+        });
+
         it("PR4: silent-merge when vclocks divergent but chunks identical (audit MEDIUM)", async () => {
             // audit-2026-05-08 MEDIUM: a re-imported device pushed under its
             // own deviceId, then catchup brings remote with same content but

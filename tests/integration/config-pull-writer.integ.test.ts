@@ -156,6 +156,31 @@ describe("ConfigPullWriter — incremental pull", () => {
         expect(Number(cps.getPullSeq())).toBeLessThan(99999);
     });
 
+    it("recreate re-pull adopts vclock ties (take-remote), NO concurrent flood (E)", async () => {
+        // After an Init recreates the remote, a peer's stale local doc collides
+        // with the fresh remote at the same {dev-A:1}. Across the Init's key
+        // rotation the chunk ids differ even for identical content, so the tie
+        // must be ADOPTED from the fresh authority (take-remote) — NOT surfaced
+        // as concurrent (the 2026-06-14 false-positive flood) and NOT silently
+        // kept (the non-propagation bug). Drives the real didSeqReset path.
+        const localF = await makeConfigDoc(".obsidian/app.json", "stale-old", { "dev-A": 1 });
+        await db.runWriteTx({
+            docs: [{ doc: localF.doc as unknown as CouchSyncDoc }],
+            chunks: localF.chunks as unknown as CouchSyncDoc[],
+        });
+        const remoteF = await makeConfigDoc(".obsidian/app.json", "fresh-new", { "dev-A": 1 });
+        await seedRemote(remote, [remoteF]);
+        // Stale cursor → run() detects the recreate and re-pulls (didSeqReset).
+        cps.setPullSeq(99999);
+
+        const result = await writer.run();
+
+        expect(result.stats.concurrent).toBe(0);   // no flood
+        expect(result.stats.accepted).toBe(1);      // tie adopted from remote
+        const adopted = (await db.get(localF.doc._id)) as ConfigDoc;
+        expect(adopted.chunks).toEqual(remoteF.doc.chunks);
+    });
+
     it("second run returns empty when remote is unchanged (cursor sticks)", async () => {
         await seedRemote(remote, [
             await makeConfigDoc(".obsidian/a.json", "1", { "dev-A": 1 }),
@@ -181,6 +206,27 @@ describe("ConfigPullWriter — incremental pull", () => {
         const result = await writer.run();
 
         expect(result.stats.convergedSkip).toBe(1);
+        expect(result.stats.accepted).toBe(0);
+    });
+
+    it("equal vclock but DIFFERENT content (Init stale-collision) → concurrent, NOT converged-skip", async () => {
+        // 2026-06-14 on-device bug: after a Config Init resets all vclocks, a
+        // stale local doc (old content) collides with a freshly-pushed remote
+        // doc at the SAME {dev:1}. Content differs, so the truthful verdict is
+        // concurrent (surface) — the old code trusted the vclock proxy and
+        // silently kept the stale local, so the new build never propagated.
+        const localF = await makeConfigDoc(".obsidian/a.json", "zombie-old", { "dev-A": 1 });
+        await db.runWriteTx({
+            docs: [{ doc: localF.doc as unknown as CouchSyncDoc }],
+            chunks: localF.chunks as unknown as CouchSyncDoc[],
+        });
+        const remoteF = await makeConfigDoc(".obsidian/a.json", "fresh-build", { "dev-A": 1 });
+        await seedRemote(remote, [remoteF]);
+
+        const result = await writer.run();
+
+        expect(result.stats.convergedSkip).toBe(0);
+        expect(result.stats.concurrent).toBe(1);
         expect(result.stats.accepted).toBe(0);
     });
 

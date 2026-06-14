@@ -29,6 +29,7 @@ import { isConfigDoc, CONFIG_SCHEMA_VERSION } from "../../types.ts";
 import { configPathFromId, isConfigDocId } from "../../types/doc-id.ts";
 import { stripRev } from "../../utils/doc.ts";
 import { compareVC, mergeVC } from "../../sync/vector-clock.ts";
+import { chunkListsEqual } from "../../sync/chunk-equality.ts";
 import type { ICouchClient } from "../interfaces.ts";
 import type { ChangesResult } from "../interfaces.ts";
 import type { ConfigLocalDB } from "../config-local-db.ts";
@@ -177,7 +178,11 @@ export class ConfigPullWriter {
             }
             totalReceived += batch.results.length;
 
-            const partition = await this.classify(batch);
+            // `didSeqReset` is true once the remote-recreated self-heal has
+            // fired this run: the subsequent re-pull is against a fresh
+            // authority, so vclock ties are adopted (take-remote) rather than
+            // surfaced — see classifySyncRelation `recreateAuthority`.
+            const partition = await this.classify(batch, didSeqReset);
 
             await this.commitBatch(partition.accepted, partition.deleted, batch.last_seq);
 
@@ -221,7 +226,10 @@ export class ConfigPullWriter {
 
     // ── classify ────────────────────────────────────────
 
-    private async classify(batch: ChangesResult<ConfigDoc>): Promise<{
+    private async classify(
+        batch: ChangesResult<ConfigDoc>,
+        recreateAuthority: boolean,
+    ): Promise<{
         accepted: ConfigDoc[];
         deleted: string[];
         concurrent: ConfigConcurrentEntry[];
@@ -265,13 +273,26 @@ export class ConfigPullWriter {
             if (localDoc) {
                 const localVC = localDoc.vclock ?? {};
                 const remoteVC = remoteDoc.vclock ?? {};
+                // Content-truthful converged skip: skip ONLY when this is
+                // provably the classifier's `identical` case — vclock equal AND
+                // chunks equal AND deleted matches. A vclock TIE with differing
+                // content is the Config-Init stale-collision anomaly and MUST
+                // fall through to the resolver (→ true-divergent → concurrent),
+                // not be silently kept — that was the 2026-06-14 on-device
+                // non-propagation bug (first push at vclock {1} never reached
+                // peers). The predicate is a strict subset of `identical`, so
+                // it can never disagree with classifySyncRelation (Invariant 2).
                 if (Object.keys(localVC).length > 0
-                    && compareVC(localVC, remoteVC) === "equal") {
+                    && compareVC(localVC, remoteVC) === "equal"
+                    && chunkListsEqual(localDoc.chunks, remoteDoc.chunks)
+                    && !!localDoc.deleted === !!remoteDoc.deleted) {
                     convergedSkipCount++;
                     continue;
                 }
                 if (resolver) {
-                    const verdict = await resolver.resolveOnPull(localDoc, remoteDoc);
+                    const verdict = await resolver.resolveOnPull(
+                        localDoc, remoteDoc, { recreateAuthority },
+                    );
                     const path = configPathFromId(remoteDoc._id);
                     // **Invariant 5 (PullVerdict 完全網羅).** Every verdict
                     // must be handled explicitly — fall-through silently

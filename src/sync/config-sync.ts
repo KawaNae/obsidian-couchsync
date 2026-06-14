@@ -27,6 +27,7 @@ function defaultHasher(): ChunkHasher {
     return { alg: "x64", hash: computeHash };
 }
 import { incrementVC } from "./vector-clock.ts";
+import { chunkListsEqual } from "./chunk-equality.ts";
 import type { ICouchClient } from "../db/interfaces.ts";
 import { makeCouchClient } from "../db/couch-client.ts";
 import type { CryptoProvider } from "../db/crypto-provider.ts";
@@ -650,7 +651,7 @@ export class ConfigSync {
 
                 const cached = lastSynced.get(file);
                 if (cached && cached.size === stat.size
-                    && ConfigSync.chunksEqual(cached.chunks, chunkIds)) {
+                    && chunkListsEqual(cached.chunks, chunkIds)) {
                     continue; // unchanged since last sync — no rewrite
                 }
 
@@ -695,14 +696,6 @@ export class ConfigSync {
         }
         return count;
     }
-
-    /** Chunk-list equality. O(N) over ids; chunks are content-addressed,
-     *  so id-equality is byte-equality (invariant 14). Mirrors
-     *  VaultSync.chunksEqual. */
-    private static chunksEqual(a: readonly string[], b: readonly string[]): boolean {
-        return a.length === b.length && a.every((id, i) => id === b[i]);
-    }
-
 
     /** Write config docs to filesystem, filtered by the policy RECEIVE
      *  projection (`receiveDecision`): the meaning-unit selection narrowed by

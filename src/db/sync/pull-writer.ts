@@ -29,6 +29,7 @@ import {
 } from "../../types/doc-id.ts";
 import { stripRev } from "../../utils/doc.ts";
 import { compareVC, mergeVC } from "../../sync/vector-clock.ts";
+import { chunkListsEqual } from "../../sync/chunk-equality.ts";
 import type { LocalDB } from "../local-db.ts";
 import type { ChangesResult } from "../interfaces.ts";
 import type { ConflictResolver } from "../../conflict/conflict-resolver.ts";
@@ -263,18 +264,27 @@ export class PullWriter {
             if (resolver) {
                 const localDoc = await this.deps.localDb.get(remoteDoc._id);
                 if (localDoc && (isFileDoc(localDoc) || isConfigDoc(localDoc))) {
-                    // Data-level idempotency: identical vclocks mean the
-                    // local already reflects this revision (self-push
-                    // echo OR a foreign write that was previously pulled
-                    // in). Skip silently before reaching the resolver so
-                    // session-boundary echo loss doesn't surface as
-                    // keep-local noise. Empty-vs-empty vclocks are not
-                    // causally equal (tombstones, legacy docs) and must
-                    // fall through to the resolver.
+                    // Data-level idempotency: a TRULY converged doc (self-push
+                    // echo OR a foreign write previously pulled in) already
+                    // reflects this revision. Skip silently before the resolver
+                    // so echo doesn't surface as keep-local noise — but ONLY
+                    // when this is provably the classifier's `identical` case:
+                    // vclock equal AND chunks equal AND deleted matches. A
+                    // vclock TIE with differing content is NOT converged; it is
+                    // the Config-Init stale-collision anomaly (a zombie doc at
+                    // {device:1} vs a freshly-reset doc at {device:1}) and MUST
+                    // fall through to the resolver (→ true-divergent), not be
+                    // silently kept — that was the 2026-06-14 on-device
+                    // non-propagation bug. The predicate is a strict subset of
+                    // `identical`, so it never disagrees with the classifier
+                    // (Invariant 2). Empty-vs-empty vclocks are not causally
+                    // equal (tombstones, legacy docs) and must fall through too.
                     const localVC = localDoc.vclock ?? {};
                     const remoteVC = remoteDoc.vclock ?? {};
                     if (Object.keys(localVC).length > 0 &&
-                        compareVC(localVC, remoteVC) === "equal") {
+                        compareVC(localVC, remoteVC) === "equal" &&
+                        chunkListsEqual(localDoc.chunks, remoteDoc.chunks) &&
+                        !!localDoc.deleted === !!remoteDoc.deleted) {
                         stats.convergedSkipCount++;
                         continue;
                     }
