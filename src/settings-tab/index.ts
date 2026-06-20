@@ -20,6 +20,8 @@ export class CouchSyncSettingTab extends PluginSettingTab {
 
     display(): void {
         const { containerEl } = this;
+        const scrollEl = containerEl.closest(".vertical-tab-content") as HTMLElement | null;
+        const savedScroll = scrollEl?.scrollTop ?? 0;
         containerEl.empty();
         containerEl.addClass("cs-settings");
 
@@ -170,6 +172,10 @@ export class CouchSyncSettingTab extends PluginSettingTab {
 
         // Restore active tab (survives refresh)
         this.activateTab(wrapper, this.activeTabId);
+
+        if (scrollEl && savedScroll > 0) {
+            requestAnimationFrame(() => { scrollEl.scrollTop = savedScroll; });
+        }
     }
 
     hide(): void {
