@@ -318,7 +318,7 @@
     flex-shrink: 0;
 }
 
-.diff-history-btn {
+.diff-history-view .diff-history-btn {
     padding: 2px 8px;
     border-radius: 4px;
     font-size: 0.8em;
@@ -328,7 +328,7 @@
     color: var(--text-muted);
 }
 
-.diff-history-btn:hover {
+.diff-history-view .diff-history-btn:hover {
     background: var(--background-modifier-hover);
     color: var(--text-normal);
 }
