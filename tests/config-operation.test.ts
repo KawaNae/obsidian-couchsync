@@ -203,6 +203,21 @@ describe("ConfigOperation", () => {
             expect(bridge.errors).toHaveLength(1);
         });
 
+        it("non-retriable EncryptionError (schema-mismatch) routes to bridge.notifyTransient", async () => {
+            const { EncryptionError } = await import("../src/db/codec-errors.ts");
+            const client = makeFakeClient();
+            const op = new ConfigOperation({
+                auth, visibility: ALWAYS_VISIBLE, reconnectBridge: bridge,
+                makeClient: () => client,
+            });
+            const err = new EncryptionError("cipherVersion-3 floor breach", undefined, false);
+            await expect(
+                op.run(async () => { throw err; }),
+            ).rejects.toThrow(/cipherVersion/);
+            expect(bridge.errors).toHaveLength(1);
+            expect(bridge.errors[0]).toBe(err);
+        });
+
         it("AbortError from cancel does NOT notify bridge", async () => {
             const client = makeFakeClient();
             const op = new ConfigOperation({

@@ -121,23 +121,21 @@ export default class CouchSyncPlugin extends Plugin {
      * the stream incompressible. Pull traverses the inverse order.
      */
     private wrapVaultClient = (raw: CouchClient): ICouchClient => {
-        // Fail-closed codec integrity (Invariant III). The encrypt layer is
-        // sourced from the in-memory `vaultCryptoProvider`, the compress layer
-        // from `activeCompression` (which falls through to the *persisted*
-        // `compressionEnabled`). These two sources have different lifecycles:
-        // a clone failure drops the crypto provider but leaves the persisted
-        // compression flag intact, so without this guard we'd silently build a
-        // compress-only stack over an encrypted vault and try to gunzip still-
-        // encrypted bodies. Refuse to build an inconsistent stack instead.
-        if (this.settings.encryptionEnabled && !this.vaultCryptoProvider) {
-            throw new Error(
-                "CouchSync: refusing to build vault client — vault is encrypted " +
-                    "but no crypto provider is unlocked (provisioning incomplete). " +
-                    "Re-run Init/Clone or unlock the vault.",
-            );
-        }
+        // Policy-gated codec stack (Invariant III). The encryption POLICY
+        // (`encryptionEnabled`) gates whether the encrypt layer is applied —
+        // not the provider's existence. A stale in-memory provider left over
+        // from a prior encrypted session must not activate the encrypt layer
+        // when the policy says plaintext. Symmetric with compression, which
+        // is already policy-gated via `activeCompression`.
         let client: ICouchClient = raw;
-        if (this.vaultCryptoProvider) {
+        if (this.settings.encryptionEnabled) {
+            if (!this.vaultCryptoProvider) {
+                throw new Error(
+                    "CouchSync: refusing to build vault client — vault is encrypted " +
+                        "but no crypto provider is unlocked (provisioning incomplete). " +
+                        "Re-run Init/Clone or unlock the vault.",
+                );
+            }
             client = new EncryptingCouchClient(
                 client, this.vaultCryptoProvider, this.activeCipherVersion,
             );
@@ -373,22 +371,20 @@ export default class CouchSyncPlugin extends Plugin {
      * an independent UI toggle).
      */
     private wrapConfigClient = (raw: CouchClient): ICouchClient => {
-        // Fail-closed codec integrity, symmetric with wrapVaultClient (#12).
-        // Without this, a config DB that is supposed to be encrypted but whose
-        // `configCryptoProvider` is momentarily unset (onload early-derive
-        // failed non-fatally / provisioning incomplete) would silently build a
-        // plaintext stack and write UNENCRYPTED config bodies into an encrypted
-        // config DB. Refuse to build an inconsistent stack instead.
+        // Policy-gated codec stack, symmetric with wrapVaultClient (#12).
+        // The encryption POLICY (`codec.encryption`) gates whether the encrypt
+        // layer is applied — not the provider's existence. Mirrors the
+        // compression branch below (`if (codec.compression)`).
         const codec = resolveConfigCodec(this.settings);
-        if (codec.encryption && !this.configCryptoProvider) {
-            throw new Error(
-                "CouchSync: refusing to build config client — config DB is " +
-                    "encrypted but no crypto provider is unlocked (provisioning " +
-                    "incomplete). Re-run Config Init or unlock the vault.",
-            );
-        }
         let client: ICouchClient = raw;
-        if (this.configCryptoProvider) {
+        if (codec.encryption) {
+            if (!this.configCryptoProvider) {
+                throw new Error(
+                    "CouchSync: refusing to build config client — config DB is " +
+                        "encrypted but no crypto provider is unlocked (provisioning " +
+                        "incomplete). Re-run Config Init or unlock the vault.",
+                );
+            }
             client = new EncryptingCouchClient(
                 client, this.configCryptoProvider, this.settings.configCipherVersion,
             );
@@ -466,14 +462,19 @@ export default class CouchSyncPlugin extends Plugin {
         // literal's own `this` would refer to itself (not the plugin).
         const plugin = this;
         const vaultChunkHasher: ChunkHasher = {
-            get alg(): ChunkHashAlg { return plugin.vaultCryptoProvider ? "hmac" : "x64"; },
-            hash: (data) => plugin.vaultCryptoProvider
+            get alg(): ChunkHashAlg {
+                return plugin.settings.encryptionEnabled && plugin.vaultCryptoProvider ? "hmac" : "x64";
+            },
+            hash: (data) => plugin.settings.encryptionEnabled && plugin.vaultCryptoProvider
                 ? plugin.vaultCryptoProvider.hmacHash(data)
                 : computeHash(data),
         };
         const configChunkHasher: ChunkHasher = {
-            get alg(): ChunkHashAlg { return plugin.configCryptoProvider ? "hmac" : "x64"; },
-            hash: (data) => plugin.configCryptoProvider
+            get alg(): ChunkHashAlg {
+                return resolveConfigCodec(plugin.settings).encryption && plugin.configCryptoProvider
+                    ? "hmac" : "x64";
+            },
+            hash: (data) => resolveConfigCodec(plugin.settings).encryption && plugin.configCryptoProvider
                 ? plugin.configCryptoProvider.hmacHash(data)
                 : computeHash(data),
         };

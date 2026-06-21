@@ -155,9 +155,13 @@ export class ConfigOperation {
             this.deps.auth.raise(detail.code, detail.message);
             return;
         }
-        // Transient — let the bridge decide whether to drag the vault
-        // session into a verify-then-restart.
-        if (detail.kind === "network" || detail.kind === "timeout" || detail.kind === "server") {
+        // Transient or terminal — let the bridge decide whether to drag
+        // the vault session into a verify-then-restart. schema-mismatch
+        // (non-retriable EncryptionError / cipherVersion floor breach) is
+        // terminal on the config side; the vault session must still be
+        // notified so it can halt rather than loop against the same error.
+        if (detail.kind === "network" || detail.kind === "timeout"
+            || detail.kind === "server" || detail.kind === "schema-mismatch") {
             this.deps.reconnectBridge.notifyTransient(err);
         }
     }
