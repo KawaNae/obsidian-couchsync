@@ -253,7 +253,17 @@
 .diff-history-graph line { stroke-width: 2px; }
 .diff-history-graph .graph-main { stroke: var(--interactive-accent); fill: var(--interactive-accent); }
 .diff-history-graph .graph-branch { stroke: var(--text-faint); fill: var(--text-faint); }
-.diff-history-graph .graph-dot { stroke: none; }
+.diff-history-dot {
+    position: absolute;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    top: 50%;
+    transform: translateY(-50%);
+    z-index: 1;
+}
+.diff-history-dot.graph-main { background: var(--interactive-accent); }
+.diff-history-dot.graph-branch { background: var(--text-faint); }
 
 .diff-history-head-badge {
     font-size: 0.7em;
