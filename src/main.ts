@@ -712,6 +712,9 @@ export default class CouchSyncPlugin extends Plugin {
         registerCommands(this);
 
         this.app.workspace.onLayoutReady(async () => {
+            this.historyCapture.setOnDiffSaved((filePath) => {
+                (this.app.workspace as any).trigger("couchsync:diff-saved", filePath);
+            });
             this.historyCapture.start();
             this.historyManager.startCleanup();
             this.logManager.start();

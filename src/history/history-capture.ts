@@ -23,6 +23,7 @@ export class HistoryCapture {
     private eventRefs: VaultEventRef[] = [];
     private paused = false;
     private diffEngine = new DiffEngine();
+    private onDiffSaved: ((filePath: string) => void) | null = null;
 
     constructor(
         private vault: IVaultIO,
@@ -30,6 +31,10 @@ export class HistoryCapture {
         private storage: HistoryStorage,
         private getSettings: () => CouchSyncSettings,
     ) {}
+
+    setOnDiffSaved(cb: (filePath: string) => void): void {
+        this.onDiffSaved = cb;
+    }
 
     start(): void {
         this.eventRefs.push(
@@ -137,6 +142,7 @@ export class HistoryCapture {
             logError(`CouchSync: Failed to record conflict history for ${filePath}: ${e?.message ?? e}`);
         }
         await this.storage.saveSnapshot(filePath, winnerContent, newId ?? parentId);
+        if (newId !== null) this.onDiffSaved?.(filePath);
     }
 
     /**
@@ -242,6 +248,7 @@ export class HistoryCapture {
             }
             await this.storage.saveSnapshot(path, currentContent, newId ?? parentId);
             this.lastCaptureTime.set(path, Date.now());
+            if (newId !== null) this.onDiffSaved?.(path);
         } catch (e) {
             logError(`CouchSync: Failed to capture history: ${e?.message ?? e}`);
         }
