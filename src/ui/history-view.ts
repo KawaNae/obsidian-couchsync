@@ -80,6 +80,7 @@ export class DiffHistoryView extends ItemView {
         const maxCol = getMaxColumn(this.graphRows);
         const graphWidth = (maxCol + 1) * COLUMN_WIDTH;
 
+        const svgsToFit: SVGSVGElement[] = [];
         let prevDate = "";
         for (let i = 0; i < this.graphRows.length; i++) {
             const gRow = this.graphRows[i];
@@ -88,13 +89,13 @@ export class DiffHistoryView extends ItemView {
 
             const curDate = formatDate(entry.record.timestamp);
             if (curDate !== prevDate) {
-                this.renderDateSeparator(container, curDate, graphWidth, i > 0 ? this.graphRows[i - 1] : undefined, gRow);
+                svgsToFit.push(this.renderDateSeparator(container, curDate, graphWidth, i > 0 ? this.graphRows[i - 1] : undefined, gRow));
                 prevDate = curDate;
             }
 
             const row = container.createDiv({ cls: "diff-history-entry" });
 
-            this.renderGraphCell(row, gRow, graphWidth);
+            svgsToFit.push(this.renderGraphCell(row, gRow, graphWidth));
 
             if (isHead) {
                 row.createSpan({ cls: "diff-history-head-badge", text: "HEAD" });
@@ -124,32 +125,39 @@ export class DiffHistoryView extends ItemView {
                 restoreBtn.addEventListener("click", (e) => { e.stopPropagation(); this.onRestore(entry); });
             }
         }
+
+        requestAnimationFrame(() => {
+            for (const svg of svgsToFit) {
+                const h = (svg.parentElement as HTMLElement).offsetHeight;
+                if (h > 0) svg.setAttribute("viewBox", `0 0 ${graphWidth} ${h}`);
+            }
+        });
     }
 
-    private renderGraphCell(row: HTMLElement, gRow: GraphRow, graphWidth: number): void {
+    private renderGraphCell(row: HTMLElement, gRow: GraphRow, graphWidth: number): SVGSVGElement {
         row.style.paddingLeft = `${graphWidth + 8}px`;
+        const h = ROW_HEIGHT;
         const svg = document.createElementNS(SVG_NS, "svg");
         svg.setAttribute("class", "diff-history-graph");
         svg.setAttribute("width", String(graphWidth));
-        svg.setAttribute("viewBox", `0 0 ${graphWidth} ${ROW_HEIGHT}`)
-        svg.setAttribute("preserveAspectRatio", "none");
+        svg.setAttribute("viewBox", `0 0 ${graphWidth} ${h}`);
 
         const cx = gRow.column * COLUMN_WIDTH + COLUMN_WIDTH / 2;
-        const cy = ROW_HEIGHT / 2;
+        const cy = h / 2;
         const isBranch = gRow.column > 0;
         const mainCls = isBranch ? "graph-branch" : "graph-main";
 
         for (const col of gRow.passThrough) {
             const x = col * COLUMN_WIDTH + COLUMN_WIDTH / 2;
             const cls = col > 0 ? "graph-branch" : "graph-main";
-            this.svgLine(svg, x, 0, x, ROW_HEIGHT, cls);
+            this.svgLine(svg, x, 0, x, h, cls);
         }
 
         if (gRow.hasUp) {
             this.svgLine(svg, cx, 0, cx, cy - DOT_RADIUS, mainCls);
         }
         if (gRow.hasDown) {
-            this.svgLine(svg, cx, cy + DOT_RADIUS, cx, ROW_HEIGHT, mainCls);
+            this.svgLine(svg, cx, cy + DOT_RADIUS, cx, h, mainCls);
         }
 
         for (const fromCol of gRow.mergeFrom) {
@@ -165,6 +173,7 @@ export class DiffHistoryView extends ItemView {
         svg.appendChild(circle);
 
         row.appendChild(svg);
+        return svg;
     }
 
     private renderDateSeparator(
@@ -173,7 +182,7 @@ export class DiffHistoryView extends ItemView {
         graphWidth: number,
         above: GraphRow | undefined,
         below: GraphRow,
-    ): void {
+    ): SVGSVGElement {
         const SEP_HEIGHT = 24;
         const sep = container.createDiv({ cls: "diff-history-date-sep" });
         sep.style.paddingLeft = `${graphWidth + 8}px`;
@@ -191,7 +200,6 @@ export class DiffHistoryView extends ItemView {
         svg.setAttribute("class", "diff-history-graph");
         svg.setAttribute("width", String(graphWidth));
         svg.setAttribute("viewBox", `0 0 ${graphWidth} ${SEP_HEIGHT}`);
-        svg.setAttribute("preserveAspectRatio", "none");
 
         for (const col of active) {
             const x = col * COLUMN_WIDTH + COLUMN_WIDTH / 2;
@@ -201,6 +209,7 @@ export class DiffHistoryView extends ItemView {
 
         sep.appendChild(svg);
         sep.createSpan({ cls: "diff-history-date-label", text: date });
+        return svg;
     }
 
     private svgLine(svg: SVGElement, x1: number, y1: number, x2: number, y2: number, cls: string): void {
