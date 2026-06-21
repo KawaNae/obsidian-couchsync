@@ -214,7 +214,7 @@ describe("invariant 15 — local schema version stamped on every Dexie DB", () =
         await probe.open();
         const row = await probe.table("_meta").get("schemaVersion");
         probe.close();
-        expect(row?.value).toBe(1);
+        expect(row?.value).toBe(2);
     });
 
     it("LogStorage stamps schemaVersion", async () => {

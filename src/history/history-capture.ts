@@ -125,26 +125,18 @@ export class HistoryCapture {
     ): Promise<void> {
         const winnerContent = winner === "local" ? localContent : remoteContent;
         const loserContent = winner === "local" ? remoteContent : localContent;
-        // Record-keeping must advance even when the diff fails (the same
-        // principle as Invariant 7's "deletion is an integration event"):
-        // callers (ConflictOrchestrator) treat a saveConflict throw as an
-        // APPLY failure — applyBatchChoice skips clearDurable (ghost
-        // re-presentation of an already-applied conflict) and processSingle
-        // emits a false "keeping local version" notice. A failed diff loses
-        // one history entry; it must not corrupt conflict resolution. So:
-        // swallow diff-stage errors, always advance the snapshot baseline.
+        const snapshot = await this.storage.getSnapshot(filePath);
+        const parentId = snapshot?.headRecordId ?? null;
+        let newId: number | null = null;
         try {
             const patch = this.diffEngine.computePatch(winnerContent, loserContent);
             const hash = await hashString(winnerContent);
             const { added, removed } = this.diffEngine.computeLineDiff(winnerContent, loserContent);
-            await this.storage.saveDiff(filePath, patch, hash, added, removed, true);
+            newId = await this.storage.saveDiff(filePath, patch, hash, added, removed, true, "local", parentId);
         } catch (e: any) {
             logError(`CouchSync: Failed to record conflict history for ${filePath}: ${e?.message ?? e}`);
         }
-        // Update snapshot to winner content so subsequent diffs have correct
-        // baseline — unconditionally, or the stale snapshot reproduces the
-        // same failure on every later capture (the 2026-06-04 cascade).
-        await this.storage.saveSnapshot(filePath, winnerContent);
+        await this.storage.saveSnapshot(filePath, winnerContent, newId ?? parentId);
     }
 
     /**
@@ -220,10 +212,6 @@ export class HistoryCapture {
         providedContent?: string,
     ): Promise<void> {
         try {
-            // Local edits use cachedRead (memory-cached parsed text) for the
-            // typing hot path. Sync writes go through the byte-sniff path so
-            // binary files don't pollute history. We re-encode the cached
-            // string to validate it's diffable UTF-8 either way.
             let currentContent: string;
             if (providedContent !== undefined) {
                 if (!isDiffableText(new TextEncoder().encode(providedContent))) return;
@@ -241,27 +229,20 @@ export class HistoryCapture {
             const prevContent = snapshot?.content ?? "";
             if (prevContent === currentContent) return;
 
-            // Once we hold the current content, record-keeping must advance
-            // even if the diff stage fails: leaving the snapshot stale made
-            // every subsequent capture re-derive the SAME failing diff (the
-            // 2026-06-04 "URI malformed" cascade — 13 consecutive failures),
-            // and the un-advanced lastCaptureTime disabled the rate-limit on
-            // top. A failed diff costs one history entry; a stale snapshot
-            // costs the whole chain.
+            const parentId = snapshot?.headRecordId ?? null;
+            let newId: number | null = null;
             try {
                 const patches = this.diffEngine.computePatch(prevContent, currentContent);
                 const baseHash = await hashString(prevContent);
                 const { added, removed } = this.diffEngine.computeLineDiff(prevContent, currentContent);
-                await this.storage.saveDiff(path, patches, baseHash, added, removed, false, source);
+                newId = await this.storage.saveDiff(path, patches, baseHash, added, removed, false, source, parentId);
                 logDebug(`History captured for ${path} (${source})`);
             } catch (e: any) {
                 logError(`CouchSync: Failed to capture history: ${e?.message ?? e}`);
             }
-            await this.storage.saveSnapshot(path, currentContent);
+            await this.storage.saveSnapshot(path, currentContent, newId ?? parentId);
             this.lastCaptureTime.set(path, Date.now());
         } catch (e) {
-            // Content acquisition (or snapshot bookkeeping) failed — there is
-            // no basis to advance the baseline. Next event retries.
             logError(`CouchSync: Failed to capture history: ${e?.message ?? e}`);
         }
     }

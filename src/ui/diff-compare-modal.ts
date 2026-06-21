@@ -29,8 +29,17 @@ export class DiffCompareModal extends Modal {
 
         buildSideBySide(this.oldText, this.newText, leftContent, rightContent);
 
-        leftContent.addEventListener("scroll", () => { rightContent.scrollTop = leftContent.scrollTop; });
-        rightContent.addEventListener("scroll", () => { leftContent.scrollTop = rightContent.scrollTop; });
+        let syncing = false;
+        leftContent.addEventListener("scroll", () => {
+            if (syncing) return;
+            syncing = true;
+            requestAnimationFrame(() => { rightContent.scrollTop = leftContent.scrollTop; syncing = false; });
+        });
+        rightContent.addEventListener("scroll", () => {
+            if (syncing) return;
+            syncing = true;
+            requestAnimationFrame(() => { leftContent.scrollTop = rightContent.scrollTop; syncing = false; });
+        });
     }
 
     onClose(): void { this.contentEl.empty(); }

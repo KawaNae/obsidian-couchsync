@@ -1,3 +1,4 @@
+import { Notice } from "obsidian";
 import type CouchSyncPlugin from "./main.ts";
 import { ProgressNotice } from "./ui/notices.ts";
 import { ConsistencyReportModal } from "./ui/consistency-report-modal.ts";
@@ -18,7 +19,11 @@ export function registerCommands(plugin: CouchSyncPlugin): void {
         name: "Show file history",
         callback: () => {
             const file = plugin.app.workspace.getActiveFile();
-            if (file) plugin.showHistory(file.path);
+            if (file) {
+                plugin.showHistory(file.path);
+            } else {
+                new Notice("No active file. Open a file to view its history.");
+            }
         },
     });
 

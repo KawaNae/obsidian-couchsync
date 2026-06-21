@@ -3,13 +3,20 @@ import type CouchSyncPlugin from "../main.ts";
 import type { HistoryEntry } from "../history/types.ts";
 import { ConfirmModal } from "./confirm-modal.ts";
 import { DiffCompareModal } from "./diff-compare-modal.ts";
-import { formatTime, formatDate, groupBy } from "../utils/format.ts";
+import { formatTime, formatDate } from "../utils/format.ts";
+import { buildGraphLayout, getMaxColumn, type GraphRow } from "./history-graph.ts";
 
 export const VIEW_TYPE_DIFF_HISTORY = "couchsync-history-view";
 
+const COLUMN_WIDTH = 16;
+const ROW_HEIGHT = 32;
+const DOT_RADIUS = 4;
+const SVG_NS = "http://www.w3.org/2000/svg";
+
 export class DiffHistoryView extends ItemView {
     private currentFile: string | null = null;
-    private entries: HistoryEntry[] = [];
+    private graphRows: GraphRow[] = [];
+    private headRecordId: number | null = null;
 
     constructor(leaf: WorkspaceLeaf, private plugin: CouchSyncPlugin) {
         super(leaf);
@@ -50,8 +57,10 @@ export class DiffHistoryView extends ItemView {
 
     async showFileHistory(filePath: string): Promise<void> {
         this.currentFile = filePath;
-        this.entries = await this.plugin.historyManager.getFileHistory(filePath);
-        this.entries.reverse();
+        const entries = await this.plugin.historyManager.getFileHistory(filePath);
+        const snapshot = await this.plugin.historyManager.getSnapshot(filePath);
+        this.headRecordId = snapshot?.headRecordId ?? null;
+        this.graphRows = buildGraphLayout(entries, this.headRecordId);
         this.render();
     }
 
@@ -66,44 +75,98 @@ export class DiffHistoryView extends ItemView {
         const fileName = this.currentFile.split("/").pop() || this.currentFile;
         header.createEl("strong", { text: fileName });
 
-        if (this.entries.length === 0) { this.renderEmpty(); return; }
+        if (this.graphRows.length === 0) { this.renderEmpty(); return; }
 
-        const groups = groupBy(this.entries, (e) => formatDate(e.record.timestamp));
+        const maxCol = getMaxColumn(this.graphRows);
+        const graphWidth = (maxCol + 1) * COLUMN_WIDTH;
 
-        for (const [date, entries] of groups) {
-            const group = container.createDiv({ cls: "diff-history-date-group" });
-            group.createDiv({ cls: "diff-history-date-header", text: date });
+        for (let i = 0; i < this.graphRows.length; i++) {
+            const gRow = this.graphRows[i];
+            const entry = gRow.entry;
+            const isHead = entry.record.id === this.headRecordId;
 
-            for (const entry of entries) {
-                const globalIndex = this.entries.indexOf(entry);
-                const row = group.createDiv({ cls: "diff-history-entry" });
-                row.createSpan({ cls: "diff-history-time", text: formatTime(entry.record.timestamp) });
+            const row = container.createDiv({ cls: "diff-history-entry" });
 
-                if (entry.record.conflict) {
-                    row.createSpan({ cls: "diff-history-conflict-badge", text: "conflict" });
-                }
+            this.renderGraphCell(row, gRow, graphWidth);
 
-                const summary = row.createSpan({ cls: "diff-history-summary" });
-                if (entry.added > 0) summary.createSpan({ cls: "diff-history-additions", text: `+${entry.added}` });
-                if (entry.removed > 0) summary.createSpan({ cls: "diff-history-deletions", text: `-${entry.removed}` });
+            if (isHead) {
+                row.createSpan({ cls: "diff-history-head-badge", text: "HEAD" });
+            }
 
-                if ((entry.record.source ?? "local") === "sync") {
-                    const icon = row.createSpan({ cls: "diff-history-sync-icon", attr: { "aria-label": "from sync" } });
-                    setIcon(icon, "cloud-download");
-                }
+            row.createSpan({ cls: "diff-history-time", text: formatTime(entry.record.timestamp) });
 
-                const actions = row.createSpan({ cls: "diff-history-entry-actions" });
-                const diffBtn = actions.createEl("button", { cls: "diff-history-btn", text: "Diff" });
-                diffBtn.addEventListener("click", (e) => { e.stopPropagation(); this.onShowDiff(entry, globalIndex); });
+            if (entry.record.conflict) {
+                row.createSpan({ cls: "diff-history-conflict-badge", text: "conflict" });
+            }
 
-                // The top entry reflects the current on-disk state, so restoring
-                // to it is a no-op. Omit the button there to avoid UX confusion.
-                if (globalIndex > 0) {
-                    const restoreBtn = actions.createEl("button", { cls: "diff-history-btn", text: "Restore" });
-                    restoreBtn.addEventListener("click", (e) => { e.stopPropagation(); this.onRestore(entry); });
-                }
+            const summary = row.createSpan({ cls: "diff-history-summary" });
+            if (entry.added > 0) summary.createSpan({ cls: "diff-history-additions", text: `+${entry.added}` });
+            if (entry.removed > 0) summary.createSpan({ cls: "diff-history-deletions", text: `-${entry.removed}` });
+
+            if ((entry.record.source ?? "local") === "sync") {
+                const icon = row.createSpan({ cls: "diff-history-sync-icon", attr: { "aria-label": "from sync" } });
+                setIcon(icon, "cloud-download");
+            }
+
+            const actions = row.createSpan({ cls: "diff-history-entry-actions" });
+            const diffBtn = actions.createEl("button", { cls: "diff-history-btn", text: "Diff" });
+            diffBtn.addEventListener("click", (e) => { e.stopPropagation(); this.onShowDiff(entry); });
+
+            if (!isHead) {
+                const restoreBtn = actions.createEl("button", { cls: "diff-history-btn", text: "Restore" });
+                restoreBtn.addEventListener("click", (e) => { e.stopPropagation(); this.onRestore(entry); });
             }
         }
+    }
+
+    private renderGraphCell(row: HTMLElement, gRow: GraphRow, graphWidth: number): void {
+        const svg = document.createElementNS(SVG_NS, "svg");
+        svg.setAttribute("class", "diff-history-graph");
+        svg.setAttribute("width", String(graphWidth));
+        svg.setAttribute("height", String(ROW_HEIGHT));
+        svg.setAttribute("viewBox", `0 0 ${graphWidth} ${ROW_HEIGHT}`);
+
+        const cx = gRow.column * COLUMN_WIDTH + COLUMN_WIDTH / 2;
+        const cy = ROW_HEIGHT / 2;
+        const isBranch = gRow.column > 0;
+        const mainCls = isBranch ? "graph-branch" : "graph-main";
+
+        for (const col of gRow.passThrough) {
+            const x = col * COLUMN_WIDTH + COLUMN_WIDTH / 2;
+            const cls = col > 0 ? "graph-branch" : "graph-main";
+            this.svgLine(svg, x, 0, x, ROW_HEIGHT, cls);
+        }
+
+        if (gRow.hasUp) {
+            this.svgLine(svg, cx, 0, cx, cy - DOT_RADIUS, mainCls);
+        }
+        if (gRow.hasDown) {
+            this.svgLine(svg, cx, cy + DOT_RADIUS, cx, ROW_HEIGHT, mainCls);
+        }
+
+        for (const fromCol of gRow.mergeFrom) {
+            const fx = fromCol * COLUMN_WIDTH + COLUMN_WIDTH / 2;
+            this.svgLine(svg, fx, 0, cx, cy, "graph-branch");
+        }
+
+        const circle = document.createElementNS(SVG_NS, "circle");
+        circle.setAttribute("cx", String(cx));
+        circle.setAttribute("cy", String(cy));
+        circle.setAttribute("r", String(DOT_RADIUS));
+        circle.setAttribute("class", `graph-dot ${mainCls}`);
+        svg.appendChild(circle);
+
+        row.appendChild(svg);
+    }
+
+    private svgLine(svg: SVGElement, x1: number, y1: number, x2: number, y2: number, cls: string): void {
+        const line = document.createElementNS(SVG_NS, "line");
+        line.setAttribute("x1", String(x1));
+        line.setAttribute("y1", String(y1));
+        line.setAttribute("x2", String(x2));
+        line.setAttribute("y2", String(y2));
+        line.setAttribute("class", cls);
+        svg.appendChild(line);
     }
 
     private renderEmpty(): void {
@@ -115,19 +178,25 @@ export class DiffHistoryView extends ItemView {
         });
     }
 
-    private async onShowDiff(entry: HistoryEntry, index: number): Promise<void> {
-        if (!this.currentFile) return;
-        const reconstructed = await this.plugin.historyManager.reconstructAtPoint(this.currentFile, entry.record.timestamp);
+    private async onShowDiff(entry: HistoryEntry): Promise<void> {
+        if (!this.currentFile || entry.record.id == null) return;
+
+        const reconstructed = await this.plugin.historyManager.reconstructAtRecord(this.currentFile, entry.record.id);
         if (reconstructed === null) { new Notice("Failed to reconstruct file at this point."); return; }
 
         let previousContent: string;
         let leftLabel: string;
-        const prevIndex = index + 1;
-        if (prevIndex < this.entries.length) {
-            const prev = await this.plugin.historyManager.reconstructAtPoint(this.currentFile, this.entries[prevIndex].record.timestamp);
+
+        if (entry.record.parentId != null) {
+            const prev = await this.plugin.historyManager.reconstructAtRecord(this.currentFile, entry.record.parentId);
             if (prev === null) { new Notice("Failed to reconstruct previous state."); return; }
             previousContent = prev;
-            leftLabel = `${formatDate(this.entries[prevIndex].record.timestamp)} ${formatTime(this.entries[prevIndex].record.timestamp)}`;
+            const parentEntry = this.graphRows.find((r) => r.entry.record.id === entry.record.parentId);
+            if (parentEntry) {
+                leftLabel = `${formatDate(parentEntry.entry.record.timestamp)} ${formatTime(parentEntry.entry.record.timestamp)}`;
+            } else {
+                leftLabel = "(previous)";
+            }
         } else {
             previousContent = "";
             leftLabel = "(empty)";
@@ -138,14 +207,19 @@ export class DiffHistoryView extends ItemView {
     }
 
     private async onRestore(entry: HistoryEntry): Promise<void> {
-        if (!this.currentFile) return;
+        if (!this.currentFile || entry.record.id == null) return;
         const time = formatTime(entry.record.timestamp);
         const date = formatDate(entry.record.timestamp);
 
-        const confirmed = await new ConfirmModal(this.plugin.app, "Restore file", `Restore to ${date} ${time}?`, "Restore").waitForResult();
+        const confirmed = await new ConfirmModal(
+            this.plugin.app,
+            "Restore file",
+            `Restore to ${date} ${time}?\nCurrent changes will remain on a separate branch.`,
+            "Restore",
+        ).waitForResult();
         if (!confirmed) return;
 
-        const success = await this.plugin.historyManager.restoreToPoint(this.currentFile, entry.record.timestamp);
+        const success = await this.plugin.restoreFromHistory(this.currentFile, entry.record.id);
         if (success) {
             new Notice("File restored successfully.");
             await this.showFileHistory(this.currentFile);

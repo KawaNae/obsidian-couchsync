@@ -1,16 +1,13 @@
 import Dexie, { type Table } from "dexie";
 import type { DiffRecord, FileSnapshot, HistorySource } from "./types.ts";
+import { logDebug, logError } from "../ui/log.ts";
 
-/** Local content schema version stamped into `_meta` on first open.
- *  Bumped when the shape of a DiffRecord / FileSnapshot row changes
- *  in a way that requires a one-shot migration. Independent of the
- *  Dexie DB-level version (which tracks table-shape evolution). */
-const HISTORY_SCHEMA_VERSION = 1 as const;
+const HISTORY_SCHEMA_VERSION = 2 as const;
 
 interface MetaRow { key: string; value: number }
 
 class HistoryDB extends Dexie {
-    diffs!: Table<DiffRecord, string>;
+    diffs!: Table<DiffRecord, number>;
     snapshots!: Table<FileSnapshot, string>;
     _meta!: Table<MetaRow, string>;
 
@@ -20,11 +17,13 @@ class HistoryDB extends Dexie {
             diffs: "++id, [filePath+timestamp], filePath, timestamp",
             snapshots: "filePath",
         });
-        // v2: add `_meta` table for application-level schema versioning.
-        // Invariant 15 — every local Dexie DB carries its own format
-        // version row independent of the DB-level Dexie migration chain.
         this.version(2).stores({
             diffs: "++id, [filePath+timestamp], filePath, timestamp",
+            snapshots: "filePath",
+            _meta: "&key",
+        });
+        this.version(3).stores({
+            diffs: "++id, [filePath+timestamp], filePath, timestamp, parentId",
             snapshots: "filePath",
             _meta: "&key",
         });
@@ -38,12 +37,14 @@ export class HistoryStorage {
         this.db = new HistoryDB(vaultName);
     }
 
-    /** Stamp `_meta.schemaVersion` on first open, or assert the stored
-     *  value matches `HISTORY_SCHEMA_VERSION`. Idempotent. */
     async ensureSchemaVersion(): Promise<void> {
         const existing = await this.db._meta.get("schemaVersion");
         if (existing === undefined) {
             await this.db._meta.put({ key: "schemaVersion", value: HISTORY_SCHEMA_VERSION });
+            return;
+        }
+        if (existing.value === 1) {
+            await this.migrateV1toV2();
             return;
         }
         if (existing.value !== HISTORY_SCHEMA_VERSION) {
@@ -53,16 +54,46 @@ export class HistoryStorage {
         }
     }
 
+    private async migrateV1toV2(): Promise<void> {
+        logDebug("History: migrating schema v1 → v2 (parentId chain)");
+        await this.db.transaction("rw", this.db.diffs, this.db.snapshots, this.db._meta, async () => {
+            const filePaths = new Set<string>();
+            await this.db.diffs.each((d) => filePaths.add(d.filePath));
+
+            for (const fp of filePaths) {
+                const diffs = await this.db.diffs
+                    .where("[filePath+timestamp]")
+                    .between([fp, Dexie.minKey], [fp, Dexie.maxKey])
+                    .sortBy("timestamp");
+
+                let prevId: number | null = null;
+                for (const diff of diffs) {
+                    await this.db.diffs.update(diff.id!, { parentId: prevId });
+                    prevId = diff.id!;
+                }
+
+                const snapshot = await this.db.snapshots.get(fp);
+                if (snapshot) {
+                    await this.db.snapshots.put({ ...snapshot, headRecordId: prevId });
+                }
+            }
+
+            await this.db._meta.put({ key: "schemaVersion", value: HISTORY_SCHEMA_VERSION });
+        });
+        logDebug("History: migration v1 → v2 complete");
+    }
+
     async saveDiff(
         filePath: string,
         patches: string,
         baseHash: string,
         added: number,
         removed: number,
-        conflict = false,
-        source: HistorySource = "local",
-    ): Promise<void> {
-        await this.db.diffs.add({
+        conflict: boolean,
+        source: HistorySource,
+        parentId: number | null,
+    ): Promise<number> {
+        return await this.db.diffs.add({
             filePath,
             timestamp: Date.now(),
             patches,
@@ -71,18 +102,20 @@ export class HistoryStorage {
             removed,
             conflict: conflict || undefined,
             source,
-        });
+            parentId,
+        }) as number;
     }
 
     async getSnapshot(filePath: string): Promise<FileSnapshot | undefined> {
         return this.db.snapshots.get(filePath);
     }
 
-    async saveSnapshot(filePath: string, content: string): Promise<void> {
+    async saveSnapshot(filePath: string, content: string, headRecordId: number | null): Promise<void> {
         await this.db.snapshots.put({
             filePath,
             content,
             lastModified: Date.now(),
+            headRecordId,
         });
     }
 

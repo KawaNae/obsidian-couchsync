@@ -233,24 +233,30 @@
 
 .diff-history-view { padding: 8px; }
 .diff-history-file-header { padding: 4px 8px 8px; }
-.diff-history-date-group { margin-bottom: 12px; }
-
-.diff-history-date-header {
-    font-weight: 600;
-    font-size: 0.9em;
-    color: var(--text-muted);
-    margin-bottom: 4px;
-    padding: 4px 0;
-    border-bottom: 1px solid var(--background-modifier-border);
-}
 
 .diff-history-entry {
     display: flex;
     align-items: center;
-    padding: 6px 8px;
-    border-radius: 4px;
+    padding: 0 8px;
     font-size: 0.85em;
     gap: 4px;
+}
+
+.diff-history-graph { flex-shrink: 0; }
+.diff-history-graph line { stroke-width: 2px; }
+.diff-history-graph .graph-main { stroke: var(--interactive-accent); fill: var(--interactive-accent); }
+.diff-history-graph .graph-branch { stroke: var(--text-faint); fill: var(--text-faint); }
+.diff-history-graph .graph-dot { stroke: none; }
+
+.diff-history-head-badge {
+    font-size: 0.7em;
+    padding: 1px 4px;
+    border-radius: 3px;
+    background: var(--interactive-accent);
+    color: var(--text-on-accent);
+    margin-right: 2px;
+    flex-shrink: 0;
+    font-weight: 600;
 }
 
 .diff-history-entry:hover { background-color: var(--background-modifier-hover); }
@@ -406,7 +412,7 @@
     padding: 0 8px;
     min-height: 1.5em;
     white-space: pre-wrap;
-    word-break: break-all;
+    overflow-wrap: anywhere;
 }
 
 .diff-line-num {

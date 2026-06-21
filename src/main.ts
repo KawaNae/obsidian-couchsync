@@ -1248,4 +1248,16 @@ export default class CouchSyncPlugin extends Plugin {
             await view.showFileHistory(filePath);
         }
     }
+
+    async restoreFromHistory(filePath: string, recordId: number): Promise<boolean> {
+        this.changeTracker.ignoreNextModify(filePath);
+        const content = await this.historyManager.restoreToRecord(filePath, recordId);
+        if (content === null) return false;
+        try {
+            await this.vaultSync.forceLocalEdit(filePath, {});
+        } catch {
+            // Sync propagation failure is non-fatal — file is already restored on disk.
+        }
+        return true;
+    }
 }

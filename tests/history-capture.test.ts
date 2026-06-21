@@ -22,6 +22,7 @@ class FakeHistoryStorage {
     diffs: SavedDiff[] = [];
     snapshots = new Map<string, FileSnapshot>();
     renames: Array<{ oldPath: string; newPath: string }> = [];
+    private nextId = 1;
 
     async saveDiff(
         filePath: string,
@@ -29,9 +30,10 @@ class FakeHistoryStorage {
         baseHash: string,
         added: number,
         removed: number,
-        conflict = false,
-        source: HistorySource = "local",
-    ): Promise<void> {
+        conflict: boolean,
+        source: HistorySource,
+        parentId: number | null,
+    ): Promise<number> {
         this.diffs.push({
             filePath,
             patches,
@@ -41,14 +43,15 @@ class FakeHistoryStorage {
             conflict,
             source: source === "local" ? undefined : source,
         });
+        return this.nextId++;
     }
 
     async getSnapshot(filePath: string): Promise<FileSnapshot | undefined> {
         return this.snapshots.get(filePath);
     }
 
-    async saveSnapshot(filePath: string, content: string): Promise<void> {
-        this.snapshots.set(filePath, { filePath, content, lastModified: Date.now() });
+    async saveSnapshot(filePath: string, content: string, headRecordId: number | null): Promise<void> {
+        this.snapshots.set(filePath, { filePath, content, lastModified: Date.now(), headRecordId });
     }
 
     async renamePath(oldPath: string, newPath: string): Promise<void> {
@@ -208,7 +211,7 @@ describe("HistoryCapture", () => {
         it("skips capture when content unchanged since last snapshot", async () => {
             capture.start();
             vault.addFile("a.md", "same");
-            await storage.saveSnapshot("a.md", "same");
+            await storage.saveSnapshot("a.md", "same", null);
 
             events.emit("modify", "a.md", stat);
             await vi.advanceTimersByTimeAsync(100);
@@ -413,7 +416,7 @@ describe("HistoryCapture", () => {
         it("saveDiff throw: snapshot and rate-limit still advance (no cascade)", async () => {
             capture.start();
             vault.addFile("a.md", "v1");
-            storage.snapshots.set("a.md", { filePath: "a.md", content: "v0", lastModified: 1 });
+            storage.snapshots.set("a.md", { filePath: "a.md", content: "v0", lastModified: 1, headRecordId: null });
             let failures = 0;
             storage.saveDiff = async () => { failures++; throw new Error("URI malformed"); };
 
@@ -435,7 +438,7 @@ describe("HistoryCapture", () => {
 
         it("content-read failure does NOT advance the snapshot", async () => {
             capture.start();
-            storage.snapshots.set("a.md", { filePath: "a.md", content: "v0", lastModified: 1 });
+            storage.snapshots.set("a.md", { filePath: "a.md", content: "v0", lastModified: 1, headRecordId: null });
             // No file in vault → cachedRead throws → nothing to base an
             // advance on; baseline must stay put for a later retry.
             events.emit("modify", "a.md", stat);
