@@ -80,10 +80,17 @@ export class DiffHistoryView extends ItemView {
         const maxCol = getMaxColumn(this.graphRows);
         const graphWidth = (maxCol + 1) * COLUMN_WIDTH;
 
+        let prevDate = "";
         for (let i = 0; i < this.graphRows.length; i++) {
             const gRow = this.graphRows[i];
             const entry = gRow.entry;
             const isHead = entry.record.id === this.headRecordId;
+
+            const curDate = formatDate(entry.record.timestamp);
+            if (curDate !== prevDate) {
+                this.renderDateSeparator(container, curDate, graphWidth, i > 0 ? this.graphRows[i - 1] : undefined, gRow);
+                prevDate = curDate;
+            }
 
             const row = container.createDiv({ cls: "diff-history-entry" });
 
@@ -157,6 +164,41 @@ export class DiffHistoryView extends ItemView {
         svg.appendChild(circle);
 
         row.appendChild(svg);
+    }
+
+    private renderDateSeparator(
+        container: HTMLElement,
+        date: string,
+        graphWidth: number,
+        above: GraphRow | undefined,
+        below: GraphRow,
+    ): void {
+        const SEP_HEIGHT = 24;
+        const sep = container.createDiv({ cls: "diff-history-date-sep" });
+
+        const active = new Set<number>();
+        if (above) {
+            if (above.hasDown) active.add(above.column);
+            for (const c of above.passThrough) active.add(c);
+        }
+        if (below.hasUp) active.add(below.column);
+        for (const c of below.passThrough) active.add(c);
+        for (const c of below.mergeFrom) active.add(c);
+
+        const svg = document.createElementNS(SVG_NS, "svg");
+        svg.setAttribute("class", "diff-history-graph");
+        svg.setAttribute("width", String(graphWidth));
+        svg.setAttribute("height", String(SEP_HEIGHT));
+        svg.setAttribute("viewBox", `0 0 ${graphWidth} ${SEP_HEIGHT}`);
+
+        for (const col of active) {
+            const x = col * COLUMN_WIDTH + COLUMN_WIDTH / 2;
+            const cls = col > 0 ? "graph-branch" : "graph-main";
+            this.svgLine(svg, x, 0, x, SEP_HEIGHT, cls);
+        }
+
+        sep.appendChild(svg);
+        sep.createSpan({ cls: "diff-history-date-label", text: date });
     }
 
     private svgLine(svg: SVGElement, x1: number, y1: number, x2: number, y2: number, cls: string): void {

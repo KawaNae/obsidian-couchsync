@@ -261,6 +261,20 @@
 
 .diff-history-entry:hover { background-color: var(--background-modifier-hover); }
 
+.diff-history-date-sep {
+    display: flex;
+    align-items: center;
+    padding: 0 8px;
+    gap: 6px;
+}
+
+.diff-history-date-label {
+    font-size: 0.75em;
+    font-weight: 600;
+    color: var(--text-faint);
+    white-space: nowrap;
+}
+
 .diff-history-time {
     color: var(--text-muted);
     margin-right: 4px;
