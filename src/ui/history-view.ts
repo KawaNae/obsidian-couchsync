@@ -11,6 +11,7 @@ export const VIEW_TYPE_DIFF_HISTORY = "couchsync-history-view";
 const COLUMN_WIDTH = 16;
 const ROW_HEIGHT = 32;
 const DOT_RADIUS = 4;
+const GRAPH_LEFT = 8;
 const SVG_NS = "http://www.w3.org/2000/svg";
 
 export class DiffHistoryView extends ItemView {
@@ -128,7 +129,7 @@ export class DiffHistoryView extends ItemView {
     }
 
     private renderGraphCell(row: HTMLElement, gRow: GraphRow, graphWidth: number): void {
-        row.style.paddingLeft = `${graphWidth + 8}px`;
+        row.style.paddingLeft = `${graphWidth + GRAPH_LEFT}px`;
         const h = ROW_HEIGHT;
         const svg = document.createElementNS(SVG_NS, "svg");
         svg.setAttribute("class", "diff-history-graph");
@@ -162,7 +163,7 @@ export class DiffHistoryView extends ItemView {
         row.appendChild(svg);
 
         const dot = row.createDiv({ cls: `diff-history-dot ${mainCls}` });
-        dot.style.left = `${cx - DOT_RADIUS}px`;
+        dot.style.left = `${cx - DOT_RADIUS + GRAPH_LEFT}px`;
     }
 
     private renderDateSeparator(
@@ -174,7 +175,7 @@ export class DiffHistoryView extends ItemView {
     ): void {
         const SEP_HEIGHT = 24;
         const sep = container.createDiv({ cls: "diff-history-date-sep" });
-        sep.style.paddingLeft = `${graphWidth + 8}px`;
+        sep.style.paddingLeft = `${graphWidth + GRAPH_LEFT}px`;
 
         const active = new Set<number>();
         if (above) {
