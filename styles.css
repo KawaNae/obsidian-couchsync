@@ -273,6 +273,9 @@
     font-weight: 600;
     color: var(--text-faint);
     white-space: nowrap;
+    flex: 1;
+    border-bottom: 1px solid var(--background-modifier-border);
+    padding-bottom: 2px;
 }
 
 .diff-history-time {
