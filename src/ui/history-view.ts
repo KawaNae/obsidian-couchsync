@@ -127,11 +127,12 @@ export class DiffHistoryView extends ItemView {
     }
 
     private renderGraphCell(row: HTMLElement, gRow: GraphRow, graphWidth: number): void {
+        row.style.paddingLeft = `${graphWidth + 8}px`;
         const svg = document.createElementNS(SVG_NS, "svg");
         svg.setAttribute("class", "diff-history-graph");
         svg.setAttribute("width", String(graphWidth));
-        svg.setAttribute("height", String(ROW_HEIGHT));
-        svg.setAttribute("viewBox", `0 0 ${graphWidth} ${ROW_HEIGHT}`);
+        svg.setAttribute("viewBox", `0 0 ${graphWidth} ${ROW_HEIGHT}`)
+        svg.setAttribute("preserveAspectRatio", "none");
 
         const cx = gRow.column * COLUMN_WIDTH + COLUMN_WIDTH / 2;
         const cy = ROW_HEIGHT / 2;
@@ -175,6 +176,7 @@ export class DiffHistoryView extends ItemView {
     ): void {
         const SEP_HEIGHT = 24;
         const sep = container.createDiv({ cls: "diff-history-date-sep" });
+        sep.style.paddingLeft = `${graphWidth + 8}px`;
 
         const active = new Set<number>();
         if (above) {
@@ -188,8 +190,8 @@ export class DiffHistoryView extends ItemView {
         const svg = document.createElementNS(SVG_NS, "svg");
         svg.setAttribute("class", "diff-history-graph");
         svg.setAttribute("width", String(graphWidth));
-        svg.setAttribute("height", String(SEP_HEIGHT));
         svg.setAttribute("viewBox", `0 0 ${graphWidth} ${SEP_HEIGHT}`);
+        svg.setAttribute("preserveAspectRatio", "none");
 
         for (const col of active) {
             const x = col * COLUMN_WIDTH + COLUMN_WIDTH / 2;
