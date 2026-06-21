@@ -19,6 +19,12 @@ export function migrateSettings(data: Record<string, any>): void {
         delete data.syncEnabled;
     }
 
+    // Infer serverTested from connectionState (pre-v0.30).
+    // Any state beyond "editing" required a working server connection.
+    if (data.serverTested === undefined) {
+        data.serverTested = data.connectionState !== "editing";
+    }
+
     // Ensure previousDeviceIds exists (pre-v0.12)
     if (!data.previousDeviceIds) {
         data.previousDeviceIds = [];

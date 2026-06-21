@@ -134,6 +134,8 @@ export interface CouchSyncSettings {
     configCipherVersion?: number;
 
     // Internal
+    /** Server reachable + auth verified (CouchDB tab Test+Apply). */
+    serverTested: boolean;
     connectionState: ConnectionState;
     /** Config-sync equivalent of `connectionState`'s `settingUp` transient
      *  (Invariant C). Set true before ConfigSetupService destroys the local
@@ -186,6 +188,7 @@ export const DEFAULT_SETTINGS: CouchSyncSettings = {
     encryptionPassphrase: "",
     compressionEnabled: true,
 
+    serverTested: false,
     connectionState: "editing",
     configSettingUp: false,
     deviceId: "",

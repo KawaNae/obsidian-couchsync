@@ -26,6 +26,11 @@ import type { AuthGate } from "./auth-gate.ts";
 
 export type ProgressCallback = (docId: string, count: number) => void;
 
+export type DbCheckResult =
+    | { status: "exists"; docCount: number }
+    | { status: "created" }
+    | { status: "error"; message: string };
+
 export class VaultRemoteOps {
     constructor(
         private localDb: LocalDB,
@@ -102,6 +107,44 @@ export class VaultRemoteOps {
         return this.testConnectionWith(
             s.couchdbUri, s.couchdbUser, s.couchdbPassword, s.couchdbDbName,
         );
+    }
+
+    /**
+     * Check a database with explicit credentials — returns structured info
+     * about the DB state. Used by the Settings tab's Step 2 (Database)
+     * Check button. Creates the DB via `ensureDb()` if it doesn't exist.
+     */
+    async checkDatabaseWith(
+        uri: string, user: string, pass: string, db: string,
+    ): Promise<DbCheckResult> {
+        try {
+            const client = makeCouchClient(uri, db, user, pass);
+            const info = await client.info();
+            return {
+                status: "exists",
+                docCount: info.doc_count,
+            };
+        } catch (e: any) {
+            if (e?.status === 404) {
+                try {
+                    const client = makeCouchClient(uri, db, user, pass);
+                    await client.ensureDb();
+                    return { status: "created" };
+                } catch (createErr: any) {
+                    if (createErr?.status === 401 || createErr?.status === 403) {
+                        this.auth.raise(createErr.status, createErr?.message);
+                    }
+                    return {
+                        status: "error",
+                        message: createErr?.message || "Failed to create database",
+                    };
+                }
+            }
+            if (e?.status === 401 || e?.status === 403) {
+                this.auth.raise(e.status, e?.message);
+            }
+            return { status: "error", message: e?.message || "Connection failed" };
+        }
     }
 
     /**

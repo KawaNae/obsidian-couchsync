@@ -1,28 +1,21 @@
 /**
  * Config Sync settings tab.
  *
- * New in v0.11.0. ConfigDocs (`.obsidian/` files) live in their own
- * remote CouchDB database, separate from the vault DB. This tab mirrors
- * the step structure of Vault Sync:
+ * ConfigDocs (`.obsidian/` files) live in their own remote CouchDB
+ * database, separate from the vault DB. This tab mirrors the step
+ * structure of Vault Sync:
  *
- *   Step 1: Connection — pick the config database name. URI / user /
- *           password are inherited from Vault Sync (1 CouchDB server),
- *           shown read-only here. Test → Apply confirms the choice.
- *   Step 2: Setup (Init) — reset the shared config DB. Structural only,
+ *   Step 1: Encryption & compression — config-specific codec overrides.
+ *   Step 2: Database — pick the config database name. Server credentials
+ *           are shared via the CouchDB tab. Check → Apply confirms.
+ *   Step 3: Setup (Init) — reset the shared config DB. Structural only,
  *           run once per device pool; it does not send content.
- *   Step 3: Sync — the meaning-unit filter (what this device syncs, by
+ *   Step 4: Sync — the meaning-unit filter (what this device syncs, by
  *           meaning), then Push (send) and Pull & Reload (receive+apply).
  *           The same filter governs both directions (receive ⊆ send).
  *
- * Step 1 is gated on Vault Sync being at least "tested": you can't
- * point at a config DB if there's no vault server settled yet.
- *
- * Step 2 is gated on the local "configState" UI machine reaching
- * "ready" — i.e. the user has Test→Applied a non-empty config DB name.
- * This state is NOT persisted in settings; it's a per-render UI flag,
- * because there's nothing meaningful to remember between sessions —
- * either the saved `couchdbConfigDbName` is empty (disabled) or it's
- * set (ready).
+ * Step 2+ is gated on `serverTested` (server connection verified in the
+ * CouchDB tab).
  */
 import { type App, Notice, Platform, Setting, type ButtonComponent } from "obsidian";
 import type { CouchSyncSettings } from "../settings.ts";
@@ -166,7 +159,7 @@ export class ConfigSyncTab {
         }
         return this.testPassed
             ? "Save the config database name."
-            : "Test connection first.";
+            : "Check database first.";
     }
 
     /**
@@ -258,8 +251,6 @@ export class ConfigSyncTab {
 
     render(el: HTMLElement): void {
         const settings = this.deps.getSettings();
-        const vaultState = settings.connectionState;
-        const vaultReady = vaultState === "tested" || vaultState === "setupDone" || vaultState === "syncing";
 
         // Reset DOM references
         this.pencils.clear();
@@ -279,18 +270,18 @@ export class ConfigSyncTab {
         // ── Step 1: Encryption & compression (independent) ──
         this.renderConfigCodecStep(el, settings);
 
-        // ── Gate: vault sync must be at least Tested ────────
-        if (!vaultReady) {
-            el.createEl("h3", { text: "Step 2: Connection" });
+        // ── Gate: server must be tested ─────────────────────
+        if (!settings.serverTested) {
+            el.createEl("h3", { text: "Step 2: Database" });
             el.createEl("p", {
-                text: "Complete Vault Sync Step 2 (Connection) first.",
+                text: "Complete server connection in the CouchDB tab first.",
                 cls: "setting-item-description",
             });
             return;
         }
 
-        // ── Step 2: Connection ──────────────────────────────
-        el.createEl("h3", { text: "Step 2: Connection" });
+        // ── Step 2: Database ────────────────────────────────
+        el.createEl("h3", { text: "Step 2: Database" });
 
         el.createEl("p", {
             text:
@@ -299,30 +290,16 @@ export class ConfigSyncTab {
             cls: "setting-item-description",
         });
 
-        const serverSetting = new Setting(el).setName("Server");
-        serverSetting.settingEl.addClass("cs-field-2row");
-        serverSetting.descEl.createEl("span", {
-            text: settings.couchdbUri || "(not set)",
-            cls: "cs-inherited-value",
-        });
-
-        const userSetting = new Setting(el).setName("Username");
-        userSetting.settingEl.addClass("cs-field-2row");
-        userSetting.descEl.createEl("span", {
-            text: settings.couchdbUser || "(not set)",
-            cls: "cs-inherited-value",
-        });
-
         this.renderField(el, "Config Database Name", "db", "obsidian-config");
 
         new Setting(el)
-            .setName("Test Connection")
-            .setDesc("Verify the config database is reachable")
+            .setName("Check Database")
+            .setDesc("Verify the config database exists or create it")
             .addButton((btn) => {
                 this.testBtn = btn;
-                btn.setButtonText("Test")
+                btn.setButtonText("Check")
                     .setDisabled(this.draft.db.trim() === "")
-                    .onClick(async () => this.handleTest(btn));
+                    .onClick(async () => this.handleCheck(btn));
             });
 
         const applySetting = new Setting(el)
@@ -698,35 +675,39 @@ export class ConfigSyncTab {
         });
     }
 
-    private async handleTest(btn: ButtonComponent): Promise<void> {
-        btn.setButtonText("Testing...");
+    private async handleCheck(btn: ButtonComponent): Promise<void> {
+        btn.setButtonText("Checking...");
         btn.setDisabled(true);
 
-        // Validation: vault and config DB names must differ
         const settings = this.deps.getSettings();
         if (this.draft.db.trim() === settings.couchdbDbName) {
             new Notice("Vault and config databases must have different names.", 8000);
-            btn.setButtonText("Test");
+            btn.setButtonText("Check");
             btn.setDisabled(false);
             return;
         }
 
-        // Construct a temporary URL using the inherited credentials and
-        // the draft config DB name. VaultRemoteOps.testConnectionWith
-        // handles the HEAD check and auth-latch bookkeeping.
-        const error = await this.deps.remoteOps.testConnectionWith(
+        const result = await this.deps.remoteOps.checkDatabaseWith(
             settings.couchdbUri,
             settings.couchdbUser,
             settings.couchdbPassword,
             this.draft.db,
         );
-        if (error) {
+
+        if (result.status === "error") {
             this.testPassed = false;
-            new Notice(`Connection failed: ${error}`, 8000);
+            new Notice(`Database check failed: ${result.message}`, 8000);
         } else {
             this.testPassed = true;
             this.deps.auth.clear();
-            new Notice("Connection successful!", 3000);
+            if (result.status === "created") {
+                new Notice(`Database "${this.draft.db}" created.`, 3000);
+            } else {
+                new Notice(
+                    `Database "${this.draft.db}" found — ${result.docCount.toLocaleString()} docs.`,
+                    3000,
+                );
+            }
         }
         this.deps.refresh();
     }

@@ -16,17 +16,22 @@ import type { ConnectionState } from "../settings.ts";
 export interface SetupGating {
     /** Whole connection section is locked (live sync running). */
     locked: boolean;
-    /** Init / Clone buttons enabled. */
-    initCloneEnabled: boolean;
+    /** Init button enabled. */
+    initEnabled: boolean;
+    /** Clone button enabled (tab further restricts based on DB doc_count). */
+    cloneEnabled: boolean;
     /** Live Sync toggle enabled. */
     syncToggleEnabled: boolean;
 }
 
-export function setupGating(state: ConnectionState): SetupGating {
+export function setupGating(state: ConnectionState, serverTested: boolean): SetupGating {
+    const syncing = state === "syncing";
+    const canSetup = serverTested
+        && (state === "tested" || state === "setupDone" || state === "settingUp");
     return {
-        locked: state === "syncing",
-        initCloneEnabled:
-            state === "tested" || state === "setupDone" || state === "settingUp",
+        locked: syncing,
+        initEnabled: canSetup,
+        cloneEnabled: canSetup,
         syncToggleEnabled: state === "setupDone" || state === "syncing",
     };
 }
