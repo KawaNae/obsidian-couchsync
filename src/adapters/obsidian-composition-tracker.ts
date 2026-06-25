@@ -34,7 +34,7 @@ export class ObsidianCompositionTracker implements CompositionTracker {
 
     private leafChangeRef: EventRef | null = null;
     private layoutChangeRef: EventRef | null = null;
-    private blurHandler: (() => void) | null = null;
+    private visibilityHandler: (() => void) | null = null;
 
     constructor(private app: App) {}
 
@@ -61,8 +61,12 @@ export class ObsidianCompositionTracker implements CompositionTracker {
             this.rebindToActiveLeaf();
         });
 
-        this.blurHandler = () => this.endAllCompositions("window-blur");
-        window.addEventListener("blur", this.blurHandler);
+        this.visibilityHandler = () => {
+            if (document.visibilityState === "hidden") {
+                this.endAllCompositions("visibility-hidden");
+            }
+        };
+        document.addEventListener("visibilitychange", this.visibilityHandler);
     }
 
     /** Stop tracking and release all bindings. */
@@ -76,9 +80,9 @@ export class ObsidianCompositionTracker implements CompositionTracker {
             this.app.workspace.offref(this.layoutChangeRef);
             this.layoutChangeRef = null;
         }
-        if (this.blurHandler) {
-            window.removeEventListener("blur", this.blurHandler);
-            this.blurHandler = null;
+        if (this.visibilityHandler) {
+            document.removeEventListener("visibilitychange", this.visibilityHandler);
+            this.visibilityHandler = null;
         }
         this.endAllCompositions("stop");
         this.listeners = [];
@@ -90,13 +94,16 @@ export class ObsidianCompositionTracker implements CompositionTracker {
         const newPath = this.app.workspace.activeEditor?.file?.path ?? null;
         const newEl = this.findContentEl(newPath);
 
-        // Same target — nothing to do.
         if (this.boundEl === newEl && this.boundPath === newPath) return;
 
-        // Leaving a composing leaf without a real compositionend
-        // (rare: user switched panes mid-IME — Obsidian typically
-        // fires compositionend on focus loss but we belt-and-suspend).
+        if (this.boundPath === newPath && newEl) {
+            logDebug(`composition: element changed for ${newPath} (DOM rebuild)`);
+        } else {
+            logDebug(`composition: rebind ${this.boundPath} → ${newPath}`);
+        }
+
         if (this.boundPath && this.composingPaths.has(this.boundPath)) {
+            logDebug(`composition: force-end ${this.boundPath} (was composing)`);
             this.endComposition(this.boundPath, "leaf-change");
         }
 
@@ -153,6 +160,9 @@ export class ObsidianCompositionTracker implements CompositionTracker {
 
     private endAllCompositions(reason: string): void {
         const paths = Array.from(this.composingPaths);
+        if (paths.length > 0) {
+            logDebug(`composition: ${reason}, ending ${paths.length} compositions`);
+        }
         for (const p of paths) this.endComposition(p, reason);
     }
 }

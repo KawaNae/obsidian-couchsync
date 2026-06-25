@@ -89,9 +89,7 @@ export class EditorAwareVaultWriter implements VaultWriter {
 
         const composing = editors.some((e) => e.cm.composing);
         if (composing) {
-            // Capture the doc state we'd be replacing so drain can
-            // detect a mid-composition divergence (user committed
-            // text before drain).
+            logDebug(`VaultWriter: defer ${path} (composing, editors=${editors.length})`);
             const expected = editors[0].cm.state.doc.toString();
             return this.gate.defer(path, () =>
                 this.applyAfterDefer(path, content, expected),
@@ -153,8 +151,8 @@ export class EditorAwareVaultWriter implements VaultWriter {
             return { applied: false, reason: "local-changed-during-composition" };
         }
 
-        // If composition resumed before drain (race), defer again.
         if (editors.some((e) => e.cm.composing)) {
+            logDebug(`VaultWriter: re-defer ${path} (composition resumed)`);
             return this.gate.defer(path, () =>
                 this.applyAfterDefer(path, content, expectedDoc),
             );
@@ -169,18 +167,12 @@ export class EditorAwareVaultWriter implements VaultWriter {
         editors: EditorLeaf[],
     ): Promise<WriteResult> {
         const text = new TextDecoder("utf-8").decode(content);
+        const anyComposing = editors.some((e) => e.cm.composing);
+        logDebug(`VaultWriter: dispatch ${path} (editors=${editors.length}, composing=${anyComposing})`);
 
-        // PR1 disk-write invariant: persist to disk BEFORE updating the
-        // editor. Disk is the source of truth; CM dispatch is the UX
-        // overlay that preserves cursor / scroll. The modify event from
-        // writeBinary is suppressed via ignoreNextModify so it doesn't
-        // schedule a redundant fileToDb pass.
         this.writeIgnore?.ignoreNextModify(path);
         await this.io.writeBinary(path, content);
 
-        // Dispatch on every pane. With disk already updated, Obsidian's
-        // external-change reload (if it fires before our dispatch lands)
-        // would set CM to the new content too — same end state.
         for (const { cm } of editors) {
             cm.dispatch({
                 changes: { from: 0, to: cm.state.doc.length, insert: text },
