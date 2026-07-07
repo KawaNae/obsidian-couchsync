@@ -524,6 +524,7 @@ export default class CouchSyncPlugin extends Plugin {
             this.auth,
             encClientFactory,
             (signal) => this.reconcileEncryptionAgreement(signal),
+            async () => { await this.vaultSync.stampVaultDrift(); },
         );
         // Verify pulled chunk bodies hash to their content-addressed id
         // (the inverse of the mint in splitIntoChunks). Reads the live

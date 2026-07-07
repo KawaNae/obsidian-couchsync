@@ -13,7 +13,7 @@ import { classifySyncRelation, type SyncRelation } from "./classify-sync-relatio
 import { chunkListsEqual } from "./chunk-equality.ts";
 import { makeFileId, filePathFromId } from "../types/doc-id.ts";
 import { toPathKey, parentDir, unsafeVaultPathReason, type PathKey } from "../utils/path.ts";
-import { logDebug, logWarn } from "../ui/log.ts";
+import { logDebug, logInfo, logWarn } from "../ui/log.ts";
 import { DbError, type VclockUpdate } from "../db/write-transaction.ts";
 
 /**
@@ -149,6 +149,44 @@ export class VaultSync {
     /** Public read accessor for divergent-edit detection in Reconciler. */
     getLastSynced(path: string): LastSynced | undefined {
         return this.lastSynced.get(toPathKey(path));
+    }
+
+    /**
+     * Lightweight vault-drift detection: compare vault file stat against
+     * lastSynced and stamp any drifted files via fileToDb.
+     *
+     * Must run AFTER loadLastSyncedVclocks (cache warm) and BEFORE
+     * catchup (so local edits are in LocalDB before pull compares).
+     * Closes the startup-ordering hole where offline edits get silently
+     * overwritten because catchup runs before reconcile stamps them.
+     *
+     * Uses the same trust model as diskChunkIds: mtime+size match →
+     * content unchanged. Files without a lastSynced entry (baseline not
+     * yet established) are left for the post-catchup reconcile.
+     */
+    async stampVaultDrift(): Promise<number> {
+        const files = this.vault.getFiles();
+        let stamped = 0;
+        for (const file of files) {
+            if (!this.shouldSync(file.path)) continue;
+            const ls = this.lastSynced.get(toPathKey(file.path));
+            if (!ls) continue;
+            if (ls.deleted) continue;
+            if (ls.mtime !== undefined && ls.mtime === file.stat.mtime
+                && ls.size === file.stat.size) {
+                continue;
+            }
+            try {
+                await this.fileToDb(file.path);
+                stamped++;
+            } catch (e: any) {
+                logWarn(`stampVaultDrift: failed for ${file.path}: ${e?.message ?? e}`);
+            }
+        }
+        if (stamped > 0) {
+            logInfo(`stampVaultDrift: ${stamped} file(s) stamped`);
+        }
+        return stamped;
     }
 
     /** Compute the chunk-id list for a vault file (content fingerprint).

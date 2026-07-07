@@ -89,6 +89,11 @@ export class ConflictOrchestrator {
      *  reconnect) stacking a second modal for a path already in flight. */
     private inFlightConflicts = new Set<string>();
 
+    /** Newer concurrent events that arrived while a modal was showing.
+     *  After the in-flight resolution completes, these are re-enqueued
+     *  so the user sees the latest remote state. */
+    private pendingUpdates = new Map<string, { localDoc: CouchSyncDoc; remoteDoc: CouchSyncDoc }>();
+
     /** Conflicts awaiting presentation, keyed by path (dedup). Drained as a
      *  group so a burst presents as ONE batch modal instead of N stacked ones
      *  (the 2026-06-02 black-screen). */
@@ -151,8 +156,24 @@ export class ConflictOrchestrator {
         localDoc: CouchSyncDoc,
         remoteDoc: CouchSyncDoc,
     ): Promise<void> {
-        if (this.inFlightConflicts.has(filePath) || this.queue.has(filePath)) {
-            logDebug(`Concurrent for ${filePath.split("/").pop()} suppressed — already in flight/queued`);
+        if (this.queue.has(filePath)) {
+            if (isFileDoc(localDoc) && isFileDoc(remoteDoc)) {
+                const existing = this.queue.get(filePath)!;
+                try {
+                    existing.remoteBuf = joinChunks(await this.deps.localDb.getChunks(remoteDoc.chunks));
+                    existing.localBuf = joinChunks(await this.deps.localDb.getChunks(localDoc.chunks));
+                    existing.applyTakeRemote = () => this.applyConflictChoice("take-remote", filePath, localDoc, remoteDoc);
+                    existing.applyKeepLocal = () => this.applyConflictChoice("keep-local", filePath, localDoc, remoteDoc);
+                } catch {
+                    // chunk fetch failed — keep existing entry
+                }
+            }
+            logDebug(`Concurrent for ${filePath.split("/").pop()} updated in queue — newer rev captured`);
+            return;
+        }
+        if (this.inFlightConflicts.has(filePath)) {
+            this.pendingUpdates.set(filePath, { localDoc, remoteDoc });
+            logDebug(`Concurrent for ${filePath.split("/").pop()} stashed — in-flight resolution pending`);
             return;
         }
 
@@ -248,6 +269,11 @@ export class ConflictOrchestrator {
                     for (const it of items) {
                         this.inFlightConflicts.delete(it.filePath);
                         for (const w of it.waiters) w();
+                        const pending = this.pendingUpdates.get(it.filePath);
+                        if (pending) {
+                            this.pendingUpdates.delete(it.filePath);
+                            void this.handleConcurrent(it.filePath, pending.localDoc, pending.remoteDoc);
+                        }
                     }
                 }
             }
@@ -278,7 +304,10 @@ export class ConflictOrchestrator {
         }
         // A defer keeps the durable record so it re-presents next session
         // (Invariant B). Anything else (resolved / error keep-local) clears it.
-        if (outcome !== "deferred") await item.clearDurable();
+        if (outcome !== "deferred") {
+            await item.clearDurable();
+            this.deps.replicator.events.emit("conflict-resolved", { filePath: item.filePath });
+        }
     }
 
     /** Present many conflicts as ONE batch modal and apply the bulk decision. */
@@ -347,6 +376,7 @@ export class ConflictOrchestrator {
                 choice === "take-remote" ? "remote" : "local",
             );
             await item.clearDurable();
+            this.deps.replicator.events.emit("conflict-resolved", { filePath: item.filePath });
         } catch (e: any) {
             // Leave the durable record so the failed item re-presents.
             logError(`Batch ${choice} failed for ${item.filePath.split("/").pop()}: ${e?.message ?? e}`);
@@ -597,17 +627,29 @@ export class ConflictOrchestrator {
 
         if (choice === "take-remote") {
             logInfo(`Conflict resolved: take-remote for ${fileName}`);
-            // Invariant 6: deletion conflicts seed from localDoc because
-            // the fake tombstone's vclock is empty by construction.
-            // Non-deletion concurrent edits keep the existing behaviour
-            // (remoteDoc.vclock is real causality from the remote rev).
             const isDeletionConflict = remoteDoc.deleted === true;
-            const seedVC = isDeletionConflict
-                ? mergeVC(localDoc.vclock ?? {}, remoteDoc.vclock ?? {})
-                : (remoteDoc.vclock ?? {});
+            let updatedVC: Record<string, number>;
+            if (isDeletionConflict) {
+                // Invariant 6: the fake tombstone's vclock is {} by
+                // construction — seed from localDoc so the result
+                // strictly dominates both sides and propagates cleanly.
+                updatedVC = incrementVC(
+                    mergeVC(localDoc.vclock ?? {}, remoteDoc.vclock ?? {}),
+                    deviceId,
+                );
+            } else {
+                // Invariant 3 (chunks-equal → doc is vclock authority):
+                // take-remote adopts remote content verbatim, so chunks
+                // will equal the remote head. The remote vclock is the
+                // sole authority — adding a self-component would create
+                // a clock that the push churn guard (#sync-005) skips
+                // forever, poisoning future comparisons into false
+                // concurrent (the pixel conflict-loop root cause).
+                updatedVC = remoteDoc.vclock ?? {};
+            }
             const updated = {
                 ...remoteDoc,
-                vclock: incrementVC(seedVC, deviceId),
+                vclock: updatedVC,
             };
             await localDb.runWriteTx({
                 docs: [{ doc: stripRev(updated) as CouchSyncDoc }],

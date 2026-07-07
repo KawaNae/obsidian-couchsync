@@ -56,6 +56,7 @@ export interface SyncEventMap {
         source?: "pull" | "push";
     };
     "auto-resolve": { filePath: string };
+    "conflict-resolved": { filePath: string };
     /** Pull batch left N files in a divergent state (LocalDB doc advanced
      *  but vault write declined by VaultWriter). The supervisor schedules
      *  a reconciler pass so dbToFile retries on the next cycle, instead
@@ -96,6 +97,7 @@ export class SyncEvents {
         reconnect: new Set(),
         concurrent: new Set(),
         "auto-resolve": new Set(),
+        "conflict-resolved": new Set(),
         "pull-skipped": new Set(),
         "catchup-complete": new Set(),
         "catchup-failed": new Set(),

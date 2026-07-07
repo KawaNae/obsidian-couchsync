@@ -81,6 +81,7 @@ export class EditorAwareVaultWriter implements VaultWriter {
             // No live editor session — write straight to disk. Suppress
             // the resulting modify event so the echo doesn't roundtrip
             // through ChangeTracker.
+            await this.capturePreSync(path);
             this.writeIgnore?.ignoreNextModify(path);
             await this.io.writeBinary(path, content);
             await this.captureHistoryFromBytes(path, content);
@@ -170,6 +171,7 @@ export class EditorAwareVaultWriter implements VaultWriter {
         const anyComposing = editors.some((e) => e.cm.composing);
         logDebug(`VaultWriter: dispatch ${path} (editors=${editors.length}, composing=${anyComposing})`);
 
+        await this.capturePreSync(path);
         this.writeIgnore?.ignoreNextModify(path);
         await this.io.writeBinary(path, content);
 
@@ -199,6 +201,15 @@ export class EditorAwareVaultWriter implements VaultWriter {
             out.push({ leaf, cm });
         }
         return out;
+    }
+
+    private async capturePreSync(path: string): Promise<void> {
+        if (!this.historyCapture) return;
+        try {
+            await this.historyCapture.capturePreSyncState(path);
+        } catch {
+            // best-effort — failure must not block the sync write
+        }
     }
 
     private async captureHistoryFromText(path: string, text: string): Promise<void> {

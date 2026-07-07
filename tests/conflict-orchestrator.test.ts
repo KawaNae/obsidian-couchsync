@@ -150,10 +150,11 @@ describe("ConflictOrchestrator", () => {
 
         await replicator.fireConcurrent("a.md", localDoc, remoteDoc);
 
-        // dbToFile should have been called with the remote doc
+        // dbToFile should have been called with the remote doc.
+        // Invariant 3: non-deletion take-remote adopts remote vclock
+        // verbatim — no self-component added, no merge with local.
         expect(dbToFileCalls).toHaveLength(1);
-        expect(dbToFileCalls[0].vclock["dev-B"]).toBeDefined();
-        expect(dbToFileCalls[0].vclock["dev-A"]).toBe(1); // merged
+        expect(dbToFileCalls[0].vclock).toEqual({ "dev-B": 1 });
 
         // History recorded
         expect(saveConflictCalls).toHaveLength(1);

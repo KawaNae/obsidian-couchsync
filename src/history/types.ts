@@ -1,4 +1,4 @@
-export type HistorySource = "local" | "sync";
+export type HistorySource = "local" | "sync" | "pre-sync";
 
 export interface DiffRecord {
     id?: number;

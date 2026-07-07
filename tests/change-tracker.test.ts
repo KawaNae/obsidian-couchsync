@@ -102,17 +102,31 @@ describe("ChangeTracker", () => {
         });
     });
 
-    describe("ignoreNextModify", () => {
-        it("suppresses next modify for ignored path (single use)", async () => {
+    describe("ignoreNextModify (time-window)", () => {
+        it("suppresses modify events within the 5 s window", async () => {
             tracker.start();
             tracker.ignoreNextModify("a.md");
-            events.emit("modify", "a.md", stat);
 
+            events.emit("modify", "a.md", stat);
             vi.advanceTimersByTime(200);
             await vi.runAllTimersAsync();
             expect(vaultSync.calls.fileToDb).toHaveLength(0);
 
-            // Token is consumed — second modify does fire.
+            // Second modify still within window — also suppressed.
+            vi.advanceTimersByTime(2000);
+            events.emit("modify", "a.md", stat);
+            vi.advanceTimersByTime(200);
+            await vi.runAllTimersAsync();
+            expect(vaultSync.calls.fileToDb).toHaveLength(0);
+        });
+
+        it("allows modify after window expires", async () => {
+            tracker.start();
+            tracker.ignoreNextModify("a.md");
+
+            // Advance past the 5 s window.
+            vi.advanceTimersByTime(5001);
+
             events.emit("modify", "a.md", stat);
             vi.advanceTimersByTime(200);
             await vi.runAllTimersAsync();

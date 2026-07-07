@@ -25,7 +25,7 @@ import type { CouchSyncDoc, FileDoc } from "../../types.ts";
 import { isFileDoc, isConfigDoc, FILE_SCHEMA_VERSION, CONFIG_SCHEMA_VERSION } from "../../types.ts";
 import { assertSchemaVersion } from "./schema-gate.ts";
 import {
-    filePathFromId, configPathFromId, isFileDocId,
+    filePathFromId, configPathFromId, isFileDocId, makeFileId,
 } from "../../types/doc-id.ts";
 import { stripRev } from "../../utils/doc.ts";
 import { compareVC, mergeVC } from "../../sync/vector-clock.ts";
@@ -159,7 +159,11 @@ function buildAcceptedTombstone(docId: string, localDoc: FileDoc): FileDoc {
 }
 
 export class PullWriter {
-    constructor(private deps: PullWriterDeps) {}
+    constructor(private deps: PullWriterDeps) {
+        deps.events.on("conflict-resolved", ({ filePath }) => {
+            this.emittedConflicts.delete(makeFileId(filePath));
+        });
+    }
 
     /** In-memory count of the pending-apply set (Invariant B). -1 = not
      *  yet loaded this session; a non-negative value lets `drainPendingApply`

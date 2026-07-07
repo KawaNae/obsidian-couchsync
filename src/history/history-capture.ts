@@ -160,6 +160,18 @@ export class HistoryCapture {
         await this.captureChange(path, "sync", content);
     }
 
+    /**
+     * Capture the vault's current disk content BEFORE a sync write
+     * overwrites it. Fills the history gap between the last local
+     * capture and the sync write — without this, edits made after the
+     * last local capture are lost to history when the sync write lands.
+     * No-op when the disk content matches the last snapshot (no gap).
+     */
+    async capturePreSyncState(path: string): Promise<void> {
+        if (!this.isTargetPath(path)) return;
+        await this.captureChange(path, "pre-sync");
+    }
+
     private isTargetPath(path: string): boolean {
         // Binary detection happens in captureChange() to avoid sync I/O in
         // the modify event handler.
@@ -222,7 +234,7 @@ export class HistoryCapture {
             if (providedContent !== undefined) {
                 if (!isDiffableText(new TextEncoder().encode(providedContent))) return;
                 currentContent = providedContent;
-            } else if (source === "sync") {
+            } else if (source === "sync" || source === "pre-sync") {
                 const buffer = await this.vault.readBinary(path);
                 if (!isDiffableText(buffer)) return;
                 currentContent = new TextDecoder("utf-8").decode(buffer);

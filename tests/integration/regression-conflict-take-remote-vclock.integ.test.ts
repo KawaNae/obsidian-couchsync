@@ -42,9 +42,13 @@ function makeFakeTombstone(localDoc: FileDoc): FileDoc {
 }
 
 /**
- * Replicate the PR-D take-remote vclock derivation. Kept as a helper
- * so the test can exercise the exact arithmetic without dragging the
- * full orchestrator + LocalDB stack into a unit-shaped test.
+ * Replicate the take-remote vclock derivation. Kept as a helper so the
+ * test can exercise the exact arithmetic without dragging the full
+ * orchestrator + LocalDB stack into a unit-shaped test.
+ *
+ * Post-conflict-loop-fix: non-deletion take-remote adopts remoteDoc.vclock
+ * verbatim (Invariant 3: chunks-equal → remote is vclock authority).
+ * Deletion conflicts still use mergeVC + incrementVC (Invariant 6).
  */
 function deriveTakeRemoteVclock(
     localDoc: FileDoc,
@@ -52,10 +56,13 @@ function deriveTakeRemoteVclock(
     deviceId: string,
 ): Record<string, number> {
     const isDeletionConflict = remoteDoc.deleted === true;
-    const seedVC = isDeletionConflict
-        ? mergeVC(localDoc.vclock ?? {}, remoteDoc.vclock ?? {})
-        : (remoteDoc.vclock ?? {});
-    return incrementVC(seedVC, deviceId);
+    if (isDeletionConflict) {
+        return incrementVC(
+            mergeVC(localDoc.vclock ?? {}, remoteDoc.vclock ?? {}),
+            deviceId,
+        );
+    }
+    return remoteDoc.vclock ?? {};
 }
 
 describe("regression: PR-D fake tombstone vclock derivation", () => {
@@ -83,10 +90,11 @@ describe("regression: PR-D fake tombstone vclock derivation", () => {
         expect(newVclock).toEqual({ "dev-A": 5, "dev-B": 3, "dev-self": 1 });
     });
 
-    it("non-deletion concurrent take-remote keeps the legacy remote-seeded vclock", async () => {
-        // For real concurrent edits remoteDoc.vclock is the genuine
-        // causality from the remote rev; we keep using it as the seed
-        // (no behaviour change vs pre-PR-D).
+    it("non-deletion concurrent take-remote adopts remote vclock verbatim", async () => {
+        // Invariant 3: take-remote adopts remote content → chunks-equal
+        // → remote.vclock is the sole authority. No self-component is
+        // added — doing so would poison the push churn guard (#sync-005)
+        // into skipping the doc forever, causing a permanent conflict loop.
         const localDoc: FileDoc = {
             _id: makeFileId("notes/edit-conflict.md"),
             type: "file",
@@ -97,12 +105,27 @@ describe("regression: PR-D fake tombstone vclock derivation", () => {
         const remoteDoc: FileDoc = {
             ...localDoc,
             chunks: ["chunk:remote"],
-            // Real remote rev — concurrent vclock with a non-empty body.
             vclock: { "dev-B": 1 },
         };
         const newVclock = deriveTakeRemoteVclock(localDoc, remoteDoc, "dev-self");
-        // Seeded from remote.vclock per legacy behaviour.
-        expect(newVclock).toEqual({ "dev-B": 1, "dev-self": 1 });
+        // Remote vclock verbatim — no self-component added.
+        expect(newVclock).toEqual({ "dev-B": 1 });
+    });
+
+    it("non-deletion take-remote does not cause false concurrent on next remote edit", async () => {
+        // After take-remote with verbatim adoption, a subsequent remote
+        // edit must be classified as "dominated" (not "concurrent").
+        const remoteVC = { "dev-B": 1 };
+        const resolvedVC = deriveTakeRemoteVclock(
+            { _id: makeFileId("x.md"), type: "file", chunks: ["c:l"], mtime: 0, ctime: 0, size: 1, vclock: { "dev-A": 1 } },
+            { _id: makeFileId("x.md"), type: "file", chunks: ["c:r"], mtime: 0, ctime: 0, size: 1, vclock: remoteVC },
+            "dev-self",
+        );
+        // Simulates the next remote edit bumping dev-B.
+        const nextRemoteVC = { "dev-B": 2 };
+        // The resolved device's doc has resolvedVC = { dev-B: 1 }.
+        // The new remote has { dev-B: 2 } which dominates { dev-B: 1 }.
+        expect(compareVC(resolvedVC, nextRemoteVC)).toBe("dominated");
     });
 
     it("pre-PR-D shape would NOT dominate localDoc (regression evidence)", async () => {

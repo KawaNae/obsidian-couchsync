@@ -43,6 +43,20 @@ if (!fs.existsSync(outDir)) {
     fs.mkdirSync(outDir, { recursive: true });
 }
 
+const renameDexieSymbol = {
+    name: "rename-dexie-symbol",
+    setup(build) {
+        build.onEnd(() => {
+            const outfile = path.join(outDir, "main.js");
+            let code = fs.readFileSync(outfile, "utf8");
+            const patched = code.replace(/Symbol\.for\(["']Dexie["']\)/g, 'Symbol.for("Dexie-couchsync")');
+            if (patched !== code) {
+                fs.writeFileSync(outfile, patched);
+            }
+        });
+    },
+};
+
 const copyStaticFiles = {
     name: "copy-static-files",
     setup(build) {
@@ -97,7 +111,7 @@ const context = await esbuild.context({
     treeShaking: true,
     outfile: path.join(outDir, "main.js"),
     minify: prod,
-    plugins: [copyStaticFiles],
+    plugins: [renameDexieSymbol, copyStaticFiles],
 });
 
 if (prod) {

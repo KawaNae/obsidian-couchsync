@@ -255,6 +255,7 @@ export class SyncEngine {
         auth?: AuthGate,
         clientFactory?: (s: CouchSyncSettings) => ICouchClient,
         private preCatchupCheck?: (signal: AbortSignal) => Promise<void>,
+        private stampVaultDrift?: () => Promise<void>,
     ) {
         this.auth = auth ?? new AuthGate();
         this.clientFactory = clientFactory ?? ((s) =>
@@ -860,6 +861,19 @@ export class SyncEngine {
 
         // (Encryption gate already ran before the vault client was built — see
         // the top of openSession. #1c)
+
+        // Vault-drift stamp: detect offline edits (mtime/size drift from
+        // lastSynced) and commit them to LocalDB BEFORE catchup pulls
+        // remote changes. Without this, catchup's pull-writer sees the
+        // stale LocalDB doc and silently overwrites the vault edit.
+        if (this.stampVaultDrift) {
+            try {
+                await this.stampVaultDrift();
+            } catch (e: any) {
+                logWarn(`openSession: stampVaultDrift failed: ${e?.message ?? e}`);
+            }
+            if (session.disposed) return;
+        }
 
         // Catchup = actual data transfer → syncing.
         this.setState("syncing");

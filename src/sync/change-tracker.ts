@@ -10,9 +10,15 @@ export class ChangeTracker implements IWriteIgnore, IPendingProbe {
     private eventRefs: VaultEventRef[] = [];
     /** Paths whose next `delete` event should be treated as sync-driven. */
     private pendingDeleteIgnores = new Set<string>();
-    /** Paths whose next `modify` event should be treated as sync-driven (PR1
-     *  disk-write invariant: pull-side writeBinary echoes back as modify). */
-    private pendingModifyIgnores = new Set<string>();
+    /** Paths whose `modify` events should be treated as sync-driven until the
+     *  deadline (epoch ms). Extends the old one-shot `pendingModifyIgnores` to
+     *  a time-window model: Obsidian's stale-buffer flush on resume/hidden can
+     *  fire multiple modify events seconds after a pull-apply, which a one-shot
+     *  ignore misses. The 5 s window absorbs these while staying short enough
+     *  that genuine user edits (which trigger the next reconcile anyway) are
+     *  not delayed materially. */
+    private modifyIgnoreUntil = new Map<string, number>();
+    private static readonly MODIFY_IGNORE_WINDOW_MS = 5000;
 
     constructor(
         private events: IVaultEvents,
@@ -23,7 +29,11 @@ export class ChangeTracker implements IWriteIgnore, IPendingProbe {
     start(): void {
         this.eventRefs.push(
             this.events.on("modify", (path) => {
-                if (this.pendingModifyIgnores.delete(path)) return;
+                const until = this.modifyIgnoreUntil.get(path);
+                if (until !== undefined) {
+                    if (Date.now() <= until) return;
+                    this.modifyIgnoreUntil.delete(path);
+                }
                 this.scheduleSync(path);
             }),
         );
@@ -87,9 +97,13 @@ export class ChangeTracker implements IWriteIgnore, IPendingProbe {
         this.pendingDeleteIgnores.add(path);
     }
 
-    /** Register that the next `modify` event on `path` is sync-driven. */
+    /** Suppress modify events on `path` for the next MODIFY_IGNORE_WINDOW_MS.
+     *  Each call resets the deadline — rapid pull-applies extend the window. */
     ignoreNextModify(path: string): void {
-        this.pendingModifyIgnores.add(path);
+        this.modifyIgnoreUntil.set(
+            path,
+            Date.now() + ChangeTracker.MODIFY_IGNORE_WINDOW_MS,
+        );
     }
 
     /**
