@@ -600,10 +600,12 @@ export class ConflictOrchestrator {
     /**
      * Re-check whether a stashed concurrent event is still concurrent
      * against the CURRENT local doc (which may have changed during the
-     * in-flight resolution). If still concurrent, re-enqueue normally.
-     * If the resolution already brought the local doc to a state that
-     * is dominated by or equal to the remote, skip silently — showing
-     * another modal would be unnecessary UX noise.
+     * in-flight resolution). Three outcomes:
+     *   - equal: both sides converged — nothing to do.
+     *   - dominated: local is behind the stashed remote — silently
+     *     apply take-remote to close the gap (no modal needed).
+     *   - concurrent/dominates: still divergent — re-enqueue for a
+     *     fresh modal with the latest data.
      */
     private async reEnqueueIfStillConcurrent(
         filePath: string,
@@ -619,10 +621,17 @@ export class ConflictOrchestrator {
                     currentLocal.vclock ?? {},
                     remoteDoc.vclock ?? {},
                 );
-                if (rel === "dominated" || rel === "equal") {
+                if (rel === "equal") {
                     logDebug(
-                        `Stashed concurrent for ${filePath.split("/").pop()} resolved by prior choice (${rel}) — skipping re-enqueue`,
+                        `Stashed concurrent for ${filePath.split("/").pop()} already converged — skipping`,
                     );
+                    return;
+                }
+                if (rel === "dominated") {
+                    logDebug(
+                        `Stashed concurrent for ${filePath.split("/").pop()} dominated — silent take-remote`,
+                    );
+                    await this.applyConflictChoice("take-remote", filePath, currentLocal, remoteDoc);
                     return;
                 }
             }
