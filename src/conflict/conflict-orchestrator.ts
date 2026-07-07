@@ -11,7 +11,7 @@ import type { IModalPresenter, ConflictBatchItem } from "../types/modal-presente
 import { isFileDoc, isConfigDoc } from "../types.ts";
 import { joinChunks } from "../db/chunker.ts";
 import { isDiffableText } from "../utils/binary.ts";
-import { incrementVC, mergeVC } from "../sync/vector-clock.ts";
+import { incrementVC, mergeVC, compareVC } from "../sync/vector-clock.ts";
 import { stripRev } from "../utils/doc.ts";
 import { clearPendingConflict } from "../db/sync/pending-conflict.ts";
 import { makeFileId } from "../types/doc-id.ts";
@@ -272,7 +272,7 @@ export class ConflictOrchestrator {
                         const pending = this.pendingUpdates.get(it.filePath);
                         if (pending) {
                             this.pendingUpdates.delete(it.filePath);
-                            void this.handleConcurrent(it.filePath, pending.localDoc, pending.remoteDoc);
+                            void this.reEnqueueIfStillConcurrent(it.filePath, pending.remoteDoc);
                         }
                     }
                 }
@@ -597,6 +597,41 @@ export class ConflictOrchestrator {
      * `concurrent` event. Merges vclocks and writes to localDB so the
      * push loop carries the result to remote.
      */
+    /**
+     * Re-check whether a stashed concurrent event is still concurrent
+     * against the CURRENT local doc (which may have changed during the
+     * in-flight resolution). If still concurrent, re-enqueue normally.
+     * If the resolution already brought the local doc to a state that
+     * is dominated by or equal to the remote, skip silently — showing
+     * another modal would be unnecessary UX noise.
+     */
+    private async reEnqueueIfStillConcurrent(
+        filePath: string,
+        remoteDoc: CouchSyncDoc,
+    ): Promise<void> {
+        let currentLocal: CouchSyncDoc | null = null;
+        try {
+            currentLocal = await this.deps.localDb.get<CouchSyncDoc>(
+                makeFileId(filePath),
+            );
+            if (currentLocal && isFileDoc(currentLocal) && isFileDoc(remoteDoc)) {
+                const rel = compareVC(
+                    currentLocal.vclock ?? {},
+                    remoteDoc.vclock ?? {},
+                );
+                if (rel === "dominated" || rel === "equal") {
+                    logDebug(
+                        `Stashed concurrent for ${filePath.split("/").pop()} resolved by prior choice (${rel}) — skipping re-enqueue`,
+                    );
+                    return;
+                }
+            }
+        } catch {
+            // DB read failed — fall through to re-enqueue (safe side)
+        }
+        void this.handleConcurrent(filePath, currentLocal ?? remoteDoc, remoteDoc);
+    }
+
     /**
      * Apply the user's conflict-modal choice. The take-remote branch
      * has a special-case for **fake tombstones** produced by
