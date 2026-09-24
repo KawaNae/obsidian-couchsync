@@ -5,7 +5,7 @@
  * Tests use in-memory stubs for both sides.
  */
 
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import {
     pushDocs,
     pullDocs,
@@ -28,6 +28,7 @@ import { makeFileId, makeChunkId } from "../src/types/doc-id.ts";
 import type { ChunkHasher } from "../src/db/chunker.ts";
 import { computeHash } from "../src/db/chunker.ts";
 import { encodeEnvelope, plainEnvelope } from "../src/db/envelope.ts";
+import { RetryingCouchClient } from "../src/db/retrying-couch-client.ts";
 
 // x64 hasher for the verified pull fetch boundary. These tests seed plaintext
 // (x64) docs, so this matches; chunks with absent attachments never reach it.
@@ -425,6 +426,31 @@ describe("remote-couch (IDocStore + ICouchClient)", () => {
 
             expect(local._docs.has(chunkId)).toBe(false); // skipped, not trusted
             expect(written).toBe(0);
+        });
+
+        it("completes when one getAttachment fails transiently once (RetryingCouchClient)", async () => {
+            // Regression: Clone aborted with "Failed to fetch" when a single
+            // chunk GET out of thousands hit a transport blip. Through the
+            // retry layer the failed read is re-issued and the pull completes.
+            vi.spyOn(console, "warn").mockImplementation(() => {});
+            const bytes = new TextEncoder().encode("REAL");
+            const chunkId = makeChunkId(await computeHash(bytes));
+            const file = { ...makeFileDoc("a.md", "1"), chunks: [chunkId], _rev: "1-r" };
+            remote._docs.set(file._id, file);
+            remote._docs.set(chunkId, { _id: chunkId, type: "chunk", schemaVersion: 2, _rev: "1-r" });
+            let calls = 0;
+            remote.getAttachment = async () => {
+                if (calls++ === 0) throw new TypeError("Failed to fetch");
+                return encodeEnvelope(plainEnvelope(bytes));
+            };
+
+            const retrying = new RetryingCouchClient(remote, { sleep: async () => {} });
+            const written = await pullAll(local, retrying, h);
+
+            expect(calls).toBe(2);
+            expect(local._docs.has(chunkId)).toBe(true);
+            expect(local._docs.has(file._id)).toBe(true);
+            expect(written).toBe(2);
         });
     });
 });

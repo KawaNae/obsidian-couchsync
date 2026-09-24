@@ -286,7 +286,7 @@ export async function createE2EHarness(opts: CreateE2EHarnessOpts = {}): Promise
         // Codec stack mirrors main.ts wrapVaultClient: Compressing(Encrypting(raw)).
         // Encrypt iff a crypto provider is installed; compress per the persisted
         // flag — the exact two-source composition that G4 exercised.
-        const wrapVaultClient = (raw: CouchClient): ICouchClient => {
+        const wrapVaultClient = (raw: ICouchClient): ICouchClient => {
             let c: ICouchClient = raw;
             if (deviceCrypto) c = new EncryptingCouchClient(c, deviceCrypto, deviceCipherVersion);
             if (settingsRef.current.compressionEnabled) c = new CompressingCouchClient(c);

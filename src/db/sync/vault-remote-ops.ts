@@ -22,6 +22,7 @@ import type { ICouchClient } from "../interfaces.ts";
 import type { ChunkHasher } from "../chunker.ts";
 import { CouchClient, makeCouchClient } from "../couch-client.ts";
 import * as remoteCouch from "../remote-couch.ts";
+import { RetryingCouchClient } from "../retrying-couch-client.ts";
 import type { AuthGate } from "./auth-gate.ts";
 
 export type ProgressCallback = (docId: string, count: number) => void;
@@ -44,7 +45,7 @@ export class VaultRemoteOps {
          * mutable setter and the Init/Clone vs sync-loop drift that
          * silently dropped the Compressing layer from Init pushes.
          */
-        private wrapClient: (raw: CouchClient) => ICouchClient,
+        private wrapClient: (raw: ICouchClient) => ICouchClient,
         /**
          * Vault chunk hasher (same instance the live sync loop uses, reading
          * the live cryptoProvider via closure). Threaded into `pullAll` so the
@@ -176,9 +177,18 @@ export class VaultRemoteOps {
      * ids are restored, chunk attachments are decrypted on read and
      * encrypted on write. This is the correct client for every file/chunk
      * diagnostic, repair, and bulk data operation. Transparent (== raw)
-     * when the vault is unencrypted and uncompressed.
+     * when the vault is unencrypted and uncompressed (apart from retry).
+     *
+     * One-shot ops get transport retry: idempotent reads survive a
+     * transient network/timeout/5xx failure instead of aborting the whole
+     * op (a Clone issues thousands of reads; one dropped chunk GET used to
+     * fail it). `RetryingCouchClient` sits innermost — codec(retry(raw)) —
+     * so only HTTP is retried and decode runs once. The live sync client
+     * (SyncEngine's clientFactory) intentionally does NOT get this layer:
+     * the session owns retry there, and a double retry would delay error
+     * surfacing by up to ~20s and skew stall detection.
      */
     makeDataClient(): ICouchClient {
-        return this.wrapClient(this.makeClient());
+        return this.wrapClient(new RetryingCouchClient(this.makeClient()));
     }
 }

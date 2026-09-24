@@ -120,7 +120,7 @@ export default class CouchSyncPlugin extends Plugin {
      * push so the plain payload reaches gzip before the cipher renders
      * the stream incompressible. Pull traverses the inverse order.
      */
-    private wrapVaultClient = (raw: CouchClient): ICouchClient => {
+    private wrapVaultClient = (raw: ICouchClient): ICouchClient => {
         // Policy-gated codec stack (Invariant III). The encryption POLICY
         // (`encryptionEnabled`) gates whether the encrypt layer is applied —
         // not the provider's existence. A stale in-memory provider left over
@@ -511,6 +511,9 @@ export default class CouchSyncPlugin extends Plugin {
         // call vaultSync.dbToFile directly via constructor DI (replaces
         // the former events.onAsync("pull-write", ...) bus, whose catch-
         // all swallowed write errors and let `Pull: N written` lie).
+        // No RetryingCouchClient here (unlike VaultRemoteOps.makeDataClient):
+        // the live session owns retry, and a second layer would delay error
+        // surfacing and skew stall detection.
         const encClientFactory: (s: CouchSyncSettings) => ICouchClient = (s) =>
             this.wrapVaultClient(
                 makeCouchClient(s.couchdbUri, s.couchdbDbName, s.couchdbUser, s.couchdbPassword),

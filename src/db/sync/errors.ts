@@ -90,6 +90,13 @@ export function classifyError(err: unknown): SyncErrorDetail {
             message: `Server error (${code}): ${rawMessage}`,
         };
     }
+    // A streamed body that stops delivering bytes ("CouchDB body stale (no
+    // data for Nms)", CouchClient's per-chunk stale timer) is a transport
+    // timeout, not an unknown failure — so the one-shot retry layer retries
+    // it and live sync labels it as a timeout.
+    if (/\bbody stale\b/i.test(rawMessage)) {
+        return { kind: "timeout", code, message: rawMessage };
+    }
     if (/timed?[\s_-]?out|timeout/i.test(rawMessage)) {
         return { kind: "timeout", code, message: rawMessage };
     }

@@ -18,6 +18,13 @@ describe("classifyError", () => {
         expect(classifyError(new Error("Catchup timed out")).kind).toBe("timeout");
     });
 
+    it("stalled streamed body → timeout (not unknown)", () => {
+        // CouchClient's per-chunk stale timer: status 0, no timeout keyword.
+        const err: any = new Error("CouchDB body stale (no data for 30000ms)");
+        err.status = 0;
+        expect(classifyError(err).kind).toBe("timeout");
+    });
+
     it("network patterns → network", () => {
         expect(classifyError({ message: "ECONNREFUSED" }).kind).toBe("network");
         expect(classifyError({ message: "Failed to fetch" }).kind).toBe("network");

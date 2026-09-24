@@ -2,6 +2,25 @@
 
 All notable changes to obsidian-couchsync.
 
+## Unreleased
+
+### Fixed
+
+- **Clone no longer aborts on a single transient network failure.** A Clone
+  issues thousands of read requests (paginated `_all_docs` plus one GET per
+  chunk attachment); one dropped request (`Failed to fetch`, a request
+  timeout, a 5xx) failed the whole Clone, and a re-run started over from an
+  empty local DB. Vault one-shot operations (Clone, repair, chunk
+  consistency) now retry each idempotent read with Fibonacci backoff (up to
+  6 retries, ≈20s) before giving up with the original error. Auth, 404 and
+  codec errors still fail immediately. Writes are never retried (a re-send
+  after an unknown outcome would conflict), and live sync is unchanged — its
+  session already owns retry.
+- **A stalled response body is classified as a timeout.** `CouchDB body
+  stale (no data for …ms)` was reported as an unknown error; it is now a
+  timeout, so the one-shot retry above covers it and live sync labels it
+  accordingly.
+
 ## 0.29.0
 
 Three structural changes: a first-principles redesign of config sync that
