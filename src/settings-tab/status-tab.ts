@@ -9,7 +9,7 @@
  * Also renders the existing server info + database list dashboard (read
  * from the live server state via raw fetch, not CouchClient).
  */
-import { type App, Modal, Notice, Setting, type ButtonComponent } from "obsidian";
+import { type App, Modal, Setting, type ButtonComponent } from "obsidian";
 import type { CouchSyncSettings, ConnectionState } from "../settings.ts";
 import type { SyncEngine } from "../db/sync-engine.ts";
 import type { AuthGate } from "../db/sync/auth-gate.ts";
@@ -21,6 +21,7 @@ import {
 import { addPasswordToggle } from "./vault-sync-tab.ts";
 import { applyServerSettings, type ConfigServerSwitch } from "./server-apply.ts";
 import { logWarn } from "../ui/log.ts";
+import { showNotice } from "../ui/notices.ts";
 
 class TypeToConfirmModal extends Modal {
     private resolved = false;
@@ -246,7 +247,7 @@ export class CouchDbTab {
         const baseUri = this.draft.uri.replace(/\/+$/, "");
         if (!baseUri) {
             this.testPassed = false;
-            new Notice("Server URI is required.", 5000);
+            showNotice("Server URI is required.", 5000);
             this.deps.refresh();
             return;
         }
@@ -255,14 +256,14 @@ export class CouchDbTab {
             await fetchJson(baseUri, this.draft.user, this.draft.pass);
             this.testPassed = true;
             this.deps.auth.clear();
-            new Notice("Server connection successful!", 3000);
+            showNotice("Server connection successful!", 3000);
         } catch (e: any) {
             this.testPassed = false;
             if (e instanceof AuthError) {
                 this.deps.auth.raise(e.status, e.message);
-                new Notice(`Authentication failed (${e.status}): ${e.message}`, 8000);
+                showNotice(`Authentication failed (${e.status}): ${e.message}`, 8000);
             } else {
-                new Notice(`Connection failed: ${e.message}`, 8000);
+                showNotice(`Connection failed: ${e.message}`, 8000);
             }
         }
         this.deps.refresh();
@@ -297,8 +298,8 @@ export class CouchDbTab {
             save: () => this.deps.updateSettings(patch),
         });
         if (result.kind === "refused-busy") {
-            new Notice(
-                "CouchSync: a config operation is running — the server was not " +
+            showNotice(
+                "a config operation is running — the server was not " +
                     "changed. Apply again when it finishes.",
                 10000,
             );
@@ -307,7 +308,7 @@ export class CouchDbTab {
         }
         if (result.kind === "saved-config-unbound") {
             const e: any = result.error;
-            logWarn(`CouchSync: config store for the new server could not be opened: ${e?.message ?? e}`);
+            logWarn(`config store for the new server could not be opened: ${e?.message ?? e}`);
         }
         this.testPassed = false;
         this.deps.refresh();
@@ -530,10 +531,10 @@ export class CouchDbTab {
 
         try {
             await deleteDb(baseUri, user, pass, dbName);
-            new Notice(`CouchSync: Database "${dbName}" deleted.`);
+            showNotice(`Database "${dbName}" deleted.`);
             this.deps.refresh();
         } catch (e: any) {
-            new Notice(`CouchSync: Failed to delete "${dbName}": ${e.message}`);
+            showNotice(`Failed to delete "${dbName}": ${e.message}`);
         }
     }
 }

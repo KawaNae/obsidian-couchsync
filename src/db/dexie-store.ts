@@ -269,7 +269,7 @@ export class DexieStore<T extends { _id: string; _rev?: string } = any>
                 // with full descriptor — this path is rare, not a hot loop.
                 if (kind === "unknown") {
                     logWarn(
-                        `CouchSync: [dexie-store] runTx failed unclassified — ${debugDescribeError(e)}`,
+                        `[dexie-store] runTx failed unclassified — ${debugDescribeError(e)}`,
                     );
                 }
                 throw toDbError(e);

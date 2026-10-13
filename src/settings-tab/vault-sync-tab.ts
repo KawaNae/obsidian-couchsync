@@ -6,7 +6,7 @@
  * filters. Server connection (URI / user / password) lives in the CouchDB
  * tab since v0.30.0 — this tab reads them from saved settings.
  */
-import { type App, Notice, Setting, type ButtonComponent } from "obsidian";
+import { type App, Setting, type ButtonComponent } from "obsidian";
 import { MAX_PREVIOUS_DEVICE_IDS, type ConnectionState, type CouchSyncSettings } from "../settings.ts";
 import type { SyncEngine } from "../db/sync-engine.ts";
 import type { AuthGate } from "../db/sync/auth-gate.ts";
@@ -14,6 +14,7 @@ import type { VaultRemoteOps, DbCheckResult } from "../db/sync/vault-remote-ops.
 import type { LocalDB } from "../db/local-db.ts";
 import { validateDeviceName } from "../utils/device-name.ts";
 import { setupGating } from "./setup-gating.ts";
+import { showNotice } from "../ui/notices.ts";
 
 export interface VaultSyncTabDeps {
     app: App;
@@ -293,14 +294,14 @@ export class VaultSyncTab {
 
         if (result.status === "error") {
             this.testPassed = false;
-            new Notice(`Database check failed: ${result.message}`, 8000);
+            showNotice(`Database check failed: ${result.message}`, 8000);
         } else {
             this.testPassed = true;
             this.deps.auth.clear();
             if (result.status === "created") {
-                new Notice(`Database "${this.draft.db}" created.`, 3000);
+                showNotice(`Database "${this.draft.db}" created.`, 3000);
             } else {
-                new Notice(
+                showNotice(
                     `Database "${this.draft.db}" found — ${result.docCount.toLocaleString()} docs.`,
                     3000,
                 );
@@ -386,11 +387,11 @@ export class VaultSyncTab {
                 .onClick(async () => {
                     const error = validateDeviceName(inputValue);
                     if (error) {
-                        new Notice(error);
+                        showNotice(error);
                         return;
                     }
                     if (inputValue === settings.deviceId) {
-                        new Notice("Device name unchanged.");
+                        showNotice("Device name unchanged.");
                         return;
                     }
                     if (settings.deviceId) {
@@ -405,7 +406,7 @@ export class VaultSyncTab {
                     } else {
                         await this.deps.updateSettings({ deviceId: inputValue });
                     }
-                    new Notice(`Device name set to "${inputValue}". Restart sync to apply.`);
+                    showNotice(`Device name set to "${inputValue}". Restart sync to apply.`);
                     this.deps.refresh();
                 }),
         );

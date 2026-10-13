@@ -75,7 +75,7 @@ export class HistoryCapture {
                 this.lastCaptureTime.delete(oldPath);
                 if (lastTime !== undefined) this.lastCaptureTime.set(path, lastTime);
                 this.storage.renamePath(oldPath, path).catch((e: any) =>
-                    logError(`CouchSync: history renamePath failed ${oldPath} → ${path}: ${e?.message ?? e}`),
+                    logError(`history renamePath failed ${oldPath} → ${path}: ${e?.message ?? e}`),
                 );
                 if (hadPending && this.isTargetPath(path)) this.scheduleCapture(path);
             }),
@@ -139,7 +139,7 @@ export class HistoryCapture {
             const { added, removed } = this.diffEngine.computeLineDiff(winnerContent, loserContent);
             newId = await this.storage.saveDiff(filePath, patch, hash, added, removed, true, "local", parentId);
         } catch (e: any) {
-            logError(`CouchSync: Failed to record conflict history for ${filePath}: ${e?.message ?? e}`);
+            logError(`Failed to record conflict history for ${filePath}: ${e?.message ?? e}`);
         }
         await this.storage.saveSnapshot(filePath, winnerContent, newId ?? parentId);
         if (newId !== null) this.onDiffSaved?.(filePath);
@@ -256,13 +256,13 @@ export class HistoryCapture {
                 newId = await this.storage.saveDiff(path, patches, baseHash, added, removed, false, source, parentId);
                 logDebug(`History captured for ${path} (${source})`);
             } catch (e: any) {
-                logError(`CouchSync: Failed to capture history: ${e?.message ?? e}`);
+                logError(`Failed to capture history: ${e?.message ?? e}`);
             }
             await this.storage.saveSnapshot(path, currentContent, newId ?? parentId);
             this.lastCaptureTime.set(path, Date.now());
             if (newId !== null) this.onDiffSaved?.(path);
         } catch (e) {
-            logError(`CouchSync: Failed to capture history: ${e?.message ?? e}`);
+            logError(`Failed to capture history: ${e?.message ?? e}`);
         }
     }
 }

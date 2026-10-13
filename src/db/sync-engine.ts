@@ -500,7 +500,7 @@ export class SyncEngine {
                 // starts, and so the caller never sees a recursive stack.
                 queueMicrotask(() => {
                     this.requestReconnect(next).catch((e: any) =>
-                        logError(`CouchSync: queued reconnect failed: ${e?.message ?? e}`),
+                        logError(`queued reconnect failed: ${e?.message ?? e}`),
                     );
                 });
             }
@@ -636,7 +636,7 @@ export class SyncEngine {
             message: e.userMessage ?? "Local DB is no longer usable — restart Obsidian.",
         });
         this.events.emit("degraded", {
-            message: e.userMessage ?? "CouchSync: Local DB handle is no longer usable.",
+            message: e.userMessage ?? "Local DB handle is no longer usable.",
         });
         void this.teardown();
     }
@@ -653,7 +653,7 @@ export class SyncEngine {
             try {
                 await this.requestReconnect("retry-backoff");
             } catch (e: any) {
-                logError(`CouchSync: retry reconnect failed: ${e?.message ?? e}`);
+                logError(`retry reconnect failed: ${e?.message ?? e}`);
             }
         }, delay);
     }
@@ -928,7 +928,7 @@ export class SyncEngine {
                 signal: session.signal,
             });
         } catch (e: any) {
-            logWarn(`CouchSync: push backfill failed (will retry next session): ${e?.message ?? e}`);
+            logWarn(`push backfill failed (will retry next session): ${e?.message ?? e}`);
         }
         if (session.disposed) return;
 
@@ -1011,7 +1011,7 @@ export class SyncEngine {
                 try {
                     await this.requestReconnect("periodic-tick");
                 } catch (e: any) {
-                    logError(`CouchSync: Health check error: ${e?.message ?? e}`);
+                    logError(`Health check error: ${e?.message ?? e}`);
                 }
             }
             return;
@@ -1021,7 +1021,7 @@ export class SyncEngine {
             try {
                 await this.requestReconnect("periodic-tick");
             } catch (e: any) {
-                logError(`CouchSync: Health check error: ${e?.message ?? e}`);
+                logError(`Health check error: ${e?.message ?? e}`);
             }
             return;
         }

@@ -1,4 +1,4 @@
-import { Notice, Platform, Plugin, apiVersion } from "obsidian";
+import { Platform, Plugin, apiVersion } from "obsidian";
 import { type CouchSyncSettings, DEFAULT_SETTINGS } from "./settings.ts";
 import { LocalDB } from "./db/local-db.ts";
 import type { ConfigLocalDB } from "./db/config-local-db.ts";
@@ -16,7 +16,7 @@ import { checkInstallMarker } from "./sync/install-marker.ts";
 import { StatusBar } from "./ui/status-bar.ts";
 import { initLog, logInfo, logError, logWarn, notify } from "./ui/log.ts";
 import { CouchSyncSettingTab } from "./settings-tab/index.ts";
-import { ProgressNotice } from "./ui/notices.ts";
+import { ProgressNotice, showNotice } from "./ui/notices.ts";
 import { HistoryStorage } from "./history/storage.ts";
 import { HistoryCapture } from "./history/history-capture.ts";
 import { HistoryManager } from "./history/history-manager.ts";
@@ -128,7 +128,7 @@ export default class CouchSyncPlugin extends Plugin {
         if (this.settings.encryptionEnabled) {
             if (!this.vaultCryptoProvider) {
                 throw new Error(
-                    "CouchSync: refusing to build vault client — vault is encrypted " +
+                    "refusing to build vault client — vault is encrypted " +
                         "but no crypto provider is unlocked (provisioning incomplete). " +
                         "Re-run Init/Clone or unlock the vault.",
                 );
@@ -272,7 +272,7 @@ export default class CouchSyncPlugin extends Plugin {
         if (agreement.status === "cipher-downgrade-detected") {
             this.encryptionMismatch = agreement;
             throw await this.encryptionPause(
-                "CouchSync: vault encryption was downgraded on the server " +
+                "vault encryption was downgraded on the server " +
                 `(cipherVersion below this device's floor ${agreement.localFloor}). ` +
                 "Sync paused — verify the server has not been tampered with.",
             );
@@ -286,7 +286,7 @@ export default class CouchSyncPlugin extends Plugin {
                     passphrase = await modal.waitForResult() ?? "";
                     if (!passphrase) {
                         throw await this.encryptionPause(
-                            "CouchSync: passphrase required. Sync paused.",
+                            "passphrase required. Sync paused.",
                         );
                     }
                 }
@@ -295,7 +295,7 @@ export default class CouchSyncPlugin extends Plugin {
                     this.settings.encryptionPassphrase = "";
                     await this.saveSettings();
                     throw await this.encryptionPause(
-                        "CouchSync: wrong passphrase. Sync paused.",
+                        "wrong passphrase. Sync paused.",
                     );
                 }
                 if (!this.settings.encryptionPassphrase) {
@@ -313,13 +313,13 @@ export default class CouchSyncPlugin extends Plugin {
             || agreement.status === "remote-plaintext") {
             this.encryptionMismatch = agreement;
             throw await this.encryptionPause(
-                "CouchSync: encryption state changed by another device. " +
+                "encryption state changed by another device. " +
                 "Open Settings → Vault Sync to re-run Init or Clone.",
             );
         } else if (agreement.status === "legacy-meta-only") {
             // Pre-v2 `encryption:meta` doc found but no v2 `vault:meta`.
             throw await this.encryptionPause(
-                "CouchSync: this vault was set up with a pre-v2 build. " +
+                "this vault was set up with a pre-v2 build. " +
                 "Open Settings → Vault Sync and re-run Init or Clone to migrate.",
             );
         }
@@ -364,7 +364,7 @@ export default class CouchSyncPlugin extends Plugin {
             });
             if (result.markerMismatch) {
                 notify(
-                    "CouchSync: this vault may have been copied from another installation. " +
+                    "this vault may have been copied from another installation. " +
                         "Please verify your device name in Settings → Vault Sync.",
                     10000,
                 );
@@ -379,10 +379,7 @@ export default class CouchSyncPlugin extends Plugin {
         this.localDb.open();
         await this.localDb.ensureSchemaVersion();
 
-        initLog(
-            () => this.settings,
-            (msg, dur) => new Notice(`CouchSync: ${msg}`, dur),
-        );
+        initLog(() => this.settings, showNotice);
         const vaultIO = new ObsidianVaultIO(this.app);
         const adapterIO = new ObsidianAdapterIO(this.app);
         const vaultEvents = new ObsidianVaultEvents(this.app);
@@ -473,7 +470,7 @@ export default class CouchSyncPlugin extends Plugin {
                 // vault session to verify reachability if it itself is
                 // unhealthy. decideReconnect skips when vault is healthy.
                 this.replicator.requestReconnect("config-failure").catch((e: any) =>
-                    logError(`CouchSync: config-failure reconnect failed: ${e?.message ?? e}`),
+                    logError(`config-failure reconnect failed: ${e?.message ?? e}`),
                 );
             },
         };
@@ -529,7 +526,7 @@ export default class CouchSyncPlugin extends Plugin {
         // until it closes.
         void deleteLegacyConfigStore(vaultName, this.settings.couchdbConfigDbName)
             .catch((e: any) => {
-                logWarn(`CouchSync: could not delete the old local config store (retried next load): ${e?.message ?? e}`);
+                logWarn(`could not delete the old local config store (retried next load): ${e?.message ?? e}`);
             });
         // Open the binding for the applied config DB name (no-op when empty).
         // Apply in the settings tab calls rebind again at runtime.
@@ -540,11 +537,11 @@ export default class CouchSyncPlugin extends Plugin {
             await this.configSync.rebind(this.settings.couchdbConfigDbName || null);
         } catch (e: any) {
             logError(
-                `CouchSync: could not open the local config store for ` +
+                `could not open the local config store for ` +
                 `"${this.settings.couchdbConfigDbName}": ${e?.message ?? e}`,
             );
             notify(
-                "CouchSync: config sync is inactive — its local store could not be " +
+                "config sync is inactive — its local store could not be " +
                     "opened. See the log.",
                 10000,
             );
@@ -577,7 +574,7 @@ export default class CouchSyncPlugin extends Plugin {
         // Surface a sticky Notice with a "Reload now" button that fires
         // `app:reload`; emitted at most once per SyncEngine lifecycle.
         this.replicator.events.on("degraded", ({ message }) => {
-            const notice = new Notice(`${message} Tap "Reload now" to recover.`, 0);
+            const notice = showNotice(`${message} Tap "Reload now" to recover.`, 0);
             const btn = notice.noticeEl.createEl("button", {
                 text: "Reload now",
                 cls: "mod-cta",
@@ -705,8 +702,8 @@ export default class CouchSyncPlugin extends Plugin {
             if (this.settings.configSyncPolicyMigrated) {
                 this.settings.configSyncPolicyMigrated = false;
                 await this.saveSettings();
-                new Notice(
-                    "CouchSync: Config sync filtering was upgraded to a " +
+                showNotice(
+                    "Config sync filtering was upgraded to a " +
                     "meaning-based model. Plugin executable code is no longer " +
                     "synced by default (safety). Review Settings → Config Sync.",
                     12000,
@@ -740,7 +737,7 @@ export default class CouchSyncPlugin extends Plugin {
                     );
                     if (agreement.status === "cipher-downgrade-detected") {
                         logWarn(
-                            `CouchSync: vault:meta cipherVersion downgrade detected ` +
+                            `vault:meta cipherVersion downgrade detected ` +
                             `(below floor ${agreement.localFloor}) — refusing early unlock.`,
                         );
                         this.encryptionMismatch = agreement;
@@ -761,7 +758,7 @@ export default class CouchSyncPlugin extends Plugin {
                     }
                 } catch (e: any) {
                     logWarn(
-                        `CouchSync: early vault crypto derivation failed (non-fatal): ${e?.message ?? e}`,
+                        `early vault crypto derivation failed (non-fatal): ${e?.message ?? e}`,
                     );
                 }
                 // The config key is NOT derived here: config is an
@@ -786,15 +783,15 @@ export default class CouchSyncPlugin extends Plugin {
                 if (vaultLegacy) {
                     const isConfigOrphan = vaultLegacy.startsWith("config:");
                     const message = isConfigOrphan
-                        ? `CouchSync: legacy config doc found in vault DB (${vaultLegacy}). ` +
+                        ? `legacy config doc found in vault DB (${vaultLegacy}). ` +
                             "Open Settings → Maintenance → Clean up legacy configs from vault DB " +
                             "after running Create (and Push) in Config Sync. Sync is paused until then."
-                        : `CouchSync: old schema detected in vault DB (${vaultLegacy}). ` +
+                        : `old schema detected in vault DB (${vaultLegacy}). ` +
                             "Open Settings → Maintenance → Delete local vault database, " +
                             "then re-run Init or Clone. Sync is paused until then.";
                     notify(message, 15000);
                     logWarn(
-                        `CouchSync: blocking replicator.start() — legacy vault doc: ${vaultLegacy}`,
+                        `blocking replicator.start() — legacy vault doc: ${vaultLegacy}`,
                     );
                     this.fireReconcile("onload");
                     return;
@@ -805,31 +802,31 @@ export default class CouchSyncPlugin extends Plugin {
                     const configLegacy = await configStore.findLegacyConfigDoc();
                     if (configLegacy) {
                         notify(
-                            `CouchSync: old schema detected in config DB (${configLegacy}). ` +
+                            `old schema detected in config DB (${configLegacy}). ` +
                                 "Open Settings → Maintenance → Delete local config database, " +
                                 "then Join (or Create) and Pull in Config Sync. Sync is paused until then.",
                             15000,
                         );
                         logWarn(
-                            `CouchSync: blocking replicator.start() — legacy config doc: ${configLegacy}`,
+                            `blocking replicator.start() — legacy config doc: ${configLegacy}`,
                         );
                         this.fireReconcile("onload");
                         return;
                     }
                 }
             } catch (e) {
-                logError(`CouchSync: schema guard probe failed: ${e?.message ?? e}`);
+                logError(`schema guard probe failed: ${e?.message ?? e}`);
             }
 
             if (!this.settings.deviceId) {
                 notify(
-                    "CouchSync: Please set a device name (Settings → Vault Sync). " +
+                    "Please set a device name (Settings → Vault Sync). " +
                         "Sync will not start until a device name is configured.",
                     15000,
                 );
             } else if (this.isLegacyDeviceId(this.settings.deviceId)) {
                 notify(
-                    "CouchSync: Please set a device name (Settings → Vault Sync). " +
+                    "Please set a device name (Settings → Vault Sync). " +
                         "Currently using an auto-generated ID.",
                     10000,
                 );
@@ -886,7 +883,7 @@ export default class CouchSyncPlugin extends Plugin {
         try {
             await this.configSync?.close();
         } catch (e) {
-            logError(`CouchSync: failed to close config local DB: ${e?.message ?? e}`);
+            logError(`failed to close config local DB: ${e?.message ?? e}`);
         }
     }
 
@@ -1085,7 +1082,7 @@ export default class CouchSyncPlugin extends Plugin {
     async startSync(): Promise<void> {
         if (this.settings.connectionState !== "syncing") return;
         if (!this.settings.deviceId) {
-            notify("CouchSync: Set a device name before starting sync.");
+            notify("Set a device name before starting sync.");
             return;
         }
         await this.vaultSync.loadLastSyncedVclocks();
@@ -1102,7 +1099,7 @@ export default class CouchSyncPlugin extends Plugin {
 
     private fireReconcile(reason: ReconcileReason): void {
         this.reconciler.reconcile(reason).catch((e) =>
-            logError(`CouchSync: ${reason} reconcile failed: ${e?.message ?? e}`),
+            logError(`${reason} reconcile failed: ${e?.message ?? e}`),
         );
     }
 

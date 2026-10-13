@@ -87,7 +87,7 @@ export class SetupService {
                     await this.vaultSync.dbToFile(fileDoc);
                     vaultFiles++;
                 } catch (e) {
-                    logError(`CouchSync: Failed to write ${vaultPath}: ${e?.message ?? e}`);
+                    logError(`Failed to write ${vaultPath}: ${e?.message ?? e}`);
                 }
             }
 
@@ -128,7 +128,7 @@ export class SetupService {
                 await this.vaultSync.fileToDb(file.path);
                 synced++;
             } catch (e) {
-                logError(`CouchSync: Failed to scan ${file.path}: ${e?.message ?? e}`);
+                logError(`Failed to scan ${file.path}: ${e?.message ?? e}`);
             }
         }
         return synced;

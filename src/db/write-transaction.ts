@@ -48,9 +48,9 @@ export class DbError extends Error {
         this.recovery = opts?.recovery ?? ((kind === "quota" || kind === "degraded") ? "halt" : "fail");
         this.userMessage = opts?.userMessage ?? (
             kind === "quota"
-                ? "CouchSync: Local DB storage is full — run chunk GC from Settings → Maintenance."
+                ? "Local DB storage is full — run chunk GC from Settings → Maintenance."
                 : kind === "degraded"
-                    ? "CouchSync: Please restart Obsidian — the local DB handle is no longer usable."
+                    ? "Please restart Obsidian — the local DB handle is no longer usable."
                     : undefined
         );
     }

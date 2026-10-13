@@ -169,13 +169,13 @@ export class SyncSession {
         this.track(
             "pullLoop",
             this.pullPipeline.runLongpoll().catch((e) =>
-                logError(`CouchSync: [sess#${this.epoch}] pullLoop unexpected exit: ${e?.message ?? e}`),
+                logError(`[sess#${this.epoch}] pullLoop unexpected exit: ${e?.message ?? e}`),
             ),
         );
         this.track(
             "pushLoop",
             this.pushPipeline.run().catch((e) =>
-                logError(`CouchSync: [sess#${this.epoch}] pushLoop unexpected exit: ${e?.message ?? e}`),
+                logError(`[sess#${this.epoch}] pushLoop unexpected exit: ${e?.message ?? e}`),
             ),
         );
     }

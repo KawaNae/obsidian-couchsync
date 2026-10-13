@@ -76,7 +76,7 @@ export class HistoryManager {
         }
 
         if (forkIdx === -1) {
-            logWarn(`CouchSync: No common ancestor for record ${recordId}`);
+            logWarn(`No common ancestor for record ${recordId}`);
             return null;
         }
 
@@ -85,7 +85,7 @@ export class HistoryManager {
         for (let i = headPath.length - 1; i > forkIdx; i--) {
             const result = this.diffEngine.applyPatchReverse(content, headPath[i].patches);
             if (!result.ok) {
-                logWarn(`CouchSync: Patch reverse failed at ${headPath[i].timestamp} (id=${headPath[i].id})`);
+                logWarn(`Patch reverse failed at ${headPath[i].timestamp} (id=${headPath[i].id})`);
             }
             content = result.text;
         }
@@ -93,7 +93,7 @@ export class HistoryManager {
         for (let i = forkIdx + 1; i < targetPath.length; i++) {
             const result = this.diffEngine.applyPatch(content, targetPath[i].patches);
             if (!result.ok) {
-                logWarn(`CouchSync: Patch forward failed at ${targetPath[i].timestamp} (id=${targetPath[i].id})`);
+                logWarn(`Patch forward failed at ${targetPath[i].timestamp} (id=${targetPath[i].id})`);
             }
             content = result.text;
         }

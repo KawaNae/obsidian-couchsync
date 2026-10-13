@@ -1,6 +1,5 @@
-import { Notice } from "obsidian";
 import type CouchSyncPlugin from "./main.ts";
-import { ProgressNotice } from "./ui/notices.ts";
+import { ProgressNotice, showNotice } from "./ui/notices.ts";
 import { UserFacingError } from "./ui/describe-error.ts";
 import { ConsistencyReportModal } from "./ui/consistency-report-modal.ts";
 import { ChunkConsistencyReportModal } from "./ui/chunk-consistency-report-modal.ts";
@@ -23,7 +22,7 @@ export function registerCommands(plugin: CouchSyncPlugin): void {
             if (file) {
                 plugin.showHistory(file.path);
             } else {
-                new Notice("No active file. Open a file to view its history.");
+                showNotice("No active file. Open a file to view its history.");
             }
         },
     });
@@ -45,7 +44,7 @@ export function registerCommands(plugin: CouchSyncPlugin): void {
                     try {
                         await plugin.remoteOps.pullAll();
                     } catch (e: any) {
-                        logWarn(`CouchSync: verify pull failed, continuing with local view: ${e?.message ?? e}`);
+                        logWarn(`verify pull failed, continuing with local view: ${e?.message ?? e}`);
                     }
                     // Push-backfill: re-enqueue docs a pre-fix push cursor
                     // skipped (permanently unpushed tombstones). Manual path
@@ -54,10 +53,10 @@ export function registerCommands(plugin: CouchSyncPlugin): void {
                     try {
                         const bf = await plugin.replicator.runPushBackfillNow();
                         if (bf && bf.enqueued > 0) {
-                            notify(`CouchSync: re-enqueued ${bf.enqueued} doc(s) the push cursor had skipped.`);
+                            notify(`re-enqueued ${bf.enqueued} doc(s) the push cursor had skipped.`);
                         }
                     } catch (e: any) {
-                        logWarn(`CouchSync: push backfill failed during verify: ${e?.message ?? e}`);
+                        logWarn(`push backfill failed during verify: ${e?.message ?? e}`);
                     }
                 }
                 progress.update("Reconciling...");
@@ -88,7 +87,7 @@ export function registerCommands(plugin: CouchSyncPlugin): void {
             // sweep would race its writes), and Apply cannot switch the
             // store mid-sweep.
             if (!plugin.configLocalDb) {
-                notify("CouchSync: Config DB is not configured.", 5000);
+                notify("Config DB is not configured.", 5000);
                 return;
             }
             const progress = new ProgressNotice("Config GC");
@@ -118,13 +117,13 @@ export function registerCommands(plugin: CouchSyncPlugin): void {
             }
             if (plugin.settings.connectionState !== "syncing") {
                 notify(
-                    "CouchSync: enable Live Sync in Vault Sync (Step 3) first.",
+                    "enable Live Sync in Vault Sync (Step 3) first.",
                     5000,
                 );
                 return;
             }
             await plugin.replicator.requestReconnect("manual");
-            notify("CouchSync: reconnect requested.", 3000);
+            notify("reconnect requested.", 3000);
         },
     });
 }
@@ -211,7 +210,7 @@ export async function runChunkConsistencyReport(
                         `${summary}, ${repairResult.failed.length} failed (see the log).`,
                     ));
                     logWarn(
-                        `CouchSync: chunk repair failures: ${
+                        `chunk repair failures: ${
                             repairResult.failed
                                 .map((f) => `${f.direction} ${f.id}: ${f.reason}`)
                                 .join("; ")
@@ -228,7 +227,7 @@ export async function runChunkConsistencyReport(
                     );
                 } catch (e: any) {
                     logWarn(
-                        `CouchSync: chunk-consistency retry pull failed, continuing with whatever landed: ${e?.message ?? e}`,
+                        `chunk-consistency retry pull failed, continuing with whatever landed: ${e?.message ?? e}`,
                     );
                 }
                 pullProgress.update("re-analysing...");
