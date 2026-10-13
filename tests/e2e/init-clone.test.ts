@@ -10,7 +10,8 @@
  */
 import "fake-indexeddb/auto";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { createE2EHarness, bytesEqual, type E2EHarness } from "./couch-harness.ts";
+import { createE2EHarness, bytesEqual, waitFor, type E2EHarness } from "./couch-harness.ts";
+import { makeFileId } from "../../src/types/doc-id.ts";
 import { fetchVaultMeta } from "../../src/db/vault-meta.ts";
 
 describe("E2E: Init + Clone (real setup + real CouchDB)", () => {
@@ -63,5 +64,26 @@ describe("E2E: Init + Clone (real setup + real CouchDB)", () => {
         const b = h.addDevice("b2");
         await b.runClone(); // no passphrase needed
         expect(b.vault.readText("plain.md")).toBe("no crypto here");
+    });
+
+    it("Clone counts the files it wrote, not deletions or files kept out by the filter", async () => {
+        const a = h.addDevice("a3");
+        a.vault.addFile("keep/one.md", "one");
+        a.vault.addFile("keep/two.md", "two");
+        a.vault.addFile("gone.md", "deleted before the clone");
+        a.vault.addFile("private/secret.md", "filtered on the cloning device");
+        await a.runInit({ encryption: false, compression: false });
+        await a.vault.delete("gone.md");
+        await a.vs.markDeleted("gone.md");
+        await a.engine.start();
+        await waitFor(async () => (await h.adminClient.getDoc<{ deleted?: boolean }>(makeFileId("gone.md")))?.deleted === true, {
+            label: "tombstone pushed",
+        });
+        await a.engine.stop();
+
+        const b = h.addDevice("b3", { syncIgnore: "^private/" });
+        const summary = await b.runClone();
+        expect(summary).toBe("2 files written.");
+        expect(b.vault.getFiles().map((f) => f.path).sort()).toEqual(["keep/one.md", "keep/two.md"]);
     });
 });

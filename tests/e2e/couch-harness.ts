@@ -157,16 +157,17 @@ export interface E2EDeviceHarness {
      * `VaultBinding.init`: build vault:meta (deriving the key when
      * encryption is on), wipe + push the whole local vault through the real
      * codec stack, then publish the meta. Leaves the device live-syncable.
+     * Resolves with the summary the notice shows.
      */
-    runInit(opts: { encryption: boolean; passphrase?: string; compression: boolean }): Promise<void>;
+    runInit(opts: { encryption: boolean; passphrase?: string; compression: boolean }): Promise<string>;
     /**
      * Clone this device from the remote through the production
      * `VaultBinding.clone`: fetch vault:meta, unlock the key with the
      * passphrase, pull everything and write the vault. A wrong or missing
      * passphrase for an encrypted remote ends as a cancelled prompt — the
-     * harness answers no prompt.
+     * harness answers no prompt. Resolves with the summary the notice shows.
      */
-    runClone(opts?: { passphrase?: string }): Promise<void>;
+    runClone(opts?: { passphrase?: string }): Promise<string>;
     destroy(): Promise<void>;
 }
 
@@ -276,6 +277,7 @@ export async function createE2EHarness(opts: CreateE2EHarnessOpts = {}): Promise
         // (`seeded`), standing in for a device that is already set up; the
         // first runInit / runClone hands the codec over to the binding.
         let setupService!: SetupService;
+        let summary = "";
         const binding = new VaultBinding({
             getSettings,
             saveSettings: async () => {},
@@ -285,7 +287,7 @@ export async function createE2EHarness(opts: CreateE2EHarnessOpts = {}): Promise
             stopLive: () => { engine.stop(); ct.stop(); },
             startLive: async () => {},
             checkDatabase: (db) => remoteOps.checkDatabaseWith(cfg.couchUrl, cfg.user, cfg.password, db),
-            openProgress: () => ({ update: () => {}, done: () => {}, fail: () => {} }),
+            openProgress: () => ({ update: () => {}, done: (s) => { summary = s; }, fail: () => {} }),
             askPassphrase: async (reason) => {
                 throw new Error(`the harness answers no passphrase prompt (${reason} passphrase)`);
             },
@@ -349,7 +351,7 @@ export async function createE2EHarness(opts: CreateE2EHarnessOpts = {}): Promise
         // scan/pull → push/write → reconcile), through the real codec stack.
         setupService = new SetupService(vault, db, remoteOps, vs, reconciler);
 
-        async function runInit(o: { encryption: boolean; passphrase?: string; compression: boolean }): Promise<void> {
+        async function runInit(o: { encryption: boolean; passphrase?: string; compression: boolean }): Promise<string> {
             seeded = undefined;
             settingsRef.current.encryptionEnabled = o.encryption;
             settingsRef.current.compressionEnabled = o.compression;
@@ -357,14 +359,16 @@ export async function createE2EHarness(opts: CreateE2EHarnessOpts = {}): Promise
             settingsRef.current.connectionState = "tested";
             await binding.init();
             settingsRef.current.connectionState = "syncing";
+            return summary;
         }
 
-        async function runClone(o: { passphrase?: string } = {}): Promise<void> {
+        async function runClone(o: { passphrase?: string } = {}): Promise<string> {
             seeded = undefined;
             settingsRef.current.encryptionPassphrase = o.passphrase ?? "";
             settingsRef.current.connectionState = "tested";
             await binding.clone();
             settingsRef.current.connectionState = "syncing";
+            return summary;
         }
 
         const device: E2EDeviceHarness = {

@@ -90,6 +90,15 @@ All notable changes to obsidian-couchsync.
   applied database's, and Clone stays disabled only for a database known to
   be empty. Init reads its database back and Clone records what it read,
   so the document count shown after either is current.
+- **Clone reports the files it wrote.** "Clone — N files written." counted
+  every file document in the database, including files deleted on another
+  device and files this device's filters keep out, so it could say 10 for a
+  vault that received 2. It now counts only the files written to the vault.
+- **Live sync no longer re-sends chunks the server already holds.** The first
+  live sync after an Init or Clone wrote every chunk to the server again as
+  a new revision of the same content, which advanced the database's
+  sequence and woke every other device's pull. A chunk the server holds is
+  now skipped.
 - **More failures are worded with their cause and fix.** Step 2's Check (in
   Vault Sync and Config Sync), the CouchDB tab's Test and database delete,
   Verify's Repair, the chunk repair and its retry, and the Maintenance
