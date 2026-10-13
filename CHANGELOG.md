@@ -17,6 +17,12 @@ All notable changes to obsidian-couchsync.
   checking the passphrase, so a missing passphrase disabled Live Sync
   although nothing had been touched. A second Init or Clone while one runs,
   and a run while the server rejects the credentials, are refused.
+- **Clone of an encrypted vault works when Step 1 has encryption off.** Step 1
+  says the remote's encryption is detected on Clone, but the pull applied the
+  decrypt layer only when Step 1's switch was on, so such a Clone failed
+  ("cannot decompress still-encrypted body"). Clone now pulls with the
+  cloned vault's encryption, like its compression, and saves both only when
+  it succeeds.
 - **Clone asks for the passphrase the way Config Join does.** When the Step 1
   passphrase is missing or does not unlock the vault, Clone asks for it,
   saying which of the two it is; a wrong answer keeps the prompt open with an

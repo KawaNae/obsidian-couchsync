@@ -145,9 +145,13 @@ export function vaultTarget(s: Pick<CouchSyncSettings, "couchdbUri" | "couchdbDb
 export class VaultBinding {
     /** The key unlocked from `vault:meta` (or derived by Init). */
     private crypto?: CryptoProvider;
+    /** Encryption flag applied in memory while a Clone runs, before it
+     *  commits `settings.encryptionEnabled` — the vault being cloned decides
+     *  whether the encrypt layer is applied, whatever Step 1 says. A failed
+     *  Clone persists nothing. Undefined at all other times. */
+    private encryptionOverride?: boolean;
     /** Compression flag applied in memory while a Clone runs, before it
-     *  commits `settings.compressionEnabled` — a failed Clone persists
-     *  nothing. Undefined at all other times. */
+     *  commits `settings.compressionEnabled`. Undefined at all other times. */
     private compressionOverride?: boolean;
     /** Cipher floor applied in memory while a Clone runs, before it
      *  commits `settings.vaultCipherVersion`. Undefined at all other times. */
@@ -181,7 +185,13 @@ export class VaultBinding {
     // ── Codec stack ────────────────────────────────────
 
     private hmacKey(): CryptoProvider | undefined {
-        return this.settings().encryptionEnabled ? this.crypto : undefined;
+        return this.activeEncryption ? this.crypto : undefined;
+    }
+
+    /** Encryption flag the vault decorator stack uses: the persisted one,
+     *  except while a Clone runs. */
+    private get activeEncryption(): boolean {
+        return this.encryptionOverride ?? this.settings().encryptionEnabled;
     }
 
     /** Compression flag the vault decorator stack uses: the persisted one,
@@ -200,7 +210,7 @@ export class VaultBinding {
     /**
      * Wrap a raw client with the vault decorator stack, read at each call so
      * a change made by Init / Clone reaches every vault client
-     * (VaultRemoteOps, SyncEngine). The encryption setting decides whether
+     * (VaultRemoteOps, SyncEngine). The encryption flag decides whether
      * the encrypt layer is applied, not whether a key exists: a key left
      * from an earlier encrypted session never encrypts a plaintext vault,
      * and an encrypted vault without a key is refused (fail-closed).
@@ -210,7 +220,7 @@ export class VaultBinding {
      */
     wrapClient = (raw: ICouchClient): ICouchClient => {
         let client: ICouchClient = raw;
-        if (this.settings().encryptionEnabled) {
+        if (this.activeEncryption) {
             if (!this.crypto) {
                 throw new Error(
                     "refusing to build vault client — vault is encrypted " +
@@ -240,7 +250,7 @@ export class VaultBinding {
 
     // ── Setup state ────────────────────────────────────
 
-    /** Persist the setup state. The one place `connectionState` changes. */
+    /** Set the setup state alone and persist it. */
     private async writeState(state: ConnectionState): Promise<void> {
         this.settings().connectionState = state;
         await this.host.saveSettings();
@@ -544,6 +554,7 @@ export class VaultBinding {
 
             await this.beginDestructive();
             this.crypto = crypto;
+            this.encryptionOverride = targetEncryption;
             this.compressionOverride = targetCompression;
             this.cipherVersionOverride = targetCipherVersion;
             try {
@@ -553,11 +564,13 @@ export class VaultBinding {
                 s.compressionEnabled = targetCompression;
                 s.vaultCipherVersion = targetCipherVersion;
                 s.connectionState = "setupDone";
+                this.encryptionOverride = undefined;
                 this.compressionOverride = undefined;
                 this.cipherVersionOverride = undefined;
                 await this.host.saveSettings();
                 return `${result.vaultFiles} files written.`;
             } catch (e) {
+                this.encryptionOverride = undefined;
                 this.compressionOverride = undefined;
                 this.cipherVersionOverride = undefined;
                 this.crypto = undefined;

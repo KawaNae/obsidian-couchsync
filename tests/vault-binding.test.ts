@@ -27,6 +27,8 @@ interface Rig {
     stops: number;
     starts: number;
     saves: CouchSyncSettings["connectionState"][];
+    /** Called when the destructive setup step starts. */
+    onSetup: () => void;
     /** connectionState seen when the destructive setup step started. */
     stateAtSetup: CouchSyncSettings["connectionState"] | null;
     failures: unknown[];
@@ -52,7 +54,7 @@ function rig(opts: {
     const r: Rig = {
         binding: null as unknown as VaultBinding,
         settings, remote, auth: new AuthGate(),
-        stops: 0, starts: 0, saves: [], stateAtSetup: null, failures: [], dones: [], setupError: null, setupGate: null,
+        stops: 0, starts: 0, saves: [], stateAtSetup: null, failures: [], dones: [], setupError: null, setupGate: null, onSetup: () => {},
         dbCheckResult: { status: "exists", docCount: 5 },
     };
     const result = { vaultFiles: 3, totalDocs: 7 };
@@ -64,12 +66,15 @@ function rig(opts: {
         setup: () => ({
             init: async () => {
                 r.stateAtSetup = settings.connectionState;
+                r.onSetup();
                 await r.setupGate;
                 if (r.setupError) throw r.setupError;
                 return result;
             },
             clone: async () => {
                 r.stateAtSetup = settings.connectionState;
+                r.onSetup();
+                await r.setupGate;
                 if (r.setupError) throw r.setupError;
                 return result;
             },
@@ -197,6 +202,18 @@ describe("VaultBinding.clone", () => {
             vaultCipherVersion: 3, connectionState: "setupDone",
         });
         expect(r.stateAtSetup).toBe("settingUp");
+    });
+
+    it("pulls through the encrypt layer although Step 1 has encryption off", async () => {
+        const r = rig({ settings: { encryptionEnabled: false, encryptionPassphrase: "pw" } });
+        await encryptedRemote(r.remote, "pw");
+        // While the pull runs, Step 1 still says unencrypted; the vault being
+        // cloned decides the codec.
+        let alg: string | null = null;
+        r.onSetup = () => { alg = r.binding.chunkHasher.alg; };
+        await r.binding.clone();
+        expect(alg).toBe("hmac");
+        expect(r.settings.encryptionEnabled).toBe(true);
     });
 
     it("asks when the passphrase at hand does not unlock; the prompt checks each answer", async () => {
