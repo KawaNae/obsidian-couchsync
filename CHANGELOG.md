@@ -33,12 +33,19 @@ All notable changes to obsidian-couchsync.
   says why sync paused on encryption (e.g. "Last encryption check: Sync
   paused — another device turned vault encryption on. …") instead of "Choose
   how to initialize this vault.", and shows the last failed Init or Clone.
-  While Init or Clone runs, Init, Clone and Live Sync are disabled, and
-  Step 2 Apply, the Step 1 switches and the CouchDB tab's Apply are refused.
+  The pause reason is saved with the setup state, so it is still shown
+  after Obsidian restarts, until the encryption check passes or an Init or
+  Clone succeeds. Rejected credentials are shown while requests are on hold
+  and no longer after a Test clears the hold. The open settings tab redraws
+  when Init or Clone starts and ends and when sync pauses. While Init or
+  Clone runs, Init, Clone and Live Sync are disabled, and Step 2 Apply, the
+  Step 1 switches and the CouchDB tab's Apply are refused.
 - **Clone no longer claims an unchecked database is empty.** After reopening
   the settings, Clone said "Database is empty — use Init" until Step 2's
-  Check was pressed again. It now asks for the Check instead; the result of
-  the last Check is kept until Obsidian restarts.
+  Check was pressed again. It now asks for the Check instead. The result of
+  the Check is kept for each database until Obsidian restarts, so checking
+  another name does not drop the applied database's, and Init reads its
+  database back, so Clone no longer calls it empty after an Init.
 - **More failures are worded with their cause and fix.** Step 2's Check (in
   Vault Sync and Config Sync), the CouchDB tab's Test and database delete,
   Verify's Repair, the chunk repair and its retry, and the Maintenance

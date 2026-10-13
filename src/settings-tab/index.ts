@@ -13,13 +13,38 @@ export class CouchSyncSettingTab extends PluginSettingTab {
     private couchDbTab: CouchDbTab | null = null;
     private vaultSyncTab: VaultSyncTab | null = null;
     private configSyncTab: ConfigSyncTab | null = null;
+    /** Unsubscribers of the sources the open tab is drawn from. */
+    private unsubscribers: (() => void)[] = [];
+    private redrawQueued = false;
 
     constructor(app: App, plugin: CouchSyncPlugin) {
         super(app, plugin);
         this.plugin = plugin;
     }
 
+    /**
+     * Redraw while the tab is open whenever the vault setup or the auth
+     * latch changes: an Init or Clone starts or ends, the live session
+     * pauses, a Test clears the latch. Changes in one task are drawn once.
+     */
+    private subscribe(): void {
+        if (this.unsubscribers.length > 0) return;
+        const queueRedraw = () => {
+            if (this.redrawQueued) return;
+            this.redrawQueued = true;
+            window.setTimeout(() => {
+                this.redrawQueued = false;
+                if (this.unsubscribers.length > 0) this.display();
+            }, 0);
+        };
+        this.unsubscribers.push(
+            this.plugin.vaultBinding.onChange(queueRedraw),
+            this.plugin.auth.onChange(queueRedraw),
+        );
+    }
+
     display(): void {
+        this.subscribe();
         const { containerEl } = this;
         const scrollEl = containerEl.closest(".vertical-tab-content") as HTMLElement | null;
         const savedScroll = scrollEl?.scrollTop ?? 0;
@@ -193,6 +218,8 @@ export class CouchSyncSettingTab extends PluginSettingTab {
     }
 
     hide(): void {
+        for (const unsubscribe of this.unsubscribers) unsubscribe();
+        this.unsubscribers = [];
         this.couchDbTab?.resetDraft();
         this.vaultSyncTab?.resetDraft();
         this.configSyncTab?.resetDraft();

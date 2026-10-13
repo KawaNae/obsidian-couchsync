@@ -170,9 +170,9 @@ export class VaultSyncTab {
                     .onClick(async () => {
                         btn.setButtonText("Pushing...");
                         btn.setDisabled(true);
-                        // The binding reports and records a failure.
+                        // The binding reports and records a failure, and
+                        // announces each change, which redraws the tab.
                         await this.deps.vault.init().catch(() => {});
-                        this.deps.refresh();
                     })
             );
 
@@ -188,9 +188,9 @@ export class VaultSyncTab {
                     .onClick(async () => {
                         btn.setButtonText("Pulling...");
                         btn.setDisabled(true);
-                        // The binding reports and records a failure.
+                        // The binding reports and records a failure, and
+                        // announces each change, which redraws the tab.
                         await this.deps.vault.clone().catch(() => {});
-                        this.deps.refresh();
                     })
             );
 
