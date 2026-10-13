@@ -117,6 +117,17 @@ Migrating is destructive:
 
 See the [CHANGELOG](CHANGELOG.md) for per-version breaking changes.
 
+### Config sync: Join once after updating
+
+If a device uses config sync, run **Join** (Config Sync tab, Step 3) on it
+once after updating from 0.30.2 or earlier. Newer versions record whether a
+device has joined a config database, and with which codec, inside that
+database's local store, and the earlier record cannot be carried over.
+Until the device Joins, its first config Push or Pull asks it to.
+
+Join does not change the server, any config file or the Step 1 settings.
+The next Pull downloads the config again.
+
 ## Development
 
 ```bash
@@ -129,7 +140,7 @@ npm test       # Unit + integration tests (vitest)
 Built files are written to
 `{OBSIDIAN_VAULT_PATH}/.obsidian/plugins/obsidian-couchsync/`. Set the
 `OBSIDIAN_VAULT_PATH` environment variable to your vault path (defaults to
-`C:\Develop\Obsidian\Dev`).
+`~/Develop/Obsidian/Dev`, under your home directory).
 
 ## License
 

@@ -1,6 +1,7 @@
 /**
- * E2E: the ping-pong scenario that v0.20.1 fixed, exercised against a real
- * CouchDB. The integration test (regression-chunk-repair-pingpong.integ)
+ * E2E: chunk-repair ping-pong between devices (a lagging device pushing back
+ * chunks an up-to-date device had already tombstoned), exercised against a
+ * real CouchDB. The integration test (regression-chunk-repair-pingpong.integ)
  * covers the analyzer at the fake-client level; this guards CouchDB-specific
  * quirks (rev threading, _all_docs id enumeration over attachment-backed
  * chunks, tombstone shape).

@@ -109,6 +109,23 @@ All notable changes to obsidian-couchsync.
   Clone and Verify failures use the same wording as config sync, and a
   failed Verify is reported as a failure. A cancelled operation is logged as
   a warning, not an error.
+- **Every notice and console line carries the `CouchSync:` prefix once.**
+  Many notices and log lines read `CouchSync: CouchSync: …`, while notices
+  shown directly from the settings tabs and some console lines had no prefix
+  at all. The prefix is now added once where a line leaves the plugin (the
+  notice and the console); the Log View keeps the bare text. The startup
+  line reads `CouchSync: Starting v… — built …, commit …`. A completed
+  operation's notice no longer repeats its name, e.g.
+  `Verify — 3 discrepancy(ies)` instead of
+  `Verify — Verify: 3 discrepancy(ies)`.
+- **A config Pull with nothing new no longer rewrites every config file.**
+  Each Pull wrote every config file it receives, even when the disk already
+  matched, so all of them got a new modification time. Obsidian re-reads
+  `app.json`, `appearance.json` and plugins' `data.json` on that, which could
+  undo a setting just changed in the settings window. Pull now writes only
+  the files whose content differs and reports `Files up to date.` when there
+  were none. Pull & Reload then does not reload Obsidian and says
+  `No config files changed. Skipping reload.`
 - **Changing a codec setting no longer stops config sync.** Push and Pull
   now use the encryption and compression of the config database this device
   created or joined. Step 1 in Config Sync is what the next Create builds a

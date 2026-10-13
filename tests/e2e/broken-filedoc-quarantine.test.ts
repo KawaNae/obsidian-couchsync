@@ -1,8 +1,9 @@
 /**
  * E2E: a FileDoc whose chunks are unavailable on this device AND the
  * server (broken / missingReferenced) must be QUARANTINED by the reconciler —
- * not restore-looped (the field ping-pong), not opaque-crashed (content-less chunk TypeError). Recovers
- * automatically once the chunk reappears.
+ * not restored again and failing on every reconcile, and not crashed with an
+ * opaque TypeError from a content-less chunk. Recovers automatically once the
+ * chunk reappears.
  *
  * Drives the real Reconciler + real engine.ensureFileChunks against real
  * CouchDB (getAttachment actually returns null for the absent chunk), so this

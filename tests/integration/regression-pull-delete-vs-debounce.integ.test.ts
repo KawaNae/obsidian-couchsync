@@ -98,8 +98,9 @@ describe("regression: pull-delete vs debounce silent loss", () => {
     });
 
     it("end-to-end: pull-delete query returns true during a vault drift", async () => {
-        // Simulates the main.ts:217 query handler decision shape end to
-        // end. Wired directly here without SyncEngine to keep the test
+        // Simulates end to end the decision of the pull-side deletion
+        // probe (SyncEngine's `probeUnpushed`, which main.ts wires to
+        // `VaultSync.hasUnpushedChanges`). Wired directly here without SyncEngine to keep the test
         // focused on the VaultSync primitive.
         const path = "notes/contended.md";
         vault.addFile(path, "v0");

@@ -186,7 +186,10 @@ current database, the step says so.
 - **Push** (**Push ↑**) — scans `.obsidian/` and pushes the selected units.
   If remote copies have diverged, it asks before overwriting them.
 - **Pull & Reload** (**Pull & Reload ↓**) — pulls, writes the selected units
-  to this device, then reloads Obsidian. A failed Pull does not reload.
+  to this device, then reloads Obsidian. Only files whose content differs
+  from the pulled config are written. When none differ, it shows `No config
+  files changed. Skipping reload.` and does not reload. A failed Pull does
+  not reload.
 - Push and Pull on a device that has not joined stop and ask it to Join.
   When another device ran Create, they stop and ask this device to Join
   again.

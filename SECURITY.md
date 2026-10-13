@@ -27,8 +27,8 @@ attacker who already has local file access on one of your devices.
 
 ## Codec modes
 
-Both encryption and compression are independent toggles, set at Init time
-and recorded in the `vault:meta` document. They form four named modes:
+Both encryption and compression are independent toggles. They form four
+named modes:
 
 | Mode | Encryption | Compression | When to choose |
 |---|---|---|---|
@@ -36,6 +36,25 @@ and recorded in the `vault:meta` document. They form four named modes:
 | **`gzip`** | off | on | Server fully trusted (LAN-only, your own NAS). Lowest wire bytes. |
 | **`encrypt`** | on | off | Theoretical-best E2E secrecy under exotic threat models. See "Why turn compression off" below. |
 | **`gzip-encrypt`** | on | on | **Default recommendation.** E2E confidentiality plus ~50 % less wire than `encrypt`-only. Trade-off described below. |
+
+The vault database and the config database each have their own mode,
+recorded in their own meta document:
+
+- **Vault database**: set at Init and recorded in `vault:meta`. Clone
+  adopts it.
+- **Config database**: set at Create from Config Sync's Step 1 and recorded
+  in `config:meta`. Step 1 values left unset inherit the Vault Sync settings.
+  `config:meta` is a crypto root of its own (its own salt and `keyCheck`),
+  so the config database can use a different mode and passphrase from the
+  vault.
+  - Join reads the mode from `config:meta`, and the device records it.
+    Push and Pull use the recorded mode, so changing Step 1 afterwards only
+    affects the next Create.
+  - To change the mode, run Create again. Create is destructive: it deletes
+    the remote config database and re-creates it holding only the new
+    `config:meta`, so run Push afterwards to seed it. Every other device
+    must then Join again; until it does, its Push and Pull are refused
+    because `config:meta` is no longer the root it joined.
 
 ## What encryption protects (when enabled)
 
@@ -218,9 +237,9 @@ invariant.
 | Site | Form | Notes |
 |---|---|---|
 | Chunk attachment (`_attachments.c`) | binary envelope | Plaintext + uncompressed still carries the `0x00` header — universality is required, not optional. |
-| `ConfigDoc.data` when encrypted | base64(envelope) | Plaintext vaults skip the envelope (the field is just `base64(bytes)`); the format is unambiguous either way because `vault:meta.encryption.enabled` declares which case applies and the encrypted form's base64 has no colon separator (legacy hint). |
-| `encryptedPath` field on FileDoc / ConfigDoc | base64(envelope) | Only present in encrypted vaults. Always carries `encrypted=1`. |
-| `vault:meta.encryption.keyCheck` | base64(envelope) | Same shape; the well-known plaintext `"couchsync-e2e-v1"` confirms a passphrase derives the correct contentKey. |
+| `encBody` field on FileDoc / ConfigDoc | base64(envelope) | Only present in an encrypted database; always carries `encrypted=1`, and `compressed=1` when gzip made the body smaller (regardless of the compression toggle). In a plaintext database the doc body is plain JSON with no envelope. Which case applies is declared by `encryption.enabled` in the database's meta document: `vault:meta` for the vault database, `config:meta` for the config database. Config file content is not in the doc; it is chunked and rides in chunk attachments like vault files. |
+| `encryptedPath` field on FileDoc / ConfigDoc | base64(envelope) | Legacy (cipherVersion 2) path-only scheme. Never written; still read from a database not yet re-initialised, and refused once the local cipherVersion floor is 3 or higher. Always carries `encrypted=1`. |
+| `encryption.keyCheck` in `vault:meta` / `config:meta` | base64(envelope) | Same shape; the well-known plaintext `"couchsync-e2e-v1"` confirms a passphrase derives the correct contentKey. |
 
 ### Why the envelope matters
 

@@ -374,8 +374,10 @@ describe("Reconciler", () => {
         });
 
         // A broken FileDoc (chunks missing on this device
-        // AND the server) must be quarantined, not restore-looped. Reproduces
-        // the field ping-pong (couchsync_log_* with GC'd chunks).
+        // AND the server) must be quarantined, not restore-looped. Without
+        // quarantine, such a file (e.g. a synced couchsync_log_* whose chunks
+        // were garbage-collected) was restored again on every reconcile,
+        // failing each time and fighting chunk-repair.
         it("quarantines (not restores) when chunks are missing everywhere", async () => {
             const broken = async () => ({ stillMissing: ["chunk:x64:gone"], remoteConsulted: true });
             const h = setup([], broken);
@@ -720,8 +722,8 @@ describe("Reconciler", () => {
 
     describe("Case F: PathKey collision", () => {
         it("converges two same-content docs to the vclock-canonical case (DB-only variant)", async () => {
-            // The scripts/Scripts incident on a case-insensitive device: vault
-            // holds one file (Scripts/X), DB holds BOTH docs. Scripts/X
+            // Two docs whose paths differ only in case, on a case-insensitive
+            // device: vault holds one file (Scripts/X), DB holds BOTH docs. Scripts/X
             // dominates scripts/X causally → canonical. scripts/X has no
             // exact-case file here → tombstone only (no disk delete).
             const h = setup([makeFile("Scripts/X", 1000)]);

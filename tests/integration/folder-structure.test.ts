@@ -111,7 +111,7 @@ describe("Integration: folder structure", () => {
         await dev.vs.fileToDb("Scripts/X.md");
         const upperDoc = await dev.db.get(makeFileId("Scripts/X.md")) as FileDoc;
 
-        // A different-case sibling doc arrives (the scripts/Scripts incident).
+        // A doc whose path differs only in case (`scripts/` vs `Scripts/`) arrives.
         const lowerDoc: FileDoc = {
             ...upperDoc,
             _id: makeFileId("scripts/X.md"),
