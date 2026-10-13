@@ -94,8 +94,9 @@ and recorded in the `vault:meta` document. They form four named modes:
   observable by anyone watching the server's `_changes` feed.
 - **Anything stored locally on your devices**: Obsidian writes
   plaintext to disk. Local file-system compromise reveals everything. The
-  plugin's own `data.json` also stores your CouchDB password and encryption
-  passphrase in plaintext. This is local-FS-access only (out of scope above);
+  plugin's own `data.json` also stores your CouchDB password, the encryption
+  passphrases, and the passphrase kept for each config database this device
+  created or joined in plaintext. This is local-FS-access only (out of scope above);
   on the same machine an attacker already has every plaintext note. Migrating
   these secrets to Obsidian/OS SecretStorage is planned. v0.26.0 did not change
   this — it stores no new secret.
