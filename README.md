@@ -24,9 +24,10 @@ Simplified CouchDB-only vault sync for Obsidian. Fork of [Self-hosted LiveSync](
   where you choose **keep local** or **take remote**. There is no text-level
   auto-merge.
 - **Config sync (optional, manual)** — Replicate `.obsidian/` settings,
-  snippets, themes, and plugin files through a separate CouchDB database.
-  Button-driven (Init / Push / Pull), not real-time. Opt-in: only active when
-  a config DB name is set.
+  snippets and themes through a separate CouchDB database. Button-driven
+  (Create on the first device, Join on the others, then Push / Pull &
+  Reload), not real-time. Plugin code is not synced by default. Opt-in: only
+  active when a config DB name is set.
 
 ## Setup
 
@@ -40,8 +41,8 @@ docker run -d -p 5984:5984 \
   --name couchdb couchdb
 ```
 
-CouchSync creates the vault database itself on first connect, so you only
-need the server reachable with valid admin credentials.
+CouchSync creates the vault database itself (**Check** in Vault Sync →
+Step 2), so you only need the server reachable with valid admin credentials.
 
 **Enable CORS** (required — Obsidian talks to CouchDB from a sandboxed
 origin). Either use Fauxton (`http://localhost:5984/_utils` → Configuration →
@@ -72,15 +73,16 @@ Install from Obsidian Community Plugins (search "CouchSync"), or manually copy
 
 ### 3. Configure and start syncing
 
-Open **Settings → CouchSync → Vault Sync** and work top to bottom:
+Open **Settings → CouchSync**. In the **CouchDB** tab, enter the server
+URI, username, and password, then **Test** → **Apply**. Then open the
+**Vault Sync** tab and work top to bottom:
 
 1. **Device name** — a short identifier for this device (lowercase letters,
    numbers, and hyphens; 2–30 chars, e.g. `desktop`, `iphone`). Required; it
    is this device's vector-clock key.
 2. **Encryption (optional)** — enable end-to-end encryption and set a
    passphrase, and/or toggle gzip compression (on by default).
-3. **Connection** — enter the CouchDB URL, username, password, and vault
-   database name, then **Test Connection** → **Apply**.
+3. **Database** — enter the vault database name, then **Check** → **Apply**.
 4. **Init or Clone:**
    - On the **first** device, run **Init**. ⚠️ This is **destructive** to the
      remote database — it recreates it from this vault. The codec mode
