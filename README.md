@@ -129,7 +129,7 @@ npm test       # Unit + integration tests (vitest)
 Built files are written to
 `{OBSIDIAN_VAULT_PATH}/.obsidian/plugins/obsidian-couchsync/`. Set the
 `OBSIDIAN_VAULT_PATH` environment variable to your vault path (defaults to
-`C:\Develop\Obsidian\Dev`).
+`~/Develop/Obsidian/Dev`, under your home directory).
 
 ## License
 

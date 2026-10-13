@@ -283,7 +283,8 @@ describe("config binding lifecycle", () => {
             // PBKDF2 ran once for this binding (Join); the Pull's preflight
             // used the cached key.
             expect(binding.keyDerivations).toBe(1);
-            expect(await dev.cs.pull()).toBe(1);
+            // The disk already matches, so the second Pull writes nothing.
+            expect(await dev.cs.pull()).toBe(0);
             expect(binding.keyDerivations).toBe(1);
             expect(binding.relation().lastOp).toMatchObject({ op: "pull", error: null });
         });
@@ -393,7 +394,7 @@ describe("config binding lifecycle", () => {
             expect(fp).toMatch(/^sha256:/);
             // Repeated ops against the same old meta never read as a reset.
             expect(await b.cs.pull()).toBe(1);
-            expect(await b.cs.pull()).toBe(1);
+            expect(await b.cs.pull()).toBe(0);
             expect((await attachmentOf(b))!.metaFingerprint).toBe(fp);
             expect(b.vault.readText(".obsidian/app.json")).toBe(`{"old":1}`);
         });
@@ -655,7 +656,8 @@ describe("config binding lifecycle", () => {
             b.settings.configEncryptionPassphrase = "a-different-one";
             expect(await b.cs.pull()).toBe(1);
             b.settings.configEncryptionPassphrase = "";
-            expect(await b.cs.pull()).toBe(1);
+            // Succeeds; the disk already matches, so nothing is written.
+            expect(await b.cs.pull()).toBe(0);
         });
 
         it("passphrase-mismatch after joining (the binding's passphrase no longer unlocks): Join, never Create", async () => {
@@ -1000,8 +1002,9 @@ describe("config binding lifecycle", () => {
             await dev.vault.delete(".obsidian/snippets/y.css");
             await dev.vault.delete(".obsidian/snippets/y2.css");
 
-            // Nothing of X is skipped, and nothing of Y is written.
-            expect(await dev.cs.pull()).toBe(2);
+            // Nothing of X is skipped, and nothing of Y is written. X's
+            // app.json is still on disk unchanged, so only x.css is written.
+            expect(await dev.cs.pull()).toBe(1);
             expect(dev.vault.readText(".obsidian/snippets/x.css")).toBe("x{}");
             expect(dev.vault.readText(".obsidian/app.json")).toBe(`{"x":1}`);
             expect(await dev.vault.exists(".obsidian/snippets/y.css")).toBe(false);

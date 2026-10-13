@@ -691,7 +691,7 @@ export default class CouchSyncPlugin extends Plugin {
             {
                 const built = typeof __BUILD_TIME__ !== "undefined" ? __BUILD_TIME__ : "unknown";
                 const commit = typeof __COMMIT_HASH__ !== "undefined" ? __COMMIT_HASH__ : "unknown";
-                logInfo(`CouchSync v${this.manifest.version} starting — built ${built}, commit ${commit}`);
+                logInfo(`Starting v${this.manifest.version} — built ${built}, commit ${commit}`);
             }
             this.compositionTracker.start();
             this.compositionGate.start();

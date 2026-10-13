@@ -443,7 +443,7 @@ export class ConfigSyncTab {
         new Setting(el)
             .setName("Pull & Reload")
             .setDesc(
-                "Pull config from remote, write the selected units to this device, then reload Obsidian.",
+                "Pull config from remote, write the selected units to this device, then reload Obsidian if any file changed.",
             )
             .addButton((btn) =>
                 btn.setButtonText("Pull & Reload ↓")
@@ -452,7 +452,14 @@ export class ConfigSyncTab {
                         btn.setButtonText("Pulling...");
                         btn.setDisabled(true);
                         try {
-                            await this.trackOp(this.deps.configSync.pull());
+                            const written = await this.trackOp(this.deps.configSync.pull());
+                            if (written === 0) {
+                                // Nothing on disk changed, so a reload
+                                // would load the same settings again.
+                                showNotice("No config files changed. Skipping reload.");
+                                this.deps.refresh();
+                                return;
+                            }
                             showNotice("Reloading Obsidian...");
                             setTimeout(() => {
                                 (this.deps.app as any).commands.executeCommandById("app:reload");
