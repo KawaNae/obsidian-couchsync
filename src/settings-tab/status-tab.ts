@@ -22,7 +22,8 @@ import { addPasswordToggle } from "./vault-sync-tab.ts";
 import { applyServerSettings, type ConfigServerSwitch } from "./server-apply.ts";
 import type { VaultBinding } from "../sync/vault-binding.ts";
 import { logWarn } from "../ui/log.ts";
-import { showNotice } from "../ui/notices.ts";
+import { ProgressNotice, showNotice } from "../ui/notices.ts";
+import { UserFacingError } from "../ui/describe-error.ts";
 
 class TypeToConfirmModal extends Modal {
     private resolved = false;
@@ -252,27 +253,18 @@ export class CouchDbTab {
         btn.setButtonText("Testing...");
         btn.setDisabled(true);
 
-        const baseUri = this.draft.uri.replace(/\/+$/, "");
-        if (!baseUri) {
-            this.testPassed = false;
-            showNotice("Server URI is required.", 5000);
-            this.deps.refresh();
-            return;
-        }
-
+        const progress = new ProgressNotice("Test connection");
         try {
+            const baseUri = this.draft.uri.replace(/\/+$/, "");
+            if (!baseUri) throw new UserFacingError("Enter the server URI first.");
             await fetchJson(baseUri, this.draft.user, this.draft.pass);
             this.testPassed = true;
             this.deps.auth.clear();
-            showNotice("Server connection successful!", 3000);
-        } catch (e: any) {
+            progress.done("the server accepted the connection.", 3000);
+        } catch (e) {
             this.testPassed = false;
-            if (e instanceof AuthError) {
-                this.deps.auth.raise(e.status, e.message);
-                showNotice(`Authentication failed (${e.status}): ${e.message}`, 8000);
-            } else {
-                showNotice(`Connection failed: ${e.message}`, 8000);
-            }
+            if (e instanceof AuthError) this.deps.auth.raise(e.status, e.message);
+            progress.fail(e);
         }
         this.deps.refresh();
     }
@@ -540,13 +532,15 @@ export class CouchDbTab {
         const typed = await new TypeToConfirmModal(this.deps.app, dbName).waitForResult();
         if (!typed) return;
 
+        const progress = new ProgressNotice("Delete database");
         try {
             await deleteDb(baseUri, user, pass, dbName);
-            showNotice(`Database "${dbName}" deleted.`);
-            this.deps.refresh();
-        } catch (e: any) {
-            showNotice(`Failed to delete "${dbName}": ${e.message}`);
+        } catch (e) {
+            progress.fail(e);
+            return;
         }
+        progress.done(`"${dbName}" deleted.`);
+        this.deps.refresh();
     }
 }
 

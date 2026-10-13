@@ -8,7 +8,9 @@ import type { IModalPresenter } from "../types/modal-presenter.ts";
 import type { LogManager } from "../log/log-manager.ts";
 import { DOC_ID } from "../types/doc-id.ts";
 import { logError } from "../ui/log.ts";
-import { showNotice } from "../ui/notices.ts";
+import { ProgressNotice } from "../ui/notices.ts";
+import { UserFacingError } from "../ui/describe-error.ts";
+import type { VaultBinding } from "../sync/vault-binding.ts";
 
 interface MaintenanceTabDeps {
     getSettings: () => CouchSyncSettings;
@@ -22,6 +24,8 @@ interface MaintenanceTabDeps {
      *  while a config op runs; a rebind cannot close the store mid-way). */
     runConfigExclusive: <T>(fn: (store: ConfigLocalDB) => Promise<T>) => Promise<T>;
     replicator: SyncEngine;
+    /** Deleting the local vault DB is refused while Init or Clone runs. */
+    vault: Pick<VaultBinding, "changeBlocker">;
     statusBar: StatusBar;
     modalPresenter: IModalPresenter;
     logManager: LogManager;
@@ -149,15 +153,13 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
             btn.setButtonText("Export").onClick(async () => {
                 btn.setDisabled(true);
                 btn.setButtonText("Exporting...");
+                const progress = new ProgressNotice("Export logs");
                 try {
                     const result = await deps.logManager.exportToVault();
-                    showNotice(
-                        `exported ${result.count} log entries to ${result.path}`,
-                        8000,
-                    );
+                    progress.done(`${result.count} log entries written to ${result.path}.`, 8000);
                     await refreshLogStats();
-                } catch (e: any) {
-                    showNotice(`Log export failed: ${e?.message ?? e}`, 10000);
+                } catch (e) {
+                    progress.fail(e);
                 } finally {
                     btn.setButtonText("Export");
                     btn.setDisabled(false);
@@ -181,12 +183,13 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
                     );
                     if (!ok) return;
                     btn.setDisabled(true);
+                    const progress = new ProgressNotice("Clear stored logs");
                     try {
                         await deps.logManager.clearStoredLogs();
-                        showNotice("log buffer cleared.", 4000);
+                        progress.done("log buffer cleared.", 4000);
                         await refreshLogStats();
-                    } catch (e: any) {
-                        showNotice(`Clear failed: ${e?.message ?? e}`, 10000);
+                    } catch (e) {
+                        progress.fail(e);
                     } finally {
                         btn.setDisabled(false);
                     }
@@ -210,12 +213,13 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
                     );
                     if (!ok) return;
                     btn.setDisabled(true);
+                    const progress = new ProgressNotice("Delete local log database");
                     try {
                         await deps.logManager.deleteLogDatabase();
-                        showNotice("log database deleted.", 4000);
+                        progress.done("log database deleted.", 4000);
                         await refreshLogStats();
-                    } catch (e: any) {
-                        showNotice(`Delete failed: ${e?.message ?? e}`, 10000);
+                    } catch (e) {
+                        progress.fail(e);
                     } finally {
                         btn.setDisabled(false);
                     }
@@ -250,15 +254,16 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
                 if (!ok) return;
                 btn.setButtonText("Cleaning...");
                 btn.setDisabled(true);
+                const progress = new ProgressNotice("Clean up legacy configs");
                 try {
                     const deleted = await deps.localDb.deleteAllByPrefix(DOC_ID.CONFIG);
-                    showNotice(
+                    progress.done(
                         `removed ${deleted.length} legacy config doc(s) from vault DB. ` +
                             "Replication will propagate the deletions to the remote shortly.",
                         10000,
                     );
-                } catch (e: any) {
-                    showNotice(`Cleanup failed: ${e?.message ?? e}`, 10000);
+                } catch (e) {
+                    progress.fail(e);
                 } finally {
                     btn.setButtonText("Clean up");
                     btn.setDisabled(false);
@@ -361,9 +366,17 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
                         true,
                     );
                     if (!ok) return;
-                    deps.replicator.stop();
-                    await deps.localDb.destroy();
-                    showNotice("Local vault database deleted. Restarting...");
+                    const progress = new ProgressNotice("Delete local vault database");
+                    try {
+                        const blocked = deps.vault.changeBlocker();
+                        if (blocked) throw new UserFacingError(blocked);
+                        deps.replicator.stop();
+                        await deps.localDb.destroy();
+                    } catch (e) {
+                        progress.fail(e);
+                        return;
+                    }
+                    progress.done("deleted. Restarting...");
                     deps.onRestart();
                 })
         );
@@ -398,15 +411,15 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
                         // modal: the one shown when the tab rendered may
                         // have been replaced since, and a running config op
                         // must not have its store destroyed underneath it.
+                        const progress = new ProgressNotice("Delete local config database");
                         try {
                             await deps.runConfigExclusive((store) => store.destroy());
-                            showNotice(
-                                "Local config database deleted. Restarting...",
-                            );
-                            deps.onRestart();
-                        } catch (e: any) {
-                            showNotice(`Delete failed: ${e?.message ?? e}`, 10000);
+                        } catch (e) {
+                            progress.fail(e);
+                            return;
                         }
+                        progress.done("deleted. Restarting...");
+                        deps.onRestart();
                     })
             );
     }

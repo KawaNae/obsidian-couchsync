@@ -170,6 +170,7 @@ export class CouchSyncSettingTab extends PluginSettingTab {
                 runConfigExclusive: (fn) =>
                     this.plugin.configSync.runExclusive((binding) => fn(binding.store)),
                 replicator: this.plugin.replicator,
+                vault: this.plugin.vaultBinding,
                 statusBar: this.plugin.statusBar,
                 modalPresenter: this.plugin.modalPresenter,
                 logManager: this.plugin.logManager,

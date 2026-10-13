@@ -64,7 +64,13 @@ export function registerCommands(plugin: CouchSyncPlugin): void {
                 const total = totalDiscrepancies(report);
                 progress.done(`${total} discrepancy(ies)`);
                 new ConsistencyReportModal(plugin.app, report, async () => {
-                    await plugin.reconciler.reconcile("manual-repair");
+                    const repair = new ProgressNotice("Repair");
+                    try {
+                        const done = await plugin.reconciler.reconcile("manual-repair");
+                        repair.done(`${totalDiscrepancies(done)} discrepancy(ies) handled.`);
+                    } catch (e) {
+                        repair.fail(e);
+                    }
                 }).open();
             } catch (e) {
                 progress.fail(e);
@@ -184,21 +190,28 @@ export async function runChunkConsistencyReport(
                 // on a stale snapshot can tombstone a chunk another device just
                 // re-referenced. A fresh analyze also re-checks the convergence
                 // gate; if the vault diverged meanwhile, abort rather than repair.
-                const fresh = await analyze();
-                if (fresh.state !== "converged") {
-                    repairProgress.fail(new UserFacingError(
-                        "The vault is not converged, so nothing was repaired. Let sync settle and retry.",
-                    ));
-                    return fresh;
+                let repairResult: Awaited<ReturnType<typeof repairChunkDrift>>;
+                try {
+                    const fresh = await analyze();
+                    if (fresh.state !== "converged") {
+                        repairProgress.fail(new UserFacingError(
+                            "The vault is not converged, so nothing was repaired. Let sync settle and retry.",
+                        ));
+                        return fresh;
+                    }
+                    const plan = planFromReport(fresh.report);
+                    repairResult = await repairChunkDrift(plan, {
+                        localDb: plugin.localDb,
+                        remote,
+                        chunkHasher: plugin.remoteOps.chunkHasher,
+                        onProgress: (phase, current, total) =>
+                            repairProgress.update(`${phase}: ${current}/${total}`),
+                    });
+                } catch (e) {
+                    // Reported here; the modal only restores its button.
+                    repairProgress.fail(e);
+                    throw e;
                 }
-                const plan = planFromReport(fresh.report);
-                const repairResult = await repairChunkDrift(plan, {
-                    localDb: plugin.localDb,
-                    remote,
-                    chunkHasher: plugin.remoteOps.chunkHasher,
-                    onProgress: (phase, current, total) =>
-                        repairProgress.update(`${phase}: ${current}/${total}`),
-                });
                 const summary =
                     `pushed ${repairResult.pushed}, pulled ${repairResult.pulled}, ` +
                     `deleted-local ${repairResult.deletedLocal}, ` +
@@ -217,7 +230,14 @@ export async function runChunkConsistencyReport(
                         }`,
                     );
                 }
-                return await analyze();
+                try {
+                    return await analyze();
+                } catch (e) {
+                    // The repair itself was reported above; this is the
+                    // re-analysis that refreshes the modal.
+                    new ProgressNotice("Chunk consistency").fail(e);
+                    throw e;
+                }
             },
             async () => {
                 const pullProgress = new ProgressNotice("Pull & re-analyse");
@@ -231,7 +251,14 @@ export async function runChunkConsistencyReport(
                     );
                 }
                 pullProgress.update("re-analysing...");
-                const next = await analyze();
+                let next: Awaited<ReturnType<typeof analyze>>;
+                try {
+                    next = await analyze();
+                } catch (e) {
+                    // Reported here; the modal only restores its button.
+                    pullProgress.fail(e);
+                    throw e;
+                }
                 if (next.state === "converged") {
                     pullProgress.done("converged");
                 } else {
