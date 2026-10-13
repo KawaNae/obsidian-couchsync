@@ -62,7 +62,7 @@ export function registerCommands(plugin: CouchSyncPlugin): void {
                 progress.update("Reconciling...");
                 const report = await plugin.reconciler.reconcile("manual", { mode: "report" });
                 const total = totalDiscrepancies(report);
-                progress.done(`Verify: ${total} discrepancy(ies)`);
+                progress.done(`${total} discrepancy(ies)`);
                 new ConsistencyReportModal(plugin.app, report, async () => {
                     await plugin.reconciler.reconcile("manual-repair");
                 }).open();
@@ -97,7 +97,7 @@ export function registerCommands(plugin: CouchSyncPlugin): void {
                     return gcOrphanConfigChunks(binding.store);
                 });
                 progress.done(
-                    `Config GC: scanned ${result.scannedChunks}, ` +
+                    `scanned ${result.scannedChunks}, ` +
                     `referenced ${result.referencedChunks}, ` +
                     `deleted ${result.deletedChunks} orphan(s).`,
                 );
@@ -161,13 +161,13 @@ export async function runChunkConsistencyReport(
         if (result.state === "needs-convergence") {
             const d = result.divergence;
             progress.done(
-                `Chunk report — not converged: ${d.localOnly.length} pending push, ` +
+                `not converged: ${d.localOnly.length} pending push, ` +
                     `${d.remoteOnly.length} pending pull, ${d.differing.length} differing`,
             );
         } else {
             const r = result.report;
             progress.done(
-                `Chunk report — ${r.counts.localOnly} local-only, ` +
+                `${r.counts.localOnly} local-only, ` +
                     `${r.counts.remoteOnly} remote-only, ` +
                     `${r.counts.missingReferenced} broken, ` +
                     `${r.counts.orphanLocal + r.counts.orphanRemote} orphan(s)`,
@@ -204,7 +204,7 @@ export async function runChunkConsistencyReport(
                     `deleted-local ${repairResult.deletedLocal}, ` +
                     `deleted-remote ${repairResult.deletedRemote}`;
                 if (repairResult.failed.length === 0) {
-                    repairProgress.done(`Repair — ${summary}`);
+                    repairProgress.done(summary);
                 } else {
                     repairProgress.fail(new UserFacingError(
                         `${summary}, ${repairResult.failed.length} failed (see the log).`,
@@ -233,10 +233,10 @@ export async function runChunkConsistencyReport(
                 pullProgress.update("re-analysing...");
                 const next = await analyze();
                 if (next.state === "converged") {
-                    pullProgress.done("Re-analyse — converged");
+                    pullProgress.done("converged");
                 } else {
                     pullProgress.done(
-                        `Re-analyse — still not converged (${
+                        `still not converged (${
                             next.divergence.localOnly.length +
                             next.divergence.remoteOnly.length +
                             next.divergence.differing.length

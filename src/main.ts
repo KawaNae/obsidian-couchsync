@@ -977,7 +977,7 @@ export default class CouchSyncPlugin extends Plugin {
             if (enc) modes.push("encrypted");
             if (compress) modes.push("compressed");
             const tag = modes.length ? ` (${modes.join(", ")})` : "";
-            progress.done(`Init complete! ${result.vaultFiles} files, ${result.totalDocs} docs pushed${tag}.`);
+            progress.done(`${result.vaultFiles} files, ${result.totalDocs} docs pushed${tag}.`);
         } catch (e: any) {
             if (this.settings.encryptionEnabled) {
                 this.vaultCryptoProvider = undefined;
@@ -1065,7 +1065,7 @@ export default class CouchSyncPlugin extends Plugin {
             this.settings.connectionState = "setupDone";
             this.encryptionMismatch = undefined;
             await this.saveSettings();
-            progress.done(`Clone complete! ${result.vaultFiles} files written.`);
+            progress.done(`${result.vaultFiles} files written.`);
         } catch (e: any) {
             // Failure: roll back in-memory codec state. Persisted settings
             // were never mutated; connectionState stays "settingUp".

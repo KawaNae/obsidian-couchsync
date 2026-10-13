@@ -76,7 +76,7 @@ describe("ProgressNotice", () => {
     });
 
     it("done: '<label> — <summary>', prefixed exactly once", () => {
-        new ProgressNotice("Verify").done("Verify: 0 discrepancy(ies)");
-        expect(shown).toEqual(["CouchSync: Verify — Verify: 0 discrepancy(ies)"]);
+        new ProgressNotice("Verify").done("0 discrepancy(ies)");
+        expect(shown).toEqual(["CouchSync: Verify — 0 discrepancy(ies)"]);
     });
 });

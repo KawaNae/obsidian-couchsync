@@ -690,7 +690,7 @@ export class ConfigSync {
             if (result.stats.skipped) summaryParts.push(`${result.stats.skipped} skipped`);
             if (result.stats.conflicts) summaryParts.push(`${result.stats.conflicts} conflicts (will retry)`);
             const summary = summaryParts.length > 0 ? summaryParts.join(", ") : "no changes";
-            progress.done(`Push: ${summary}. (Scanned ${scanned} local file(s).)`);
+            progress.done(`${summary}. (Scanned ${scanned} local file(s).)`);
             return result.stats.pushed;
         }, {
             // Push advances vclocks under this device's name.
@@ -743,7 +743,7 @@ export class ConfigSync {
             if (result.stats.convergedSkip) summaryParts.push(`${result.stats.convergedSkip} converged`);
             if (result.stats.concurrent) summaryParts.push(`${result.stats.concurrent} concurrent`);
             const summary = summaryParts.length > 0 ? summaryParts.join(", ") : "no changes";
-            progress.done(`Pull: ${summary}. Wrote ${written} file(s). Reload Obsidian to apply.`);
+            progress.done(`${summary}. Wrote ${written} file(s). Reload Obsidian to apply.`);
             return written;
         });
     }
