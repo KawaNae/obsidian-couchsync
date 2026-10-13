@@ -118,7 +118,6 @@ export class CouchSyncSettingTab extends PluginSettingTab {
             app: this.app,
             replicator: this.plugin.replicator,
             auth: this.plugin.auth,
-            remoteOps: this.plugin.remoteOps,
             localDb: this.plugin.localDb,
             vault: this.plugin.vaultBinding,
             refresh: () => this.display(),

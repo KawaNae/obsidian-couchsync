@@ -193,6 +193,9 @@ export default class CouchSyncPlugin extends Plugin {
                 this.settings.couchdbUser, this.settings.couchdbPassword,
             ),
             setup: () => this.setupService,
+            checkDatabase: (db) => this.remoteOps.checkDatabaseWith(
+                this.settings.couchdbUri, this.settings.couchdbUser, this.settings.couchdbPassword, db,
+            ),
             stopLive: () => this.stopSync(),
             startLive: () => this.startSync(),
             openProgress: (label) => new ProgressNotice(label),

@@ -284,6 +284,7 @@ export async function createE2EHarness(opts: CreateE2EHarnessOpts = {}): Promise
             setup: () => setupService,
             stopLive: () => { engine.stop(); ct.stop(); },
             startLive: async () => {},
+            checkDatabase: (db) => remoteOps.checkDatabaseWith(cfg.couchUrl, cfg.user, cfg.password, db),
             openProgress: () => ({ update: () => {}, done: () => {}, fail: () => {} }),
             askPassphrase: async (reason) => {
                 throw new Error(`the harness answers no passphrase prompt (${reason} passphrase)`);

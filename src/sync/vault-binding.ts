@@ -16,8 +16,9 @@
  *     an execution that is destructive (see `runOperation`);
  *   - the encryption-agreement check the live session runs before catchup
  *     (`checkAgreement`);
- *   - how the last Init / Clone and the last agreement check ended
- *     (`relation`).
+ *   - how the last Init / Clone and the last agreement check ended, and
+ *     what Step 2's Check found (`relation`, which the Step 3 status line
+ *     is drawn from).
  *
  * Has no dependency on Obsidian: the host injects settings, the setup
  * runner, the live-sync switch, the progress notice and the passphrase
@@ -43,8 +44,9 @@ import { checkEncryptionAgreement } from "../db/encryption-agreement.ts";
 import { classifyError } from "../db/sync/errors.ts";
 import { describeError, rawErrorMessage, UserFacingError } from "../ui/describe-error.ts";
 import { logWarn } from "../ui/log.ts";
-import { OutcomeLedger, type OpOutcome, type OutcomeView } from "./op-outcome.ts";
+import { OutcomeLedger, type OpOutcome } from "./op-outcome.ts";
 import type { SetupResult } from "./setup.ts";
+import type { DbCheckResult } from "../db/sync/vault-remote-ops.ts";
 
 /** The one-shot run's notice: progress lines, then a summary or the error.
  *  The host builds it (`ProgressNotice`), which also logs. */
@@ -83,6 +85,9 @@ export interface VaultBindingHost {
     /** The setup runner. A function because the host builds it after the
      *  binding (it needs the binding's client wrapper). */
     setup(): VaultSetupRunner;
+    /** Step 2's Check: read the DB's info with the saved credentials
+     *  (creating the DB when it is missing). */
+    checkDatabase(dbName: string): Promise<DbCheckResult>;
     /** Stop the live session and the change tracker. */
     stopLive(): void;
     /** Start the live session (the state is `syncing` when called). */
@@ -97,6 +102,29 @@ export interface VaultBindingHost {
 export type VaultOpName = "init" | "clone" | "agreement";
 
 export type VaultOutcome = OpOutcome<VaultOpName>;
+
+/** What Step 2's Check found, for the DB it checked. */
+export interface VaultDbCheck {
+    at: number;
+    /** `vaultTarget` of the checked DB. */
+    against: string;
+    result: DbCheckResult;
+}
+
+/** Snapshot of this device's setup of the vault DB, for the status line.
+ *  Outcomes and the DB check are given only for the vault DB the settings
+ *  name now. */
+export interface VaultRelation {
+    state: ConnectionState;
+    serverTested: boolean;
+    /** The Init or Clone running now. */
+    busy: "init" | "clone" | null;
+    /** The last Init or Clone. */
+    lastOp: VaultOutcome | null;
+    /** The last conclusive encryption-agreement check. */
+    lastCheck: VaultOutcome | null;
+    dbCheck: VaultDbCheck | null;
+}
 
 const OP_LABELS: Record<Exclude<VaultOpName, "agreement">, string> = {
     init: "Init",
@@ -126,6 +154,7 @@ export class VaultBinding {
     private cipherVersionOverride?: number;
     private inflight: Exclude<VaultOpName, "agreement"> | null = null;
     private readonly outcomes = new OutcomeLedger<VaultOpName>((op) => op === "agreement");
+    private dbCheck: VaultDbCheck | null = null;
 
     /** The vault chunk hasher: HMAC under the key when the vault is
      *  encrypted and unlocked, xxhash64 otherwise. Reads the key on every
@@ -293,10 +322,49 @@ export class VaultBinding {
         await this.host.saveSettings();
     }
 
-    /** How the last Init / Clone and the last agreement check ended, for the
-     *  vault DB the settings name now. In memory only. */
-    outcomesNow(): OutcomeView<VaultOpName> {
-        return this.outcomes.view(vaultTarget(this.settings()));
+    /** This device's setup of the vault DB now. In memory only (the state
+     *  aside): after a reload the outcomes are unknown until the next run. */
+    relation(): VaultRelation {
+        const s = this.settings();
+        const target = vaultTarget(s);
+        return {
+            state: s.connectionState,
+            serverTested: s.serverTested,
+            busy: this.inflight,
+            ...this.outcomes.view(target),
+            dbCheck: this.dbCheckFor(s.couchdbDbName),
+        };
+    }
+
+    /** What Step 2's Check found for `dbName` on the saved server, or null
+     *  when it was not checked since the plugin loaded. */
+    dbCheckFor(dbName: string): VaultDbCheck | null {
+        const against = vaultTarget({ couchdbUri: this.settings().couchdbUri, couchdbDbName: dbName });
+        return this.dbCheck?.against === against ? this.dbCheck : null;
+    }
+
+    /**
+     * Step 2's Check of `dbName` (not yet applied): whether it exists and
+     * how many documents it holds; a missing DB is created. Kept so Step 3
+     * can tell whether Clone has something to pull. A failure is reported
+     * on the notice, worded by `describeError`; a success clears the auth
+     * latch (the credentials were accepted).
+     */
+    async checkDatabase(dbName: string): Promise<DbCheckResult> {
+        const at = Date.now();
+        const against = vaultTarget({ couchdbUri: this.settings().couchdbUri, couchdbDbName: dbName });
+        const progress = this.host.openProgress("Database check");
+        const result = await this.host.checkDatabase(dbName);
+        if (!this.dbCheck || at >= this.dbCheck.at) this.dbCheck = { at, against, result };
+        if (result.status === "error") {
+            progress.fail(result.error);
+        } else {
+            this.host.auth.clear();
+            progress.done(result.status === "created"
+                ? `"${dbName}" created — empty.`
+                : `"${dbName}" found — ${result.docCount.toLocaleString()} docs.`);
+        }
+        return result;
     }
 
     // ── Init / Clone ───────────────────────────────────
