@@ -6,13 +6,12 @@
  * for the lifetime of one session; the caller is responsible for
  * aborting via the `isCancelled` callback on teardown.
  *
- * ## Conflict-aware redesign (2026-05)
+ * ## Conflict-aware cursor
  *
- * Pre-2026-05 the loop committed `lastPushedSeq` unconditionally after
- * `bulkDocs`, which silently dropped any id whose result was `conflict`
- * (audit-2026-05-08, HIGH). The new flow keeps the cursor monotonic but
- * routes uncomitted ids into a persistent `_sync/unpushed/<id>` set
- * (see unpushed-ids.ts) so they are retried on the next cycle. Cursor
+ * Committing `lastPushedSeq` unconditionally after `bulkDocs` would
+ * silently drop any id whose result was `conflict`. The flow keeps the
+ * cursor monotonic but routes uncomitted ids into a persistent
+ * `_sync/unpushed/<id>` set (see unpushed-ids.ts) so they are retried on the next cycle. Cursor
  * advance and set mutation commit together via
  * `Checkpoints.commitPushCycle`.
  *
@@ -38,7 +37,7 @@
  * conflict → chunk lands ahead) is harmless: the file's next push
  * cycle re-batches the chunk via the file's `chunks[]` reference.
  *
- * ## Push order contract (Invariant A)
+ * ## Push order contract
  *
  * A file doc becomes visible in the remote `_changes` feed only after
  * every chunk it references is durably committed. `pushDocs` enforces
@@ -46,7 +45,7 @@
  * await their durable commit, then the files whose chunks all landed.
  * A file referencing a chunk that hard-failed is withheld and re-queued
  * as race-stale. This is the source-side prevention layer; pull-side
- * recovery (Invariant B, pending-apply.ts) is the safety net for the
+ * recovery (pending-apply.ts) is the safety net for the
  * cases push ordering cannot see (cross-cycle / cross-device races,
  * expired attachments, pre-fix peers).
  */
@@ -66,7 +65,7 @@ import type {
 import { buildChunkAttachment } from "../chunk-attachment.ts";
 import { DbError } from "../write-transaction.ts";
 // Codec error from its decorator-independent home — the sync stack must not
-// compile-depend on the EncryptingCouchClient decorator implementation (#18).
+// compile-depend on the EncryptingCouchClient decorator implementation.
 import { EncryptionError } from "../codec-errors.ts";
 import { classifyError } from "./errors.ts";
 import { logDebug, logInfo, logWarn } from "../../ui/log.ts";
@@ -129,12 +128,12 @@ interface FileClassifyResult {
     proceed: ClassifiedFile[];
     divergent: DivergentFile[];
     /** Ids whose local already matches remote (vclock equal, OR vclock
-     *  dominates but chunks are byte-identical — #sync-005) — drop from
+     *  dominates but chunks are byte-identical) — drop from
      *  unpushed-set if they were previously flagged. */
     skippedEqual: string[];
     /** Remote docs fetched this cycle, keyed by id. Lets race-stale
      *  escalation surface the REAL remote content instead of a local
-     *  placeholder (#sync-001). */
+     *  placeholder. */
     remoteDocMap: Map<string, FileDoc>;
 }
 
@@ -439,7 +438,7 @@ export class PushPipeline {
                 const rDoc = classified.remoteDocMap.get(p.doc._id);
                 if (rDoc) {
                     // Surface the conflict with the REAL remote doc fetched this
-                    // cycle, not a local placeholder (#sync-001). The old code
+                    // cycle, not a local placeholder. The old code
                     // set `remoteDoc: p.doc`, so the orchestrator fetched local
                     // chunks for BOTH sides and rendered an identical-content modal.
                     classified.divergent.push({
@@ -453,7 +452,7 @@ export class PushPipeline {
                     // No fresh remote state this cycle (doc absent on remote).
                     // Re-flag as divergent in the set so push retry stops, but
                     // DON'T emit a placeholder conflict with local content
-                    // (#sync-001) — the next cycle's pre-classify fetches the
+                    // — the next cycle's pre-classify fetches the
                     // real remote and emits via the normal divergent path.
                     escalatedNoRemote.push({ id: p.doc._id, attempts: p.prevAttempts });
                 }
@@ -477,7 +476,7 @@ export class PushPipeline {
             });
         }
         // Escalated race-stale entries with no fresh remote state: re-flag as
-        // divergent (stop push retry) without emitting a placeholder (#sync-001).
+        // divergent (stop push retry) without emitting a placeholder.
         for (const e of escalatedNoRemote) {
             unpushedAdd.push({ id: e.id, reason: "divergent", attempts: e.attempts + 1 });
         }
@@ -571,7 +570,7 @@ export class PushPipeline {
             }
             const rel = compareVC(doc.vclock ?? {}, rVc);
             if (rel === "dominates") {
-                // Churn guard (#sync-005): a local clock that dominates remote
+                // Churn guard: a local clock that dominates remote
                 // but whose chunks are byte-identical (e.g. a pull-side silent
                 // vclock merge) needs no push — the content is already
                 // replicated. Skipping avoids a write that only bumps the clock
@@ -685,8 +684,8 @@ export class PushPipeline {
             }
         }
 
-        // v2 ordered two-phase transport (Invariant A — push order
-        // contract): a file doc may become visible in the remote
+        // v2 ordered two-phase transport (push order contract): a file doc
+        // may become visible in the remote
         // `_changes` feed only AFTER every chunk it references is durably
         // committed. Chunks ride the attachment-aware bulk; files ride the
         // plain JSON bulk. We push chunks FIRST, await their durable
@@ -740,7 +739,7 @@ export class PushPipeline {
         // ── Phase 2: files, gated on chunk durability ──────────
         // Ship a file only if none of the chunks it references hard-failed
         // in Phase 1. Chunks absent from this batch are presumed durable
-        // from a prior cycle (Invariant B is the recovery net if that
+        // from a prior cycle (pull-side pending-apply is the recovery net if that
         // presumption is ever wrong). A withheld file gets a synthetic
         // `conflict` result so step [9] re-queues it as race-stale and the
         // next cycle retries — the same path a real rev-race takes.

@@ -1,14 +1,14 @@
 /**
  * PushBackfill — one-time recovery sweep for docs the push cursor skipped.
  *
- * Until 2026-06-07, `DexieStore.changes()` derived `last_seq` from
+ * Before v0.28.2, `DexieStore.changes()` derived `last_seq` from
  * `_update_seq` read in a separate transaction from the row query. A write
  * committing in that gap produced a cursor that covered a row that was
  * never enumerated; `commitPushCycle` then advanced past it permanently.
  * For live docs the next edit re-enumerates them, but a skipped tombstone
  * never gets another vault event: the deletion silently stops propagating
- * (2026-06-03 incident — search1.jpeg deleted on melchior, resurrected on
- * every other device). The cursor fix (max of enumerated row seqs) makes
+ * (a file deleted on one device stayed alive on every other device).
+ * The cursor fix (max of enumerated row seqs) makes
  * the race structurally impossible going forward; this sweep repairs the
  * damage already sitting in fleets.
  *

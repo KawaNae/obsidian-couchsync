@@ -455,7 +455,7 @@ export class CouchClient implements ICouchClient {
             // Render each doc with inline `_attachments.<name>.data` (base64).
             // CouchDB consumes this and stores the body as a native binary
             // attachment, so the wire is base64-inflated on push but storage
-            // and pull-side fetches are binary. Phase 14 / post-v1.0 may swap
+            // and pull-side fetches are binary. A future version may swap
             // this for individual multipart PUTs to recover the push wire
             // bytes — for now JSON-inline keeps the implementation simple and
             // batched.

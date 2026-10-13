@@ -42,7 +42,7 @@ export interface IVaultEvents {
     /**
      * A FOLDER (not a file) was deleted. Obsidian emits a single event for
      * the folder, not one per descendant file, so consumers must expand it
-     * into the child file set themselves (invariant S1/S6). Kept distinct
+     * into the child file set themselves (folders have no doc). Kept distinct
      * from the file `delete` event so a folder path never leaks into a
      * file-only handler (which would no-op on a non-existent FileDoc).
      */
@@ -54,7 +54,7 @@ export interface IVaultEvents {
     /**
      * A FOLDER (not a file) was renamed/moved. Single event for the folder;
      * descendants move implicitly with no per-child event. Consumers expand
-     * it into per-file renames (invariant S1/S6).
+     * it into per-file renames (folders have no doc).
      */
     on(
         event: "folder-rename",

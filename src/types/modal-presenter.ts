@@ -14,8 +14,8 @@
  *   or an explicit "Later" action). Defer applies NOTHING — no push, no
  *   LocalDB write, no vault write — and the conflict is kept durably so it is
  *   re-presented next session. This is the safe default: closing a conflict
- *   must never overwrite remote with a possibly-stale local copy (the
- *   2026-06-02 data-loss incident, where × defaulted to keep-local → push).
+ *   must never overwrite remote with a possibly-stale local copy (when ×
+ *   defaulted to keep-local → push, that lost newer remote content).
  */
 export type ConflictChoice = "keep-local" | "take-remote" | "defer";
 
@@ -72,7 +72,7 @@ export interface IModalPresenter {
      * Show ONE modal listing many conflicts at once and let the user pick a
      * bulk action (or fall back to individual resolution). Used when a batch
      * of conflicts would otherwise stack N separate modals — the stacked
-     * `modal-bg` overlays turned the screen black at ~10+ (2026-06-02). The
+     * `modal-bg` overlays turned the screen black at ~10+. The
      * caller decides the threshold; this method just renders whatever it's
      * given.
      */

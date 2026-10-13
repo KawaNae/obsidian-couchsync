@@ -94,7 +94,7 @@ export class EncryptingCouchClient implements ICouchClient {
          *  When >= 3, `decryptDoc` refuses any file/config doc that is not a
          *  sealed `encBody` — rejecting both the legacy `encryptedPath` branch
          *  and the plaintext passthrough, which are unauthenticated and let a
-         *  curious server downgrade a v3 vault (#1/#3). When `undefined` or 2,
+         *  curious server downgrade a v3 vault. When `undefined` or 2,
          *  the legacy dual-read is preserved for vaults not yet re-init'd to
          *  v3. The floor MUST come from client-local state (see
          *  `settings.vaultCipherVersion`), never from the server-writable
@@ -131,7 +131,7 @@ export class EncryptingCouchClient implements ICouchClient {
         const { _id: _omitId, _rev, ...body } = doc;
         void _omitId;
         const payload = UTF8.encode(JSON.stringify({ path, ...body }));
-        // NB (#17): doc-BODY compression here is ALWAYS-ON and independent of
+        // NB: doc-BODY compression here is ALWAYS-ON and independent of
         // the user's compression toggle (which gates only attachment bodies via
         // CompressingCouchClient). It is safe because `gzipIfSmaller` keeps the
         // result only when strictly smaller and the envelope's self-describing
@@ -158,7 +158,7 @@ export class EncryptingCouchClient implements ICouchClient {
         // legacy `encryptedPath` body or a plaintext injection — both
         // unauthenticated, both let a curious server roll back a vclock,
         // resurrect a deleted file, or swap chunk references undetected
-        // (#1/#3). Refuse them. The floor is local-anchored (TOFU), so a
+        // Refuse them. The floor is local-anchored (TOFU), so a
         // server cannot re-open the hole by rewriting `vault:meta`. Docs that
         // are not path docs (chunks, `_local`, the raw meta docs) carry no
         // `encBody` legitimately and pass through untouched. Floor < 3 (or
@@ -170,7 +170,7 @@ export class EncryptingCouchClient implements ICouchClient {
                     `file/config doc ${d._id} (missing encBody — possible ` +
                     `server downgrade attack)`,
                 undefined,
-                false, // policy violation — terminal, never retry (#enc-1)
+                false, // policy violation — terminal, never retry
             );
         }
         try {
@@ -219,7 +219,7 @@ export class EncryptingCouchClient implements ICouchClient {
             throw new EncryptionError(
                 `encBody id/path mismatch: ${remoteId} does not HMAC to its path`,
                 undefined,
-                false, // identity/security violation — terminal (#enc-1)
+                false, // identity/security violation — terminal
             );
         }
         const { path: _omitPath, ...rest } = payload;

@@ -65,7 +65,7 @@ export interface PullWriterDeps {
     ensureChunks: (doc: FileDoc) => Promise<void>;
     /** Fetch the current remote FileDoc by id (decoded through the codec
      *  stack), or null if absent. Used by `drainPendingConflict` to re-present
-     *  a persisted local-delete-vs-remote-edit conflict (#7): the surviving
+     *  a persisted local-delete-vs-remote-edit conflict: the surviving
      *  local side is a tombstone, so the remote alive edit — which is not in
      *  LocalDB — must be re-fetched to show the conflict. */
     getRemoteDoc: (id: string) => Promise<FileDoc | null>;
@@ -86,7 +86,7 @@ export interface PullWriterDeps {
      *  between applying the deletion durably and surfacing a delete-vs-edit
      *  conflict. Replaces the former `events.emitAsyncAny("pull-delete")`
      *  query whose catch swallowed I/O errors into a `false` (= unsafe
-     *  apply) — `probeUnpushedSafe` wraps this to fail safe-side (#err-10). */
+     *  apply) — `probeUnpushedSafe` wraps this to fail safe-side. */
     probeUnpushed: (path: string) => Promise<boolean>;
 }
 
@@ -108,8 +108,8 @@ interface BatchStats {
     convergedSkipCount: number;
     /** `silent-merge` verdicts — same content but vclocks drifted. The
      *  remote doc is committed with `mergeVC(local, remote)` and no
-     *  concurrent event is emitted. Counts toward audit-2026-05-08
-     *  MEDIUM (false-positive concurrent) reduction. */
+     *  concurrent event is emitted, instead of a false-positive
+     *  concurrent conflict. */
     vclockOnlyDriftCount: number;
 }
 
@@ -123,7 +123,7 @@ interface ConcurrentEntry {
  * Build the synthetic tombstone that carries a remote-deletion-vs-local-edit
  * conflict to the modal.
  *
- * **Invariant 6 (vclock 派生の出所制限).** This tombstone is a flag carrier —
+ * **vclock derivation provenance.** This tombstone is a flag carrier —
  * a placeholder so the orchestrator can decide between "apply deletion" and
  * "keep edit". `vclock: {}` is intentional: CouchDB `_changes` does NOT include
  * deleted-doc bodies, so we cannot reconstruct the deleting device's true
@@ -141,7 +141,7 @@ function buildDeletionTombstone(docId: string, localDoc: FileDoc): FileDoc {
 
 /**
  * Build the tombstone that carries a SAFE remote hard-deletion into the
- * durable `accepted → pending-deletion → drain` path (#del-1/#del-2).
+ * durable `accepted → pending-deletion → drain` path.
  *
  * Unlike `buildDeletionTombstone` (a flag carrier with `vclock: {}` shown in
  * the conflict modal), this tombstone is COMMITTED to LocalDB and APPLIED to
@@ -165,7 +165,7 @@ export class PullWriter {
         });
     }
 
-    /** In-memory count of the pending-apply set (Invariant B). -1 = not
+    /** In-memory count of the pending-apply set. -1 = not
      *  yet loaded this session; a non-negative value lets `drainPendingApply`
      *  short-circuit the common empty case without a meta scan. */
     private pendingApplyCount = -1;
@@ -239,7 +239,7 @@ export class PullWriter {
             if (!row.doc) continue;
             const remoteDoc = stripRev(row.doc) as CouchSyncDoc;
 
-            // v2 (data-layer-v2 Phase 5): chunks no longer flow through
+            // v2 (since v0.25): chunks no longer flow through
             // `_changes`. Their bodies are tiny attachment metadata and
             // the canonical binary lives in `_attachments.c`, fetched
             // lazily via `ensureChunks` when the referencing file lands.
@@ -278,10 +278,10 @@ export class PullWriter {
                     // the config-Create stale-collision anomaly (a zombie doc at
                     // {device:1} vs a freshly-reset doc at {device:1}) and MUST
                     // fall through to the resolver (→ true-divergent), not be
-                    // silently kept — that was the 2026-06-14 on-device
-                    // non-propagation bug. The predicate is a strict subset of
+                    // silently kept — otherwise the newer content never
+                    // propagates to peers. The predicate is a strict subset of
                     // `identical`, so it never disagrees with the classifier
-                    // (Invariant 2). Empty-vs-empty vclocks are not causally
+                    // (single classifier). Empty-vs-empty vclocks are not causally
                     // equal (tombstones, legacy docs) and must fall through too.
                     const localVC = localDoc.vclock ?? {};
                     const remoteVC = remoteDoc.vclock ?? {};
@@ -296,12 +296,12 @@ export class PullWriter {
                     const docPath = isFileDoc(remoteDoc)
                         ? filePathFromId(remoteDoc._id)
                         : configPathFromId(remoteDoc._id);
-                    // **Invariant 5 (PullVerdict 完全網羅).** Every
+                    // **PullVerdict exhaustive.** Every
                     // verdict must be handled explicitly. The trailing
                     // `_exhaustive: never` makes future verdict additions
                     // a compile error rather than a silent regression
-                    // (this was the audit-2026-05-08 MEDIUM bug shape on
-                    // the ConfigSync side, fixed in PR-C).
+                    // (ConfigPullWriter once fell through and dropped
+                    // `silent-merge`).
                     switch (verdict) {
                         case "keep-local":
                             logDebug(`  × ${docPath} (keep-local)`);
@@ -313,7 +313,7 @@ export class PullWriter {
                             if (isFileDoc(remoteDoc)) {
                                 await this.deps.ensureChunks(remoteDoc);
                             }
-                            // Durability for ALL concurrent shapes (Invariant B).
+                            // Durability for ALL concurrent shapes.
                             // Persisted in the same tx as the cursor advance so a
                             // missed modal / restart cannot silently lose a side.
                             // File deletions are soft (a `deleted:true` doc, not a
@@ -322,16 +322,16 @@ export class PullWriter {
                             // Edit-vs-edit is now ALSO persisted: with defer
                             // (× = 保留) the cursor advances past the remote rev
                             // without accepting it, so without a durable record a
-                            // deferred remote edit would be lost (2026-06-02).
+                            // deferred remote edit would be lost.
                             if (isFileDoc(remoteDoc) && isFileDoc(localDoc)) {
                                 if (remoteDoc.deleted === true && localDoc.deleted !== true) {
-                                    // remote-delete vs local-edit (#3).
+                                    // remote-delete vs local-edit.
                                     pendingConflictAdd.push({
                                         id: remoteDoc._id, kind: "pull-delete-vs-edit",
                                     });
                                     this.emittedConflicts.add(remoteDoc._id);
                                 } else if (localDoc.deleted === true && remoteDoc.deleted !== true) {
-                                    // The mirror: local-delete vs remote-edit (#7).
+                                    // The mirror: local-delete vs remote-edit.
                                     // The remote alive doc is NOT accepted (we don't
                                     // auto-resurrect); without this record a missed
                                     // modal / restart would drop the remote edit.
@@ -401,8 +401,8 @@ export class PullWriter {
 
         if (await this.probeUnpushedSafe(path)) {
             // Unpushed local edit present (or the probe couldn't tell —
-            // safe-side, #err-10). Durably remember the deletion-vs-edit
-            // conflict (Invariant B): the caller persists `pendingConflictAdd`
+            // safe-side). Durably remember the deletion-vs-edit
+            // conflict: the caller persists `pendingConflictAdd`
             // in the SAME tx as the cursor advance, so a missed modal / restart
             // cannot lose the deletion. Surface it live; the per-cycle drain
             // won't re-emit a modal already open for this doc.
@@ -416,7 +416,7 @@ export class PullWriter {
 
         // No unpushed local edit: the deletion is safe to apply. Route it
         // through the SAME durable `accepted → pending-deletion → drain` path
-        // as a soft-delete (#del-1/#del-2) — committed atomically with the
+        // as a soft-delete — committed atomically with the
         // cursor advance and retried by drainPendingApply on apply failure —
         // instead of the former tx-external immediate applyRemoteDeletion that
         // could lose the file on a mid-delete crash.
@@ -428,7 +428,7 @@ export class PullWriter {
      *  throws (I/O error), assume "yes, unpushed" and surface a conflict
      *  rather than silently applying the deletion. The old
      *  `emitAsyncAny("pull-delete")` swallowed the exception and returned
-     *  `false` (= apply), violating the safe-side principle (#err-10). */
+     *  `false` (= apply), violating the safe-side principle. */
     private async probeUnpushedSafe(path: string): Promise<boolean> {
         try {
             return await this.deps.probeUnpushed(path);
@@ -440,7 +440,7 @@ export class PullWriter {
 
     /**
      * Re-present persisted deletion conflicts not yet surfaced this session
-     * (Invariant B recovery for the deletion-conflict class). The common case
+     * (pull-durability recovery for the deletion-conflict class). The common case
      * is a restart: the in-memory modal queue is gone but the `pending-conflict`
      * entry survived, so the deletion intent is re-shown instead of being
      * silently un-deleted by the surviving local edit. Called every pull cycle
@@ -456,7 +456,7 @@ export class PullWriter {
             const path = filePathFromId(id);
 
             if (entry.kind === "local-delete-vs-remote-edit") {
-                // The mirror direction (#7): the surviving local side is the
+                // The mirror direction: the surviving local side is the
                 // tombstone, and the thing to re-present is the REMOTE alive
                 // edit, which is not in LocalDB. The conflict is moot if the
                 // local doc is no longer a tombstone (a newer local edit
@@ -510,7 +510,7 @@ export class PullWriter {
                 continue;
             }
 
-            // "pull-delete-vs-edit" (#3): the surviving local side is the edit;
+            // "pull-delete-vs-edit": the surviving local side is the edit;
             // re-present a tombstone as the remote deletion intent.
             if (!localDoc || !isFileDoc(localDoc) || localDoc.deleted) {
                 // The local edit is gone (the deletion was applied locally, or a
@@ -542,7 +542,7 @@ export class PullWriter {
         stats: BatchStats,
         pendingConflictAdd: Array<{ id: string; kind: PendingConflictKind }>,
     ): Promise<void> {
-        // Invariant B pre-record: file docs whose chunks aren't local yet
+        // Pull-durability pre-record: file docs whose chunks aren't local yet
         // might fail to apply in `onCommit` (which runs AFTER this tx
         // durably commits, so its outcome can't ride the tx). Record those
         // ids in the SAME tx as the remoteSeq advance, then drop the ones
@@ -572,7 +572,7 @@ export class PullWriter {
                     try {
                         // Tombstones skip the chunk fetch: their fingerprint
                         // is NOT normalized (markDeleted retains the deleted
-                        // content's chunks — Invariant 7), but applying a
+                        // content's chunks), but applying a
                         // deletion never reads chunk bodies (dbToFile's
                         // tombstone branch). Fetching them wastes bandwidth
                         // on dead content that the next chunk GC drops again
@@ -626,7 +626,7 @@ export class PullWriter {
         for (const doc of accepted) {
             if (!isFileDoc(doc)) continue;
             if (doc.deleted) {
-                // #5: a clean remote soft-deletion is applied post-commit in
+                // A clean remote soft-deletion is applied post-commit in
                 // `onCommit`; if that vault delete throws or the process is
                 // killed the deletion silently un-applies. Record it so the
                 // drain re-applies the deletion — the symmetric counterpart of
@@ -643,7 +643,7 @@ export class PullWriter {
     }
 
     /**
-     * Drain the pending-apply set (Invariant B recovery). For each id whose
+     * Drain the pending-apply set. For each id whose
      * file still exists, re-fetch its chunks and re-apply to the vault; on
      * success (or a deliberate skip) the id leaves the set, otherwise its
      * attempt count is bumped and it stays for the next cycle. Called every
@@ -662,7 +662,7 @@ export class PullWriter {
             const path = filePathFromId(id);
 
             if (entry.reason === "pending-deletion") {
-                // #5 recovery: the durable tombstone must still be a deletion.
+                // Deletion recovery: the durable tombstone must still be a deletion.
                 // If the local doc is gone or superseded by a live (non-deleted)
                 // edit, the deletion is moot — drop it. `doc.deleted` is the
                 // EXPECTED state here, NOT a moot signal. Re-apply the vault

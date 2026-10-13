@@ -4,11 +4,10 @@
  * **Do not duplicate this logic at call sites.** Every classification
  * decision in the codebase — `compareFileToDoc`, the `fileToDb` divergent
  * guard, the reconciler's Case A/B dispatch, and `pull-writer.classify`
- * — should route through `classifySyncRelation`. Past bugs (rev 197
- * phantom-write, audit-2026-05-08 false-positive concurrent on initial
- * sync, 2026-05-10 Home.md silent loss) all stem from a vclock-only
- * classifier missing chunks-level signals; consolidating prevents the
- * pattern from recurring.
+ * — should route through `classifySyncRelation`. Past bugs (a phantom
+ * write, false-positive concurrent conflicts on initial sync, a silent
+ * loss of a note's content) all stem from a vclock-only classifier missing
+ * chunks-level signals; consolidating prevents the pattern from recurring.
  *
  * The classifier compares two `(chunks, vclock)` pairs and an optional
  * integration baseline (`lastSynced`). It returns one of:
@@ -17,10 +16,10 @@
  * - `vclock-only-drift` — chunks equal but vclock not equal. Caller MUST
  *                         adopt the FileDoc's vclock as the integration
  *                         baseline (`lastSynced.vclock = fileDoc.vclock`)
- *                         and MUST NOT push or emit `concurrent`. Closes
- *                         the audit-2026-05-08 false-positive concurrent
- *                         class plus the 2026-05-10 phantom-loop shape
- *                         (project_phantom_lastsynced_stamp.md).
+ *                         and MUST NOT push or emit `concurrent`. Pushing
+ *                         would raise false-positive concurrent conflicts,
+ *                         and merging clocks into the baseline loops on
+ *                         phantom stamps.
  * - `remote-edit`       — chunks differ + right side dominates. Pure pull
  *                         case (left content matches the integration
  *                         baseline; safe to overwrite).
@@ -34,7 +33,8 @@
  *                         requiring user resolution.
  * - `legacy-skip`       — `lastSynced.chunks` is undefined (pre-extension
  *                         meta entry); caller falls back to vclock-only
- *                         logic. PR5 startup sweep will upgrade these.
+ *                         logic. The startup legacy-lastSynced sweep
+ *                         upgrades these.
  *
  * Mapping at call sites:
  *   - vault-scan (compareFileToDoc / reconciler): left = vault disk +
@@ -46,32 +46,29 @@
  *     vault state).
  *
  * ─────────────────────────────────────────────────────────────────────
- * Sync-state invariants this codebase upholds (cumulative across the
- * `feature/sync-classifier` and `feature/sync-classifier-followup` plans;
- * each failure mode below previously caused a real production silent-loss
- * or vclock-pollution bug):
+ * Sync-state invariants this codebase upholds (each failure mode below
+ * previously caused a real production silent-loss or vclock-pollution bug):
  *
- * **Invariant 1 — disk-write truth.**
+ * **Disk-write truth.**
  *   `lastSynced.chunks/size === disk chunks/size` (always). Enforced by
  *   `EditorAwareVaultWriter.applyRemoteContent` writing disk before
  *   reporting `applied: true`. Without this, a stale CM-only path lets
  *   the classifier read a lying baseline.
  *
- * **Invariant 2 — single classifier.**
+ * **Single classifier.**
  *   This file is the only place the chunks×vclock matrix is interpreted.
  *   Call sites consume the discriminated union; they do not branch on
  *   `compareVC` directly.
  *
- * **Invariant 3 — chunks-equal vclock authority.**
+ * **Chunks-equal vclock authority.**
  *   `vclock-only-drift` callers MUST adopt `fileDoc.vclock` as the new
  *   `lastSynced.vclock` (no `mergeVC`). Chunks-equal means the FileDoc is
  *   the canonical authority for this path's vclock identity; any extra
  *   stamps on the prior `lastSynced.vclock` are either phantom orphans
  *   or echoes of rev-tree conflict branches, neither of which need to
  *   live in the local integration baseline. Pushing or emitting
- *   `concurrent` here is the false-positive concurrent bug shape
- *   (audit-2026-05-08); a `mergeVC`-based resolver here is the
- *   phantom-loop bug shape (project_phantom_lastsynced_stamp.md, 2026-05-10)
+ *   `concurrent` here is the false-positive concurrent bug shape; a
+ *   `mergeVC`-based resolver here is the phantom-loop bug shape
  *   because lastSynced ends up dominating fileDoc and the next reconcile
  *   re-triggers vclock-only-drift forever. Note the asymmetry with
  *   `pull-writer` / `config-pull-writer`, which DO write the merged
@@ -81,31 +78,31 @@
  *   holds, so adopting fileDoc.vclock on the lastSynced side is the
  *   only convergence path.
  *
- * **Invariant 4 — pending-edit oracle.**
+ * **Pending-edit oracle.**
  *   "Has the vault been edited but not yet pushed?" is answered by
  *   `VaultSync.hasUnpushedChanges` via `IPendingProbe.hasPending(path)`
  *   plus a chunks-vs-`lastSynced` comparison. Vclock-only checks are
  *   forbidden here — they are kept in lockstep by `fileToDb`/`dbToFile`
  *   and so always say "no" (= the silent-loss-during-debounce shape).
  *
- * **Invariant 5 — PullVerdict exhaustive.**
+ * **PullVerdict exhaustive.**
  *   Every consumer of `PullVerdict` (vault `PullWriter`, `ConfigPullWriter`,
  *   future pullers) handles all 4 verdicts explicitly with a trailing
- *   `_exhaustive: never`. Fall-through on `silent-merge` was the
- *   audit-2026-05-08 MEDIUM bug shape on the ConfigSync side.
+ *   `_exhaustive: never`. On the ConfigSync side, `silent-merge` once fell
+ *   through into the accepted (apply) branch.
  *
- * **Invariant 6 — vclock derivation provenance.**
+ * **Vclock derivation provenance.**
  *   A doc whose `vclock` is a placeholder (notably the fake tombstone
  *   built by `pull-writer.handlePulledDeletion`, which is empty because
  *   `_changes` doesn't carry deleted-doc bodies) MUST NOT be used as an
  *   `incrementVC` seed. `ConflictOrchestrator.applyConflictChoice`
  *   derives deletion-conflict vclocks from `localDoc.vclock` instead.
  *
- * **Invariant 7 — deletion is an integration event.**
+ * **Deletion is an integration event.**
  *   A tombstone (`deleted: true`) is a doc state like any other: applying
  *   one establishes a *deleted baseline* (`lastSynced.deleted`), it does
- *   NOT erase the baseline. Erasing was the 2026-06-07 W24 bug shape: the
- *   recreate-after-delete path lost its causal anchor, the guard classified
+ *   NOT erase the baseline. Erasing it left a note recreated after its
+ *   deletion stuck: the recreate-after-delete path lost its causal anchor, the guard classified
  *   the tombstone as `remote-edit`, and the path was stuck unpushable
  *   forever (pull was already converged; reconcile re-entered the same
  *   guard). Two corollaries:
@@ -120,8 +117,8 @@
  *   - `remote-edit` against a tombstone means "deletion pending disk
  *     apply" — it is only safe when the left content still matches an
  *     alive baseline. With no baseline (or a deleted/legacy one) the safe
- *     verdict is `true-divergent`: silent-skip is the W24 stuck shape and
- *     silent-restore is the H-1 data-loss shape, so the conflict
+ *     verdict is `true-divergent`: silent-skip wedges the path unpushable
+ *     and silent-restore resurrects a user deletion, so the conflict
  *     orchestrator must arbitrate.
  */
 
@@ -146,7 +143,7 @@ export interface ClassifyInput {
     leftVC: VectorClock;
     leftChunks: readonly string[];
     leftSize: number;
-    /** Whether the left side is a deletion tombstone (Invariant 7).
+    /** Whether the left side is a deletion tombstone (deletion is an integration event).
      *  Defaults to false — a disk file is always alive; pull-writer call
      *  sites pass `localDoc.deleted`. */
     leftDeleted?: boolean;
@@ -155,7 +152,7 @@ export interface ClassifyInput {
      *  so `lastSynced.vclock` is attributed to it). With an attributed
      *  vclock, "right dominates" against a tombstone is only trustworthy
      *  when a baseline explains the left content — without one the verdict
-     *  must fall to `true-divergent` (Invariant 7). Pull call sites compare
+     *  must fall to `true-divergent`. Pull call sites compare
      *  two docs with real vclocks and omit this: there "right dominates"
      *  is genuine causality and a dominating tombstone is a legitimate
      *  deletion to take. */
@@ -167,7 +164,7 @@ export interface ClassifyInput {
     rightVC: VectorClock;
     rightChunks: readonly string[];
     rightSize: number;
-    /** Whether the right side is a deletion tombstone (Invariant 7). */
+    /** Whether the right side is a deletion tombstone. */
     rightDeleted?: boolean;
     /** Integration baseline. When provided, lets the classifier distinguish
      *  "pure stale, safe to apply remote" from "user edited stale state,
@@ -195,7 +192,7 @@ export function classifySyncRelation(input: ClassifyInput): SyncRelation {
     const { leftVC, leftChunks, leftSize, rightVC, rightChunks, rightSize } = input;
     const leftDeleted = input.leftDeleted === true;
     const rightDeleted = input.rightDeleted === true;
-    // Invariant 7: the deleted flag outranks the fingerprint. Tombstone
+    // Deletion is an integration event: the deleted flag outranks the fingerprint. Tombstone
     // fingerprints are not normalized, so deleted×deleted is content-equal
     // (two deletions of the same path are the same state) and deleted×alive
     // is never content-equal (even when the tombstone retained the chunks
@@ -240,8 +237,8 @@ export function classifySyncRelation(input: ClassifyInput): SyncRelation {
     //      legit local edit (it would have bumped the clock above remote). It
     //      is the config-Create stale-collision anomaly — a zombie doc left at
     //      `{device:1}` colliding with a freshly-reset doc at `{device:1}`
-    //      (confirmed on-device 2026-06-14: the first push at vclock {1} did
-    //      not propagate). The vclocks cannot order them, so silently keeping
+    //      (confirmed on a device: the first push at vclock {1} did not
+    //      propagate). The vclocks cannot order them, so silently keeping
     //      either side is the silent-loss / non-propagation bug. Surface it.
     //      → true-divergent — UNLESS this is a recreate re-pull (see below).
     if (vcRel === "equal" && input.leftVCAttributed !== true) {
@@ -263,15 +260,15 @@ export function classifySyncRelation(input: ClassifyInput): SyncRelation {
  * still matches the integration baseline; otherwise the local side has
  * drifted (conflict needed).
  *
- * Tombstone right side (Invariant 7): `remote-edit` here means "deletion
+ * Tombstone right side: `remote-edit` here means "deletion
  * pending disk apply", which is only safe when the left content still
  * matches an *alive* baseline (= the user has not touched the file since
  * the last integration; the pull pipeline will delete it from disk). With
  * no baseline, a legacy baseline, or a deleted baseline (the tombstone
  * advanced past our integrated deletion — another device deleted again
  * while we recreated), the alive left side is unexplained local content:
- * silent-skip would wedge the path (the W24 bug) and silent-restore would
- * resurrect a deletion (the H-1 data-loss shape), so route to the conflict
+ * silent-skip would wedge the path unpushable and silent-restore would
+ * resurrect a deletion, so route to the conflict
  * orchestrator via `true-divergent`.
  */
 function refineRemoteEdit(input: ClassifyInput): SyncRelation {

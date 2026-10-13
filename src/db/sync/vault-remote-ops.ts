@@ -50,7 +50,7 @@ export class VaultRemoteOps {
          * Vault chunk hasher (same instance the live sync loop uses, reading
          * the live cryptoProvider via closure). Threaded into `pullAll` so the
          * Clone / full-resync path verifies every chunk body against its
-         * content-addressed id — the authenticated fetch boundary (Invariant I)
+         * content-addressed id — the authenticated fetch boundary
          * that live sync already enforced but the one-shot path did not.
          *
          * Public so maintenance/repair commands (chunk-repair) can thread the

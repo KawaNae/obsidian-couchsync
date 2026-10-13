@@ -48,7 +48,7 @@ import { BrowserVisibilityGate, ALWAYS_VISIBLE, type VisibilityGate } from "./vi
 
 // ── Types ────────────────────────────────────────────────
 
-/** Residual availability after an ensure-chunks attempt (Invariant I/II).
+/** Residual availability after an ensure-chunks attempt.
  *  `stillMissing` lists chunk ids unavailable after the attempt; when
  *  `remoteConsulted` is true those are missing on the server too = broken
  *  (reconciler quarantines), when false the device was offline = transient. */
@@ -85,8 +85,8 @@ const TRANSIENT_ESCALATION_MS = 10_000;
  *  - `app-resume` / `network-online` use a 15s budget because the mobile
  *    network stack often takes several seconds to come back after suspend.
  *    Slow revival is absorbed by *re-issuing short probes* across the
- *    budget — NOT by waiting out one long probe. (2026-06-14 main-vault
- *    iPad logs: the first post-resume `info()` rode a suspend-killed
+ *    budget — NOT by waiting out one long probe. (Observed in iPad
+ *    logs: the first post-resume `info()` rode a suspend-killed
  *    socket and hung the full 15s ceiling — err=aborted — while a fresh
  *    probe ~1s later returned in 28-311ms. A single long ceiling does not
  *    absorb revival; it just squats on a dead socket.)
@@ -243,7 +243,7 @@ export class SyncEngine {
         private applyPullWrite: (doc: FileDoc) => Promise<WriteResult>,
         /** True if the vault has an unpushed local edit for `path`. The
          *  pull-writer's hard-delete path uses it to choose between durable
-         *  deletion apply and a delete-vs-edit conflict (#del-1/#err-10). */
+         *  deletion apply and a delete-vs-edit conflict. */
         private probeUnpushed: (path: string) => Promise<boolean>,
         /** True on Obsidian mobile (iOS + Android). Selects
          *  BrowserVisibilityGate so push/pull loops pause on
@@ -324,7 +324,7 @@ export class SyncEngine {
         fileDoc: FileDoc,
     ): Promise<EnsureChunksResult> {
         const existing = await this.localDb.getChunks(fileDoc.chunks);
-        // Availability (Invariant I): a chunk doc that exists but carries no
+        // Availability: a chunk doc that exists but carries no
         // content buffer is NOT usable — treat it as missing so it gets
         // re-fetched (the remote attachment re-materialises content) instead
         // of being trusted by id alone and later crashing reassembly.
@@ -339,7 +339,7 @@ export class SyncEngine {
                 `missing ${missing.length} chunk(s) for ${filePathFromId(fileDoc._id)} but no remote client`,
             );
             // No remote consulted → caller treats as transient (offline), not
-            // as broken (Invariant II): do not quarantine, retry when online.
+            // as broken: do not quarantine, retry when online.
             return { stillMissing: missing, remoteConsulted: false };
         }
 
@@ -349,7 +349,7 @@ export class SyncEngine {
 
         // Fetch + verify + classify via the shared chunk-fetch core, so the
         // vault and config boundaries cannot drift in how they treat a corrupt
-        // chunk (#4 — corrupt == isCorruptChunkError, incl. EnvelopeError).
+        // chunk (corrupt == isCorruptChunkError, incl. EnvelopeError).
         const { fetched, notFound, corrupt } = await fetchMissingChunks(missing, {
             getAttachment: (id, name, sig) => client.getAttachment(id, name, sig),
             hasher: this.chunkHasher,
@@ -470,7 +470,7 @@ export class SyncEngine {
      * is in flight, additional calls compare reasons by priority and
      * either drop (lower-or-equal) or queue exactly one follow-up
      * (higher). This absorbs the app-resume + retry-backoff race that
-     * produced the sess#1→sess#5 cascade observed in 2026-04-22 logs.
+     * produced a sess#1→sess#5 reconnect cascade observed in mobile logs.
      */
     async requestReconnect(reason: ReconnectReason): Promise<void> {
         if (this.reconnectInFlight) {
@@ -559,10 +559,10 @@ export class SyncEngine {
         if (detail.kind === "schema-mismatch" || detail.kind === "encryption-paused") {
             // Terminal, user-actionable. schema-mismatch = remote doc shape
             // this build can't read; encryption-paused = remote encryption
-            // state needs Init/Clone or a passphrase (#1c). Retrying loops
+            // state needs Init/Clone or a passphrase. Retrying loops
             // forever against the same remote, so halt retries and tear down.
             // The host surfaces the Notice via the "error" event emitted
-            // above — single notify authority (#1d). A fresh start() clears it.
+            // above — single notify authority. A fresh start() clears it.
             this.stopRetryTimer();
             void this.teardown();
             return;
@@ -601,7 +601,7 @@ export class SyncEngine {
             // read, or a non-retriable EncryptionError = cipherVersion
             // downgrade gate) is terminal. Both must halt immediately rather
             // than burn the 10s transient grace window — enterError handles
-            // each terminal class. (#enc-1)
+            // each terminal class.
             this.enterError(detail);
             return;
         }
@@ -754,7 +754,7 @@ export class SyncEngine {
         if (this.auth.isBlocked()) return;
         if (this.degraded) return;
 
-        // Encryption gate (#1c): unlock the vault crypto provider BEFORE
+        // Encryption gate: unlock the vault crypto provider BEFORE
         // building the vault client. `makeVaultClient` (wrapVaultClient)
         // refuses to build when the vault is encrypted but no provider is
         // unlocked, so the gate must precede it — otherwise a reconnect after
@@ -762,7 +762,8 @@ export class SyncEngine {
         // offline) throws uncaught here and strands the engine in
         // "reconnecting" with no retry. Running it inside openSession means a
         // transient fetch failure routes to enterError → retry and
-        // auto-recovers when the network returns (the #1 root cause); a
+        // auto-recovers when the network returns instead of leaving sync
+        // dead until a manual reload; a
         // user-actionable state pauses via the encryption-paused terminal
         // kind. The `openingSession` latch above dedupes across this await.
         //  `lifecycleGeneration` detects a stop()/teardown()/unload racing in
@@ -860,7 +861,7 @@ export class SyncEngine {
         logDebug(`${tag}openSession: checkpoints.load done in ${Date.now() - checkpointsStart}ms`);
 
         // (Encryption gate already ran before the vault client was built — see
-        // the top of openSession. #1c)
+        // the top of openSession.)
 
         // Vault-drift stamp: detect offline edits (mtime/size drift from
         // lastSynced) and commit them to LocalDB BEFORE catchup pulls
@@ -914,8 +915,9 @@ export class SyncEngine {
         await session.warmup();
         if (session.disposed) return;
 
-        // One-time push-backfill sweep: re-enqueue docs the pre-2026-06-07
-        // cursor race skipped (permanently unpushed tombstones). Best-effort
+        // One-time push-backfill sweep: re-enqueue docs the push-cursor race
+        // of builds before v0.28.2 skipped (permanently unpushed
+        // tombstones). Best-effort
         // — a failure (offline mid-sweep, abort) leaves the flag unset and
         // the next session retries. Runs after catchup/warmup so the local
         // and remote FileDoc views are both fresh.
@@ -1103,7 +1105,7 @@ export class SyncEngine {
         const via = session ? "session-client" : "probe-client";
         // The probe client. Each info() issues a fresh fetch, so re-invoking
         // it escapes a suspend-killed socket that a single long probe would
-        // squat on (2026-06-14 iPad logs: first post-resume probe hung 15s,
+        // squat on (observed on iPad: first post-resume probe hung 15s,
         // a re-issued one returned in tens of ms).
         const client = session ? session.client : this.clientFactory(this.getSettings());
 
@@ -1151,7 +1153,7 @@ export class SyncEngine {
 
             const detail = classifyError({ message: err, name: errName, status: errStatus });
 
-            // Suspend-frozen verify (#6/#7): the probe was aborted, but this
+            // Suspend-frozen verify: the probe was aborted, but this
             // single attempt's wall-clock is far beyond what its own
             // per-attempt timer could have produced — the process was frozen
             // in mobile background and the OS tore the socket on resume. This
@@ -1200,7 +1202,7 @@ export class SyncEngine {
 
         // Budget exhausted without a reachable probe: genuinely unreachable.
         // Surface as network so the status bar shows it, but no toast (the
-        // host filters transient kinds). (#1d)
+        // host filters transient kinds).
         const detail = classifyError({ message: err ?? "timeout", name: errName, status: errStatus });
         if (detail.kind === "unknown" || detail.kind === "aborted") {
             detail.kind = "network";

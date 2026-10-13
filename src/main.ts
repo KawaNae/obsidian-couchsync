@@ -81,14 +81,14 @@ export default class CouchSyncPlugin extends Plugin {
     private compositionTracker!: ObsidianCompositionTracker;
     private compositionGate!: CompositionGate;
     private vaultWriter!: EditorAwareVaultWriter;
-    /** Phase 2 (v0.26): per-DB crypto principals (invariant 18). Each
+    /** v0.26: per-DB crypto principals. Each
      *  DB is its own crypto root — same passphrase + different salts →
      *  different keys. vault:meta unlocks `vaultCryptoProvider`; the
      *  config key lives on the current `ConfigBinding` (dropped whenever
      *  the config DB name changes). */
     private vaultCryptoProvider?: CryptoProvider;
-    /** Transient compression override active only during Clone (Invariant
-     *  C — setup atomicity). The vault decorator stack reads
+    /** Transient compression override active only during Clone, so that
+     *  a failed Clone leaves the persisted settings untouched. The vault decorator stack reads
      *  `activeCompression`, not `settings.compressionEnabled` directly, so
      *  Clone can run the remote's codec config in-memory and persist
      *  `settings.compressionEnabled` only on success. Undefined at all
@@ -113,12 +113,12 @@ export default class CouchSyncPlugin extends Plugin {
      * on every invocation, so Init/Clone state changes propagate to all
      * vault-side consumers (VaultRemoteOps + SyncEngine) automatically.
      *
-     * Compose order encodes invariant 10: `compress(encrypt(raw))` on
+     * Compose order is `compress(encrypt(raw))`: compress runs first on
      * push so the plain payload reaches gzip before the cipher renders
      * the stream incompressible. Pull traverses the inverse order.
      */
     private wrapVaultClient = (raw: ICouchClient): ICouchClient => {
-        // Policy-gated codec stack (Invariant III). The encryption POLICY
+        // Policy-gated codec stack (fail-closed). The encryption POLICY
         // (`encryptionEnabled`) gates whether the encrypt layer is applied —
         // not the provider's existence. A stale in-memory provider left over
         // from a prior encrypted session must not activate the encrypt layer
@@ -146,7 +146,8 @@ export default class CouchSyncPlugin extends Plugin {
     /** Compression flag the vault decorator stack actually uses. Equals
      *  the persisted setting except during Clone, when the remote's flag
      *  is applied in-memory before `settings.compressionEnabled` is
-     *  committed (Invariant C). See `compressionOverride`. */
+     *  committed, so a failed Clone persists nothing. See
+     *  `compressionOverride`. */
     private get activeCompression(): boolean {
         return this.compressionOverride ?? this.settings.compressionEnabled;
     }
@@ -154,8 +155,8 @@ export default class CouchSyncPlugin extends Plugin {
     /** cipherVersion policy floor the vault decorator stack enforces. Equals
      *  the persisted floor (`settings.vaultCipherVersion`, TOFU) except during
      *  Clone, when the just-unlocked remote meta's cipherVersion is applied
-     *  in-memory before the floor is committed (Invariant C). See
-     *  `cipherVersionOverride`. */
+     *  in-memory before the floor is committed, so a failed Clone
+     *  persists nothing. See `cipherVersionOverride`. */
     private get activeCipherVersion(): number | undefined {
         return this.cipherVersionOverride ?? this.settings.vaultCipherVersion;
     }
@@ -242,7 +243,7 @@ export default class CouchSyncPlugin extends Plugin {
     }
 
     /**
-     * The single, supervised encryption-agreement gate (#1c). Passed to
+     * The single, supervised encryption-agreement gate. Passed to
      * SyncEngine as `preCatchupCheck`, so it runs inside openSession before
      * catchup — and crucially, under the engine's retry supervision.
      *
@@ -252,7 +253,7 @@ export default class CouchSyncPlugin extends Plugin {
      *     reconcile the compression flag. Returns normally → catchup proceeds.
      *   - transient network/abort while checking → throws the raw error,
      *     which openSession routes to `enterError` → retry-backoff. The
-     *     network's return auto-recovers it (this is the #1 fix: the old
+     *     network's return auto-recovers it (the old
      *     onload gate dead-`return`ed here and never retried).
      *   - user-actionable state (server downgrade, cross-device mismatch,
      *     pre-v2 legacy meta, wrong passphrase) → `encryptionPause()` sets
@@ -342,7 +343,7 @@ export default class CouchSyncPlugin extends Plugin {
      *  "tested" connectionState (so the next onload won't auto-sync and the
      *  settings tab shows the re-Init affordance) and return a terminal
      *  `encryptionPaused` error for the caller to throw. The host toasts the
-     *  message once via the "error" event (#1d). */
+     *  message once via the "error" event. */
     private async encryptionPause(message: string): Promise<Error> {
         this.settings.connectionState = "tested";
         await this.saveSettings();
@@ -392,11 +393,11 @@ export default class CouchSyncPlugin extends Plugin {
         this.auth = new AuthGate();
         // ChunkHasher: bundles the hash function with its own algorithm
         // identity so the chunk id is stamped with the truly-used tag
-        // (`chunk:x64:<xxhash>` vs `chunk:hmac:<HMAC>`). Phase 2 splits
-        // this into two — vault and config each read their own
+        // (`chunk:x64:<xxhash>` vs `chunk:hmac:<HMAC>`). There are
+        // two — vault and config each read their own
         // cryptoProvider live via closure, so encryption-state changes
         // propagate without rebuilding the hasher and the two DBs mint
-        // chunk ids in disjoint id spaces (invariant 18). Constructed here
+        // chunk ids in disjoint id spaces. Constructed here
         // (before remoteOps) because VaultRemoteOps.pullAll now verifies
         // pulled chunks with it — the authenticated Clone fetch boundary.
         //
@@ -436,7 +437,7 @@ export default class CouchSyncPlugin extends Plugin {
         // used by VaultWriter only on the deletion path (the modify
         // path now relies on chunksEqual idempotency in fileToDb).
         this.vaultWriter.setWriteIgnore(this.changeTracker);
-        // Late-bind the pending-edit probe (invariant 4). VaultSync uses
+        // Late-bind the pending-edit probe. VaultSync uses
         // it from `hasUnpushedChanges` to detect debounced user edits
         // before applying a remote deletion.
         this.vaultSync.setPendingProbe(this.changeTracker);
@@ -492,7 +493,7 @@ export default class CouchSyncPlugin extends Plugin {
             () => this.settings,
             {
                 // Real own-data.json path so ConfigSync excludes it from
-                // replication even under a renamed plugin folder (#14).
+                // replication even under a renamed plugin folder.
                 // manifest.dir is the actual install dir; fall back to the
                 // configDir + id composition.
                 ownDataJsonPath: this.manifest.dir
@@ -556,11 +557,11 @@ export default class CouchSyncPlugin extends Plugin {
             () => this.replicator.getLastErrorDetail(),
         );
         this.replicator.events.on("state-change", ({ state }) => this.statusBar.update(state));
-        // Single notify authority (#1d). Only user-actionable errors warrant
+        // Single notify authority. Only user-actionable errors warrant
         // a Notice; transient kinds (network / timeout / aborted / server /
         // not-found) auto-recover and are shown via the status bar alone —
-        // toasting every blip was the spurious resume-notification noise
-        // (#6). encryption-paused additionally re-runs the onload reconcile,
+        // toasting every blip was the spurious resume-notification noise.
+        // encryption-paused additionally re-runs the onload reconcile,
         // preserving the local-state pass the old onload gate did on pause.
         this.replicator.events.on("error", ({ message, kind }) => {
             const userActionable =
@@ -641,7 +642,7 @@ export default class CouchSyncPlugin extends Plugin {
         this.reconciler.setConflictOrchestrator(this.conflictOrchestrator);
 
         // Pull-driven deletions are handled entirely inside the pull-writer
-        // now (#del-1): the unpushed-edit probe is the `probeUnpushed` DI wired
+        // now: the unpushed-edit probe is the `probeUnpushed` DI wired
         // into SyncEngine below, and the deletion is applied through the same
         // durable accepted→pending-deletion→drain path as a soft-delete rather
         // than the former tx-external applyRemoteDeletion in this handler.
@@ -765,7 +766,7 @@ export default class CouchSyncPlugin extends Plugin {
                     );
                 }
                 // The config key is NOT derived here: config is an
-                // independent crypto principal (invariant 18) and its key must
+                // independent crypto principal and its key must
                 // not depend on the vault's connectionState. Every config op
                 // unlocks it in the binding's preflight (or Join / Create).
             }
@@ -839,8 +840,8 @@ export default class CouchSyncPlugin extends Plugin {
             // SyncEngine session as the supervised preCatchupCheck
             // (`reconcileEncryptionAgreement`), NOT as an unsupervised onload
             // gate. The old gate's catch `return`ed on a transient fetch
-            // failure and left sync permanently dead until a manual reload
-            // (#1). Funnelling the single gate through openSession means a
+            // failure and left sync permanently dead until a manual reload.
+            // Funnelling the single gate through openSession means a
             // network blip now throws into the retry loop and auto-recovers
             // when the network returns; user-actionable states pause via the
             // encryption-paused terminal kind. So onload just starts the
@@ -908,7 +909,7 @@ export default class CouchSyncPlugin extends Plugin {
     async initVault(): Promise<void> {
         this.replicator.stop();
         this.changeTracker.stop();
-        // Invariant C: drop to a non-syncable state and persist it BEFORE
+        // Setup atomicity: drop to a non-syncable state and persist it BEFORE
         // setupService.init destroys the local DB. A failure (or a crash)
         // mid-init then leaves "settingUp", never the prior setupDone/
         // syncing — so the user can't start sync on a half-built DB.
@@ -941,8 +942,8 @@ export default class CouchSyncPlugin extends Plugin {
                     ...existing,
                     // Preserve salt + keyCheck (same passphrase still unlocks),
                     // but stamp the current cipher format: a re-init on a build
-                    // that writes encBody bodies produces a cipherVersion-3 vault
-                    // (#2). Without this the marker would wrongly stay at the
+                    // that writes encBody bodies produces a cipherVersion-3 vault.
+                    // Without this the marker would wrongly stay at the
                     // value the vault was first created with.
                     encryption: { ...existing.encryption, cipherVersion: 3 },
                     compression: compress
@@ -997,7 +998,7 @@ export default class CouchSyncPlugin extends Plugin {
         );
         const meta = await fetchVaultMeta(rawClient);
 
-        // Invariant C: Clone is a transaction. We derive the remote's codec
+        // Clone is a transaction. We derive the remote's codec
         // config into IN-MEMORY state only (vaultCryptoProvider for
         // encryption, compressionOverride for compression) so the pull can
         // decrypt/decompress, but we DO NOT touch persisted settings until

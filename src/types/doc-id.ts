@@ -16,7 +16,7 @@
  * Adding a new hash function (e.g. blake3) introduces a new tag (`b3`,
  * etc.) that coexists in the same namespace — old `chunk:x64:...` ids
  * and new `chunk:b3:...` ids can live side-by-side, with the algorithm
- * trivially derivable from the id alone (invariant 14).
+ * trivially derivable from the id alone.
  *
  * All three replicated prefixes (`file:`, `chunk:`, `config:`) are
  * lexicographically disjoint, so `allDocs({ startkey, endkey })` range

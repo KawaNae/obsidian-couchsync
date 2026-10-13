@@ -63,10 +63,10 @@ export class ChangeTracker implements IWriteIgnore, IPendingProbe {
             })
         );
 
-        // Folder delete (invariant S1/S6): Obsidian fires one event for the
-        // folder, not per descendant file. Desugar into per-file markDeleted
-        // by enumerating the children from the DB (they are already gone from
-        // the vault FS). The reconcile backstop (invariant S2) recovers any
+        // Folder delete: Obsidian fires one event for the folder, not per
+        // descendant file, and folders have no document of their own. Desugar
+        // into per-file markDeleted by enumerating the children from the DB
+        // (they are already gone from the vault FS). Reconcile recovers any
         // children missed here (e.g. an event dropped on mobile).
         this.eventRefs.push(
             this.events.on("folder-delete", (path) => {
@@ -75,10 +75,10 @@ export class ChangeTracker implements IWriteIgnore, IPendingProbe {
                 );
             })
         );
-        // NB: folder-rename live desugaring is Phase 2. Until then a folder
-        // rename converges via reconcile (old paths → delete, new paths →
-        // push); no live handler is wired, but the event is surfaced so a
-        // folder path never reaches the file `rename` handler (S6).
+        // NB: folder renames are not desugared live yet; a folder rename
+        // converges via reconcile (old paths → delete, new paths → push). No
+        // live handler is wired, but the event is surfaced so a folder path
+        // never reaches the file `rename` handler.
     }
 
     stop(): void {
@@ -107,7 +107,7 @@ export class ChangeTracker implements IWriteIgnore, IPendingProbe {
     }
 
     /**
-     * **Invariant 4 (Pending-edit oracle).** True iff a debounced or
+     * **Pending-edit oracle.** True iff a debounced or
      * min-interval-deferred `fileToDb` is scheduled for `path`. Echo
      * suppressors (`pendingDeleteIgnores` / `pendingModifyIgnores`) do
      * NOT count — those mark sync-driven events, not user edits.

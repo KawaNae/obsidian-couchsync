@@ -13,7 +13,7 @@
  *   - `sync/chunk-consistency.ts` — cross-store diff
  *
  * Centralising the rule prevents the callers from drifting on what
- * counts as a reference. Invariant 16: chunk reference graphs are
+ * counts as a reference. Chunk reference graphs are
  * scoped to a single owner-doc kind; mixing vault and config refs in
  * one map would silently break orphan accounting.
  */

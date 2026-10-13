@@ -24,7 +24,8 @@ import type { PullWriter } from "./pull-writer.ts";
 import type { SyncEvents } from "./sync-events.ts";
 import type { Checkpoints } from "./checkpoints.ts";
 import { classifyError } from "./errors.ts";
-// Codec error from its decorator-independent home (#18).
+// Codec error from its decorator-independent home, so the sync stack does
+// not compile-depend on the EncryptingCouchClient decorator.
 import { EncryptionError } from "../codec-errors.ts";
 import type { VisibilityGate } from "../visibility-gate.ts";
 
@@ -108,7 +109,7 @@ export class PullPipeline {
                     // timeout halt catchup if it never clears, instead of
                     // tearing the whole session down. A non-retriable
                     // EncryptionError (downgrade gate) falls through to throw →
-                    // classifyError → schema-mismatch → terminal. (#enc-1)
+                    // classifyError → schema-mismatch → terminal.
                     await this.deps.delay(this.retryMs);
                     this.retryMs = Math.min(this.retryMs * 2, PULL_RETRY_MAX_MS);
                     continue;
@@ -139,7 +140,7 @@ export class PullPipeline {
                     this.deps.handleLocalDbError(e, "checkpoint save");
                 }
                 // One drain at catchup end: chunks for files pulled earlier
-                // in this catchup may now all be durable (Invariant B).
+                // in this catchup may now all be durable.
                 await this.deps.pullWriter.drainPendingApply();
                 // And re-present any deletion conflicts parked by a prior
                 // session — this is the load-bearing restart recovery: it runs
@@ -237,7 +238,7 @@ export class PullPipeline {
                             // classifyError maps it to schema-mismatch, which
                             // handleTransientError escalates to a hard error
                             // immediately — no backoff, no 10s grace. Exit the
-                            // loop; the session is terminal. (#enc-1)
+                            // loop; the session is terminal.
                             this.deps.onTransientError(e);
                             exitReason = "halted";
                             return;
@@ -283,7 +284,7 @@ export class PullPipeline {
         // tx — advance the checkpoint explicitly here. Otherwise
         // commitPullBatch already advanced remoteSeq inside its onCommit.
         // A delete-only batch can still carry a deletion-vs-edit conflict;
-        // persist it in the SAME tx as the cursor advance (Invariant B).
+        // persist it in the SAME tx as the cursor advance.
         if (applied.empty) {
             try {
                 await this.deps.checkpoints.saveEmptyPullBatch(
@@ -293,10 +294,10 @@ export class PullPipeline {
                 this.deps.handleLocalDbError(e, "checkpoint save");
             }
         }
-        // Invariant B: retry any files checkpointed-past without a vault
+        // Pull durability: retry any files checkpointed-past without a vault
         // write (chunks landed late). Short-circuits when the set is empty.
         await this.deps.pullWriter.drainPendingApply();
-        // Invariant B (deletion-conflict class): re-present any persisted
+        // Same for the deletion-conflict class: re-present any persisted
         // remote-deletion-vs-local-edit conflicts not yet shown this session
         // (e.g. parked by a prior session before a restart).
         await this.deps.pullWriter.drainPendingConflict();

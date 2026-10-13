@@ -12,7 +12,7 @@
  * (A boolean-aggregated query API — `emitAsyncAny` / `onQuery` — used to
  * live here for the `pull-delete` "does anyone have unpushed edits?" probe.
  * Its catch swallowed I/O errors into a `false` (= apply the deletion),
- * violating the safe-side principle (#err-10). The single subscriber was
+ * violating the safe-side principle. The single subscriber was
  * promoted to the `probeUnpushed` function DI on the pull-writer and the
  * query API was removed so the trap can't be fallen into again.)
  *
@@ -43,7 +43,7 @@ export interface SyncEventMap {
      *  user-actionable kinds (auth / schema-mismatch / encryption-paused)
      *  warrant a toast. Transient kinds (network / timeout / aborted /
      *  server / not-found) auto-recover and are shown via the status bar
-     *  only — toasting every blip was the resume-notification noise. (#6) */
+     *  only — toasting every blip was the resume-notification noise. */
     error: { message: string; kind: SyncErrorKind };
     paused: void;
     reconnect: void;
@@ -62,7 +62,7 @@ export interface SyncEventMap {
      *  a reconciler pass so dbToFile retries on the next cycle, instead
      *  of waiting for visibility/reconnect to bring the next catchup.
      *  Without this trigger, idle longpoll persists divergent state
-     *  indefinitely (verified by the 2026-05-06 phantom-write probe). */
+     *  indefinitely (verified by a phantom-write reproduction). */
     "pull-skipped": { count: number };
     "catchup-complete": void;
     "catchup-failed": void;

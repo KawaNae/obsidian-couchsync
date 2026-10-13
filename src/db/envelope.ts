@@ -17,10 +17,10 @@
  *
  * The order of operations is fixed: on push the body is compressed
  * before it is encrypted (`encrypt(compress(plain))`). The header
- * records what was applied; the order is implicit in invariant 10.
+ * records what was applied; the order itself is fixed, not recorded.
  *
  * Plaintext + uncompressed attachments still carry the `0x00` header
- * for universal self-description (invariant 12). Plaintext string
+ * so every attachment is self-describing. Plaintext string
  * fields without encryption keep their bare base64 encoding — the
  * format is unambiguous and an envelope adds no information.
  */

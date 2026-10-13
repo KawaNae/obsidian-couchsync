@@ -4,14 +4,14 @@
  * yet be applied to the vault, because one or more of their chunks were
  * missing on the remote at apply time.
  *
- * This is the pull-side mirror of `unpushed-ids.ts` (Invariant B — pull
- * durability). The push pipeline never advances `lastPushedSeq` past an
+ * This is the pull-side mirror of `unpushed-ids.ts` (pull durability).
+ * The push pipeline never advances `lastPushedSeq` past an
  * id without either placing it on remote or recording it in the unpushed
  * set; symmetrically, the pull pipeline must never advance `remoteSeq`
  * past a file doc without either applying it to the vault or recording it
  * here for retry. Without this set a file whose chunks land slightly
- * after its doc (the race Invariant A prevents at the source, but cannot
- * cover for cross-device / cross-cycle / expired-attachment cases) would
+ * after its doc (the race the push order contract prevents at the source,
+ * but cannot cover for cross-device / cross-cycle / expired-attachment cases) would
  * be checkpointed-past and never re-attempted — a permanent ghost.
  *
  * Stored as one meta entry per id (`_sync/pending-apply/<fileDocId>`)
@@ -37,7 +37,7 @@ export type PendingApplyReason =
      *  process is killed between the durable tombstone commit and the vault
      *  delete, the deletion silently un-applies (LocalDB tombstone vs surviving
      *  vault file). Recorded so `drainPendingApply` re-applies the deletion —
-     *  the symmetric counterpart of `missing-chunks` for deletions (#5). */
+     *  the symmetric counterpart of `missing-chunks` for deletions. */
     | "pending-deletion";
 
 export interface PendingApplyEntry {

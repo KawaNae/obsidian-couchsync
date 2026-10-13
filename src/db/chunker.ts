@@ -118,7 +118,7 @@ function splitBinary(bytes: Uint8Array, chunkBytes: number): Uint8Array[] {
  *  Required because encrypted vaults swap `computeHash` (xxhash64) for
  *  `cryptoProvider.hmacHash` — the chunker can't tell from the function
  *  alone which algorithm produced the bytes, so the algorithm must be
- *  declared alongside (invariant 14). The `alg` getter is consulted on
+ *  declared alongside so the chunk id names it. The `alg` getter is consulted on
  *  every chunk so live changes to the underlying crypto state propagate
  *  without re-wiring the hasher. */
 export interface ChunkHasher {
@@ -195,7 +195,7 @@ function isChunkHasher(x: ChunkerConfig | ChunkHasher): x is ChunkHasher {
 }
 
 export function joinChunks(chunks: ChunkDoc[]): ArrayBuffer {
-    // Fail-closed (Invariant I): a ChunkDoc is only usable when it carries a
+    // Fail-closed: a ChunkDoc is only usable when it carries a
     // real content buffer. A content-less doc (e.g. carried over from an old
     // schema, or a partial/corrupt write) must raise a typed, routable error
     // here rather than an opaque `TypeError: cannot read 'length' of

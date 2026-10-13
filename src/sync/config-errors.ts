@@ -29,7 +29,7 @@ export type ConfigNotReadyKind =
     | "uninitialized"
     /** No `config:meta` but docs exist — legacy layout or an interrupted setup. */
     | "meta-missing"
-    /** `config:meta` schemaVersion 1 (pre-Phase-2 legacy root). */
+    /** `config:meta` schemaVersion 1 (legacy root cloned from `vault:meta`, pre-v0.26). */
     | "legacy-meta"
     /** This device has not joined the configured config DB. */
     | "unattached"
@@ -50,7 +50,7 @@ export type ConfigNotReadyKind =
     | "encryption-removed"
     /** `config:meta` cipherVersion below the local floor — possible tampering. */
     | "cipher-downgrade"
-    /** This device's Create died mid-flight (#err-9). */
+    /** This device's Create died mid-flight (the setup flag is still set). */
     | "setup-interrupted"
     /** Push needs a device name to advance vclocks. */
     | "device-id-missing"

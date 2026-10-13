@@ -71,8 +71,8 @@ export class ObsidianVaultEvents implements IVaultEvents {
                 );
             // `delete` and `folder-delete` share Obsidian's single `delete`
             // event; the `isTFile` guard routes each abstract file to exactly
-            // one channel (invariant S6 — a folder path never reaches a
-            // file-only handler). Likewise `rename` / `folder-rename`.
+            // one channel (a folder path never reaches a file-only
+            // handler). Likewise `rename` / `folder-rename`.
             case "delete":
                 return wrap(
                     this.app.vault.on("delete", (file: TAbstractFile) => {
