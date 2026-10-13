@@ -23,6 +23,14 @@ All notable changes to obsidian-couchsync.
   ("cannot decompress still-encrypted body"). Clone now pulls with the
   cloned vault's encryption, like its compression, and saves both only when
   it succeeds.
+- **A quarantined file recovers when its chunks reach the server again.**
+  A file whose chunks were missing here and on the server stayed missing
+  after another device pushed the chunks, because a reconcile that saw no
+  change in the local database skipped it. The same held for a file whose
+  restore was skipped while offline and for a file cloned without its
+  chunks. Such files are now recorded with the pulled files that could not
+  be written yet, and both live sync and every reconcile retry that record,
+  without rescanning the vault.
 - **Init encrypts the new vault with the Step 1 passphrase.** When the vault
   key was already unlocked in the session, Init kept the previous
   `vault:meta`'s salt and key, so a passphrase changed in Step 1 was ignored

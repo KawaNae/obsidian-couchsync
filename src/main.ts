@@ -397,7 +397,7 @@ export default class CouchSyncPlugin extends Plugin {
             this.vaultSync,
             () => this.settings,
             (msg) => notify(msg),
-            (doc) => this.replicator.ensureFileChunks(doc),
+            this.replicator.pendingApply,
         );
         this.setupService = new SetupService(
             vaultIO, this.localDb, this.remoteOps, this.vaultSync, this.reconciler,

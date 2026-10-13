@@ -26,6 +26,7 @@ import { makeFileId } from "../../src/types/doc-id.ts";
 import type { FileDoc, CouchSyncDoc } from "../../src/types.ts";
 import { ALWAYS_VISIBLE } from "../../src/db/visibility-gate.ts";
 import { EncryptionError } from "../../src/db/codec-errors.ts";
+import { makePendingApply } from "../helpers/pending-apply.ts";
 
 interface PipelineRig {
     pipeline: PullPipeline;
@@ -51,6 +52,7 @@ function attachPullPipeline(opts: {
     const pausedCount = { value: 0 };
     events.on("paused", () => { pausedCount.value++; });
 
+    const pendingApply = makePendingApply(opts.device.db);
     const pullWriter = new PullWriter({
         localDb: opts.device.db,
         events,
@@ -58,6 +60,7 @@ function attachPullPipeline(opts: {
         checkpoints,
         getConflictResolver: () => opts.device.resolver,
         ensureChunks: async () => {},
+        pendingApply,
     });
 
     let cancelled = false;
@@ -68,6 +71,7 @@ function attachPullPipeline(opts: {
     const pipeline = new PullPipeline({
         client: opts.couch,
         pullWriter,
+        pendingApply,
         checkpoints,
         events,
         sessionEpoch: 1,

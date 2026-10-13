@@ -23,7 +23,8 @@ import {
     loadAllPendingConflict,
     clearPendingConflict,
 } from "../../src/db/sync/pending-conflict.ts";
-import { loadAllPendingApply } from "../../src/db/sync/pending-apply.ts";
+import { loadAllPendingApply, type PendingApply } from "../../src/db/sync/pending-apply.ts";
+import { makePendingApply } from "../helpers/pending-apply.ts";
 import { ConflictResolver } from "../../src/conflict/conflict-resolver.ts";
 import type { WriteResult } from "../../src/sync/vault-writer.ts";
 import { makeFileId, makeChunkId } from "../../src/types/doc-id.ts";
@@ -34,6 +35,7 @@ import * as log from "../../src/ui/log.ts";
 
 interface WriterRig {
     writer: PullWriter;
+    pendingApply: PendingApply;
     echoes: EchoTracker;
     events: SyncEvents;
     checkpoints: Checkpoints;
@@ -63,6 +65,16 @@ function attachPullWriter(opts: {
     const checkpoints = new Checkpoints(opts.device.db);
     const resolver = opts.withResolver ? new ConflictResolver() : undefined;
     const callback = opts.applyPullWrite;
+    const applyPullWrite = async (doc: FileDoc): Promise<WriteResult> => {
+        if (!callback) return { applied: true };
+        const ret = await callback(doc);
+        // Backwards-compat: legacy callbacks returning void are treated as success.
+        return ret ?? { applied: true };
+    };
+    const pendingApply = makePendingApply(opts.device.db, {
+        ensureChunks: opts.ensureChunks,
+        write: applyPullWrite,
+    });
     const writer = new PullWriter({
         localDb: opts.device.db,
         events,
@@ -70,16 +82,12 @@ function attachPullWriter(opts: {
         checkpoints,
         getConflictResolver: () => resolver,
         ensureChunks: opts.ensureChunks ?? (async () => {}),
+        pendingApply,
         getRemoteDoc: opts.getRemoteDoc ?? (async () => null),
-        applyPullWrite: async (doc) => {
-            if (!callback) return { applied: true };
-            const ret = await callback(doc);
-            // Backwards-compat: legacy callbacks returning void are treated as success.
-            return ret ?? { applied: true };
-        },
+        applyPullWrite,
         probeUnpushed: opts.probeUnpushed ?? (async () => false),
     });
-    return { writer, echoes, events, checkpoints };
+    return { writer, pendingApply, echoes, events, checkpoints };
 }
 
 /** Pre-populate B's DB with a FileDoc carrying the given vclock. */
@@ -685,7 +693,7 @@ describe("PullWriter integration", () => {
                 [{ id: makeFileId("doomed.md"), seq: "3", deleted: true }], "3",
             ));
             // The pending-deletion entry is durable → the drain re-applies it.
-            await rig.writer.drainPendingApply();
+            await rig.pendingApply.drain();
 
             const stored = await b.db.get<FileDoc>(makeFileId("doomed.md"));
             expect(stored?.deleted).toBe(true); // no permanent loss
@@ -720,7 +728,7 @@ describe("PullWriter integration", () => {
     // A file pulled while its chunk is not yet durable must NOT be
     // checkpointed-past silently: it is recorded in the pending-apply set
     // (in the same tx as the remoteSeq advance) and recovered by
-    // drainPendingApply once the chunk becomes available.
+    // the PendingApply drain once the chunk becomes available.
 
     describe("pull durability — pending-apply recovery", () => {
         const PENDING_PREFIX = "_sync/pending-apply/";
@@ -731,32 +739,43 @@ describe("PullWriter integration", () => {
             const echoes = new EchoTracker();
             const checkpoints = new Checkpoints(device.db);
             const state = { chunkReady: false };
+            const ensureChunks = async (): Promise<void> => {
+                // Models remote fetch: only lands the chunk locally once
+                // it is durable on the remote.
+                if (!state.chunkReady) return;
+                await device.db.runWriteTx({
+                    chunks: [{
+                        _id: chunkId, type: "chunk", schemaVersion: 1,
+                        content: new Uint8Array([1, 2, 3]),
+                    } as unknown as CouchSyncDoc],
+                });
+            };
+            const applyPullWrite = async (doc: FileDoc): Promise<WriteResult> => {
+                const have = await device.db.getChunks(doc.chunks);
+                if (have.length < doc.chunks.length) {
+                    throw new Error(`Missing ${doc.chunks.length - have.length} chunk(s)`);
+                }
+                return { applied: true };
+            };
+            // The engine wires a recovery to the auto-resolve event; mirror it.
+            const pendingApply = makePendingApply(device.db, {
+                ensureChunks,
+                write: applyPullWrite,
+                onRecovered: (filePath) => events.emit("auto-resolve", { filePath }),
+            });
             const writer = new PullWriter({
                 localDb: device.db,
                 events,
                 echoes,
                 checkpoints,
                 getConflictResolver: () => undefined,
-                ensureChunks: async () => {
-                    // Models remote fetch: only lands the chunk locally once
-                    // it is durable on the remote.
-                    if (!state.chunkReady) return;
-                    await device.db.runWriteTx({
-                        chunks: [{
-                            _id: chunkId, type: "chunk", schemaVersion: 1,
-                            content: new Uint8Array([1, 2, 3]),
-                        } as unknown as CouchSyncDoc],
-                    });
-                },
-                applyPullWrite: async (doc) => {
-                    const have = await device.db.getChunks(doc.chunks);
-                    if (have.length < doc.chunks.length) {
-                        throw new Error(`Missing ${doc.chunks.length - have.length} chunk(s)`);
-                    }
-                    return { applied: true };
-                },
+                ensureChunks,
+                pendingApply,
+                getRemoteDoc: async () => null,
+                applyPullWrite,
+                probeUnpushed: async () => false,
             });
-            return { writer, events, checkpoints, state };
+            return { writer, pendingApply, events, checkpoints, state };
         }
 
         it("records the file when its chunk is missing, advancing remoteSeq", async () => {
@@ -777,7 +796,7 @@ describe("PullWriter integration", () => {
             expect(pending.map((p) => p.key)).toEqual([PENDING_PREFIX + fileDoc._id]);
         });
 
-        it("drainPendingApply recovers the file once the chunk is durable, then empties the set", async () => {
+        it("the drain recovers the file once the chunk is durable, then empties the set", async () => {
             h = createSyncHarness();
             const b = h.addDevice("dev-B");
             const chunkId = makeChunkId("cafef00dcafef00d");
@@ -789,17 +808,18 @@ describe("PullWriter integration", () => {
             ));
             expect((await b.db.getMetaByPrefix(PENDING_PREFIX)).length).toBe(1);
 
-            // Drain while the chunk is still missing → stays pending, bumps attempt.
-            await rig.writer.drainPendingApply();
-            const stillPending = await b.db.getMetaByPrefix<{ attempts: number }>(PENDING_PREFIX);
+            // Drain while the chunk is still missing → stays pending, now
+            // marked broken (the modelled server does not have the chunk).
+            await rig.pendingApply.drain();
+            const stillPending = await b.db.getMetaByPrefix<{ missingChunks?: string[] }>(PENDING_PREFIX);
             expect(stillPending.length).toBe(1);
-            expect(stillPending[0].value.attempts).toBe(1);
+            expect(stillPending[0].value.missingChunks).toEqual([chunkId]);
 
             // Chunk becomes durable → next drain applies the file and clears it.
             const recovered: string[] = [];
             rig.events.on("auto-resolve", ({ filePath }) => recovered.push(filePath));
             rig.state.chunkReady = true;
-            await rig.writer.drainPendingApply();
+            await rig.pendingApply.drain();
 
             expect(await b.db.getMetaByPrefix(PENDING_PREFIX)).toEqual([]);
             expect(recovered).toContain("late.md");
@@ -818,7 +838,7 @@ describe("PullWriter integration", () => {
             // Remove the file doc from LocalDB (e.g. superseded by a delete).
             await b.db.runWriteTx({ deletes: [fileDoc._id] });
 
-            await rig.writer.drainPendingApply();
+            await rig.pendingApply.drain();
             expect(await b.db.getMetaByPrefix(PENDING_PREFIX)).toEqual([]);
         });
     });
@@ -1058,7 +1078,7 @@ describe("PullWriter integration", () => {
             // Drain with a working writer re-applies the deletion and clears it.
             throwOnApply = false;
             appliedDocs.length = 0;
-            await rig.writer.drainPendingApply();
+            await rig.pendingApply.drain();
             expect(appliedDocs.some((d) => d._id === remoteDelete._id && d.deleted === true)).toBe(true);
             expect(await loadAllPendingApply(b.db)).toEqual([]);
         });

@@ -21,6 +21,7 @@ import type { ICouchClient, ChangesResult } from "../interfaces.ts";
 import { DbError } from "../write-transaction.ts";
 import { logDebug, logInfo } from "../../ui/log.ts";
 import type { PullWriter } from "./pull-writer.ts";
+import type { PendingApply } from "./pending-apply.ts";
 import type { SyncEvents } from "./sync-events.ts";
 import type { Checkpoints } from "./checkpoints.ts";
 import { classifyError } from "./errors.ts";
@@ -47,6 +48,8 @@ const PULL_RETRY_MAX_MS = 30_000;
 export interface PullPipelineDeps {
     client: ICouchClient;
     pullWriter: PullWriter;
+    /** Retried every cycle: docs committed but not yet in the vault. */
+    pendingApply: PendingApply;
     checkpoints: Checkpoints;
     events: SyncEvents;
     /** Session epoch, used as `[sess#N]` prefix on diagnostic logs so
@@ -141,7 +144,7 @@ export class PullPipeline {
                 }
                 // One drain at catchup end: chunks for files pulled earlier
                 // in this catchup may now all be durable.
-                await this.deps.pullWriter.drainPendingApply();
+                await this.deps.pendingApply.drain();
                 // And re-present any deletion conflicts parked by a prior
                 // session — this is the load-bearing restart recovery: it runs
                 // even when catchup found no new changes.
@@ -201,7 +204,7 @@ export class PullPipeline {
                         // chunk landing never wakes this loop on its own
                         // (chunks don't flow through _changes). Cheap no-op
                         // when the set is empty.
-                        await this.deps.pullWriter.drainPendingApply();
+                        await this.deps.pendingApply.drain();
                         await this.deps.pullWriter.drainPendingConflict();
                     }
                 } catch (e: any) {
@@ -296,7 +299,7 @@ export class PullPipeline {
         }
         // Pull durability: retry any files checkpointed-past without a vault
         // write (chunks landed late). Short-circuits when the set is empty.
-        await this.deps.pullWriter.drainPendingApply();
+        await this.deps.pendingApply.drain();
         // Same for the deletion-conflict class: re-present any persisted
         // remote-deletion-vs-local-edit conflicts not yet shown this session
         // (e.g. parked by a prior session before a restart).

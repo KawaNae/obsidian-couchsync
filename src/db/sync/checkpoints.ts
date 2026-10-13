@@ -110,7 +110,7 @@ export class Checkpoints {
         ];
         const now = Date.now();
         for (const { id, reason } of params.pendingApplyAdd ?? []) {
-            const entry: PendingApplyEntry = { addedAt: now, reason, attempts: 0 };
+            const entry: PendingApplyEntry = { addedAt: now, reason };
             meta.push({ op: "put", key: pendingApplyKey(id), value: entry });
         }
         for (const { id, kind } of params.pendingConflictAdd ?? []) {
@@ -128,32 +128,6 @@ export class Checkpoints {
     }
 
     /**
-     * Add and/or remove pending-apply entries. Used by the
-     * post-commit cleanup (remove the ids that applied cleanly) and by the
-     * drain (remove resolved ids, re-add still-missing ones with a bumped
-     * attempt count). A standalone tx — not paired with a cursor advance,
-     * because by the time we know an apply outcome the cursor has already
-     * committed; the pre-record in `commitPullBatch` is what bounds the
-     * cursor. Removing an absent key is a harmless no-op.
-     */
-    async commitPendingApply(params: {
-        add?: Array<{ id: string; reason: PendingApplyReason; attempts: number }>;
-        remove?: string[];
-    }): Promise<void> {
-        const meta: MetaWrite[] = [];
-        for (const id of params.remove ?? []) {
-            meta.push({ op: "delete", key: pendingApplyKey(id) });
-        }
-        const now = Date.now();
-        for (const { id, reason, attempts } of params.add ?? []) {
-            const entry: PendingApplyEntry = { addedAt: now, reason, attempts };
-            meta.push({ op: "put", key: pendingApplyKey(id), value: entry });
-        }
-        if (meta.length === 0) return;
-        await this.localDb.runWriteTx({ meta });
-    }
-
-    /**
      * Advance the remote checkpoint for a batch that produced no accepted
      * docs (empty fetch, or every row skipped by echo/keep-local). Persists
      * both seqs so the on-disk cursor matches in-memory state.
@@ -162,7 +136,7 @@ export class Checkpoints {
         nextRemoteSeq: number | string,
         pendingConflictAdd?: Array<{ id: string; kind: PendingConflictKind }>,
     ): Promise<void> {
-        // No-op guard (symmetric to commitPendingApply): a cycle that
+        // No-op guard (symmetric to PendingApply.record): a cycle that
         // proves "cursor unchanged AND nothing to record" writes nothing.
         // Sound because the in-memory seq only moves via load() (disk
         // truth) or a committed tx's onCommit — memory == disk holds, so

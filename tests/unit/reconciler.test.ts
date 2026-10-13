@@ -5,6 +5,7 @@ import type { DocsChangeSignature } from "../../src/db/dexie-store.ts";
 import type { FileDoc } from "../../src/types.ts";
 import { makeFileId, filePathFromId } from "../../src/types/doc-id.ts";
 import type { LastSynced } from "../../src/sync/last-synced.ts";
+import { PendingApply, type EnsureChunksResult } from "../../src/db/sync/pending-apply.ts";
 
 const SELF = "device-self";
 const OTHER = "device-other";
@@ -57,7 +58,7 @@ class FakeLocalDb {
     async putScanCursor(c: ScanCursor) { this.cursor = { ...c }; }
     async getVaultManifest() { return this.manifest; }
     async putVaultManifest(m: VaultManifest) { this.manifest = { paths: [...m.paths], updatedAt: m.updatedAt }; }
-    async allFileDocs(): Promise<FileDoc[]> { return [...this.fileDocs.values()]; }
+    async allFileDocs(): Promise<FileDoc[]> { this.allFileDocsCalls++; return [...this.fileDocs.values()]; }
     async getFileDoc(path: string) { return this.fileDocs.get(path) ?? null; }
     /** Mimic a docs-row write (a pull/push landing a FileDoc or chunk) —
      *  the only kind of write the Reconciler short-circuit must notice.
@@ -72,6 +73,20 @@ class FakeLocalDb {
     }
     async docsChangeSignature(): Promise<DocsChangeSignature> {
         return { ...this.docsSig };
+    }
+    /** Docs-store meta rows (the pending-apply set lives here). Meta writes
+     *  leave the docs signature untouched, as in the real store. */
+    meta = new Map<string, unknown>();
+    allFileDocsCalls = 0;
+    async get(id: string) { return this.fileDocs.get(filePathFromId(id)) ?? null; }
+    async getMetaByPrefix(prefix: string) {
+        return [...this.meta].filter(([k]) => k.startsWith(prefix)).map(([key, value]) => ({ key, value }));
+    }
+    async runWriteTx(tx: { meta?: Array<{ op: "put" | "delete"; key: string; value?: unknown }> }) {
+        for (const m of tx.meta ?? []) {
+            if (m.op === "put") this.meta.set(m.key, m.value);
+            else this.meta.delete(m.key);
+        }
     }
 }
 
@@ -97,7 +112,7 @@ interface FakeVaultSync {
     /** Paths the test marks as having unpushed local edits (Case F gate). */
     unpushed: Set<string>;
     fileToDb(path: string): Promise<void>;
-    dbToFile(doc: FileDoc): Promise<void>;
+    dbToFile(doc: FileDoc): Promise<{ applied: true }>;
     markDeleted(path: string): Promise<void>;
     applyRemoteDeletion(path: string): Promise<void>;
     hasUnpushedChanges(path: string): Promise<boolean>;
@@ -109,14 +124,6 @@ interface FakeVaultSync {
     lastSyncedMap: Map<string, LastSynced>;
     getLastSynced(path: string): LastSynced | undefined;
     computeVaultChunks(path: string): Promise<string[]>;
-    // Quarantine of broken FileDocs. Defaults to "nothing quarantined" so existing
-    // restore/pull tests are unaffected.
-    quarantinedCalls: string[];
-    clearedCalls: string[];
-    quarantined: Set<string>;
-    wasQuarantined(path: string): Promise<boolean>;
-    recordQuarantined(path: string, missingChunks: string[]): Promise<boolean>;
-    clearQuarantined(path: string): Promise<void>;
 }
 
 function makeVaultSync(): FakeVaultSync {
@@ -132,7 +139,7 @@ function makeVaultSync(): FakeVaultSync {
         async fileToDb(path) { this.fileToDbCalls.push(path); },
         // Record the bare vault path (not the prefixed _id) so tests can
         // keep asserting `expect(dbToFileCalls).toEqual(["a.md"])`.
-        async dbToFile(doc) { this.dbToFileCalls.push(filePathFromId(doc._id)); },
+        async dbToFile(doc) { this.dbToFileCalls.push(filePathFromId(doc._id)); return { applied: true as const }; },
         async markDeleted(path) { this.markDeletedCalls.push(path); },
         async applyRemoteDeletion(path) {
             this.applyRemoteDeletionCalls.push(path);
@@ -162,42 +169,38 @@ function makeVaultSync(): FakeVaultSync {
         lastSyncedMap: new Map<string, LastSynced>(),
         getLastSynced(path) { return this.lastSyncedMap.get(path); },
         async computeVaultChunks(_path) { return []; },
-        quarantinedCalls: [],
-        clearedCalls: [],
-        quarantined: new Set<string>(),
-        async wasQuarantined(path) { return this.quarantined.has(path); },
-        async recordQuarantined(path, _missingChunks) {
-            // Mirror the real isNew contract: record (and would-notify) only on
-            // a newly-quarantined path; repeat calls are silent.
-            const had = this.quarantined.has(path);
-            this.quarantined.add(path);
-            if (!had) this.quarantinedCalls.push(path);
-            return !had;
-        },
-        async clearQuarantined(path) {
-            this.clearedCalls.push(path);
-            this.quarantined.delete(path);
-        },
     };
 }
 
 function setup(
     files: FakeFile[],
-    ensureChunks?: (doc: FileDoc) => Promise<{ stillMissing: string[]; remoteConsulted: boolean }>,
+    ensureChunks: (doc: FileDoc) => Promise<EnsureChunksResult> =
+        async () => ({ stillMissing: [], remoteConsulted: true }),
 ) {
     const db = new FakeLocalDb();
     const vaultSync = makeVaultSync();
     const notifyCalls: string[] = [];
+    const quarantineNotices: string[] = [];
+    const ensureCalls: string[] = [];
     const vault = { getFiles: () => files };
+    const pendingApply = new PendingApply({
+        localDb: db as any,
+        ensureChunks: (doc) => {
+            ensureCalls.push(filePathFromId(doc._id));
+            return ensureChunks(doc);
+        },
+        write: (doc) => vaultSync.dbToFile(doc),
+        notify: (msg) => quarantineNotices.push(msg),
+    });
     const reconciler = new Reconciler(
         vault as any,
         db as any,
         vaultSync as any,
         () => ({ deviceId: SELF } as any),
         (msg) => notifyCalls.push(msg),
-        ensureChunks as any,
+        pendingApply,
     );
-    return { reconciler, db, vaultSync, files, notifyCalls };
+    return { reconciler, db, vaultSync, files, notifyCalls, quarantineNotices, ensureCalls, pendingApply };
 }
 
 describe("Reconciler", () => {
@@ -388,30 +391,43 @@ describe("Reconciler", () => {
             expect(r1.quarantined).toEqual(["a.md"]);
             expect(r1.restored).toEqual([]);
             expect(h.vaultSync.dbToFileCalls).toEqual([]); // no opaque restore attempt
-            expect(h.vaultSync.quarantinedCalls).toEqual(["a.md"]);
+            expect(await h.pendingApply.has(makeFileId("a.md"))).toBe(true);
+            expect(h.quarantineNotices).toHaveLength(1);
 
-            // Second cycle: re-probes (still broken) → stays quarantined, but
-            // recordQuarantined's isNew guard means no repeat notice, and it
-            // never reaches dbToFile so there is no restore ping-pong.
+            // Second cycle: re-probes (still broken) → stays quarantined, no
+            // repeat notice, and it never reaches dbToFile.
             const r2 = await h.reconciler.reconcile("manual");
+            expect(r2.quarantined).toEqual(["a.md"]);
             expect(r2.restored).toEqual([]);
             expect(h.vaultSync.dbToFileCalls).toEqual([]);
-            expect(h.vaultSync.quarantinedCalls).toEqual(["a.md"]); // not re-recorded (isNew=false)
+            expect(h.quarantineNotices).toHaveLength(1);
         });
 
         it("recovers a quarantined file once its chunks become available", async () => {
-            // ensureChunks now reports the chunks available (e.g. re-pushed) →
-            // reconcile clears the quarantine and restores.
-            const available = async () => ({ stillMissing: [], remoteConsulted: true });
-            const h = setup([], available);
+            let missing = ["chunk:x64:gone"];
+            const h = setup([], async () => ({ stillMissing: missing, remoteConsulted: true }));
             h.db.fileDocs.set("a.md", makeDoc("a.md", { lastWriter: OTHER }));
             h.db.manifest = { paths: [], updatedAt: 0 };
-            h.vaultSync.quarantined.add("a.md"); // previously quarantined
+            await h.reconciler.reconcile("manual");
+            expect(await h.pendingApply.has(makeFileId("a.md"))).toBe(true);
 
+            missing = []; // another device pushed the chunk
             const r = await h.reconciler.reconcile("manual");
-            expect(h.vaultSync.clearedCalls).toEqual(["a.md"]);
             expect(r.restored).toEqual(["a.md"]);
             expect(h.vaultSync.dbToFileCalls).toEqual(["a.md"]);
+            expect(await h.pendingApply.has(makeFileId("a.md"))).toBe(false);
+        });
+
+        it("records a restore skipped while offline, without a quarantine notice", async () => {
+            const h = setup([], async () => ({ stillMissing: ["chunk:x64:c"], remoteConsulted: false }));
+            h.db.fileDocs.set("a.md", makeDoc("a.md", { lastWriter: OTHER }));
+            h.db.manifest = { paths: [], updatedAt: 0 };
+
+            const r = await h.reconciler.reconcile("manual");
+            expect(r.restored).toEqual([]);
+            expect(r.quarantined).toEqual([]);
+            expect(await h.pendingApply.has(makeFileId("a.md"))).toBe(true);
+            expect(h.quarantineNotices).toEqual([]);
         });
     });
 
@@ -490,6 +506,64 @@ describe("Reconciler", () => {
             expect(totalDiscrepancies(r)).toBe(0);
             // No vaultSync calls because we never entered the loop
             expect(h.vaultSync.fileToDbCalls).toEqual([]);
+        });
+
+        it("retries a recorded broken file on the fast path without re-reading the DB", async () => {
+            let res: EnsureChunksResult = { stillMissing: ["chunk:x64:gone"], remoteConsulted: true };
+            const h = setup([], async () => res);
+            h.db.fileDocs.set("a.md", makeDoc("a.md", { lastWriter: OTHER }));
+            h.db.fileDocs.set("b.md", makeDoc("b.md", { lastWriter: OTHER }));
+            h.db.manifest = { paths: [], updatedAt: 0 };
+            const r1 = await h.reconciler.reconcile("manual");
+            expect(r1.shortCircuited).toBe(false);
+            expect(r1.quarantined.sort()).toEqual(["a.md", "b.md"]);
+            const scans = h.db.allFileDocsCalls;
+
+            // The broken files stay recorded; later runs take the fast path
+            // and probe only them — no full scan per run.
+            const r2 = await h.reconciler.reconcile("paused");
+            expect(r2.shortCircuited).toBe(true);
+            expect(h.db.allFileDocsCalls).toBe(scans);
+            expect(r2.quarantined.sort()).toEqual(["a.md", "b.md"]);
+
+            // The chunks reach the server; nothing in the docs table changes,
+            // yet the next run applies the files.
+            res = { stillMissing: [], remoteConsulted: true };
+            h.ensureCalls.length = 0;
+            const r3 = await h.reconciler.reconcile("paused");
+            expect(r3.shortCircuited).toBe(true);
+            expect(h.db.allFileDocsCalls).toBe(scans);
+            expect(h.ensureCalls.sort()).toEqual(["a.md", "b.md"]);
+            expect(r3.restored.sort()).toEqual(["a.md", "b.md"]);
+            expect(h.vaultSync.dbToFileCalls.sort()).toEqual(["a.md", "b.md"]);
+        });
+
+        it("applies a restore skipped offline once a later run is online", async () => {
+            let online = false;
+            const h = setup([], async () => ({ stillMissing: online ? [] : ["chunk:x64:c"], remoteConsulted: online }));
+            h.db.fileDocs.set("a.md", makeDoc("a.md", { lastWriter: OTHER }));
+            h.db.manifest = { paths: [], updatedAt: 0 };
+            await h.reconciler.reconcile("onload");
+            expect(h.vaultSync.dbToFileCalls).toEqual([]);
+
+            online = true;
+            const r = await h.reconciler.reconcile("reconnect");
+            expect(r.shortCircuited).toBe(true);
+            expect(r.restored).toEqual(["a.md"]);
+        });
+
+        it("an empty pending set costs no chunk probe on the fast path", async () => {
+            const h = setup([makeFile("a.md", 1000)]);
+            h.db.cursor = {
+                lastScanStartedAt: Date.now(),
+                lastScanCompletedAt: Date.now(),
+                lastSeenDocsSig: { maxDocSeq: 0, docCount: 0 },
+            };
+            h.db.manifest = { paths: ["a.md"], updatedAt: 0 };
+            const r = await h.reconciler.reconcile("paused");
+            expect(r.shortCircuited).toBe(true);
+            expect(h.ensureCalls).toEqual([]);
+            expect(h.db.allFileDocsCalls).toBe(0);
         });
 
         it("does not short-circuit when a docs row changed", async () => {

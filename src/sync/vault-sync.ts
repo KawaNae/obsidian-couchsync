@@ -91,13 +91,6 @@ export class VaultSync {
      */
     private skippedPaths: Set<PathKey> | null = null;
 
-    /**
-     * In-memory mirror of `_local/quarantined-files` paths (broken FileDocs the reconciler quarantined).
-     * Lets reconcile skip a restore attempt for a broken FileDoc without a
-     * DB read on every cycle.
-     */
-    private quarantinedPaths: Set<PathKey> | null = null;
-
     private syncFilterCache: { pattern: string; re: RegExp } | null = null;
     private syncIgnoreCache: { pattern: string; re: RegExp } | null = null;
 
@@ -1411,57 +1404,6 @@ export class VaultSync {
         delete doc.files[key];
         await this.db.putSkippedFiles(doc);
         this.skippedPaths?.delete(key);
-    }
-
-    // ── Quarantine: broken FileDocs whose chunks are
-    //    unavailable on both sides. Mirrors the skipped-files mechanism but
-    //    with chunk-arrival as the clear condition. ────────────────────────
-
-    private async loadQuarantinedCache(): Promise<Set<PathKey>> {
-        if (this.quarantinedPaths) return this.quarantinedPaths;
-        const doc = await this.db.getQuarantinedFiles();
-        this.quarantinedPaths = new Set(Object.keys(doc.files).map(toPathKey));
-        return this.quarantinedPaths;
-    }
-
-    /** True when `path` is quarantined (broken, restore suppressed). */
-    async wasQuarantined(path: string): Promise<boolean> {
-        const cache = await this.loadQuarantinedCache();
-        return cache.has(toPathKey(path));
-    }
-
-    /** Quarantine a broken FileDoc: record its missing chunks, suppress
-     *  further restore attempts, and notify once on a new/changed entry.
-     *  Returns true when this is a newly-quarantined (or changed) path. */
-    async recordQuarantined(path: string, missingChunks: string[]): Promise<boolean> {
-        const doc = await this.db.getQuarantinedFiles();
-        const key = toPathKey(path);
-        const existing = doc.files[key];
-        const isNew = !existing
-            || existing.missingChunks.length !== missingChunks.length
-            || existing.missingChunks.some((id, i) => id !== missingChunks[i]);
-        doc.files[key] = { missingChunks: [...missingChunks], quarantinedAt: Date.now() };
-        await this.db.putQuarantinedFiles(doc);
-        (await this.loadQuarantinedCache()).add(key);
-        if (isNew) {
-            notify(
-                `Quarantined "${path}" — ${missingChunks.length} chunk(s) missing ` +
-                    `on this device and the server. It will recover automatically if ` +
-                    `another device still has them.`,
-                8000,
-            );
-        }
-        return isNew;
-    }
-
-    /** Clear quarantine for `path` (its chunks became available again). */
-    async clearQuarantined(path: string): Promise<void> {
-        const doc = await this.db.getQuarantinedFiles();
-        const key = toPathKey(path);
-        if (!(key in doc.files)) return;
-        delete doc.files[key];
-        await this.db.putQuarantinedFiles(doc);
-        this.quarantinedPaths?.delete(key);
     }
 
     private async localChunkIds(path: string): Promise<string[]> {

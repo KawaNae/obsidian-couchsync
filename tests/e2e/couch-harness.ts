@@ -320,16 +320,17 @@ export async function createE2EHarness(opts: CreateE2EHarnessOpts = {}): Promise
         );
         engine.setChunkHasher(hasher);
 
-        // Reconciler wired to the real engine's ensureFileChunks so e2e tests
-        // can exercise the onload/manual reconcile path (broken-chunk
-        // quarantine, restore) against real CouchDB.
+        // Reconciler wired to the real engine's PendingApply (chunk fetch
+        // through the live session) so e2e tests can exercise the
+        // onload/manual reconcile path (broken-chunk quarantine, restore)
+        // against real CouchDB.
         const reconciler = new Reconciler(
             vault,
             db,
             vs,
             getSettings,
             () => {},
-            (doc) => engine.ensureFileChunks(doc),
+            engine.pendingApply,
         );
 
         const resolver = new ConflictResolver();
