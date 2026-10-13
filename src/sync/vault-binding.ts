@@ -441,10 +441,11 @@ export class VaultBinding {
      *
      * Preparation: a passphrase is required when encryption is on; the
      * server must answer (a missing DB is fine — Init creates it); the meta
-     * and its key are built. With a key already unlocked in this session
-     * and encryption on, the existing `vault:meta`'s salt and keyCheck are
-     * kept (the key stays the same) and only the cipher format and the
-     * compression flag are restamped.
+     * and its key are built from the Step 1 settings alone, with a fresh
+     * salt and keyCheck. Init creates a new vault that every other device
+     * clones again, so nothing of the previous `vault:meta` or of a key
+     * unlocked earlier in this session is carried over: a passphrase
+     * changed in Step 1 is the one the new vault is encrypted with.
      */
     async init(): Promise<void> {
         return this.runOperation("init", async (progress) => {
@@ -460,37 +461,13 @@ export class VaultBinding {
             progress.update("Checking the server...");
             await probeServer(raw, { allowMissing: true });
 
-            let meta: VaultMetaDoc;
-            let crypto: CryptoProvider | undefined;
-            if (enc && this.crypto) {
-                const existing = await fetchVaultMeta(raw);
-                if (!existing || !existing.encryption.enabled) {
-                    throw new UserFacingError(
-                        "Init keeps the vault's current encryption key, but the server has " +
-                            "no encrypted vault:meta to keep it from. Reload Obsidian, then " +
-                            "run Init again to create a new key.",
-                    );
-                }
-                meta = {
-                    ...existing,
-                    // A re-init writes encBody bodies: stamp the current
-                    // cipher format, not the one the vault was created with.
-                    encryption: { ...existing.encryption, cipherVersion: 3 },
-                    compression: compress
-                        ? { enabled: true, algorithm: "gzip", version: 1 }
-                        : { enabled: false },
-                };
-                crypto = this.crypto;
-            } else {
-                progress.update(enc ? "Deriving encryption keys..." : "Preparing vault metadata...");
-                const derived = await buildInitialVaultMeta({
-                    encryption: enc,
-                    passphrase: enc ? s.encryptionPassphrase : undefined,
-                    compression: compress,
-                });
-                meta = derived.meta;
-                crypto = derived.crypto ?? undefined;
-            }
+            progress.update(enc ? "Deriving encryption keys..." : "Preparing vault metadata...");
+            const { meta, crypto: derived } = await buildInitialVaultMeta({
+                encryption: enc,
+                passphrase: enc ? s.encryptionPassphrase : undefined,
+                compression: compress,
+            });
+            const crypto = derived ?? undefined;
 
             await this.beginDestructive();
             this.crypto = crypto;

@@ -12,7 +12,9 @@ import {
 } from "../src/sync/vault-binding.ts";
 import { classifyError } from "../src/db/sync/errors.ts";
 import { AuthGate } from "../src/db/sync/auth-gate.ts";
-import { buildInitialVaultMeta, fetchVaultMeta, pushVaultMeta } from "../src/db/vault-meta.ts";
+import {
+    buildInitialVaultMeta, fetchVaultMeta, pushVaultMeta, unlockVaultMeta,
+} from "../src/db/vault-meta.ts";
 import { FakeCouchClient } from "./helpers/fake-couch-client.ts";
 import { makeSettings } from "./helpers/settings-factory.ts";
 import type { CouchSyncSettings } from "../src/settings.ts";
@@ -186,6 +188,40 @@ describe("VaultBinding.init", () => {
         release();
         await first;
         expect(r.binding.relation().lastOp).toMatchObject({ op: "init", error: null });
+    });
+
+    it("builds the vault from the Step 1 passphrase even when a key is unlocked in this session", async () => {
+        const r = rig({ settings: { encryptionEnabled: true, encryptionPassphrase: "old" } });
+        await encryptedRemote(r.remote, "old");
+        await r.binding.clone();
+        const before = await fetchVaultMeta(r.remote);
+
+        r.settings.encryptionPassphrase = "new";
+        await r.binding.init();
+
+        const after = await fetchVaultMeta(r.remote);
+        expect(after?.encryption.enabled).toBe(true);
+        if (!before?.encryption.enabled || !after?.encryption.enabled) throw new Error("unreachable");
+        expect(after.encryption.salt).not.toBe(before.encryption.salt);
+        expect(after.encryption.keyCheck).not.toBe(before.encryption.keyCheck);
+        expect(await unlockVaultMeta(after, "old")).toBeNull();
+        const unlocked = await unlockVaultMeta(after, "new");
+        expect(unlocked).not.toBeNull();
+
+        // The chunk hasher of every vault client uses the new key.
+        const data = new TextEncoder().encode("chunk body");
+        expect(await r.binding.chunkHasher.hash(data)).toBe(await unlocked!.crypto.hmacHash(data));
+    });
+
+    it("mints a fresh salt on each Init with the same passphrase", async () => {
+        const r = rig({ settings: { encryptionEnabled: true, encryptionPassphrase: "pw" } });
+        await r.binding.init();
+        const first = await fetchVaultMeta(r.remote);
+        await r.binding.init();
+        const second = await fetchVaultMeta(r.remote);
+        if (!first?.encryption.enabled || !second?.encryption.enabled) throw new Error("not encrypted");
+        expect(second.encryption.salt).not.toBe(first.encryption.salt);
+        expect(await unlockVaultMeta(second, "pw")).not.toBeNull();
     });
 });
 

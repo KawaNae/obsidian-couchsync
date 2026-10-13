@@ -23,6 +23,12 @@ All notable changes to obsidian-couchsync.
   ("cannot decompress still-encrypted body"). Clone now pulls with the
   cloned vault's encryption, like its compression, and saves both only when
   it succeeds.
+- **Init encrypts the new vault with the Step 1 passphrase.** When the vault
+  key was already unlocked in the session, Init kept the previous
+  `vault:meta`'s salt and key, so a passphrase changed in Step 1 was ignored
+  and sync paused with a passphrase mismatch on the next start. Init now
+  builds `vault:meta` from Step 1 alone, with a fresh salt, as Config Create
+  does. Other devices Clone the new vault as before.
 - **Clone asks for the passphrase the way Config Join does.** When the Step 1
   passphrase is missing or does not unlock the vault, Clone asks for it,
   saying which of the two it is; a wrong answer keeps the prompt open with an
