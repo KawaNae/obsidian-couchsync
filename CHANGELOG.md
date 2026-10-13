@@ -79,12 +79,17 @@ All notable changes to obsidian-couchsync.
   when Init or Clone starts and ends and when sync pauses. While Init or
   Clone runs, Init, Clone and Live Sync are disabled, and Step 2 Apply, the
   Step 1 switches and the CouchDB tab's Apply are refused.
-- **Clone no longer claims an unchecked database is empty.** After reopening
-  the settings, Clone said "Database is empty — use Init" until Step 2's
-  Check was pressed again. It now asks for the Check instead. The result of
-  the Check is kept for each database until Obsidian restarts, so checking
-  another name does not drop the applied database's, and Init reads its
-  database back, so Clone no longer calls it empty after an Init.
+- **Clone no longer needs a Check first.** After reopening the settings or
+  restarting Obsidian, Clone said "Database is empty — use Init" and stayed
+  disabled until Step 2's Check was pressed again, although the notice of a
+  paused sync only says to run Clone. Clone now reads the database itself
+  before it changes anything: it is enabled without a Check, and refuses an
+  empty database with "The database is empty — use Init to push your
+  vault." What Check, Clone and Init last found in each database is kept
+  until Obsidian restarts, so checking another name does not drop the
+  applied database's, and Clone stays disabled only for a database known to
+  be empty. Init reads its database back and Clone records what it read,
+  so the document count shown after either is current.
 - **More failures are worded with their cause and fix.** Step 2's Check (in
   Vault Sync and Config Sync), the CouchDB tab's Test and database delete,
   Verify's Repair, the chunk repair and its retry, and the Maintenance

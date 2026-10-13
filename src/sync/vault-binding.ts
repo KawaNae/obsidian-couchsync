@@ -23,9 +23,10 @@
  *     the agreement check paused sync (persisted with the state it
  *     explains, so a reload keeps both), and what each vault DB was found
  *     to hold (`relation`, which the Step 3 status line is drawn from).
- *     An operation that changes a fact updates what is known about it:
- *     Init refreshes what its DB holds, Init / Clone clear a pause and
- *     bind the device to the DB's current `vault:meta`.
+ *     An operation that reads or changes a fact updates what is known
+ *     about it: Init and Clone record what the DB holds (Init after it
+ *     filled the DB, Clone when its preparation read the DB), clear a
+ *     pause and bind the device to the DB's current `vault:meta`.
  *
  * Every change of what `relation` returns is announced (`onChange`), so a
  * view drawn from it can redraw while an operation runs, not only when the
@@ -36,7 +37,7 @@
  * prompt.
  */
 import type { CouchSyncSettings, ConnectionState, VaultPauseRecord } from "../settings.ts";
-import type { ICouchClient } from "../db/interfaces.ts";
+import type { DbInfo, ICouchClient } from "../db/interfaces.ts";
 import type { CryptoProvider } from "../db/crypto-provider.ts";
 import { AuthBlockedError, type AuthGate } from "../db/sync/auth-gate.ts";
 import { EncryptingCouchClient } from "../db/encrypting-couch-client.ts";
@@ -113,8 +114,8 @@ export type VaultOpName = "init" | "clone";
 
 export type VaultOutcome = OpOutcome<VaultOpName>;
 
-/** What the vault DB was found to hold: by Step 2's Check, or read back
- *  after an Init filled it. */
+/** What the vault DB was found to hold: by Step 2's Check, by the
+ *  preparation of Clone, or read back after an Init filled it. */
 export interface VaultDbCheck {
     at: number;
     /** `vaultTarget` of the DB. */
@@ -584,10 +585,12 @@ export class VaultBinding {
      * Clone: empty the local DB, pull the remote vault, write its files, and
      * adopt the remote's codec.
      *
-     * Preparation: the server must answer and the DB exist; `vault:meta` is
-     * read; an encrypted vault is unlocked — with the Step 1 passphrase,
+     * Preparation: the server must answer and the DB exist and hold
+     * documents (what it holds is recorded, as a Check would); `vault:meta`
+     * is read; an encrypted vault is unlocked — with the Step 1 passphrase,
      * else with one the user enters (the prompt stays open on a wrong one;
-     * cancelling changes nothing).
+     * cancelling changes nothing). The preparation reads the DB itself, so
+     * Clone does not depend on a Check made before it.
      *
      * Execution runs the pull under the remote's codec held in memory; the
      * settings (encryption, passphrase, compression, cipher floor) are
@@ -600,7 +603,14 @@ export class VaultBinding {
             const s = this.settings();
             const raw = this.host.makeRawClient();
             progress.update("Reading vault:meta...");
-            await probeServer(raw, { allowMissing: false });
+            const info = await probeServer(raw, { allowMissing: false });
+            const docCount = info?.doc_count ?? 0;
+            this.recordDbCheck({
+                at: Date.now(), against: vaultTarget(s), result: { status: "exists", docCount },
+            });
+            if (docCount === 0) {
+                throw new UserFacingError("The database is empty — use Init to push your vault.");
+            }
             const meta = await fetchVaultMeta(raw);
 
             let crypto: CryptoProvider | undefined;
@@ -936,12 +946,12 @@ export class VaultEncryptionPausedError extends Error {
 }
 
 /** Ask the server for the DB's info with a short timeout. A missing DB is
- *  an error unless `allowMissing`. */
-async function probeServer(raw: ICouchClient, opts: { allowMissing: boolean }): Promise<void> {
+ *  an error unless `allowMissing` (then null). */
+async function probeServer(raw: ICouchClient, opts: { allowMissing: boolean }): Promise<DbInfo | null> {
     try {
-        await raw.withTimeout(REACHABILITY_TIMEOUT_MS).info();
+        return await raw.withTimeout(REACHABILITY_TIMEOUT_MS).info();
     } catch (e) {
-        if (opts.allowMissing && classifyError(e).kind === "not-found") return;
+        if (opts.allowMissing && classifyError(e).kind === "not-found") return null;
         throw e;
     }
 }

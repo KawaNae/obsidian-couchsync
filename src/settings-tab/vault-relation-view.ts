@@ -66,10 +66,10 @@ export interface CloneAvailability {
 
 /**
  * Whether Clone can run, from what the applied DB was last found to hold
- * (Step 2's Check, or the read-back after an Init): Clone needs a DB that
- * holds data. Without a check since the plugin loaded, nothing is
- * known about the DB, so the user is asked to check it rather than told it
- * is empty.
+ * (Step 2's Check, Clone's preparation, or the read-back after an Init).
+ * Clone's preparation reads the DB itself and refuses an empty one, so
+ * Clone needs no Check before it: without a finding, or after a failed
+ * Check, it is offered. Only a DB known to be empty points to Init.
  *
  * @param setupAllowed the setup state allows Init / Clone (`setupGating`).
  */
@@ -77,13 +77,7 @@ export function cloneAvailability(dbCheck: VaultDbCheck | null, setupAllowed: bo
     const ready = "Pull remote database to local vault (2nd+ device)";
     if (!setupAllowed) return { enabled: false, desc: ready };
     const r = dbCheck?.result;
-    if (!r) {
-        return { enabled: false, desc: "Press Check in Step 2 to see whether the database holds a vault." };
-    }
-    if (r.status === "error") {
-        return { enabled: false, desc: "The database check failed (see Step 2) — fix it and Check again." };
-    }
-    if (r.status === "created" || r.docCount === 0) {
+    if (r && (r.status === "created" || (r.status === "exists" && r.docCount === 0))) {
         return { enabled: false, desc: "Database is empty — use Init to push your vault." };
     }
     return { enabled: true, desc: ready };

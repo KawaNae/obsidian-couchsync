@@ -319,6 +319,31 @@ describe("VaultBinding.clone", () => {
         expect(r.settings.vaultCipherVersion).toBeUndefined();
     });
 
+    it("records what the DB holds from its own read; no Check is needed before it", async () => {
+        const r = rig({ settings: { encryptionPassphrase: "pw" } });
+        await encryptedRemote(r.remote, "pw");
+        expect(r.binding.relation().dbCheck).toBeNull();
+        await r.binding.clone();
+        expect(r.binding.relation().dbCheck?.result).toEqual({ status: "exists", docCount: 1 });
+    });
+
+    it("a Check made before is replaced by what Clone read", async () => {
+        const r = rig({ settings: { encryptionPassphrase: "pw" } });
+        r.dbCheckResult = { status: "exists", docCount: 0 };
+        await r.binding.checkDatabase("vault");
+        await encryptedRemote(r.remote, "pw");
+        await r.binding.clone();
+        expect(r.binding.relation().dbCheck?.result).toEqual({ status: "exists", docCount: 1 });
+    });
+
+    it("an empty DB is refused in the preparation: nothing is stopped or changed", async () => {
+        const r = rig();
+        await expect(r.binding.clone()).rejects.toThrow(/empty — use Init/);
+        expect(r.stops).toBe(0);
+        expect(r.settings.connectionState).toBe("setupDone");
+        expect(r.binding.relation().dbCheck?.result).toEqual({ status: "exists", docCount: 0 });
+    });
+
     it("an outcome about another vault DB is not shown", async () => {
         const r = rig({ client: unreachable });
         await expect(r.binding.clone()).rejects.toThrow();
@@ -448,7 +473,9 @@ describe("VaultBinding: the incarnation of the vault DB a device is set up again
         await r.binding.clone();
         expect(r.settings.vaultRoot?.fingerprint).toBe(await metaFingerprint((await fetchVaultMeta(r.remote))!));
 
+        // A vault set up before vault:meta existed: documents, no meta.
         const bare = rig({ settings: { connectionState: "tested" } });
+        await bare.remote.bulkDocs([{ _id: "file:a.md", type: "file", chunks: [] } as never]);
         await bare.binding.clone();
         expect(bare.settings.vaultRoot).toEqual({ fingerprint: null, against: vaultTarget(bare.settings) });
     });
