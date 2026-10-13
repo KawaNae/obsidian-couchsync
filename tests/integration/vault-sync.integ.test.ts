@@ -151,15 +151,18 @@ describe("VaultSync", () => {
         });
 
         it("overwrites existing file", async () => {
-            vault.addFile("a.md", "v1");
+            // Explicit mtimes: dbToFile trusts the integration baseline's
+            // chunks when mtime and size are unchanged, and "v1"/"v2" have
+            // the same size, so the reset below must carry its own mtime.
+            vault.addFile("a.md", "v1", { mtime: 1000 });
             await vs.fileToDb("a.md");
 
             // Change DB content
-            vault.addFile("a.md", "v2");
+            vault.addFile("a.md", "v2", { mtime: 2000 });
             await vs.fileToDb("a.md");
 
             // Reset vault to v1
-            vault.addFile("a.md", "v1");
+            vault.addFile("a.md", "v1", { mtime: 3000 });
             const doc = await db.get(makeFileId("a.md")) as FileDoc;
 
             await vs.dbToFile(doc);
