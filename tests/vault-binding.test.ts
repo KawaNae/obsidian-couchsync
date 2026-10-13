@@ -3,8 +3,9 @@
  * and an execution that is destructive. A failure in the preparation
  * leaves the setup state and live sync as they were; the execution stops
  * live sync and persists `settingUp` before the first destructive step.
- * Every run ends at one exit: the outcome is recorded (not for a busy
- * refusal or a cancellation) and the notice words the error.
+ * Every run ends at one exit: the outcome is recorded (not for a refusal,
+ * a cancellation or a rejection of the credentials) and the notice words
+ * the error.
  */
 import { describe, it, expect, beforeEach } from "vitest";
 import {
@@ -142,18 +143,24 @@ describe("VaultBinding.init", () => {
         expect(r.settings.connectionState).toBe("setupDone");
     });
 
-    it("a 401 raises the auth latch", async () => {
+    it("a 401 raises the auth latch, which tells the rejection instead of a recorded outcome", async () => {
         const r = rig({ client: rejecting(401) });
         await expect(r.binding.init()).rejects.toThrow();
         expect(r.auth.isBlocked()).toBe(true);
+        expect(r.failures).toHaveLength(1);
+        expect(r.binding.relation().lastOp).toBeNull();
     });
 
-    it("is refused while the auth latch is raised", async () => {
+    it("is refused while the auth latch is raised, and the refusal is not recorded", async () => {
         const r = rig();
         r.auth.raise(401, "nope");
         await expect(r.binding.init()).rejects.toThrow(/rejected the credentials/);
         expect(r.stops).toBe(0);
         expect(r.stateAtSetup).toBeNull();
+        expect(r.failures).toHaveLength(1);
+        // Once a Test clears the latch, nothing claims requests are on hold.
+        r.auth.clear();
+        expect(r.binding.relation().lastOp).toBeNull();
     });
 
     it("stops live sync and persists settingUp before the destructive step, setupDone after", async () => {
@@ -166,6 +173,25 @@ describe("VaultBinding.init", () => {
         expect(await fetchVaultMeta(r.remote)).toMatchObject({ type: "vault-meta" });
         expect(r.dones).toEqual(["3 files, 7 docs pushed (compressed)."]);
         expect(r.binding.relation().lastOp).toMatchObject({ op: "init", error: null });
+    });
+
+    it("reads the DB back, so a Check that found it empty no longer describes it", async () => {
+        const r = rig({ settings: { connectionState: "tested" } });
+        r.dbCheckResult = { status: "created" };
+        await r.binding.checkDatabase("vault");
+        await r.binding.init();
+        const found = r.binding.relation().dbCheck?.result;
+        expect(found?.status).toBe("exists");
+        expect(found && found.status === "exists" && found.docCount).toBeGreaterThan(0);
+    });
+
+    it("announces the run's start and end", async () => {
+        const r = rig();
+        const seen: (string | null)[] = [];
+        r.binding.onChange(() => seen.push(r.binding.busy()));
+        await r.binding.init();
+        expect(seen[0]).toBe("init");
+        expect(seen[seen.length - 1]).toBeNull();
     });
 
     it("a failure in the execution leaves settingUp", async () => {
@@ -304,7 +330,7 @@ describe("VaultBinding.clone", () => {
 describe("VaultBinding.checkAgreement", () => {
     const signal = new AbortController().signal;
 
-    it("encryption changed by another device: pauses to tested and records why", async () => {
+    it("encryption changed by another device: pauses to tested and persists why", async () => {
         const r = rig({ settings: { connectionState: "syncing", encryptionEnabled: false } });
         await encryptedRemote(r.remote, "pw");
         const err = await r.binding.checkAgreement(signal).catch((e) => e);
@@ -312,7 +338,9 @@ describe("VaultBinding.checkAgreement", () => {
         expect(err).toMatchObject({ reason: "encryption-changed", encryptionPaused: true });
         expect(err.userMessage).toMatch(/^Sync paused — another device turned vault encryption on\./);
         expect(r.settings.connectionState).toBe("tested");
-        expect(r.binding.relation().lastCheck).toMatchObject({ op: "agreement", error: err });
+        expect(r.binding.relation().pause?.error).toMatchObject({ reason: "encryption-changed", userMessage: err.userMessage });
+        expect(r.saves).toEqual(["tested"]);
+        expect(r.settings.vaultPause).toMatchObject({ reason: "encryption-changed", detail: { remoteEncrypted: true } });
         // The engine halts on it and shows its own sentence.
         expect(classifyError(err)).toEqual({ kind: "encryption-paused", message: err.userMessage });
     });
@@ -326,18 +354,19 @@ describe("VaultBinding.checkAgreement", () => {
         expect(r.settings).toMatchObject({ connectionState: "tested", encryptionPassphrase: "" });
     });
 
-    it("an agreed vault unlocks, takes the server's compression flag and records a passed check", async () => {
+    it("an agreed vault unlocks, takes the server's compression flag and clears a pause", async () => {
         const r = rig({
             settings: {
                 connectionState: "syncing", encryptionEnabled: true, encryptionPassphrase: "pw",
                 compressionEnabled: false,
+                vaultPause: { reason: "passphrase-missing", detail: {}, at: 0, against: "x" },
             },
         });
         await encryptedRemote(r.remote, "pw");
         await r.binding.checkAgreement(signal);
         expect(r.settings).toMatchObject({ connectionState: "syncing", compressionEnabled: true, vaultCipherVersion: 3 });
         expect(r.binding.chunkHasher.alg).toBe("hmac");
-        expect(r.binding.relation().lastCheck).toMatchObject({ op: "agreement", error: null });
+        expect(r.settings.vaultPause).toBeUndefined();
     });
 
     it("a transient failure is thrown as is and not recorded", async () => {
@@ -350,15 +379,45 @@ describe("VaultBinding.checkAgreement", () => {
         const r = rig({ settings: { connectionState: "syncing" }, client: failing });
         await expect(r.binding.checkAgreement(signal)).rejects.toThrow("Failed to fetch");
         expect(r.settings.connectionState).toBe("syncing");
-        expect(r.binding.relation().lastCheck).toBeNull();
+        expect(r.binding.relation().pause).toBeNull();
+        expect(r.saves).toEqual([]);
     });
 
-    it("a successful Init clears the recorded pause", async () => {
+    it("the pause survives a reload: a new binding on the saved settings still says why", async () => {
+        const r = rig({ settings: { connectionState: "syncing", encryptionEnabled: true, encryptionPassphrase: "old" } });
+        await encryptedRemote(r.remote, "pw");
+        await r.binding.checkAgreement(signal).catch(() => {});
+        const reloaded = rig({ settings: JSON.parse(JSON.stringify(r.settings)) });
+        expect(reloaded.binding.relation()).toMatchObject({
+            state: "tested",
+            pause: { error: { reason: "passphrase-mismatch" } },
+        });
+    });
+
+    it("a pause about another vault DB is not shown", async () => {
+        const r = rig({ settings: { connectionState: "syncing", encryptionEnabled: false } });
+        await encryptedRemote(r.remote, "pw");
+        await r.binding.checkAgreement(signal).catch(() => {});
+        r.settings.couchdbDbName = "other";
+        expect(r.binding.relation().pause).toBeNull();
+    });
+
+    it("a successful Init clears the pause", async () => {
         const r = rig({ settings: { connectionState: "syncing", encryptionEnabled: false } });
         await encryptedRemote(r.remote, "pw");
         await r.binding.checkAgreement(signal).catch(() => {});
         await r.binding.init();
-        expect(r.binding.relation()).toMatchObject({ lastOp: { op: "init", error: null }, lastCheck: null });
+        expect(r.binding.relation()).toMatchObject({ lastOp: { op: "init", error: null }, pause: null });
+        expect(r.settings.vaultPause).toBeUndefined();
+    });
+
+    it("a failed Init keeps the pause", async () => {
+        const r = rig({ settings: { connectionState: "syncing", encryptionEnabled: false } });
+        await encryptedRemote(r.remote, "pw");
+        await r.binding.checkAgreement(signal).catch(() => {});
+        r.setupError = new Error("disk full");
+        await r.binding.init().catch(() => {});
+        expect(r.binding.relation().pause).not.toBeNull();
     });
 });
 
@@ -424,6 +483,15 @@ describe("VaultBinding.checkDatabase", () => {
         expect(r.dones).toEqual(['"vault" found — 5 docs.']);
         expect(r.binding.relation().dbCheck?.result).toEqual({ status: "exists", docCount: 5 });
         expect(r.binding.dbCheckFor("other")).toBeNull();
+    });
+
+    it("keeps one result per DB: checking another DB keeps the applied DB's", async () => {
+        const r = rig();
+        await r.binding.checkDatabase("vault");
+        r.dbCheckResult = { status: "created" };
+        await r.binding.checkDatabase("other");
+        expect(r.binding.relation().dbCheck?.result).toEqual({ status: "exists", docCount: 5 });
+        expect(r.binding.dbCheckFor("other")?.result).toEqual({ status: "created" });
     });
 
     it("a failure goes to the notice as the error itself", async () => {

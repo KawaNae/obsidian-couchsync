@@ -11,7 +11,7 @@ import { UserFacingError } from "../src/ui/describe-error.ts";
 function rel(patch: Partial<VaultRelation> = {}): VaultRelation {
     return {
         state: "tested", serverTested: true, busy: null,
-        lastOp: null, lastCheck: null, dbCheck: null, ...patch,
+        lastOp: null, pause: null, dbCheck: null, ...patch,
     };
 }
 
@@ -38,7 +38,7 @@ describe("vaultRelationView", () => {
 
     it("an encryption pause says why sync stopped, instead of the generic setup line", () => {
         const pause = new VaultEncryptionPausedError("encryption-changed", { remoteEncrypted: true });
-        const v = vaultRelationView(rel({ lastCheck: outcome({ op: "agreement", error: pause }) }), null);
+        const v = vaultRelationView(rel({ pause: { at: 1, error: pause } }), null);
         expect(v.tone).toBe("error");
         expect(v.text).toBe(`Last encryption check: ${pause.userMessage}`);
     });
@@ -58,12 +58,18 @@ describe("vaultRelationView", () => {
         expect(v.text).toMatch(/^Last Init: disk full\. Setup did not finish/);
     });
 
-    it("shows the newer of a failed operation and a failed check", () => {
-        const v = vaultRelationView(rel({
+    it("shows the newer of a failed operation and a pause", () => {
+        const pause = new VaultEncryptionPausedError("legacy-meta");
+        const newerPause = vaultRelationView(rel({
             lastOp: outcome({ at: 5, error: new UserFacingError("op") }),
-            lastCheck: outcome({ op: "agreement", at: 9, error: new UserFacingError("check") }),
+            pause: { at: 9, error: pause },
         }), null);
-        expect(v.text).toBe("Last encryption check: check");
+        expect(newerPause.text).toBe(`Last encryption check: ${pause.userMessage}`);
+        const newerOp = vaultRelationView(rel({
+            lastOp: outcome({ at: 9, error: new UserFacingError("op") }),
+            pause: { at: 5, error: pause },
+        }), null);
+        expect(newerOp.text).toBe("Last Clone: op");
     });
 
     it("without failures, the state speaks", () => {
@@ -100,8 +106,8 @@ describe("encryptionChangedElsewhere", () => {
     it("only for a pause because another device changed encryption", () => {
         const changed = new VaultEncryptionPausedError("encryption-changed", { remoteEncrypted: false });
         const wrong = new VaultEncryptionPausedError("passphrase-mismatch");
-        expect(encryptionChangedElsewhere(rel({ lastCheck: outcome({ op: "agreement", error: changed }) }))).toBe(true);
-        expect(encryptionChangedElsewhere(rel({ lastCheck: outcome({ op: "agreement", error: wrong }) }))).toBe(false);
+        expect(encryptionChangedElsewhere(rel({ pause: { at: 1, error: changed } }))).toBe(true);
+        expect(encryptionChangedElsewhere(rel({ pause: { at: 1, error: wrong } }))).toBe(false);
         expect(encryptionChangedElsewhere(rel())).toBe(false);
     });
 });
