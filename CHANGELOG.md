@@ -130,9 +130,17 @@ All notable changes to obsidian-couchsync.
   matched, so all of them got a new modification time. Obsidian re-reads
   `app.json`, `appearance.json` and plugins' `data.json` on that, which could
   undo a setting just changed in the settings window. Pull now writes only
-  the files whose content differs and reports `Files up to date.` when there
-  were none. Pull & Reload then does not reload Obsidian and says
-  `No config files changed. Skipping reload.`
+  the files whose content changes. When there are none, Pull & Reload does
+  not reload Obsidian and its one notice says
+  `No config files changed; no reload needed.`
+- **A config Pull no longer undoes edits that were not pushed yet.** A Pull
+  wrote the last synced version of every config file over the disk, so a
+  setting changed on this device but not pushed went back to its old value,
+  with no warning. See "Config Pull merges" below.
+- **A config Push no longer overwrites what other devices changed.** Push
+  sent whole files, so a desktop pushing `app.json` put back an old value of
+  a key only the phone had changed, after a confirmation that did not say
+  which keys. See "Config Push sends this device's changes" below.
 - **Changing a codec setting no longer stops config sync.** Push and Pull
   now use the encryption and compression of the config database this device
   created or joined. Step 1 in Config Sync is what the next Create builds a
@@ -157,6 +165,29 @@ All notable changes to obsidian-couchsync.
 
 ### Changed
 
+- **Config Pull merges.** Pull compares each config file the server changed
+  with the version this device last took in and with the disk. In
+  `app.json`, `appearance.json`, `hotkeys.json`, the other `.obsidian/*.json`
+  files and plugins' `data.json`, every key is compared on its own: a key
+  only the server changed takes the server's value, a key only this device
+  changed keeps this device's value. `community-plugins.json` is merged as a
+  set of plugin ids. Other files (snippets, themes, plugin code) and files
+  that are not valid JSON are compared as a whole. Where both sides changed
+  the same key (or file) differently, this device's value stays; the notice
+  counts such files and the log names each file and key (never the value),
+  and the next Push sends this device's value. Without a version taken in
+  before (after Join), the server's values win and keys only this device
+  has stay. Before writing, Pull copies the files it is about to overwrite
+  to `backups/config/<date_time>/` in the plugin's folder and keeps the
+  newest 10 of these backups; they are never pushed. Written files keep
+  their indentation and key order. Pull & Reload shows one notice and
+  reloads Obsidian only when it wrote a file.
+- **Config Push sends this device's changes.** Push sends the config files
+  that changed on this device since it last pushed or pulled them. A file
+  whose server copy changed since this device last pulled is not sent: the
+  notice counts it and asks to run Pull & Reload, then Push again (the log
+  names the files). The confirmation that offered to overwrite the server
+  copy is gone.
 - **Config Init is renamed Create, and Join is new.** Config Sync's Step 3
   now has Create (first device: reset the config database with a new root,
   then Push) and Join (every other device: sync with the existing
@@ -191,6 +222,13 @@ All notable changes to obsidian-couchsync.
 
 ### Migration
 
+- **Config sync state moves to the new merge by itself.** The first config
+  Push or Pull after updating compares each file this device knows with the
+  server copy once. Edits that were never pushed are kept as this device's
+  changes: where the server also changed the same file since, the keys that
+  differ keep this device's value and are reported like a conflict. The log
+  then lists the files the next Push will send; check them if a plugin was
+  installed after the last Pull, since its default settings would be sent.
 - **Existing devices Join once.** Whether a device has joined a config
   database, and with which codec, is now recorded inside that database's
   local store, which is also renamed to include the server. The previous

@@ -26,8 +26,12 @@ Simplified CouchDB-only vault sync for Obsidian. Fork of [Self-hosted LiveSync](
 - **Config sync (optional, manual)** — Replicate `.obsidian/` settings,
   snippets and themes through a separate CouchDB database. Button-driven
   (Create on the first device, Join on the others, then Push / Pull &
-  Reload), not real-time. Plugin code is not synced by default. Opt-in: only
-  active when a config DB name is set.
+  Reload), not real-time. Pull merges JSON settings key by key with what
+  this device changed, keeps this device's value where both sides changed a
+  key, and backs up the files it overwrites; Push sends only this device's
+  changes and holds files the server changed until the next Pull. Plugin
+  code is not synced by default. Opt-in: only active when a config DB name
+  is set.
 
 ## Setup
 

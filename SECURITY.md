@@ -116,7 +116,11 @@ recorded in their own meta document:
   plugin's own `data.json` also stores your CouchDB password, the encryption
   passphrases, and the passphrase kept for each config database this device
   created or joined in plaintext. This is local-FS-access only (out of scope above);
-  on the same machine an attacker already has every plaintext note. Migrating
+  on the same machine an attacker already has every plaintext note. Config
+  Pull keeps plaintext copies of the config files it overwrites (other
+  plugins' `data.json` among them, which may hold API keys) in the plugin's
+  `backups/config/` folder; like the plugin's own `data.json`, that folder
+  is never sent to the config database. Migrating
   these secrets to Obsidian/OS SecretStorage is planned. v0.26.0 did not change
   this — it stores no new secret.
 - **A weak passphrase against offline brute force**: the per-vault `salt`
