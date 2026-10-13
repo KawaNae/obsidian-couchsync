@@ -336,7 +336,7 @@ describe("Reconciler", () => {
         });
     });
 
-    describe("Case D: vault missing, DB alive (the main bug fix)", () => {
+    describe("Case D: vault missing, DB alive — a local delete propagates, a file created elsewhere is restored", () => {
         it("deletes when editedBy === self", async () => {
             const h = setup([]);
             h.db.fileDocs.set("a.md", makeDoc("a.md", { lastWriter: SELF }));
