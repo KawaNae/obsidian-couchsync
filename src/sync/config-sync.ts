@@ -329,7 +329,7 @@ export class ConfigSync {
             try {
                 await old.close();
             } catch (e: any) {
-                logError(`CouchSync: failed to close config store "${old.dbName}": ${e?.message ?? e}`);
+                logError(`failed to close config store "${old.dbName}": ${e?.message ?? e}`);
             }
         }
         if (target) {
@@ -617,7 +617,7 @@ export class ConfigSync {
         } catch (e: any) {
             const text = describeError(e).text;
             logWarn(
-                `CouchSync: reading config database "${binding.dbName}" before Create ` +
+                `reading config database "${binding.dbName}" before Create ` +
                 `failed: ${text}`,
             );
             return { kind: "unreadable", message: text, bindingKey };
@@ -690,7 +690,7 @@ export class ConfigSync {
             if (result.stats.skipped) summaryParts.push(`${result.stats.skipped} skipped`);
             if (result.stats.conflicts) summaryParts.push(`${result.stats.conflicts} conflicts (will retry)`);
             const summary = summaryParts.length > 0 ? summaryParts.join(", ") : "no changes";
-            progress.done(`Push: ${summary}. (Scanned ${scanned} local file(s).)`);
+            progress.done(`${summary}. (Scanned ${scanned} local file(s).)`);
             return result.stats.pushed;
         }, {
             // Push advances vclocks under this device's name.
@@ -743,7 +743,7 @@ export class ConfigSync {
             if (result.stats.convergedSkip) summaryParts.push(`${result.stats.convergedSkip} converged`);
             if (result.stats.concurrent) summaryParts.push(`${result.stats.concurrent} concurrent`);
             const summary = summaryParts.length > 0 ? summaryParts.join(", ") : "no changes";
-            progress.done(`Pull: ${summary}. Wrote ${written} file(s). Reload Obsidian to apply.`);
+            progress.done(`${summary}. Wrote ${written} file(s). Reload Obsidian to apply.`);
             return written;
         });
     }
@@ -763,7 +763,7 @@ export class ConfigSync {
     private notifyConcurrentPull(entries: ConfigConcurrentEntry[]): void {
         const paths = entries.map((e) => `  • ${e.path}`).join("\n");
         logWarn(
-            `CouchSync: Config pull surfaced ${entries.length} concurrent edit(s):\n${paths}`,
+            `Config pull surfaced ${entries.length} concurrent edit(s):\n${paths}`,
         );
         const previewLimit = 5;
         const preview = entries.slice(0, previewLimit).map((e) => e.path).join(", ");
@@ -778,7 +778,7 @@ export class ConfigSync {
             `To keep this device's copy, edit the file here and Push (confirm the overwrite).`,
             "OK",
             false,
-        ).catch((e) => logWarn(`CouchSync: config concurrent-pull notice failed: ${e?.message ?? e}`));
+        ).catch((e) => logWarn(`config concurrent-pull notice failed: ${e?.message ?? e}`));
     }
 
     /**
@@ -797,7 +797,7 @@ export class ConfigSync {
         const paths = divergent
             .map((d) => `  • ${d.path} (${d.relation})`).join("\n");
         logWarn(
-            `CouchSync: Config push would overwrite ${divergent.length} divergent doc(s):\n${paths}`,
+            `Config push would overwrite ${divergent.length} divergent doc(s):\n${paths}`,
         );
         const previewLimit = 5;
         const preview = divergent.slice(0, previewLimit)
@@ -922,7 +922,7 @@ export class ConfigSync {
                 });
                 count++;
             } catch (e) {
-                logError(`CouchSync: Failed to scan config ${file}: ${e?.message ?? e}`);
+                logError(`Failed to scan config ${file}: ${e?.message ?? e}`);
             }
         }
         return count;
@@ -976,7 +976,7 @@ export class ConfigSync {
             // traversal vector. Reject vault-escaping paths before ensureDir.
             const pathViolation = unsafeVaultPathReason(path);
             if (pathViolation) {
-                logWarn(`CouchSync: rejecting unsafe remote config path "${path}" — ${pathViolation}`);
+                logWarn(`rejecting unsafe remote config path "${path}" — ${pathViolation}`);
                 continue;
             }
             if (this.skipPaths.has(path)) continue;
@@ -999,7 +999,7 @@ export class ConfigSync {
                 if (usableIds.size !== doc.chunks.length) {
                     const missing = doc.chunks.filter((id) => !usableIds.has(id));
                     logWarn(
-                        `CouchSync: Skipping config write ${path} \u2014 ` +
+                        `Skipping config write ${path} \u2014 ` +
                         `missing ${missing.length} chunk(s): ${missing.slice(0, 3).join(", ")}`,
                     );
                     continue;
@@ -1011,7 +1011,7 @@ export class ConfigSync {
                 );
                 if (sizeBytes > ConfigSync.MAX_CONFIG_SIZE) {
                     logWarn(
-                        `CouchSync: Skipping config write ${path} — ` +
+                        `Skipping config write ${path} — ` +
                         `${(sizeBytes / (1024 * 1024)).toFixed(1)} MB exceeds ` +
                         `${ConfigSync.MAX_CONFIG_SIZE / (1024 * 1024)} MB config limit`,
                     );
@@ -1026,7 +1026,7 @@ export class ConfigSync {
                 }
                 count++;
             } catch (e) {
-                logError(`CouchSync: Failed to write config ${path}: ${e?.message ?? e}`);
+                logError(`Failed to write config ${path}: ${e?.message ?? e}`);
             }
         }
         return count;
@@ -1155,7 +1155,7 @@ export class ConfigSync {
             };
         } catch (e) {
             binding.record({ op: "check", at, against, error: e });
-            logWarn(`CouchSync: config remote listing failed: ${describeError(e).text}`);
+            logWarn(`config remote listing failed: ${describeError(e).text}`);
             return { paths: [], ok: false, bindingKey };
         }
     }
@@ -1172,7 +1172,7 @@ export class ConfigSync {
             // A missing plugins dir is expected (vault with no plugins).
             // Anything else is unexpected — surface it rather than silently
             // returning an empty list, which would look like "no plugins".
-            logWarn(`CouchSync: listPluginFolders failed: ${e?.message ?? e}`);
+            logWarn(`listPluginFolders failed: ${e?.message ?? e}`);
         }
         return folders.sort();
     }
@@ -1229,7 +1229,7 @@ export class ConfigSync {
             // parent yet errors on its own listing is unexpected (race or
             // permission issue), not normal operation, and silently dropping
             // its files would under-sync config without any trace.
-            logWarn(`CouchSync: listFilesRecursive skipped ${dir}: ${e?.message ?? e}`);
+            logWarn(`listFilesRecursive skipped ${dir}: ${e?.message ?? e}`);
         }
     }
 }

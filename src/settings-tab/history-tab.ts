@@ -1,6 +1,7 @@
-import { Notice, Setting } from "obsidian";
+import { Setting } from "obsidian";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { HistoryManager } from "../history/history-manager.ts";
+import { showNotice } from "../ui/notices.ts";
 
 interface HistoryTabDeps {
     getSettings: () => CouchSyncSettings;
@@ -105,7 +106,7 @@ export function renderHistoryTab(el: HTMLElement, deps: HistoryTabDeps): void {
             .setWarning()
             .onClick(async () => {
                 await deps.historyManager.clearAllHistory();
-                new Notice("All diff history cleared.");
+                showNotice("All diff history cleared.");
             })
         );
 }

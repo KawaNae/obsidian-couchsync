@@ -1,6 +1,20 @@
 import { Notice } from "obsidian";
-import { notify, logDebug, logError, logWarn } from "./log.ts";
+import { notify, logDebug, logError, logWarn, PLUGIN_PREFIX } from "./log.ts";
 import { describeError, rawErrorMessage } from "./describe-error.ts";
+
+/** The text an Obsidian Notice shows for `message`: the plugin prefix, once. */
+export function noticeText(message: string): string {
+    return PLUGIN_PREFIX + message;
+}
+
+/**
+ * Show `message` as an Obsidian Notice. Every Notice the plugin shows is
+ * created here — the log sink passed to `initLog` included — so the prefix
+ * is added in one place and callers pass bare text.
+ */
+export function showNotice(message: string, durationMs?: number): Notice {
+    return new Notice(noticeText(message), durationMs);
+}
 
 /**
  * Long-lived Notice that can be updated in-place, with a unified
@@ -14,9 +28,9 @@ import { describeError, rawErrorMessage } from "./describe-error.ts";
  * The label is added here and only here: callers pass a bare summary to
  * `done` and the error itself to `fail`, whose sentence comes from
  * `describeError` — `<label> failed — <cause and fix>`, or
- * `<label> cancelled`. The "CouchSync: " prefix of the log-routed notices
- * is added by the log sink (see log.ts); only the in-place Notice this class
- * creates itself carries it explicitly.
+ * `<label> cancelled`. The summary therefore does not repeat the label.
+ * The in-place Notice gets the plugin prefix from `showNotice` /
+ * `noticeText`, like every other notice.
  */
 type Phase = "start" | "update" | "done";
 
@@ -32,7 +46,7 @@ export class ProgressNotice {
 
     constructor(label: string) {
         this.label = label;
-        this.notice = new Notice(`CouchSync: ${label}`, 0);
+        this.notice = showNotice(label, 0);
         this.report("start", "");
     }
 
@@ -57,7 +71,7 @@ export class ProgressNotice {
         const d = describeError(err);
         if (d.cancelled) {
             const line = d.text ? `${this.label} cancelled — ${d.text}` : `${this.label} cancelled`;
-            this.notice.setMessage(`CouchSync: ${line}`);
+            this.notice.setMessage(noticeText(line));
             setTimeout(() => this.notice.hide(), CANCELLED_NOTICE_MS);
             logWarn(line);
             return;
@@ -77,7 +91,7 @@ export class ProgressNotice {
                 return;
 
             case "update": {
-                this.notice.setMessage(`CouchSync: ${this.label}\n${message}`);
+                this.notice.setMessage(noticeText(`${this.label}\n${message}`));
                 const now = Date.now();
                 if (message === this.lastLoggedMessage) return;
                 if (now - this.lastLoggedAt < UPDATE_LOG_THROTTLE_MS) return;

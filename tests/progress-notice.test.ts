@@ -2,12 +2,12 @@
  * ProgressNotice — the exit of every one-shot operation.
  *
  * The label is added once, by ProgressNotice; the "CouchSync: " prefix is
- * added once, by the log sink. Before, both ProgressNotice and its callers
- * added them, and a notice read "CouchSync: CouchSync: Config Pull —
- * Config Pull failed: …".
+ * added once, by `noticeText` at the notice exit. When both ProgressNotice
+ * and its callers added them, a notice read "CouchSync: CouchSync: Config
+ * Pull — Config Pull failed: …".
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { ProgressNotice } from "../src/ui/notices.ts";
+import { ProgressNotice, noticeText } from "../src/ui/notices.ts";
 import { clearLog, getLogEntries, initLog } from "../src/ui/log.ts";
 import { configNotReady } from "../src/sync/config-errors.ts";
 import { SchemaVersionMismatchError } from "../src/db/sync/schema-gate.ts";
@@ -25,8 +25,8 @@ describe("ProgressNotice", () => {
     beforeEach(() => {
         clearLog();
         shown = [];
-        // The host's sink: it adds the prefix to every notice it shows.
-        initLog(() => ({ verboseNotice: false }), (msg) => { shown.push(`CouchSync: ${msg}`); });
+        // The text the host's sink (`showNotice`) puts on each notice.
+        initLog(() => ({ verboseNotice: false }), (msg) => { shown.push(noticeText(msg)); });
         vi.spyOn(console, "error").mockImplementation(() => {});
         vi.spyOn(console, "warn").mockImplementation(() => {});
     });
@@ -76,7 +76,7 @@ describe("ProgressNotice", () => {
     });
 
     it("done: '<label> — <summary>', prefixed exactly once", () => {
-        new ProgressNotice("Verify").done("Verify: 0 discrepancy(ies)");
-        expect(shown).toEqual(["CouchSync: Verify — Verify: 0 discrepancy(ies)"]);
+        new ProgressNotice("Verify").done("0 discrepancy(ies)");
+        expect(shown).toEqual(["CouchSync: Verify — 0 discrepancy(ies)"]);
     });
 });

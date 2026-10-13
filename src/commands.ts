@@ -1,6 +1,5 @@
-import { Notice } from "obsidian";
 import type CouchSyncPlugin from "./main.ts";
-import { ProgressNotice } from "./ui/notices.ts";
+import { ProgressNotice, showNotice } from "./ui/notices.ts";
 import { UserFacingError } from "./ui/describe-error.ts";
 import { ConsistencyReportModal } from "./ui/consistency-report-modal.ts";
 import { ChunkConsistencyReportModal } from "./ui/chunk-consistency-report-modal.ts";
@@ -23,7 +22,7 @@ export function registerCommands(plugin: CouchSyncPlugin): void {
             if (file) {
                 plugin.showHistory(file.path);
             } else {
-                new Notice("No active file. Open a file to view its history.");
+                showNotice("No active file. Open a file to view its history.");
             }
         },
     });
@@ -45,7 +44,7 @@ export function registerCommands(plugin: CouchSyncPlugin): void {
                     try {
                         await plugin.remoteOps.pullAll();
                     } catch (e: any) {
-                        logWarn(`CouchSync: verify pull failed, continuing with local view: ${e?.message ?? e}`);
+                        logWarn(`verify pull failed, continuing with local view: ${e?.message ?? e}`);
                     }
                     // Push-backfill: re-enqueue docs a pre-fix push cursor
                     // skipped (permanently unpushed tombstones). Manual path
@@ -54,16 +53,16 @@ export function registerCommands(plugin: CouchSyncPlugin): void {
                     try {
                         const bf = await plugin.replicator.runPushBackfillNow();
                         if (bf && bf.enqueued > 0) {
-                            notify(`CouchSync: re-enqueued ${bf.enqueued} doc(s) the push cursor had skipped.`);
+                            notify(`re-enqueued ${bf.enqueued} doc(s) the push cursor had skipped.`);
                         }
                     } catch (e: any) {
-                        logWarn(`CouchSync: push backfill failed during verify: ${e?.message ?? e}`);
+                        logWarn(`push backfill failed during verify: ${e?.message ?? e}`);
                     }
                 }
                 progress.update("Reconciling...");
                 const report = await plugin.reconciler.reconcile("manual", { mode: "report" });
                 const total = totalDiscrepancies(report);
-                progress.done(`Verify: ${total} discrepancy(ies)`);
+                progress.done(`${total} discrepancy(ies)`);
                 new ConsistencyReportModal(plugin.app, report, async () => {
                     await plugin.reconciler.reconcile("manual-repair");
                 }).open();
@@ -88,7 +87,7 @@ export function registerCommands(plugin: CouchSyncPlugin): void {
             // sweep would race its writes), and Apply cannot switch the
             // store mid-sweep.
             if (!plugin.configLocalDb) {
-                notify("CouchSync: Config DB is not configured.", 5000);
+                notify("Config DB is not configured.", 5000);
                 return;
             }
             const progress = new ProgressNotice("Config GC");
@@ -98,7 +97,7 @@ export function registerCommands(plugin: CouchSyncPlugin): void {
                     return gcOrphanConfigChunks(binding.store);
                 });
                 progress.done(
-                    `Config GC: scanned ${result.scannedChunks}, ` +
+                    `scanned ${result.scannedChunks}, ` +
                     `referenced ${result.referencedChunks}, ` +
                     `deleted ${result.deletedChunks} orphan(s).`,
                 );
@@ -118,13 +117,13 @@ export function registerCommands(plugin: CouchSyncPlugin): void {
             }
             if (plugin.settings.connectionState !== "syncing") {
                 notify(
-                    "CouchSync: enable Live Sync in Vault Sync (Step 3) first.",
+                    "enable Live Sync in Vault Sync (Step 3) first.",
                     5000,
                 );
                 return;
             }
             await plugin.replicator.requestReconnect("manual");
-            notify("CouchSync: reconnect requested.", 3000);
+            notify("reconnect requested.", 3000);
         },
     });
 }
@@ -162,13 +161,13 @@ export async function runChunkConsistencyReport(
         if (result.state === "needs-convergence") {
             const d = result.divergence;
             progress.done(
-                `Chunk report — not converged: ${d.localOnly.length} pending push, ` +
+                `not converged: ${d.localOnly.length} pending push, ` +
                     `${d.remoteOnly.length} pending pull, ${d.differing.length} differing`,
             );
         } else {
             const r = result.report;
             progress.done(
-                `Chunk report — ${r.counts.localOnly} local-only, ` +
+                `${r.counts.localOnly} local-only, ` +
                     `${r.counts.remoteOnly} remote-only, ` +
                     `${r.counts.missingReferenced} broken, ` +
                     `${r.counts.orphanLocal + r.counts.orphanRemote} orphan(s)`,
@@ -205,13 +204,13 @@ export async function runChunkConsistencyReport(
                     `deleted-local ${repairResult.deletedLocal}, ` +
                     `deleted-remote ${repairResult.deletedRemote}`;
                 if (repairResult.failed.length === 0) {
-                    repairProgress.done(`Repair — ${summary}`);
+                    repairProgress.done(summary);
                 } else {
                     repairProgress.fail(new UserFacingError(
                         `${summary}, ${repairResult.failed.length} failed (see the log).`,
                     ));
                     logWarn(
-                        `CouchSync: chunk repair failures: ${
+                        `chunk repair failures: ${
                             repairResult.failed
                                 .map((f) => `${f.direction} ${f.id}: ${f.reason}`)
                                 .join("; ")
@@ -228,16 +227,16 @@ export async function runChunkConsistencyReport(
                     );
                 } catch (e: any) {
                     logWarn(
-                        `CouchSync: chunk-consistency retry pull failed, continuing with whatever landed: ${e?.message ?? e}`,
+                        `chunk-consistency retry pull failed, continuing with whatever landed: ${e?.message ?? e}`,
                     );
                 }
                 pullProgress.update("re-analysing...");
                 const next = await analyze();
                 if (next.state === "converged") {
-                    pullProgress.done("Re-analyse — converged");
+                    pullProgress.done("converged");
                 } else {
                     pullProgress.done(
-                        `Re-analyse — still not converged (${
+                        `still not converged (${
                             next.divergence.localOnly.length +
                             next.divergence.remoteOnly.length +
                             next.divergence.differing.length

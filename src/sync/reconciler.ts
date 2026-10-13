@@ -208,7 +208,7 @@ export class Reconciler {
                 const next = this.pendingReason;
                 this.pendingReason = null;
                 this.reconcile(next).catch((e) =>
-                    logError(`CouchSync: queued ${next} reconcile failed: ${e?.message ?? e}`),
+                    logError(`queued ${next} reconcile failed: ${e?.message ?? e}`),
                 );
             }
         }
@@ -355,7 +355,7 @@ export class Reconciler {
                 try {
                     relation = await this.vaultSync.classifyFileVsDoc(doc, file.path, file.stat);
                 } catch (e) {
-                    logError(`CouchSync: reconcile classify (tombstone) failed for ${displayPath}: ${e?.message ?? e}`);
+                    logError(`reconcile classify (tombstone) failed for ${displayPath}: ${e?.message ?? e}`);
                     continue;
                 }
                 switch (relation) {
@@ -393,7 +393,7 @@ export class Reconciler {
                             }
                         } else {
                             logWarn(
-                                `CouchSync: divergent recreate on ${displayPath} — no conflict ` +
+                                `divergent recreate on ${displayPath} — no conflict ` +
                                 `orchestrator wired; leaving untouched (re-detected next reconcile).`,
                             );
                         }
@@ -404,7 +404,7 @@ export class Reconciler {
                         // makes contentEqual false and legacy baselines refine
                         // to true-divergent). Guard for visibility.
                         logError(
-                            `CouchSync: unexpected relation '${relation}' for tombstone reconcile of ${displayPath}`,
+                            `unexpected relation '${relation}' for tombstone reconcile of ${displayPath}`,
                         );
                         break;
                 }
@@ -519,7 +519,7 @@ export class Reconciler {
                 try {
                     relation = await this.vaultSync.classifyFileVsDoc(doc, file.path, file.stat);
                 } catch (e) {
-                    logError(`CouchSync: reconcile classify failed for ${displayPath}: ${e?.message ?? e}`);
+                    logError(`reconcile classify failed for ${displayPath}: ${e?.message ?? e}`);
                     continue;
                 }
                 switch (relation) {
@@ -614,7 +614,7 @@ export class Reconciler {
         // silently wipe a vault.
         if (mode === "apply" && report.deleted.length > vaultFiles.length * LARGE_DELETE_RATIO) {
             const msg = `Large deletion detected: ${report.deleted.length} files removed (>${Math.floor(LARGE_DELETE_RATIO * 100)}% of vault). Verify with consistency check.`;
-            logWarn(`CouchSync: ${msg}`);
+            logWarn(msg);
             this.notify(msg);
         }
 
@@ -693,10 +693,10 @@ export class Reconciler {
      *  (disposed) to debug so teardown doesn't spam the log. */
     private logStepError(label: string, path: string, e: unknown): void {
         if (this.disposed) {
-            logDebug(`CouchSync: reconcile ${label} skipped for ${path} (shutting down)`);
+            logDebug(`reconcile ${label} skipped for ${path} (shutting down)`);
             return;
         }
-        logError(`CouchSync: reconcile ${label} failed for ${path}: ${(e as any)?.message ?? e}`);
+        logError(`reconcile ${label} failed for ${path}: ${(e as any)?.message ?? e}`);
     }
 
     /**

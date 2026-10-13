@@ -261,7 +261,7 @@ export class CouchClient implements ICouchClient {
                     // every later request skips compression up front.
                     this.gzipRequestBody = false;
                     logWarn(
-                        "CouchSync: server rejected gzip request body (415) — " +
+                        "server rejected gzip request body (415) — " +
                         "falling back to uncompressed requests for this session",
                     );
                     return await this.request<T>(path, init, opts);
@@ -344,7 +344,7 @@ export class CouchClient implements ICouchClient {
                     throw e;
                 }
                 logWarn(
-                    "CouchSync: compressed request rejected at network layer " +
+                    "compressed request rejected at network layer " +
                     "(CORS preflight?) — falling back to uncompressed requests " +
                     "for this session. Add 'content-encoding' to CouchDB " +
                     "cors.headers to enable push compression.",

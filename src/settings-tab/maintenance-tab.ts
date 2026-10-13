@@ -1,4 +1,4 @@
-import { Notice, Platform, Setting } from "obsidian";
+import { Platform, Setting } from "obsidian";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { LocalDB } from "../db/local-db.ts";
 import type { ConfigLocalDB } from "../db/config-local-db.ts";
@@ -8,6 +8,7 @@ import type { IModalPresenter } from "../types/modal-presenter.ts";
 import type { LogManager } from "../log/log-manager.ts";
 import { DOC_ID } from "../types/doc-id.ts";
 import { logError } from "../ui/log.ts";
+import { showNotice } from "../ui/notices.ts";
 
 interface MaintenanceTabDeps {
     getSettings: () => CouchSyncSettings;
@@ -150,13 +151,13 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
                 btn.setButtonText("Exporting...");
                 try {
                     const result = await deps.logManager.exportToVault();
-                    new Notice(
-                        `CouchSync: exported ${result.count} log entries to ${result.path}`,
+                    showNotice(
+                        `exported ${result.count} log entries to ${result.path}`,
                         8000,
                     );
                     await refreshLogStats();
                 } catch (e: any) {
-                    new Notice(`Log export failed: ${e?.message ?? e}`, 10000);
+                    showNotice(`Log export failed: ${e?.message ?? e}`, 10000);
                 } finally {
                     btn.setButtonText("Export");
                     btn.setDisabled(false);
@@ -182,10 +183,10 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
                     btn.setDisabled(true);
                     try {
                         await deps.logManager.clearStoredLogs();
-                        new Notice("CouchSync: log buffer cleared.", 4000);
+                        showNotice("log buffer cleared.", 4000);
                         await refreshLogStats();
                     } catch (e: any) {
-                        new Notice(`Clear failed: ${e?.message ?? e}`, 10000);
+                        showNotice(`Clear failed: ${e?.message ?? e}`, 10000);
                     } finally {
                         btn.setDisabled(false);
                     }
@@ -211,10 +212,10 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
                     btn.setDisabled(true);
                     try {
                         await deps.logManager.deleteLogDatabase();
-                        new Notice("CouchSync: log database deleted.", 4000);
+                        showNotice("log database deleted.", 4000);
                         await refreshLogStats();
                     } catch (e: any) {
-                        new Notice(`Delete failed: ${e?.message ?? e}`, 10000);
+                        showNotice(`Delete failed: ${e?.message ?? e}`, 10000);
                     } finally {
                         btn.setDisabled(false);
                     }
@@ -251,13 +252,13 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
                 btn.setDisabled(true);
                 try {
                     const deleted = await deps.localDb.deleteAllByPrefix(DOC_ID.CONFIG);
-                    new Notice(
-                        `CouchSync: removed ${deleted.length} legacy config doc(s) from vault DB. ` +
+                    showNotice(
+                        `removed ${deleted.length} legacy config doc(s) from vault DB. ` +
                             "Replication will propagate the deletions to the remote shortly.",
                         10000,
                     );
                 } catch (e: any) {
-                    new Notice(`Cleanup failed: ${e?.message ?? e}`, 10000);
+                    showNotice(`Cleanup failed: ${e?.message ?? e}`, 10000);
                 } finally {
                     btn.setButtonText("Clean up");
                     btn.setDisabled(false);
@@ -293,7 +294,7 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
             );
         } catch (e) {
             migrationSetting.setDesc("Could not check for legacy configs (see console).");
-            logError(`CouchSync: legacy probe failed: ${e?.message ?? e}`);
+            logError(`legacy probe failed: ${e?.message ?? e}`);
         }
     })();
 
@@ -362,7 +363,7 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
                     if (!ok) return;
                     deps.replicator.stop();
                     await deps.localDb.destroy();
-                    new Notice("CouchSync: Local vault database deleted. Restarting...");
+                    showNotice("Local vault database deleted. Restarting...");
                     deps.onRestart();
                 })
         );
@@ -399,12 +400,12 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
                         // must not have its store destroyed underneath it.
                         try {
                             await deps.runConfigExclusive((store) => store.destroy());
-                            new Notice(
-                                "CouchSync: Local config database deleted. Restarting...",
+                            showNotice(
+                                "Local config database deleted. Restarting...",
                             );
                             deps.onRestart();
                         } catch (e: any) {
-                            new Notice(`Delete failed: ${e?.message ?? e}`, 10000);
+                            showNotice(`Delete failed: ${e?.message ?? e}`, 10000);
                         }
                     })
             );

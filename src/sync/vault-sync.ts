@@ -905,7 +905,7 @@ export class VaultSync {
         if (e.recovery === "halt" && e.userMessage) {
             notify(e.userMessage, 15000);
         }
-        logWarn(`CouchSync: ${context}: ${e.kind} — ${e.message}`);
+        logWarn(`${context}: ${e.kind} — ${e.message}`);
     }
 
     async applyRemoteDeletion(path: string): Promise<void> {
@@ -945,7 +945,7 @@ export class VaultSync {
                 if ((await this.vault.abstractType(dir)) !== "folder") return;
                 await this.vault.delete(dir);
             } catch (e: any) {
-                logWarn(`CouchSync: pruneEmptyParents ${dir}: ${e?.message ?? e}`);
+                logWarn(`pruneEmptyParents ${dir}: ${e?.message ?? e}`);
                 return;
             }
             dir = parentDir(dir);

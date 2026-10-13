@@ -121,7 +121,7 @@ export class RetryingCouchClient implements ICouchClient {
             try {
                 const result = await fn();
                 if (attempt > 0) {
-                    logInfo(`CouchSync: ${label} succeeded after ${attempt} retr${attempt === 1 ? "y" : "ies"}`);
+                    logInfo(`${label} succeeded after ${attempt} retr${attempt === 1 ? "y" : "ies"}`);
                 }
                 return result;
             } catch (e) {
@@ -133,7 +133,7 @@ export class RetryingCouchClient implements ICouchClient {
                 const delay = backoff.nextDelay();
                 backoff.recordFailure();
                 logWarn(
-                    `CouchSync: ${label} failed (${detail.kind}: ${detail.message}); ` +
+                    `${label} failed (${detail.kind}: ${detail.message}); ` +
                         `retry ${attempt}/${this.maxRetries} in ${delay}ms`,
                 );
                 await this.sleep(delay, signal);

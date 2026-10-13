@@ -48,7 +48,7 @@ export class ChangeTracker implements IWriteIgnore, IPendingProbe {
                 this.lastSyncTime.delete(path);
                 if (this.pendingDeleteIgnores.delete(path)) return;
                 this.vaultSync.markDeleted(path).catch((e) =>
-                    logError(`CouchSync: markDeleted failed: ${path} ${e?.message ?? e}`),
+                    logError(`markDeleted failed: ${path} ${e?.message ?? e}`),
                 );
             })
         );
@@ -58,7 +58,7 @@ export class ChangeTracker implements IWriteIgnore, IPendingProbe {
                 this.cancelPending(oldPath);
                 this.lastSyncTime.delete(oldPath);
                 this.vaultSync.handleRename(path, oldPath).catch((e) =>
-                    logError(`CouchSync: handleRename failed: ${oldPath} → ${path} ${e?.message ?? e}`),
+                    logError(`handleRename failed: ${oldPath} → ${path} ${e?.message ?? e}`),
                 );
             })
         );
@@ -71,7 +71,7 @@ export class ChangeTracker implements IWriteIgnore, IPendingProbe {
         this.eventRefs.push(
             this.events.on("folder-delete", (path) => {
                 this.vaultSync.handleFolderDelete(path).catch((e) =>
-                    logError(`CouchSync: handleFolderDelete failed: ${path} ${e?.message ?? e}`),
+                    logError(`handleFolderDelete failed: ${path} ${e?.message ?? e}`),
                 );
             })
         );
@@ -155,7 +155,7 @@ export class ChangeTracker implements IWriteIgnore, IPendingProbe {
     private runSync(path: string): void {
         this.lastSyncTime.set(path, Date.now());
         this.vaultSync.fileToDb(path).catch((e) => {
-            logError(`CouchSync: Failed to sync ${path}: ${e?.message ?? e}`);
+            logError(`Failed to sync ${path}: ${e?.message ?? e}`);
         });
     }
 

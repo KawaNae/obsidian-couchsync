@@ -1,4 +1,4 @@
-import { App, Modal, Notice, Setting } from "obsidian";
+import { App, Modal, Setting } from "obsidian";
 import type { ChunkConsistencyResult } from "../sync/chunk-consistency.ts";
 import type { ChunkConsistencyReport } from "../sync/chunk-consistency.ts";
 import {
@@ -6,6 +6,7 @@ import {
     type ChunkConsistencyView,
     type ReportSection,
 } from "./chunk-consistency-view.ts";
+import { showNotice } from "./notices.ts";
 
 /**
  * Invoked by the repair button. Receives the currently displayed
@@ -104,7 +105,7 @@ export class ChunkConsistencyReportModal extends Modal {
                             this.result = next;
                             this.render();
                         } catch (e: any) {
-                            new Notice(`Repair failed: ${e?.message ?? e}`, 6000);
+                            showNotice(`Repair failed: ${e?.message ?? e}`, 6000);
                             btn.setDisabled(false);
                             btn.setButtonText(label);
                         }
@@ -145,7 +146,7 @@ export class ChunkConsistencyReportModal extends Modal {
                             this.result = next;
                             this.render();
                         } catch (e: any) {
-                            new Notice(`Retry failed: ${e?.message ?? e}`, 6000);
+                            showNotice(`Retry failed: ${e?.message ?? e}`, 6000);
                             btn.setDisabled(false);
                             btn.setButtonText("Wait for sync & retry");
                         }
@@ -165,9 +166,9 @@ export class ChunkConsistencyReportModal extends Modal {
                             await navigator.clipboard.writeText(
                                 JSON.stringify(this.result, null, 2),
                             );
-                            new Notice("Result copied to clipboard.");
+                            showNotice("Result copied to clipboard.");
                         } catch (e: any) {
-                            new Notice(`Copy failed: ${e?.message ?? e}`, 6000);
+                            showNotice(`Copy failed: ${e?.message ?? e}`, 6000);
                         }
                     }),
             )

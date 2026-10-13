@@ -160,7 +160,7 @@ export class ConflictResolver {
             case "true-divergent":
                 // Both sides changed concurrently — needs human judgment.
                 logWarn(
-                    `CouchSync: concurrent conflict on ${vaultPath} — enqueued for resolution.`,
+                    `concurrent conflict on ${vaultPath} — enqueued for resolution.`,
                 );
                 return "concurrent";
 

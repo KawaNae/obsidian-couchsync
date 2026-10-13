@@ -618,7 +618,7 @@ export class ConfigBinding {
         const prevFloor = this.entry()?.cipherFloor;
         if (prevFloor !== undefined && (floor === undefined || floor < prevFloor)) {
             logWarn(
-                `CouchSync: Config Join re-anchors the cipher floor of "${this.dbName}" ` +
+                `Config Join re-anchors the cipher floor of "${this.dbName}" ` +
                 `from ${prevFloor} to ${floor ?? "none (unencrypted)"} (the joined root's).`,
             );
         }

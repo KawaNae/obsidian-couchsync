@@ -186,7 +186,7 @@ export class ConflictOrchestrator {
             } catch (e: any) {
                 logError(`Conflict resolution error for ${filePath.split("/").pop()}: ${e?.message ?? e}`);
                 notify(
-                    `CouchSync: conflict on ${filePath.split("/").pop()} — keeping local version due to error.`,
+                    `conflict on ${filePath.split("/").pop()} — keeping local version due to error.`,
                     10000,
                 );
                 await clearPendingConflict(this.deps.localDb, localDoc._id).catch(() => {});
@@ -217,7 +217,7 @@ export class ConflictOrchestrator {
             });
         }
         notify(
-            `CouchSync: concurrent config edit on ${filePath.split("/").pop()} — keeping local version.`,
+            `concurrent config edit on ${filePath.split("/").pop()} — keeping local version.`,
             8000,
         );
     }
@@ -297,7 +297,7 @@ export class ConflictOrchestrator {
             this.openConflictDismiss.delete(item.filePath);
             logError(`Conflict resolution error for ${item.filePath.split("/").pop()}: ${e?.message ?? e}`);
             notify(
-                `CouchSync: conflict on ${item.filePath.split("/").pop()} — keeping local version due to error.`,
+                `conflict on ${item.filePath.split("/").pop()} — keeping local version due to error.`,
                 10000,
             );
             outcome = "resolved";
@@ -402,7 +402,7 @@ export class ConflictOrchestrator {
                 `Divergent-edit resolution error for ${filePath.split("/").pop()}: ${e?.message ?? e}`,
             );
             notify(
-                `CouchSync: divergent edit on ${filePath.split("/").pop()} — keeping local version due to error.`,
+                `divergent edit on ${filePath.split("/").pop()} — keeping local version due to error.`,
                 10000,
             );
             return;
@@ -446,7 +446,7 @@ export class ConflictOrchestrator {
                 `Divergent-delete resolution error for ${filePath.split("/").pop()}: ${e?.message ?? e}`,
             );
             notify(
-                `CouchSync: divergent delete on ${filePath.split("/").pop()} — keeping local deletion due to error.`,
+                `divergent delete on ${filePath.split("/").pop()} — keeping local deletion due to error.`,
                 10000,
             );
             return;
@@ -497,7 +497,7 @@ export class ConflictOrchestrator {
                 `Divergent-recreate resolution error for ${filePath.split("/").pop()}: ${e?.message ?? e}`,
             );
             notify(
-                `CouchSync: divergent recreate on ${filePath.split("/").pop()} — left untouched due to error.`,
+                `divergent recreate on ${filePath.split("/").pop()} — left untouched due to error.`,
                 10000,
             );
             return;
@@ -585,7 +585,7 @@ export class ConflictOrchestrator {
             "local",
         );
         notify(
-            `CouchSync: concurrent edit on binary file ${fileName} — ` +
+            `concurrent edit on binary file ${fileName} — ` +
                 "keeping local version. Check Diff History for details.",
             10000,
         );

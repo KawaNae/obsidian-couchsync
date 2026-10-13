@@ -22,7 +22,7 @@
  * Step 2+ is gated on `serverTested` (server connection verified in the
  * CouchDB tab).
  */
-import { type App, Notice, Platform, Setting, type ButtonComponent } from "obsidian";
+import { type App, Platform, Setting, type ButtonComponent } from "obsidian";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { ConfigSync, RemoteConfigListing } from "../sync/config-sync.ts";
 import type { SyncEngine } from "../db/sync-engine.ts";
@@ -69,6 +69,7 @@ import {
 } from "../sync/config-codec-policy.ts";
 import { describeCodec, sameCodec } from "../sync/config-binding-record.ts";
 import { CURRENT_CIPHER_VERSION } from "../db/vault-meta.ts";
+import { showNotice } from "../ui/notices.ts";
 
 export interface ConfigSyncTabDeps {
     app: App;
@@ -452,7 +453,7 @@ export class ConfigSyncTab {
                         btn.setDisabled(true);
                         try {
                             await this.trackOp(this.deps.configSync.pull());
-                            new Notice("CouchSync: Reloading Obsidian...");
+                            showNotice("Reloading Obsidian...");
                             setTimeout(() => {
                                 (this.deps.app as any).commands.executeCommandById("app:reload");
                             }, 500);
@@ -524,8 +525,8 @@ export class ConfigSyncTab {
         // The dialog described `preview.bindingKey`. Checked in the same tick
         // as create() takes the op lock, so nothing can switch in between.
         if (this.deps.configSync.currentBinding()?.key !== preview.bindingKey) {
-            new Notice(
-                "CouchSync: the config database changed while the dialog was open — " +
+            showNotice(
+                "the config database changed while the dialog was open — " +
                     "Create was not run. Press Create again.",
                 10000,
             );
@@ -820,7 +821,7 @@ export class ConfigSyncTab {
 
         const settings = this.deps.getSettings();
         if (this.draft.db.trim() === settings.couchdbDbName) {
-            new Notice("Vault and config databases must have different names.", 8000);
+            showNotice("Vault and config databases must have different names.", 8000);
             btn.setButtonText("Check");
             btn.setDisabled(false);
             return;
@@ -835,14 +836,14 @@ export class ConfigSyncTab {
 
         if (result.status === "error") {
             this.testPassed = false;
-            new Notice(`Database check failed: ${result.message}`, 8000);
+            showNotice(`Database check failed: ${result.message}`, 8000);
         } else {
             this.testPassed = true;
             this.deps.auth.clear();
             if (result.status === "created") {
-                new Notice(`Database "${this.draft.db}" created.`, 3000);
+                showNotice(`Database "${this.draft.db}" created.`, 3000);
             } else {
-                new Notice(
+                showNotice(
                     `Database "${this.draft.db}" found — ${result.docCount.toLocaleString()} docs.`,
                     3000,
                 );
@@ -884,8 +885,8 @@ export class ConfigSyncTab {
                 commit: () => this.deps.updateSettings({ couchdbConfigDbName: name }),
             });
         } catch (e: any) {
-            logWarn(`CouchSync: config database switch failed: ${e?.message ?? e}`);
-            new Notice(`CouchSync: could not switch the config database — ${e?.message ?? e}`, 10000);
+            logWarn(`config database switch failed: ${e?.message ?? e}`);
+            showNotice(`could not switch the config database — ${e?.message ?? e}`, 10000);
             if (e instanceof ConfigNotReadyError && e.kind === "busy") {
                 this.updateDirtyState();
                 return;
