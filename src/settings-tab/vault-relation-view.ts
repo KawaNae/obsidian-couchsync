@@ -9,15 +9,14 @@
  *   2. an Init or Clone is running
  *   3. the server rejects the credentials (the auth latch)
  *   4. live sync is on — setup is locked
- *   5. a failure: the last Init / Clone, or the last encryption-agreement
- *      check (a pause says why sync stopped); when both failed, the one
- *      that started later. A setup left unfinished says so too
+ *   5. a failure: the last Init / Clone, or the encryption pause (it says
+ *      why sync stopped); when both are known, the one that started later.
+ *      A setup left unfinished says so too
  *   6. a setup that did not finish (no failure known since the load)
  *   7. not set up yet
  *   8. set up
  */
-import type { VaultDbCheck, VaultOpName, VaultOutcome, VaultRelation } from "../sync/vault-binding.ts";
-import { VaultEncryptionPausedError } from "../sync/vault-binding.ts";
+import type { VaultDbCheck, VaultRelation } from "../sync/vault-binding.ts";
 import { describeError } from "../ui/describe-error.ts";
 
 export interface VaultRelationView {
@@ -26,12 +25,6 @@ export interface VaultRelationView {
      *  neutral. */
     tone: "ok" | "error" | null;
 }
-
-const OP_NAMES: Record<VaultOpName, string> = {
-    init: "Init",
-    clone: "Clone",
-    agreement: "encryption check",
-};
 
 const UNFINISHED = "Setup did not finish — re-run Init or Clone. Sync stays disabled until it completes.";
 
@@ -42,16 +35,23 @@ const UNFINISHED = "Setup did not finish — re-run Init or Clone. Sync stays di
 export function vaultRelationView(rel: VaultRelation, authError: unknown | null): VaultRelationView {
     if (!rel.serverTested) return { text: "Complete the CouchDB tab and Step 2 first.", tone: null };
     if (rel.state === "editing") return { text: "Complete Step 2 first.", tone: null };
-    if (rel.busy) return { text: `${OP_NAMES[rel.busy]} is running…`, tone: null };
+    if (rel.busy) return { text: `${rel.busy === "init" ? "Init" : "Clone"} is running…`, tone: null };
     if (authError) return { text: describeError(authError).text, tone: "error" };
     if (rel.state === "syncing") {
         return { text: "Live sync is on. Turn it off in Step 4 to re-run setup.", tone: "ok" };
     }
-    const failed = [rel.lastOp, rel.lastCheck]
-        .filter((o): o is VaultOutcome => o !== null && o.error !== null)
-        .sort((a, b) => b.at - a.at)[0];
+    const failures: { at: number; label: string; error: unknown }[] = [];
+    if (rel.lastOp?.error) {
+        failures.push({
+            at: rel.lastOp.at,
+            label: rel.lastOp.op === "init" ? "Init" : "Clone",
+            error: rel.lastOp.error,
+        });
+    }
+    if (rel.pause) failures.push({ at: rel.pause.at, label: "encryption check", error: rel.pause.error });
+    const failed = failures.sort((a, b) => b.at - a.at)[0];
     if (failed) {
-        const text = `Last ${OP_NAMES[failed.op]}: ${describeError(failed.error).text}`;
+        const text = `Last ${failed.label}: ${describeError(failed.error).text}`;
         return { text: rel.state === "settingUp" ? `${text} ${UNFINISHED}` : text, tone: "error" };
     }
     if (rel.state === "settingUp") return { text: UNFINISHED, tone: "error" };
@@ -65,8 +65,9 @@ export interface CloneAvailability {
 }
 
 /**
- * Whether Clone can run, from Step 2's Check of the applied DB: Clone needs
- * a DB that holds data. Without a check since the plugin loaded, nothing is
+ * Whether Clone can run, from what the applied DB was last found to hold
+ * (Step 2's Check, or the read-back after an Init): Clone needs a DB that
+ * holds data. Without a check since the plugin loaded, nothing is
  * known about the DB, so the user is asked to check it rather than told it
  * is empty.
  *
@@ -88,9 +89,8 @@ export function cloneAvailability(dbCheck: VaultDbCheck | null, setupAllowed: bo
     return { enabled: true, desc: ready };
 }
 
-/** The last agreement check paused because another device turned vault
- *  encryption on or off — Step 1 has to be matched before Init / Clone. */
+/** Sync is paused because another device turned vault encryption on or
+ *  off — Step 1 has to be matched before Init / Clone. */
 export function encryptionChangedElsewhere(rel: VaultRelation): boolean {
-    const e = rel.lastCheck?.error;
-    return e instanceof VaultEncryptionPausedError && e.reason === "encryption-changed";
+    return rel.pause?.error.reason === "encryption-changed";
 }

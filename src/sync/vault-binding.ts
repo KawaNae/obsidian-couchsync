@@ -16,18 +16,25 @@
  *     an execution that is destructive (see `runOperation`);
  *   - the encryption-agreement check the live session runs before catchup
  *     (`checkAgreement`);
- *   - how the last Init / Clone and the last agreement check ended, and
- *     what Step 2's Check found (`relation`, which the Step 3 status line
- *     is drawn from).
+ *   - what is known about the setup: how the last Init / Clone ended, why
+ *     the agreement check paused sync (persisted with the state it
+ *     explains, so a reload keeps both), and what each vault DB was found
+ *     to hold (`relation`, which the Step 3 status line is drawn from).
+ *     An operation that changes a fact updates what is known about it:
+ *     Init refreshes what its DB holds, Init / Clone clear a pause.
+ *
+ * Every change of what `relation` returns is announced (`onChange`), so a
+ * view drawn from it can redraw while an operation runs, not only when the
+ * view's own button resolves.
  *
  * Has no dependency on Obsidian: the host injects settings, the setup
  * runner, the live-sync switch, the progress notice and the passphrase
  * prompt.
  */
-import type { CouchSyncSettings, ConnectionState } from "../settings.ts";
+import type { CouchSyncSettings, ConnectionState, VaultPauseRecord } from "../settings.ts";
 import type { ICouchClient } from "../db/interfaces.ts";
 import type { CryptoProvider } from "../db/crypto-provider.ts";
-import type { AuthGate } from "../db/sync/auth-gate.ts";
+import { AuthBlockedError, type AuthGate } from "../db/sync/auth-gate.ts";
 import { EncryptingCouchClient } from "../db/encrypting-couch-client.ts";
 import { CompressingCouchClient } from "../db/compressing-couch-client.ts";
 import { computeHash, type ChunkHasher } from "../db/chunker.ts";
@@ -96,37 +103,43 @@ export interface VaultBindingHost {
     askPassphrase: AskVaultPassphrase;
 }
 
-/** The vault operations whose outcome describes this device's setup.
- *  `agreement` is the encryption-agreement check the live session runs;
- *  the others are the user's. */
-export type VaultOpName = "init" | "clone" | "agreement";
+/** The user's operations on the vault setup. */
+export type VaultOpName = "init" | "clone";
 
 export type VaultOutcome = OpOutcome<VaultOpName>;
 
-/** What Step 2's Check found, for the DB it checked. */
+/** What the vault DB was found to hold: by Step 2's Check, or read back
+ *  after an Init filled it. */
 export interface VaultDbCheck {
     at: number;
-    /** `vaultTarget` of the checked DB. */
+    /** `vaultTarget` of the DB. */
     against: string;
     result: DbCheckResult;
 }
 
+/** Why the agreement check paused live sync, and since when. */
+export interface VaultPause {
+    at: number;
+    error: VaultEncryptionPausedError;
+}
+
 /** Snapshot of this device's setup of the vault DB, for the status line.
- *  Outcomes and the DB check are given only for the vault DB the settings
- *  name now. */
+ *  The outcome, the pause and the DB check are given only for the vault DB
+ *  the settings name now. */
 export interface VaultRelation {
     state: ConnectionState;
     serverTested: boolean;
     /** The Init or Clone running now. */
-    busy: "init" | "clone" | null;
-    /** The last Init or Clone. */
+    busy: VaultOpName | null;
+    /** The last Init or Clone. In memory: unknown after a reload. */
     lastOp: VaultOutcome | null;
-    /** The last conclusive encryption-agreement check. */
-    lastCheck: VaultOutcome | null;
+    /** Why sync is paused on the encryption agreement. Persisted: kept until
+     *  the check passes or an Init / Clone succeeds. */
+    pause: VaultPause | null;
     dbCheck: VaultDbCheck | null;
 }
 
-const OP_LABELS: Record<Exclude<VaultOpName, "agreement">, string> = {
+const OP_LABELS: Record<VaultOpName, string> = {
     init: "Init",
     clone: "Clone",
 };
@@ -156,9 +169,13 @@ export class VaultBinding {
     /** Cipher floor applied in memory while a Clone runs, before it
      *  commits `settings.vaultCipherVersion`. Undefined at all other times. */
     private cipherVersionOverride?: number;
-    private inflight: Exclude<VaultOpName, "agreement"> | null = null;
-    private readonly outcomes = new OutcomeLedger<VaultOpName>((op) => op === "agreement");
-    private dbCheck: VaultDbCheck | null = null;
+    private inflight: VaultOpName | null = null;
+    /** Init and Clone only; the agreement check's conclusion is the
+     *  persisted pause (`settings.vaultPause`). */
+    private readonly outcomes = new OutcomeLedger<VaultOpName>(() => false);
+    /** What each vault DB was found to hold, keyed by `vaultTarget`. */
+    private readonly dbChecks = new Map<string, VaultDbCheck>();
+    private readonly listeners = new Set<() => void>();
 
     /** The vault chunk hasher: HMAC under the key when the vault is
      *  encrypted and unlocked, xxhash64 otherwise. Reads the key on every
@@ -180,6 +197,23 @@ export class VaultBinding {
 
     private settings(): CouchSyncSettings {
         return this.host.getSettings();
+    }
+
+    /** Subscribe to changes of `relation()` and `busy()`. Returns the
+     *  unsubscribe function. */
+    onChange(listener: () => void): () => void {
+        this.listeners.add(listener);
+        return () => { this.listeners.delete(listener); };
+    }
+
+    private changed(): void {
+        for (const l of this.listeners) {
+            try {
+                l();
+            } catch (e) {
+                logWarn(`vault setup listener failed: ${rawErrorMessage(e)}`);
+            }
+        }
     }
 
     // ── Codec stack ────────────────────────────────────
@@ -254,10 +288,11 @@ export class VaultBinding {
     private async writeState(state: ConnectionState): Promise<void> {
         this.settings().connectionState = state;
         await this.host.saveSettings();
+        this.changed();
     }
 
     /** The Init or Clone running now, or null. */
-    busy(): "init" | "clone" | null {
+    busy(): VaultOpName | null {
         return this.inflight;
     }
 
@@ -304,6 +339,7 @@ export class VaultBinding {
         s.couchdbDbName = dbName;
         s.connectionState = "tested";
         await this.host.saveSettings();
+        this.changed();
     }
 
     /** A Step 1 codec setting changed (encryption, compression). The vault
@@ -317,6 +353,7 @@ export class VaultBinding {
         Object.assign(s, patch);
         if (s.connectionState === "setupDone") s.connectionState = "tested";
         await this.host.saveSettings();
+        this.changed();
     }
 
     /** The CouchDB tab's Apply. New credentials (or server) send the vault
@@ -330,27 +367,49 @@ export class VaultBinding {
         Object.assign(s, patch);
         if (credentialsChanged) s.connectionState = "editing";
         await this.host.saveSettings();
+        this.changed();
     }
 
-    /** This device's setup of the vault DB now. In memory only (the state
-     *  aside): after a reload the outcomes are unknown until the next run. */
+    /** This device's setup of the vault DB now. The state and the pause are
+     *  persisted; the last Init / Clone and the DB checks are in memory,
+     *  unknown after a reload until the next run. */
     relation(): VaultRelation {
         const s = this.settings();
         const target = vaultTarget(s);
+        const p = s.vaultPause;
         return {
             state: s.connectionState,
             serverTested: s.serverTested,
             busy: this.inflight,
-            ...this.outcomes.view(target),
+            lastOp: this.outcomes.view(target).lastOp,
+            pause: p && p.against === target
+                ? { at: p.at, error: new VaultEncryptionPausedError(p.reason, p.detail) }
+                : null,
             dbCheck: this.dbCheckFor(s.couchdbDbName),
         };
     }
 
-    /** What Step 2's Check found for `dbName` on the saved server, or null
-     *  when it was not checked since the plugin loaded. */
+    /** What `dbName` on the saved server was found to hold, or null when it
+     *  was not checked since the plugin loaded. */
     dbCheckFor(dbName: string): VaultDbCheck | null {
         const against = vaultTarget({ couchdbUri: this.settings().couchdbUri, couchdbDbName: dbName });
-        return this.dbCheck?.against === against ? this.dbCheck : null;
+        return this.dbChecks.get(against) ?? null;
+    }
+
+    /** Keep what the DB was found to hold, unless a newer finding is kept. */
+    private recordDbCheck(check: VaultDbCheck): void {
+        const kept = this.dbChecks.get(check.against);
+        if (kept && check.at < kept.at) return;
+        this.dbChecks.set(check.against, check);
+        this.changed();
+    }
+
+    /** Clear a pause noticed no later than `at` (a check that passed, or an
+     *  Init / Clone that succeeded, started at `at`). Changes the settings
+     *  object only; the caller saves. */
+    private clearPause(at: number): void {
+        const p = this.settings().vaultPause;
+        if (p && p.at <= at) delete this.settings().vaultPause;
     }
 
     /**
@@ -365,7 +424,7 @@ export class VaultBinding {
         const against = vaultTarget({ couchdbUri: this.settings().couchdbUri, couchdbDbName: dbName });
         const progress = this.host.openProgress("Database check");
         const result = await this.host.checkDatabase(dbName);
-        if (!this.dbCheck || at >= this.dbCheck.at) this.dbCheck = { at, against, result };
+        this.recordDbCheck({ at, against, result });
         if (result.status === "error") {
             progress.fail(result.error);
         } else {
@@ -382,48 +441,61 @@ export class VaultBinding {
     /**
      * Run Init or Clone. The notice is opened first, so no failure goes
      * unreported. A second run while one is in flight is refused; so is a
-     * run while the auth latch is raised. `body` prepares (reads, derives,
-     * asks — nothing is changed, and a failure leaves the setup state and
-     * live sync as they were), then calls `beginDestructive` and executes.
+     * run while the auth latch is raised. Neither refusal is recorded:
+     * nothing was attempted. `body` prepares (reads, derives, asks —
+     * nothing is changed, and a failure leaves the setup state and live
+     * sync as they were), then calls `beginDestructive` and executes.
      *
      * This is the one exit of an Init / Clone failure: the outcome is
-     * recorded (a cancellation is not), a 401/403 raises the auth latch,
-     * and the notice words the error. The error is rethrown so the caller
-     * only has to restore its button.
+     * recorded, and the notice words the error. Two failures are not
+     * recorded, because something else already tells them: a cancellation,
+     * and a rejection of the credentials (401/403), which raises the auth
+     * latch — the status line shows the latch while it is raised, and once
+     * a Test clears it the rejection no longer holds. The error is rethrown
+     * so the caller only has to restore its button.
      */
     private async runOperation(
-        op: "init" | "clone",
-        body: (progress: VaultProgress) => Promise<string>,
+        op: VaultOpName,
+        body: (progress: VaultProgress, at: number) => Promise<string>,
     ): Promise<void> {
         const progress = this.host.openProgress(OP_LABELS[op]);
-        if (this.inflight) {
-            const e = new UserFacingError(
-                `${OP_LABELS[this.inflight]} is running — wait for it to finish.`,
-            );
-            progress.fail(e);
-            throw e;
+        const busy = this.changeBlocker();
+        const refusal = busy !== null
+            ? new UserFacingError(busy)
+            : this.host.auth.isBlocked() ? this.host.auth.blockedError() : null;
+        if (refusal) {
+            progress.fail(refusal);
+            throw refusal;
         }
         this.inflight = op;
+        this.changed();
         const at = Date.now();
         const against = vaultTarget(this.settings());
         try {
-            if (this.host.auth.isBlocked()) throw this.host.auth.blockedError();
-            const summary = await body(progress);
+            const summary = await body(progress, at);
             this.outcomes.record({ op, at, against, error: null });
             progress.done(summary);
         } catch (e) {
             const d = classifyError(e);
-            if (d.kind === "auth" && typeof d.code === "number") {
-                this.host.auth.raise(d.code, rawErrorMessage(e));
-            }
-            if (!describeError(e).cancelled) {
+            const rejected = d.kind === "auth" && typeof d.code === "number";
+            if (rejected) this.host.auth.raise(d.code!, rawErrorMessage(e));
+            if (!rejected && !(e instanceof AuthBlockedError) && !describeError(e).cancelled) {
                 this.outcomes.record({ op, at, against, error: e });
             }
             progress.fail(e);
             throw e;
         } finally {
             this.inflight = null;
+            this.changed();
         }
+    }
+
+    /** A finished Init or Clone, started at `at`: the setup holds, and a
+     *  pause noticed before it no longer does. Changes the settings object
+     *  only; the caller saves. */
+    private settleSetup(at: number): void {
+        this.settings().connectionState = "setupDone";
+        this.clearPause(at);
     }
 
     /** The point of no return of Init and Clone: stop live sync and persist
@@ -447,7 +519,7 @@ export class VaultBinding {
      * compression flag are restamped.
      */
     async init(): Promise<void> {
-        return this.runOperation("init", async (progress) => {
+        return this.runOperation("init", async (progress, at) => {
             const s = this.settings();
             const enc = s.encryptionEnabled;
             const compress = s.compressionEnabled;
@@ -499,11 +571,12 @@ export class VaultBinding {
                 progress.update("Writing vault metadata...");
                 await pushVaultMeta(raw, meta);
                 if (!enc) s.encryptionPassphrase = "";
-                s.connectionState = "setupDone";
+                this.settleSetup(at);
                 if (meta.encryption.enabled) {
                     this.ratchetCipherFloor(meta.encryption.cipherVersion);
                 }
                 await this.host.saveSettings();
+                await this.readBackDb(raw);
                 const modes: string[] = [];
                 if (enc) modes.push("encrypted");
                 if (compress) modes.push("compressed");
@@ -532,7 +605,7 @@ export class VaultBinding {
      * cipher version must not keep a floor from another vault.
      */
     async clone(): Promise<void> {
-        return this.runOperation("clone", async (progress) => {
+        return this.runOperation("clone", async (progress, at) => {
             const s = this.settings();
             const raw = this.host.makeRawClient();
             progress.update("Reading vault:meta...");
@@ -563,7 +636,7 @@ export class VaultBinding {
                 s.encryptionPassphrase = targetPassphrase;
                 s.compressionEnabled = targetCompression;
                 s.vaultCipherVersion = targetCipherVersion;
-                s.connectionState = "setupDone";
+                this.settleSetup(at);
                 this.encryptionOverride = undefined;
                 this.compressionOverride = undefined;
                 this.cipherVersionOverride = undefined;
@@ -577,6 +650,21 @@ export class VaultBinding {
                 throw e;
             }
         });
+    }
+
+    /** After Init filled the DB, read back what it holds, so a Check made
+     *  before (an empty DB) does not keep describing it. When the read
+     *  fails, the old finding is dropped: what the DB holds is unknown. */
+    private async readBackDb(raw: ICouchClient): Promise<void> {
+        const at = Date.now();
+        const against = vaultTarget(this.settings());
+        try {
+            const info = await raw.withTimeout(REACHABILITY_TIMEOUT_MS).info();
+            this.recordDbCheck({ at, against, result: { status: "exists", docCount: info.doc_count } });
+        } catch (e) {
+            logWarn(`could not read the vault DB back after Init: ${rawErrorMessage(e)}`);
+            if (this.dbChecks.delete(against)) this.changed();
+        }
     }
 
     /** Unlock the encrypted `meta` for Clone: the Step 1 passphrase first,
@@ -644,12 +732,12 @@ export class VaultBinding {
      *
      *   - agreed: unlock the key once (asking for the passphrase when none
      *     is stored), ratchet the cipher floor, and take the server's
-     *     compression flag. Recorded as a passed check.
+     *     compression flag. A pause noticed before is cleared.
      *   - a transient failure while reading `vault:meta` is thrown as is and
-     *     not recorded: the check did not conclude, and the engine retries
-     *     (the status bar shows the live session's errors).
-     *   - a state the user has to act on pauses (`pause`), recorded as a
-     *     failed check so Step 3 says why.
+     *     changes nothing: the check did not conclude, and the engine
+     *     retries (the status bar shows the live session's errors).
+     *   - a state the user has to act on pauses (`pause`), persisted so
+     *     Step 3 says why, also after a reload.
      */
     async checkAgreement(_signal: AbortSignal): Promise<void> {
         const at = Date.now();
@@ -687,6 +775,7 @@ export class VaultBinding {
                 passphrase = answer;
                 s.encryptionPassphrase = passphrase;
                 await this.host.saveSettings();
+                this.changed();
             } else {
                 unlocked.crypto = (await unlockVaultMeta(meta, passphrase))?.crypto ?? null;
                 if (!unlocked.crypto) {
@@ -702,16 +791,23 @@ export class VaultBinding {
 
         // The compression flag is the server's: take it so every device
         // builds the same decorator stack.
+        let changed = false;
         if (agreement.meta && s.compressionEnabled !== agreement.meta.compression.enabled) {
             s.compressionEnabled = agreement.meta.compression.enabled;
-            await this.host.saveSettings();
+            changed = true;
         }
-        this.outcomes.record({ op: "agreement", at, against, error: null });
+        const pause = s.vaultPause;
+        this.clearPause(at);
+        if (s.vaultPause !== pause) changed = true;
+        if (changed) {
+            await this.host.saveSettings();
+            this.changed();
+        }
     }
 
     /** Pause live sync for a state the user has to act on: persist
      *  `tested` (the next load does not start sync; Step 3 offers Init and
-     *  Clone), record the failed check, and return the terminal error for
+     *  Clone) together with the reason, and return the terminal error for
      *  the caller to throw. The live session surfaces it once. */
     private async pause(
         at: number,
@@ -719,10 +815,14 @@ export class VaultBinding {
         reason: VaultPauseReason,
         detail: VaultPauseDetail = {},
     ): Promise<VaultEncryptionPausedError> {
-        const e = new VaultEncryptionPausedError(reason, detail);
+        const s = this.settings();
+        const kept = s.vaultPause;
+        if (!kept || kept.at <= at) {
+            const record: VaultPauseRecord = { reason, detail, at, against };
+            s.vaultPause = record;
+        }
         await this.writeState("tested");
-        this.outcomes.record({ op: "agreement", at, against, error: e });
-        return e;
+        return new VaultEncryptionPausedError(reason, detail);
     }
 }
 

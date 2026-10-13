@@ -1,5 +1,6 @@
 import type { ConfigSyncPolicy } from "./sync/config-policy/policy.ts";
 import { defaultConfigSyncPolicy } from "./sync/config-policy/policy.ts";
+import type { VaultPauseDetail, VaultPauseReason } from "./sync/vault-binding.ts";
 
 /** Keep only the N most recent previous device IDs. */
 export const MAX_PREVIOUS_DEVICE_IDS = 10;
@@ -20,6 +21,21 @@ export const MAX_PREVIOUS_DEVICE_IDS = 10;
  */
 export type ConnectionState =
     | "editing" | "tested" | "settingUp" | "setupDone" | "syncing";
+
+/**
+ * Why the encryption-agreement check paused vault sync. Written with the
+ * `tested` state the pause persists, so the reason survives a reload with
+ * the state it explains. Cleared when the check passes or an Init / Clone
+ * succeeds. Absent: no pause.
+ */
+export interface VaultPauseRecord {
+    reason: VaultPauseReason;
+    detail: VaultPauseDetail;
+    /** When the check that paused started (ms since epoch). */
+    at: number;
+    /** `vaultTarget` of the vault DB the check ran against. */
+    against: string;
+}
 
 export interface MobileStatusPosition {
     align: "left" | "right";
@@ -158,6 +174,7 @@ export interface CouchSyncSettings {
     /** Server reachable + auth verified (CouchDB tab Test+Apply). */
     serverTested: boolean;
     connectionState: ConnectionState;
+    vaultPause?: VaultPauseRecord;
     /** Human-readable device name used as the vclock key (e.g. "desktop", "iphone"). */
     deviceId: string;
     /** Old deviceIds this device has used (UUIDs from pre-v0.12, renamed names).
