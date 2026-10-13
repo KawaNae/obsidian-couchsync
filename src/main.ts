@@ -1,13 +1,12 @@
 import { Notice, Platform, Plugin, apiVersion } from "obsidian";
 import { type CouchSyncSettings, DEFAULT_SETTINGS } from "./settings.ts";
 import { LocalDB } from "./db/local-db.ts";
-import { ConfigLocalDB } from "./db/config-local-db.ts";
+import type { ConfigLocalDB } from "./db/config-local-db.ts";
 import { SyncEngine } from "./db/sync-engine.ts";
 import { AuthGate } from "./db/sync/auth-gate.ts";
 import { VaultRemoteOps } from "./db/sync/vault-remote-ops.ts";
 import { VaultSync } from "./sync/vault-sync.ts";
 import { ConfigSync } from "./sync/config-sync.ts";
-import { resolveConfigCodec } from "./sync/config-codec-policy.ts";
 import type { ReconnectBridge } from "./sync/reconnect-bridge.ts";
 import { SetupService } from "./sync/setup.ts";
 import { ChangeTracker } from "./sync/change-tracker.ts";
@@ -26,7 +25,7 @@ import { LogManager } from "./log/log-manager.ts";
 import type { DeviceInfo } from "./log/markdown-formatter.ts";
 import { DiffHistoryView, VIEW_TYPE_DIFF_HISTORY } from "./ui/history-view.ts";
 import { LogView, VIEW_TYPE_LOG } from "./ui/log-view.ts";
-import { migrateSettings } from "./settings-migration.ts";
+import { deleteLegacyConfigStore, migrateSettings } from "./settings-migration.ts";
 import { registerCommands } from "./commands.ts";
 import { gcOrphanChunks } from "./db/chunk-gc.ts";
 import { ObsidianVaultIO } from "./adapters/obsidian-vault-io.ts";
@@ -41,17 +40,14 @@ import { computeHash, type ChunkHasher } from "./db/chunker.ts";
 import type { ChunkHashAlg } from "./types/doc-id.ts";
 import { EncryptingCouchClient } from "./db/encrypting-couch-client.ts";
 import { CompressingCouchClient } from "./db/compressing-couch-client.ts";
-import { makeCouchClient, type CouchClient } from "./db/couch-client.ts";
+import { makeCouchClient } from "./db/couch-client.ts";
 import {
     fetchVaultMeta,
     buildInitialVaultMeta,
     pushVaultMeta,
     unlockVaultMeta,
-    unlockConfigMeta,
     VAULT_META_DOC_ID,
-    CONFIG_META_DOC_ID,
     type VaultMetaDoc,
-    type ConfigMetaDoc,
 } from "./db/vault-meta.ts";
 import { checkEncryptionAgreement, type EncryptionAgreement } from "./db/encryption-agreement.ts";
 import { PassphraseModal } from "./ui/passphrase-modal.ts";
@@ -60,8 +56,12 @@ import type { ICouchClient } from "./db/interfaces.ts";
 export default class CouchSyncPlugin extends Plugin {
     settings!: CouchSyncSettings;
     localDb!: LocalDB;
-    /** Null when `couchdbConfigDbName === ""` (config sync disabled) */
-    configLocalDb: ConfigLocalDB | null = null;
+    /** The current config binding's local store; null when config sync is
+     *  disabled. A getter on purpose: `ConfigSync.rebind` (Apply) replaces
+     *  the store at runtime, so callers must read it at use time. */
+    get configLocalDb(): ConfigLocalDB | null {
+        return this.configSync?.currentStore() ?? null;
+    }
     replicator!: SyncEngine;
     auth!: AuthGate;
     remoteOps!: VaultRemoteOps;
@@ -83,10 +83,10 @@ export default class CouchSyncPlugin extends Plugin {
     private vaultWriter!: EditorAwareVaultWriter;
     /** Phase 2 (v0.26): per-DB crypto principals (invariant 18). Each
      *  DB is its own crypto root — same passphrase + different salts →
-     *  different keys. vault:meta unlocks `vaultCryptoProvider`;
-     *  config:meta unlocks `configCryptoProvider`. */
+     *  different keys. vault:meta unlocks `vaultCryptoProvider`; the
+     *  config key lives on the current `ConfigBinding` (dropped whenever
+     *  the config DB name changes). */
     private vaultCryptoProvider?: CryptoProvider;
-    private configCryptoProvider?: CryptoProvider;
     /** Transient compression override active only during Clone (Invariant
      *  C — setup atomicity). The vault decorator stack reads
      *  `activeCompression`, not `settings.compressionEnabled` directly, so
@@ -106,9 +106,6 @@ export default class CouchSyncPlugin extends Plugin {
      *  the persisted floor. */
     private cipherVersionOverride?: number;
     encryptionMismatch?: EncryptionAgreement;
-    /** Mismatch surfaced from the config:meta agreement check, if any.
-     *  Symmetric to `encryptionMismatch` (vault). */
-    configEncryptionMismatch?: EncryptionAgreement;
 
     /**
      * Wrap a raw CouchClient with the vault-DB decorator stack. Reads
@@ -352,49 +349,6 @@ export default class CouchSyncPlugin extends Plugin {
         return Object.assign(new Error(message), { encryptionPaused: true });
     }
 
-    /** Config-DB equivalent of `ratchetVaultCipherFloor`. Public so the
-     *  settings tab can ratchet the floor right after an encrypted Config
-     *  Init (#config-codec); caller persists via saveSettings on a true return. */
-    ratchetConfigCipherFloor(observed: number): boolean {
-        if (observed > (this.settings.configCipherVersion ?? 0)) {
-            this.settings.configCipherVersion = observed;
-            return true;
-        }
-        return false;
-    }
-
-    /**
-     * Wrap a raw CouchClient with the config-DB decorator stack. Mirror
-     * of `wrapVaultClient` but reads `configCryptoProvider` and the
-     * config-specific compression flag (`configCompressionEnabled` falls
-     * back to `compressionEnabled` when undefined — Phase 3 will surface
-     * an independent UI toggle).
-     */
-    private wrapConfigClient = (raw: CouchClient): ICouchClient => {
-        // Policy-gated codec stack, symmetric with wrapVaultClient (#12).
-        // The encryption POLICY (`codec.encryption`) gates whether the encrypt
-        // layer is applied — not the provider's existence. Mirrors the
-        // compression branch below (`if (codec.compression)`).
-        const codec = resolveConfigCodec(this.settings);
-        let client: ICouchClient = raw;
-        if (codec.encryption) {
-            if (!this.configCryptoProvider) {
-                throw new Error(
-                    "CouchSync: refusing to build config client — config DB is " +
-                        "encrypted but no crypto provider is unlocked (provisioning " +
-                        "incomplete). Re-run Config Init or unlock the vault.",
-                );
-            }
-            client = new EncryptingCouchClient(
-                client, this.configCryptoProvider, this.settings.configCipherVersion,
-            );
-        }
-        if (codec.compression) {
-            client = new CompressingCouchClient(client);
-        }
-        return client;
-    };
-
     async onload(): Promise<void> {
         await this.loadSettings();
 
@@ -424,18 +378,6 @@ export default class CouchSyncPlugin extends Plugin {
         this.localDb = new LocalDB(dbName);
         this.localDb.open();
         await this.localDb.ensureSchemaVersion();
-
-        // Open the config-side local store only when the user has set
-        // a config DB name. The local store is keyed by both vault name
-        // and config DB name so switching device pools (e.g. mobile ↔
-        // desktop) creates a fresh local store rather than mixing.
-        if (this.settings.couchdbConfigDbName) {
-            const configLocalName =
-                `couchsync-${vaultName}-config-${this.settings.couchdbConfigDbName}`;
-            this.configLocalDb = new ConfigLocalDB(configLocalName);
-            this.configLocalDb.open();
-            await this.configLocalDb.ensureSchemaVersion();
-        }
 
         initLog(
             () => this.settings,
@@ -467,15 +409,6 @@ export default class CouchSyncPlugin extends Plugin {
             },
             hash: (data) => plugin.settings.encryptionEnabled && plugin.vaultCryptoProvider
                 ? plugin.vaultCryptoProvider.hmacHash(data)
-                : computeHash(data),
-        };
-        const configChunkHasher: ChunkHasher = {
-            get alg(): ChunkHashAlg {
-                return resolveConfigCodec(plugin.settings).encryption && plugin.configCryptoProvider
-                    ? "hmac" : "x64";
-            },
-            hash: (data) => resolveConfigCodec(plugin.settings).encryption && plugin.configCryptoProvider
-                ? plugin.configCryptoProvider.hmacHash(data)
                 : computeHash(data),
         };
         this.remoteOps = new VaultRemoteOps(
@@ -544,29 +477,20 @@ export default class CouchSyncPlugin extends Plugin {
                 );
             },
         };
-        const encConfigClientFactory = (s: CouchSyncSettings): ICouchClient | null => {
-            if (!s.couchdbConfigDbName) return null;
-            return this.wrapConfigClient(
-                makeCouchClient(s.couchdbUri, s.couchdbConfigDbName, s.couchdbUser, s.couchdbPassword),
-            );
-        };
+        // ConfigSync owns the config binding (local store + cursors + key +
+        // codec stack + chunk hasher); main only wires host services. The
+        // store is keyed by vault name + server + config DB name, so switching
+        // device pools (e.g. mobile ↔ desktop) or servers opens a separate
+        // local store.
         this.configSync = new ConfigSync(
             adapterIO,
             modalPresenter,
-            this.configLocalDb,
+            vaultName,
             this.auth,
             this.replicator.getVisibilityGate(),
             reconnectBridge,
             () => this.settings,
             {
-                clientFactory: encConfigClientFactory,
-                hasher: configChunkHasher,
-                // Phase 2: hand a freshly-derived config CryptoProvider back
-                // so subsequent `wrapConfigClient` calls produce the right
-                // encrypting stack. Null = encryption disabled on config.
-                onConfigCryptoChange: (crypto) => {
-                    this.configCryptoProvider = crypto ?? undefined;
-                },
                 // Real own-data.json path so ConfigSync excludes it from
                 // replication even under a renamed plugin folder (#14).
                 // manifest.dir is the actual install dir; fall back to the
@@ -577,16 +501,44 @@ export default class CouchSyncPlugin extends Plugin {
                 // Receive-side platform gate: don't materialise desktop-only
                 // plugins on a mobile device. Mirrors the getPlatform wiring.
                 getIsMobile: () => Platform.isMobile,
-                persistConfigSettingUp: async (active) => {
-                    this.settings.configSettingUp = active;
-                    await this.saveSettings();
-                },
-                persistConfigCodecApplied: async (fingerprint) => {
-                    this.settings.configCodecApplied = fingerprint;
-                    await this.saveSettings();
-                },
+                // Bindings persist their settings entry (cipher floor, setup
+                // flag) and the passphrase a Create / Join used.
+                saveSettings: () => this.saveSettings(),
+                // Join asks for the config passphrase when none is set.
+                promptPassphrase: () => new PassphraseModal(
+                    this.app, false,
+                    "Enter the passphrase the config database was set up with.",
+                ).waitForResult(),
             },
         );
+        // Remove the local config store of the layout before config
+        // bindings for the applied config DB (`couchsync-<vault>-config-<db>`,
+        // exact name, see `legacyConfigStoreName`): the storage half of the
+        // migration whose settings half ran in loadSettings. Idempotent; not
+        // awaited — a store another window holds open would block the delete
+        // until it closes.
+        void deleteLegacyConfigStore(vaultName, this.settings.couchdbConfigDbName)
+            .catch((e: any) => {
+                logWarn(`CouchSync: could not delete the old local config store (retried next load): ${e?.message ?? e}`);
+            });
+        // Open the binding for the applied config DB name (no-op when empty).
+        // Apply in the settings tab calls rebind again at runtime.
+        // A config store that fails to open (e.g. schema stamp mismatch)
+        // leaves config sync unbound — every config op then says so — but
+        // must not take vault sync down with it.
+        try {
+            await this.configSync.rebind(this.settings.couchdbConfigDbName || null);
+        } catch (e: any) {
+            logError(
+                `CouchSync: could not open the local config store for ` +
+                `"${this.settings.couchdbConfigDbName}": ${e?.message ?? e}`,
+            );
+            notify(
+                "CouchSync: config sync is inactive — its local store could not be " +
+                    "opened. See the log.",
+                10000,
+            );
+        }
         this.statusBar = new StatusBar(
             this,
             () => this.settings,
@@ -751,23 +703,18 @@ export default class CouchSyncPlugin extends Plugin {
                 );
             }
 
-            // E2E encryption: derive **both** cryptoProviders FIRST,
+            // E2E encryption: derive the vault cryptoProvider FIRST,
             // before the legacy guard. The recovery action the legacy
-            // guard tells the user to perform (Config Init / Vault Init)
-            // needs the chunk hasher to flip to HMAC mode — which only
-            // happens once `*CryptoProvider` is set. Without this
-            // early-derive, a user in legacy-blocked state who clicks
-            // "Config Init" would unknowingly mint x64 (plaintext)
-            // chunk ids on an otherwise-encrypted vault.
+            // guard tells the user to perform (Vault Init) needs the
+            // chunk hasher to flip to HMAC mode — which only happens once
+            // `vaultCryptoProvider` is set. Without this early-derive, a
+            // user in legacy-blocked state who runs Init would
+            // unknowingly mint x64 (plaintext) chunk ids on an
+            // otherwise-encrypted vault.
             //
-            // Phase 2: vault and config are independent crypto principals
-            // (invariant 18). Each meta is unlocked against its own
-            // passphrase source — vault uses `encryptionPassphrase`;
-            // config uses `configEncryptionPassphrase || encryptionPassphrase` (empty = inherit)
-            // so the common "one passphrase for both" UX stays default
-            // while advanced users can decouple. Errors here fall through
-            // — the legacy guard runs anyway, the user just stays in a
-            // crypto-uninitialised state until they retry.
+            // Errors here fall through — the legacy guard runs anyway, the
+            // user just stays in a crypto-uninitialised state until they
+            // retry.
             if (this.settings.connectionState === "syncing"
                 && this.settings.deviceId) {
                 try {
@@ -807,81 +754,10 @@ export default class CouchSyncPlugin extends Plugin {
                         `CouchSync: early vault crypto derivation failed (non-fatal): ${e?.message ?? e}`,
                     );
                 }
-                // Config-side early derive — independent of vault.
-                if (this.settings.couchdbConfigDbName) {
-                    try {
-                        const rawConfigClient = makeCouchClient(
-                            this.settings.couchdbUri,
-                            this.settings.couchdbConfigDbName,
-                            this.settings.couchdbUser,
-                            this.settings.couchdbPassword,
-                        );
-                        // Independent config codec — the single resolver applies
-                        // the per-field inherit rules (empty passphrase inherits
-                        // the vault one via ||, see config-codec-policy). (#config-codec)
-                        const configCodec = resolveConfigCodec(this.settings);
-                        const configPassphrase = configCodec.passphrase;
-                        const agreement = await checkEncryptionAgreement(
-                            rawConfigClient, configCodec.encryption, CONFIG_META_DOC_ID,
-                            this.settings.configCipherVersion,
-                        );
-                        if (agreement.status === "cipher-downgrade-detected") {
-                            logWarn(
-                                `CouchSync: config:meta cipherVersion downgrade detected ` +
-                                `(below floor ${agreement.localFloor}) — refusing early unlock.`,
-                            );
-                            this.configEncryptionMismatch = agreement;
-                        } else if (agreement.status === "agreed-encrypted"
-                            && !this.configCryptoProvider
-                            && configPassphrase
-                            && agreement.meta && agreement.meta.type === "config-meta") {
-                            const configMeta = agreement.meta as ConfigMetaDoc;
-                            // Phase 2 migration guard: the Phase 1
-                            // in-progress config:meta (schemaVersion: 1)
-                            // was a clone of vault:meta — not a real
-                            // crypto root. Reject it loudly so the user
-                            // re-runs Config Init and gets a Phase 2
-                            // self-contained meta.
-                            if (configMeta.schemaVersion !== 2) {
-                                notify(
-                                    `CouchSync: Config DB has legacy meta ` +
-                                    `(schemaVersion ${configMeta.schemaVersion}). ` +
-                                    `Open Settings → Config Sync → Init & Push to upgrade.`,
-                                    15000,
-                                );
-                                logWarn(
-                                    `CouchSync: config:meta schemaVersion ${configMeta.schemaVersion} — Phase 2 expects 2. Re-Init required.`,
-                                );
-                            } else {
-                                const result = await unlockConfigMeta(
-                                    configMeta, configPassphrase,
-                                );
-                                if (result) {
-                                    this.configCryptoProvider = result.crypto;
-                                    const cv = configMeta.encryption.enabled
-                                        ? configMeta.encryption.cipherVersion : 0;
-                                    if (this.ratchetConfigCipherFloor(cv)) {
-                                        await this.saveSettings();
-                                    }
-                                } else {
-                                    logWarn(
-                                        "CouchSync: config:meta unlock failed — passphrase mismatch. " +
-                                        "Re-run Config Init to recover.",
-                                    );
-                                }
-                            }
-                        } else if (
-                            agreement.status === "remote-encrypted"
-                            || agreement.status === "remote-plaintext"
-                        ) {
-                            this.configEncryptionMismatch = agreement;
-                        }
-                    } catch (e: any) {
-                        logWarn(
-                            `CouchSync: early config crypto derivation failed (non-fatal): ${e?.message ?? e}`,
-                        );
-                    }
-                }
+                // The config key is NOT derived here: config is an
+                // independent crypto principal (invariant 18) and its key must
+                // not depend on the vault's connectionState. Every config op
+                // unlocks it in the binding's preflight (or Join / Create).
             }
 
             // Schema guard. Two checks:
@@ -902,7 +778,7 @@ export default class CouchSyncPlugin extends Plugin {
                     const message = isConfigOrphan
                         ? `CouchSync: legacy config doc found in vault DB (${vaultLegacy}). ` +
                             "Open Settings → Maintenance → Clean up legacy configs from vault DB " +
-                            "after running Config Init in Config Sync. Sync is paused until then."
+                            "after running Create (and Push) in Config Sync. Sync is paused until then."
                         : `CouchSync: old schema detected in vault DB (${vaultLegacy}). ` +
                             "Open Settings → Maintenance → Delete local vault database, " +
                             "then re-run Init or Clone. Sync is paused until then.";
@@ -914,13 +790,14 @@ export default class CouchSyncPlugin extends Plugin {
                     return;
                 }
 
-                if (this.configLocalDb) {
-                    const configLegacy = await this.configLocalDb.findLegacyConfigDoc();
+                const configStore = this.configLocalDb;
+                if (configStore) {
+                    const configLegacy = await configStore.findLegacyConfigDoc();
                     if (configLegacy) {
                         notify(
                             `CouchSync: old schema detected in config DB (${configLegacy}). ` +
                                 "Open Settings → Maintenance → Delete local config database, " +
-                                "then re-run Config Init or Pull. Sync is paused until then.",
+                                "then Join (or Create) and Pull in Config Sync. Sync is paused until then.",
                             15000,
                         );
                         logWarn(
@@ -996,13 +873,10 @@ export default class CouchSyncPlugin extends Plugin {
         this.historyStorage?.close();
         this.logStorage?.close();
         await this.localDb?.close();
-        if (this.configLocalDb) {
-            try {
-                await this.configLocalDb.close();
-            } catch (e) {
-                logError(`CouchSync: failed to close config local DB: ${e?.message ?? e}`);
-            }
-            this.configLocalDb = null;
+        try {
+            await this.configSync?.close();
+        } catch (e) {
+            logError(`CouchSync: failed to close config local DB: ${e?.message ?? e}`);
         }
     }
 

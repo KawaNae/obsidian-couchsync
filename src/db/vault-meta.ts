@@ -66,6 +66,10 @@ export async function verifyKeyCheck(
 export const VAULT_META_DOC_ID = "vault:meta";
 export const CONFIG_META_DOC_ID = "config:meta";
 
+/** cipherVersion this build writes into a new encrypted meta (Init /
+ *  Create). See `DbMetaDoc.encryption.cipherVersion`. */
+export const CURRENT_CIPHER_VERSION = 3 as const;
+
 /** Schema for the `vault:meta` doc in v2. */
 export interface VaultMetaDoc {
     _id: typeof VAULT_META_DOC_ID;
@@ -146,7 +150,7 @@ export async function fetchVaultMeta(
  *
  * `schemaVersion: 2` — bumped from the Phase 1 in-progress shape (which
  * was a clone of vault:meta and therefore not a real crypto root).
- * Readers that see schemaVersion 1 surface "Config Init required" so the
+ * Readers that see schemaVersion 1 surface `legacy-meta` (Create required) so the
  * Phase 1 → Phase 2 transition lands cleanly on a fresh own-salt write.
  */
 export interface ConfigMetaDoc {
@@ -156,6 +160,19 @@ export interface ConfigMetaDoc {
     schemaVersion: 2;
     encryption: VaultMetaDoc["encryption"];
     compression: VaultMetaDoc["compression"];
+    /** Random id minted by every Create (128 bits, hex). Identifies ONE
+     *  incarnation of the config DB, so a device can tell that the DB was
+     *  re-created elsewhere even when nothing else in the meta differs — a
+     *  plaintext root has no salt, and two plaintext roots with the same
+     *  compression flag were otherwise identical
+     *  (`configMetaFingerprint`, `root-changed`).
+     *
+     *  Optional: metas written before it existed have none, and readers
+     *  fall back to the salt-based fingerprint. Additive and not part of
+     *  `schemaVersion` — older builds read `config:meta` field by field
+     *  (`encryption`, `compression`, `schemaVersion`, `type`) and never
+     *  reject unknown fields. `vault:meta` has no counterpart. */
+    generationId?: string;
 }
 
 /** Union of self-describing meta docs. Helpers below are generic over
@@ -173,7 +190,8 @@ export async function fetchConfigMeta(
  * Build an initial config:meta doc as a self-contained crypto root.
  * Mirrors `buildInitialVaultMeta`'s shape: fresh salt → derive keys →
  * compute keyCheck. The returned `crypto` is what the host pipes into
- * `wrapConfigClient` and `configChunkHasher`.
+ * `ConfigBinding.wrapClient` and its chunk hasher. Every call also mints a
+ * fresh `generationId`, encrypted or not.
  *
  * Phase 2 signature change: previously this cloned from `vault:meta`
  * (`buildInitialConfigMeta(vaultMeta)`). That coupling broke
@@ -193,7 +211,16 @@ export async function buildInitialConfigMeta(opts: {
         passphrase: opts.passphrase,
         compression: opts.compression,
     });
-    return inner as { meta: ConfigMetaDoc; keys: EncryptionKeys | null; crypto: CryptoProvider | null };
+    const meta = inner.meta as ConfigMetaDoc;
+    meta.generationId = newGenerationId();
+    return { meta, keys: inner.keys, crypto: inner.crypto };
+}
+
+/** 128 random bits as lowercase hex — a fresh `ConfigMetaDoc.generationId`. */
+function newGenerationId(): string {
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 export async function pushConfigMeta(
@@ -311,7 +338,7 @@ export async function buildInitialMeta(opts: BuildMetaOpts): Promise<BuildMetaRe
             encryption: {
                 enabled: true,
                 kdfVersion: 1,
-                cipherVersion: 3,
+                cipherVersion: CURRENT_CIPHER_VERSION,
                 salt: saltB64,
                 keyCheck,
             },

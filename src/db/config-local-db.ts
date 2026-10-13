@@ -208,7 +208,7 @@ export class ConfigLocalDB implements IDocStore<CouchSyncDoc> {
      *   - **v2 ConfigDocs carrying a `data: string` field** (v0.25 and
      *     older). These cannot be read by the v3 chunker path; main.ts
      *     uses this signal to halt the ConfigSync replicator and route
-     *     the user to the Config Init flow.
+     *     the user to the Create / Join flow.
      *
      * Chunks (`chunk:*`) in the config DB are valid v3 content and
      * skipped. The check stops at the first legit v3 ConfigDoc — a

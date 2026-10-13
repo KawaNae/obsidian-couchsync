@@ -88,6 +88,17 @@ export class CouchSyncSettingTab extends PluginSettingTab {
             app: this.app,
             replicator: this.plugin.replicator,
             auth: this.plugin.auth,
+            // The config binding is (server, config DB): a server change
+            // switches it, with the settings saved inside the switch
+            // (invariant on ConfigSync.rebind). Refused — nothing saved —
+            // while a config op runs.
+            configBinding: {
+                changeBlocker: () => this.plugin.configSync.bindingChangeBlocker(),
+                switchServer: (serverUri: string, commit: () => Promise<void>) => this.plugin.configSync.rebind(
+                    this.plugin.settings.couchdbConfigDbName || null,
+                    { serverUri, commit },
+                ),
+            },
             refresh: () => this.display(),
         };
         if (!this.couchDbTab) {
@@ -134,16 +145,12 @@ export class CouchSyncSettingTab extends PluginSettingTab {
             auth: this.plugin.auth,
             remoteOps: this.plugin.remoteOps,
             modalPresenter: this.plugin.modalPresenter,
-            configEncryptionMismatch: this.plugin.configEncryptionMismatch,
-            ratchetConfigCipherFloor: async (cv: number) => {
-                if (this.plugin.ratchetConfigCipherFloor(cv)) {
-                    await this.plugin.saveSettings();
-                }
-            },
             refresh: () => this.display(),
         };
         if (!this.configSyncTab) {
             this.configSyncTab = new ConfigSyncTab(configSyncDeps);
+        } else {
+            this.configSyncTab.updateDeps(configSyncDeps);
         }
         const configSyncPanel = panels.get("config-sync");
         if (configSyncPanel) {
@@ -163,7 +170,9 @@ export class CouchSyncSettingTab extends PluginSettingTab {
             renderMaintenanceTab(maintenancePanel, {
                 ...settingsDeps,
                 localDb: this.plugin.localDb,
-                configLocalDb: this.plugin.configLocalDb,
+                getConfigLocalDb: () => this.plugin.configLocalDb,
+                runConfigExclusive: (fn) =>
+                    this.plugin.configSync.runExclusive((binding) => fn(binding.store)),
                 replicator: this.plugin.replicator,
                 statusBar: this.plugin.statusBar,
                 modalPresenter: this.plugin.modalPresenter,

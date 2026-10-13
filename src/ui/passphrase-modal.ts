@@ -9,6 +9,8 @@ export class PassphraseModal extends Modal {
     constructor(
         app: App,
         private isFirstSetup: boolean,
+        /** Replaces the default prompt text (e.g. for the config DB). */
+        private description?: string,
     ) {
         super(app);
     }
@@ -21,9 +23,9 @@ export class PassphraseModal extends Modal {
                 : "CouchSync: Enter Passphrase",
         });
         contentEl.createEl("p", {
-            text: this.isFirstSetup
+            text: this.description ?? (this.isFirstSetup
                 ? "Choose a passphrase to encrypt your vault data. You will need this on every device."
-                : "Enter the passphrase to decrypt your vault data.",
+                : "Enter the passphrase to decrypt your vault data."),
         });
 
         new Setting(contentEl)

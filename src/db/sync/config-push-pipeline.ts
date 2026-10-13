@@ -177,7 +177,7 @@ export class ConfigPushPipeline {
             if (cmp === "equal") {
                 // Content-truthful skip: only converged when chunks AND the
                 // deleted flag also match. A vclock tie with differing content
-                // is the Config-Init stale-collision anomaly — surface it as
+                // is the config-Create stale-collision anomaly — surface it as
                 // divergent so the modal arbitrates, rather than silently
                 // dropping the local content (symmetric with the pull-side
                 // truthful skip and the dominates-case churn guard).

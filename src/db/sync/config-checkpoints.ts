@@ -42,9 +42,9 @@ export class ConfigCheckpoints {
         // Authoritative reload: load() reflects disk truth, so an ABSENT
         // checkpoint resets the in-memory cursor to 0 rather than keeping a
         // stale value. This matters when the same long-lived instance is
-        // reloaded after a Config Init destroyed the DB (invalidateCheckpoints
-        // → load): the post-Init push must enumerate from 0 and re-seed, not
-        // skip from the pre-Init cursor. Symmetric with vault-side Checkpoints
+        // reloaded after a config Create destroyed the DB (invalidateCheckpoints
+        // → load): the post-Create push must enumerate from 0 and re-seed, not
+        // skip from the pre-Create cursor. Symmetric with vault-side Checkpoints
         // (`remote ?? 0`).
         this.pullSeq = pull ?? 0;
         this.pushSeq = push ?? 0;

@@ -275,7 +275,7 @@ export class PullWriter {
                     // when this is provably the classifier's `identical` case:
                     // vclock equal AND chunks equal AND deleted matches. A
                     // vclock TIE with differing content is NOT converged; it is
-                    // the Config-Init stale-collision anomaly (a zombie doc at
+                    // the config-Create stale-collision anomaly (a zombie doc at
                     // {device:1} vs a freshly-reset doc at {device:1}) and MUST
                     // fall through to the resolver (→ true-divergent), not be
                     // silently kept — that was the 2026-06-14 on-device

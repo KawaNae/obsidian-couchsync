@@ -4,7 +4,7 @@ import { ProgressNotice } from "./ui/notices.ts";
 import { ConsistencyReportModal } from "./ui/consistency-report-modal.ts";
 import { ChunkConsistencyReportModal } from "./ui/chunk-consistency-report-modal.ts";
 import { totalDiscrepancies } from "./sync/reconciler.ts";
-import { logError, logWarn, notify } from "./ui/log.ts";
+import { logWarn, notify } from "./ui/log.ts";
 import { analyzeChunkConsistency } from "./sync/chunk-consistency.ts";
 import { planFromReport, repairChunkDrift } from "./sync/chunk-repair.ts";
 import { gcOrphanConfigChunks } from "./db/chunk-gc.ts";
@@ -82,21 +82,26 @@ export function registerCommands(plugin: CouchSyncPlugin): void {
         id: "couchsync-config-chunk-gc",
         name: "Config: garbage-collect orphan chunks",
         callback: async () => {
+            // Runs under ConfigSync's op lock on the CURRENT binding's
+            // store: refused while a Push / Pull / Join / Create runs (the
+            // sweep would race its writes), and Apply cannot switch the
+            // store mid-sweep.
             if (!plugin.configLocalDb) {
                 notify("CouchSync: Config DB is not configured.", 5000);
                 return;
             }
             const progress = new ProgressNotice("Config GC");
             try {
-                progress.update("Sweeping orphan chunks...");
-                const result = await gcOrphanConfigChunks(plugin.configLocalDb);
+                const result = await plugin.configSync.runExclusive(async (binding) => {
+                    progress.update("Sweeping orphan chunks...");
+                    return gcOrphanConfigChunks(binding.store);
+                });
                 progress.done(
                     `Config GC: scanned ${result.scannedChunks}, ` +
                     `referenced ${result.referencedChunks}, ` +
                     `deleted ${result.deletedChunks} orphan(s).`,
                 );
             } catch (e: any) {
-                logError(`Config GC failed: ${e?.message ?? e}`);
                 progress.fail(`Config GC failed: ${e?.message ?? e}`);
             }
         },

@@ -29,7 +29,7 @@
  * - `true-divergent`    — chunks differ + (vclock concurrent OR right
  *                         dominates AND left has diverged from baseline OR a
  *                         pull-site vclock TIE — equal clocks with differing
- *                         content, the Config-Init stale-collision shape, only
+ *                         content, the config-Create stale-collision shape, only
  *                         when `leftVCAttributed` is falsy). Genuine conflict
  *                         requiring user resolution.
  * - `legacy-skip`       — `lastSynced.chunks` is undefined (pre-extension
@@ -178,10 +178,10 @@ export interface ClassifyInput {
      *  state should omit this. */
     lastSynced?: LastSynced;
     /** True only during a CONFIG pull's seq-regression re-pull (the remote
-     *  config DB was destroyed + recreated by an Init elsewhere — see
+     *  config DB was destroyed + recreated by a Create elsewhere — see
      *  `config-pull-writer` self-heal). In that window the remote is a fresh
      *  authority and chunk ids are NOT a reliable content fingerprint: an
-     *  encrypted Init rotates the salt → HMAC key, so identical content gets
+     *  encrypted Create rotates the salt → HMAC key, so identical content gets
      *  different chunk ids while the vclock resets to a colliding `{device:1}`.
      *  A pull-site vclock tie under recreate is therefore adopted from remote
      *  (take-remote) rather than surfaced as a conflict — both the
@@ -238,15 +238,15 @@ export function classifySyncRelation(input: ClassifyInput): SyncRelation {
     //    - "equal" at a PULL call site (two REAL doc vclocks, leftVCAttributed
     //      falsy): a vclock TIE with differing content is impossible for a
     //      legit local edit (it would have bumped the clock above remote). It
-    //      is the Config-Init stale-collision anomaly — a zombie doc left at
+    //      is the config-Create stale-collision anomaly — a zombie doc left at
     //      `{device:1}` colliding with a freshly-reset doc at `{device:1}`
     //      (confirmed on-device 2026-06-14: the first push at vclock {1} did
     //      not propagate). The vclocks cannot order them, so silently keeping
     //      either side is the silent-loss / non-propagation bug. Surface it.
     //      → true-divergent — UNLESS this is a recreate re-pull (see below).
     if (vcRel === "equal" && input.leftVCAttributed !== true) {
-        // Config seq-regression re-pull: the remote was recreated by an Init
-        // elsewhere. Chunk ids are unreliable across the Init's key rotation
+        // Config seq-regression re-pull: the remote was recreated by a Create
+        // elsewhere. Chunk ids are unreliable across the Create's key rotation
         // (encrypted: new salt → new HMAC ids for identical content), and the
         // recreated remote is the authoritative fresh slate, so adopt it
         // rather than surface every key-rotated doc as a conflict. Only the

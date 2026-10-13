@@ -20,6 +20,84 @@ All notable changes to obsidian-couchsync.
   stale (no data for …ms)` was reported as an unknown error; it is now a
   timeout, so the one-shot retry above covers it and live sync labels it
   accordingly.
+- **A config database set after startup can now be pulled.** When the config
+  database name was applied after Obsidian had started (or changed while it
+  was running), Pull did nothing — no notice, no log line — and after a
+  reload it failed with "refusing to build config client … Re-run Config
+  Init". Following that advice wiped the config shared by every device. The
+  config database's local store, sync cursors and encryption key now belong
+  to the server and database name and are rebuilt on Apply (in either the
+  CouchDB or the Config Sync tab), so the change takes effect without a
+  reload and nothing of the previous database is used against the new one.
+  Both Apply buttons are disabled while a config operation runs, and a change
+  refused then saves nothing — so Create's confirmation, Create itself and
+  the filter tree always use the server and database the settings name —
+  switching servers back and forth no longer skips changes or writes the
+  other server's config. The config key no longer depends on Vault Sync
+  being connected.
+- **Config sync failures are always reported.** Every config Push, Pull,
+  Join and Create failure now shows a notice and a log line naming the cause
+  (not joined, missing or wrong passphrase, the database re-created on
+  another device, server unreachable, …) with its fix. Key and passphrase
+  problems never suggest Create. The filter tree says why it cannot list the
+  server instead of always "Server not reachable", and no longer contacts the
+  server while a config operation runs.
+- **Changing a codec setting no longer stops config sync.** Push and Pull
+  now use the encryption and compression of the config database this device
+  created or joined. Step 1 in Config Sync is what the next Create builds a
+  database with; when it differs from the current database the tab says so,
+  and sync carries on. Before, toggling Step 1 — or a Vault Clone that
+  changed the vault codec Step 1 inherits — stopped config sync as "codec
+  changed" and suggested Create.
+- **An encrypted config database that becomes unencrypted is refused.** If
+  a device joined a config database encrypted and its `config:meta` is now
+  plaintext, sync stops and asks to verify the server; it is not treated as
+  an ordinary re-creation. Join asks for confirmation before adopting an
+  unencrypted database or an older cipher version for a database this device
+  knew as encrypted.
+- **Re-creating a plaintext config database is detected.** `config:meta` now
+  carries a random generation id minted by every Create, so a device notices
+  that another device re-created the database — encrypted or not — and asks
+  it to Join again instead of mixing in stale data. Metas written by older
+  builds have no generation id and are compared as before.
+- **Clearing the config passphrase is no longer a codec change.** It used to
+  be reported as a codec change that recommended Create; it is now reported
+  as a missing passphrase.
+
+### Changed
+
+- **Config Init is renamed Create, and Join is new.** Config Sync's Step 3
+  now has Create (first device: reset the config database with a new root,
+  then Push) and Join (every other device: sync with the existing
+  database's encryption and compression and unlock it with its passphrase;
+  the server is not changed, then Pull). Push and Pull on a device that has not joined
+  stop and ask it to Join. Join does not change the Step 1 settings.
+  Create's confirmation shows how many documents
+  the server holds and whether `config:meta` exists — or that the server
+  could not be read —, the encryption, compression and cipher version it
+  will build (highlighted when that is weaker than the database's current
+  one, e.g. encrypted → unencrypted), and that every other device must Join
+  again.
+- **The config passphrase is fixed when you Create or Join.** An empty Step 1
+  passphrase still means "use the Vault Sync passphrase", but only for the
+  next Create or Join; when it succeeds on an encrypted database, the
+  passphrase it used is saved in Step 1. Push and Pull use only that saved
+  passphrase, so turning Vault Sync encryption off or changing the vault
+  passphrase no longer stops config sync. A plaintext database saves no
+  passphrase.
+
+### Migration
+
+- **Existing devices Join once.** Whether a device has joined a config
+  database, and with which codec, is now recorded inside that database's
+  local store, which is also renamed to include the server. The previous
+  record cannot be carried over, so after updating every device's first
+  config Push or Pull asks it to Join. Join does not change the server, any
+  config file or the Step 1 settings, and the next Pull downloads the config
+  again. The cipher-version floor and an interrupted Create are kept in
+  settings, per server and database. The previous local config store of the
+  config database applied now (`couchsync-<vault>-config-<db>`) is deleted on
+  start; stores of config database names used earlier stay on disk.
 
 ## 0.29.0
 

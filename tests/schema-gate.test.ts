@@ -35,7 +35,7 @@ describe("schema-gate", () => {
 
     it("config-kind message names the config commands", () => {
         const err = new SchemaVersionMismatchError("config:x", 2, "config", 3);
-        expect(err.userMessage).toContain("Config Init");
+        expect(err.userMessage).toContain("Config Create");
         expect(err.userMessage).toContain("Config Pull");
     });
 

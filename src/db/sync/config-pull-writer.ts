@@ -136,11 +136,11 @@ export class ConfigPullWriter {
             );
 
             // Seq regression: the remote config DB was destroyed + recreated by
-            // a Config Init on another device, so its update-seq counter reset
+            // a config Create on another device, so its update-seq counter reset
             // below our cursor — `since > last_seq` means we'd silently fetch
             // nothing forever. Reset to 0 and re-pull the whole DB. The vault
             // pull guard (pull-pipeline.ts) throws into an error state, but a
-            // config Init is an admin op the other devices should simply follow,
+            // config Create is an admin op the other devices should simply follow,
             // so we self-heal instead. (#config-codec)
             if (seqNumeric(batch.last_seq) < seqNumeric(since)) {
                 // A second regression in one run is not a legitimate recreate —
@@ -276,7 +276,7 @@ export class ConfigPullWriter {
                 // Content-truthful converged skip: skip ONLY when this is
                 // provably the classifier's `identical` case — vclock equal AND
                 // chunks equal AND deleted matches. A vclock TIE with differing
-                // content is the Config-Init stale-collision anomaly and MUST
+                // content is the config-Create stale-collision anomaly and MUST
                 // fall through to the resolver (→ true-divergent → concurrent),
                 // not be silently kept — that was the 2026-06-14 on-device
                 // non-propagation bug (first push at vclock {1} never reached
@@ -439,7 +439,7 @@ export class ConfigPullWriter {
     /**
      * Fetch any chunks referenced by `configDoc` that aren't already
      * present in the local config DB. Mirrors `SyncEngine.ensureChunksInternal`
-     * for vault FileDocs. Bounded concurrency keeps a fresh-clone Init
+     * for vault FileDocs. Bounded concurrency keeps a first pull after a Join
      * within reasonable latency over HTTP/2-multiplexed transports.
      *
      * Missing-on-server chunks are logged via WARN and left missing —

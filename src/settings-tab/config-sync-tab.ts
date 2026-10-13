@@ -5,11 +5,17 @@
  * database, separate from the vault DB. This tab mirrors the step
  * structure of Vault Sync:
  *
- *   Step 1: Encryption & compression — config-specific codec overrides.
+ *   Step 1: Encryption & compression — config-specific codec overrides: the
+ *           codec the next Create builds the DB with (sync itself uses the
+ *           joined DB's codec), and the passphrase. Create / Join resolve an
+ *           empty passphrase to the vault's once and save the one they used
+ *           here; Push / Pull use only the saved value.
  *   Step 2: Database — pick the config database name. Server credentials
  *           are shared via the CouchDB tab. Check → Apply confirms.
- *   Step 3: Setup (Init) — reset the shared config DB. Structural only,
- *           run once per device pool; it does not send content.
+ *   Step 3: Setup — Create (first device: reset the shared config DB and
+ *           make a new root; structural only, it does not send content) or
+ *           Join (every other device: accept the existing root). Shows the
+ *           binding's latest readiness.
  *   Step 4: Sync — the meaning-unit filter (what this device syncs, by
  *           meaning), then Push (send) and Pull & Reload (receive+apply).
  *           The same filter governs both directions (receive ⊆ send).
@@ -19,12 +25,15 @@
  */
 import { type App, Notice, Platform, Setting, type ButtonComponent } from "obsidian";
 import type { CouchSyncSettings } from "../settings.ts";
-import type { ConfigSync } from "../sync/config-sync.ts";
+import type { ConfigSync, RemoteConfigListing } from "../sync/config-sync.ts";
 import type { SyncEngine } from "../db/sync-engine.ts";
 import type { AuthGate } from "../db/sync/auth-gate.ts";
 import type { VaultRemoteOps } from "../db/sync/vault-remote-ops.ts";
 import type { IModalPresenter } from "../types/modal-presenter.ts";
 import { addPasswordToggle } from "./vault-sync-tab.ts";
+import { logWarn } from "../ui/log.ts";
+import { ConfigNotReadyError, describeConfigRemoteFailure } from "../sync/config-errors.ts";
+import { describeCreateConfirm } from "../sync/config-create-preview.ts";
 import {
     classifyConfigPath,
     type ClassifiedPath,
@@ -58,6 +67,8 @@ import {
     isInheritingConfigEncryption,
     isInheritingConfigCompression,
 } from "../sync/config-codec-policy.ts";
+import { describeCodec, sameCodec } from "../sync/config-binding-record.ts";
+import { CURRENT_CIPHER_VERSION } from "../db/vault-meta.ts";
 
 export interface ConfigSyncTabDeps {
     app: App;
@@ -68,15 +79,6 @@ export interface ConfigSyncTabDeps {
     auth: AuthGate;
     remoteOps: VaultRemoteOps;
     modalPresenter: IModalPresenter;
-    /** Config-DB codec mismatch surfaced by the onload agreement check
-     *  (remote encrypted/plaintext disagrees with local, or a cipherVersion
-     *  downgrade was detected). Symmetric to the vault tab's
-     *  `encryptionMismatch`. */
-    configEncryptionMismatch?: { status: string };
-    /** Ratchet the config cipherVersion floor + persist (#config-codec). Called
-     *  after a successful encrypted Init & Push so a downgrade is refused
-     *  immediately, not only after the next onload early-derive. */
-    ratchetConfigCipherFloor: (cv: number) => Promise<void>;
     refresh: () => void;
 }
 
@@ -106,12 +108,21 @@ export class ConfigSyncTab {
 
     /** Short-lived cache of the remote config path list so re-rendering the
      *  tree (every settings refresh, incl. after each checkbox toggle) does
-     *  not re-hit the network each time. */
-    private remoteCache: { paths: string[]; ok: boolean; at: number } | null = null;
+     *  not re-hit the network each time. Tagged with the binding it was read
+     *  for (`listing.bindingKey`): it is used only while that binding is the
+     *  current one. */
+    private remoteCache: (RemoteConfigListing & { at: number }) | null = null;
     private static readonly REMOTE_TTL_MS = 30_000;
 
     constructor(private deps: ConfigSyncTabDeps) {
         this.draft = this.savedToDraft();
+    }
+
+    /** Re-supply deps on every settings display(). The instance outlives a
+     *  display (it holds the draft), so deps captured at construction would
+     *  go stale. Mirrors `VaultSyncTab.updateDeps`. */
+    updateDeps(deps: ConfigSyncTabDeps): void {
+        this.deps = deps;
     }
 
     /** Reset draft to match saved settings (call on settings tab hide) */
@@ -147,6 +158,10 @@ export class ConfigSyncTab {
     }
 
     private canApply(): boolean {
+        // Apply rebinds the config DB (closes the current local store), which
+        // ConfigSync refuses while an op runs — mirror that in the button.
+        // Same check as the CouchDB tab's Apply (`bindingChangeBlocker`).
+        if (this.deps.configSync.bindingChangeBlocker()) return false;
         // Empty value is a valid Apply (means "disable config sync") and
         // doesn't require Test. Non-empty must be Tested first.
         if (this.draft.db.trim() === "") return true;
@@ -154,6 +169,8 @@ export class ConfigSyncTab {
     }
 
     private applyDescText(): string {
+        const blocked = this.deps.configSync.bindingChangeBlocker();
+        if (blocked) return blocked;
         if (this.draft.db.trim() === "") {
             return "Apply with empty name to disable config sync.";
         }
@@ -167,30 +184,46 @@ export class ConfigSyncTab {
      * config-specific override (`config* ?? vault`): we surface the effective
      * value and persist an explicit config value the moment the user toggles it
      * — no migration backfills the inherited defaults, so an untouched install
-     * keeps inheriting. Mirrors `VaultSyncTab.renderEncryptionStep`. A codec
-     * change only takes effect on the next Init & Push (Step 3), which destroys
-     * and rebuilds the config DB — flagged in the descriptions here.
+     * keeps inheriting. Mirrors `VaultSyncTab.renderEncryptionStep`.
+     *
+     * Encryption and compression here are the input of the NEXT Create
+     * only. Push and Pull use the codec of the database this device created
+     * or joined (its attachment), so a toggle never stops sync; when the two
+     * differ, the step says so.
+     *
+     * The passphrase field holds the value Push and Pull unlock with. Left
+     * empty, it means "use the Vault Sync passphrase" for the next Create or
+     * Join only; a successful Create / Join of an encrypted database saves
+     * the passphrase it used into this field, so later vault-side changes
+     * never reach config sync.
      */
     private renderConfigCodecStep(el: HTMLElement, settings: CouchSyncSettings): void {
         el.createEl("h3", { text: "Step 1: Encryption & compression" });
         el.createEl("p", {
             text: "Config sync has its own codec, independent of Vault Sync. " +
-                "Unset values inherit the Vault Sync setting. Changes apply on the " +
-                "next Init & Push (Step 3), which rebuilds the config database.",
+                "Unset values inherit the Vault Sync setting. Encryption and " +
+                "compression are what Create (Step 3) builds the config database " +
+                "with; syncing always uses the codec of the database this device " +
+                "created or joined. The passphrase is what this device unlocks that " +
+                "database with; Create and Join save the one they used below.",
             cls: "setting-item-description",
         });
 
-        if (this.deps.configEncryptionMismatch) {
-            const warn = el.createEl("p", {
-                text: "Config DB encryption state disagrees with this device " +
-                    "(or a cipherVersion downgrade was detected on the server). " +
-                    "Re-run Config Init & Push, or verify the server.",
-                cls: "setting-item-description mod-warning",
+        const codec = resolveConfigCodec(settings);
+        const binding = settings.couchdbConfigDbName.trim() !== ""
+            ? this.deps.configSync.currentBinding() : null;
+        const joined = binding?.attachment ?? null;
+        if (joined && !sameCodec(joined.codec, codec)) {
+            const note = el.createEl("p", {
+                text: `Differs from the current database: "${binding!.dbName}" uses ` +
+                    `${describeCodec(joined.codec)}, and syncing keeps using that. ` +
+                    `The settings below (${describeCodec(codec)}) take effect only when ` +
+                    "you run Create, which rebuilds the database with them.",
+                cls: "setting-item-description",
             });
-            warn.style.color = "var(--text-error)";
+            note.style.color = "var(--text-accent)";
         }
 
-        const codec = resolveConfigCodec(settings);
         const encEnabled = codec.encryption;
         const inheritingEnc = isInheritingConfigEncryption(settings);
         new Setting(el)
@@ -198,29 +231,34 @@ export class ConfigSyncTab {
             .setDesc(
                 inheritingEnc
                     ? `Inheriting Vault Sync (${settings.encryptionEnabled ? "encrypted" : "plaintext"}). Toggle to set an independent value.`
-                    : "Independent config setting. Re-run Init & Push to apply.",
+                    : "Independent config setting, used by the next Create.",
             )
             .addToggle((toggle) =>
                 toggle
                     .setValue(encEnabled)
                     .onChange(async (value) => {
-                        const patch: Partial<CouchSyncSettings> = { configEncryptionEnabled: value };
-                        if (!value) patch.configEncryptionPassphrase = "";
-                        await this.deps.updateSettings(patch);
+                        // The passphrase is kept: the joined database may
+                        // still be encrypted and need it to sync.
+                        await this.deps.updateSettings({ configEncryptionEnabled: value });
                         this.deps.refresh();
                     })
             );
 
-        if (encEnabled) {
+        // Shown whenever a passphrase can matter: Create would encrypt, or
+        // the joined database is encrypted.
+        if (encEnabled || joined?.codec.encryption) {
             const passphraseSetting = new Setting(el)
                 .setName("Passphrase")
                 .setDesc(
-                    settings.configEncryptionPassphrase
-                        ? "Independent config passphrase. Re-run Init & Push to apply."
-                        : "Empty inherits the Vault Sync passphrase; set a value to use a different one.",
+                    "Push and Pull unlock the config database with the passphrase " +
+                        "saved here. Empty: the next Create or Join uses the Vault " +
+                        "Sync passphrase (Join asks when that is empty too) and, once " +
+                        "it succeeds, saves the passphrase it used here — later Vault " +
+                        "Sync changes do not affect config sync. Other devices: enter " +
+                        "the passphrase the config database was created with.",
                 )
                 .addText((text) => {
-                    text.setPlaceholder("Inherit Vault Sync passphrase")
+                    text.setPlaceholder("Empty: Create / Join use the Vault Sync passphrase")
                         .setValue(settings.configEncryptionPassphrase ?? "")
                         .onChange(async (value) => {
                             await this.deps.updateSettings({ configEncryptionPassphrase: value });
@@ -237,7 +275,7 @@ export class ConfigSyncTab {
             .setDesc(
                 inheritingCompress
                     ? `Inheriting Vault Sync (${settings.compressionEnabled ? "on" : "off"}). Toggle to set an independent value.`
-                    : "Independent config setting. Re-run Init & Push to apply.",
+                    : "Independent config setting, used by the next Create.",
             )
             .addToggle((toggle) =>
                 toggle
@@ -317,54 +355,44 @@ export class ConfigSyncTab {
         ) as HTMLElement;
 
         // ── Step 3: Setup ───────────────────────────────────
+        // Mirrors Vault Sync's Step 3 (Init / Clone): one state line, then
+        // the first-device and the other-device action.
         el.createEl("h3", { text: "Step 3: Setup" });
 
         const configEnabled = settings.couchdbConfigDbName.trim() !== "";
-
-        if (!configEnabled) {
-            el.createEl("p", {
-                text: "Apply a config database name in Step 2 to enable setup.",
-                cls: "setting-item-description",
-            });
-        }
+        this.renderSetupState(el, configEnabled);
 
         new Setting(el)
-            .setName("Init")
+            .setName("Create")
             .setDesc(
-                "Reset the shared config database: wipe remote + local and " +
-                "establish the encryption root. Run once per device pool, then " +
-                "use Push (below) to send this device's config.",
+                "Reset the remote config database with a new root from the Step 1 " +
+                "settings (1st device). Then Push. Every other device must Join again.",
             )
             .addButton((btn) =>
-                btn.setButtonText("Init").setWarning()
+                btn.setButtonText("Create").setWarning()
+                    .setDisabled(!configEnabled)
+                    .onClick(async () => this.handleCreate(btn))
+            );
+
+        new Setting(el)
+            .setName("Join")
+            .setDesc(
+                "Join the existing config database with its own encryption and " +
+                "compression (2nd+ device). Neither the server nor Step 1 is changed. " +
+                "Then Pull.",
+            )
+            .addButton((btn) =>
+                btn.setButtonText("Join")
                     .setDisabled(!configEnabled)
                     .onClick(async () => {
-                        const ok = await this.deps.modalPresenter.showConfirmModal(
-                            "Init",
-                            "Delete the existing remote config DB and reset to an " +
-                                "empty database? You'll send this device's config " +
-                                "with Push afterwards. This cannot be undone.",
-                            "Init",
-                            true,
-                        );
-                        if (!ok) return;
-                        btn.setButtonText("Initializing...");
+                        btn.setButtonText("Joining...");
                         btn.setDisabled(true);
                         try {
-                            // Config codec is independent (#config-codec): the
-                            // single resolver applies the per-field inherit rules.
-                            const codec = resolveConfigCodec(this.deps.getSettings());
-                            await this.deps.configSync.init(codec);
-                            // Init minted a fresh config:meta at cipherVersion 3
-                            // when encrypted — ratchet the local floor now so a
-                            // downgrade is refused immediately, not only after
-                            // the next onload early-derive.
-                            if (codec.encryption) {
-                                await this.deps.ratchetConfigCipherFloor(3);
-                            }
-                        } catch { /* handled */ }
-                        btn.setButtonText("Init");
-                        btn.setDisabled(false);
+                            await this.trackOp(this.deps.configSync.join());
+                        } catch {
+                            // Reported by ConfigSync (ProgressNotice + log).
+                        }
+                        this.afterRelationOp();
                     })
             );
 
@@ -396,9 +424,14 @@ export class ConfigSyncTab {
                     .onClick(async () => {
                         btn.setButtonText("Pushing...");
                         btn.setDisabled(true);
-                        try { await this.deps.configSync.push(); } catch { /* handled */ }
-                        btn.setButtonText("Push ↑");
-                        btn.setDisabled(false);
+                        try {
+                            await this.trackOp(this.deps.configSync.push());
+                        } catch {
+                            // Reported by ConfigSync (ProgressNotice + log).
+                        }
+                        // The status line reflects this op's preflight.
+                        this.remoteCache = null;
+                        this.deps.refresh();
                     })
             );
 
@@ -414,17 +447,125 @@ export class ConfigSyncTab {
                         btn.setButtonText("Pulling...");
                         btn.setDisabled(true);
                         try {
-                            await this.deps.configSync.pull();
+                            await this.trackOp(this.deps.configSync.pull());
                             new Notice("CouchSync: Reloading Obsidian...");
                             setTimeout(() => {
                                 (this.deps.app as any).commands.executeCommandById("app:reload");
                             }, 500);
                         } catch {
-                            btn.setButtonText("Pull & Reload ↓");
-                            btn.setDisabled(false);
+                            // Reported by ConfigSync (ProgressNotice + log);
+                            // no reload on failure. Re-render so the button
+                            // and the status line reflect this attempt.
+                            this.deps.refresh();
                         }
                     })
             );
+    }
+
+    /**
+     * Step 3 state line: this device's relation to the bound config DB.
+     *
+     * The local half is evaluated now (`assertLocalReady`, no I/O), so an
+     * unfinished Create or a missing Join shows immediately. When
+     * that passes, the latest server-side result (preflight / Join / Create)
+     * is shown; before any op ran this session, the line says the server is
+     * checked on the next one. Colours follow Vault Sync's check result:
+     * green for ready, red for a problem.
+     */
+    private renderSetupState(el: HTMLElement, configEnabled: boolean): void {
+        let text: string;
+        let tone: "ok" | "error" | null = null;
+        const binding = configEnabled ? this.deps.configSync.currentBinding() : null;
+        if (!configEnabled) {
+            text = "Apply a config database name in Step 2 first.";
+        } else if (!binding) {
+            text = "The local config store could not be opened — see the log, then " +
+                "Apply the database name again.";
+            tone = "error";
+        } else {
+            let local: ConfigNotReadyError | null = null;
+            try {
+                binding.assertLocalReady({ requireAttached: true });
+            } catch (e) {
+                if (e instanceof ConfigNotReadyError) local = e;
+                else throw e;
+            }
+            const st = binding.status;
+            if (local?.kind === "unattached") {
+                text = "Not joined yet. First device: Create. Other devices: Join.";
+            } else if (local) {
+                text = local.message;
+                tone = "error";
+            } else if (st?.state === "blocked") {
+                text = `Last check: ${st.message}`;
+                tone = "error";
+            } else if (st?.state === "ready") {
+                text = `Joined "${binding.dbName}" — ready to Push and Pull.`;
+                tone = "ok";
+            } else {
+                text = `Joined "${binding.dbName}". The server is checked on the next ` +
+                    "Push or Pull.";
+            }
+        }
+        const p = el.createEl("p", {
+            text,
+            cls: tone === "error" ? "setting-item-description mod-warning" : "setting-item-description",
+        });
+        if (tone === "ok") p.style.color = "var(--text-success)";
+        if (tone === "error") p.style.color = "var(--text-error)";
+    }
+
+    /** Create: show what it would delete (read from the server now, never
+     *  guessed) and the codec it builds, confirm, run — against the binding
+     *  the dialog described, or not at all. */
+    private async handleCreate(btn: ButtonComponent): Promise<void> {
+        const settings = this.deps.getSettings();
+        const dbName = settings.couchdbConfigDbName;
+        const step1 = resolveConfigCodec(settings);
+        const next = {
+            encryption: step1.encryption,
+            compression: step1.compression,
+            ...(step1.encryption ? { cipherVersion: CURRENT_CIPHER_VERSION } : {}),
+        };
+        btn.setButtonText("Checking server...");
+        btn.setDisabled(true);
+        const preview = await this.deps.configSync.previewCreate();
+        const ok = await this.deps.modalPresenter.showConfirmModal(
+            `Create config database "${dbName}"?`,
+            describeCreateConfirm(dbName, preview, next),
+            "Create",
+            true,
+        );
+        if (!ok) {
+            btn.setButtonText("Create");
+            btn.setDisabled(false);
+            return;
+        }
+        // The dialog described `preview.bindingKey`. Checked in the same tick
+        // as create() takes the op lock, so nothing can switch in between.
+        if (this.deps.configSync.currentBinding()?.key !== preview.bindingKey) {
+            new Notice(
+                "CouchSync: the config database changed while the dialog was open — " +
+                    "Create was not run. Press Create again.",
+                10000,
+            );
+            this.afterRelationOp();
+            return;
+        }
+        btn.setButtonText("Creating...");
+        try {
+            await this.trackOp(this.deps.configSync.create());
+        } catch {
+            // Reported by ConfigSync (ProgressNotice + log); the tab only
+            // restores its button.
+        }
+        this.afterRelationOp();
+    }
+
+    /** After Create / Join: the remote listing and the status changed. */
+    private afterRelationOp(): void {
+        this.remoteCache = null;
+        this.deps.refresh();
     }
 
     // ── Filter tree (meaning-unit policy) ───────────────
@@ -504,7 +645,13 @@ export class ConfigSyncTab {
         // Remote is best-effort: the tree still works offline, just without
         // the "on server" provenance. A short TTL cache keeps checkbox
         // toggles (which re-render the whole tab) from re-hitting the network.
-        const { paths: remotePaths, ok: remoteOk } = await this.fetchRemotePathsCached();
+        const listing = await this.fetchRemotePathsCached();
+        if (!listing) {
+            // Read for a binding that was replaced meanwhile: list again for
+            // the current one (bindings change only on Apply, so this ends).
+            return this.populateFilterTree(treeEl);
+        }
+        const { paths: remotePaths, failure: remoteFailure } = listing;
 
         treeEl.empty();
         const policy = this.deps.getSettings().configSyncPolicy;
@@ -529,10 +676,11 @@ export class ConfigSyncTab {
             arr.sort((a, b) => a.c.path.localeCompare(b.c.path));
         }
 
-        if (!remoteOk) {
+        if (remoteFailure) {
+            // Show the classified cause — "Server not reachable" for every
+            // failure hid auth errors and a missing config key.
             treeEl.createEl("p", {
-                text: "Server not reachable — showing this device's config only " +
-                    "(no “on server” status).",
+                text: describeConfigRemoteFailure(remoteFailure),
                 cls: "setting-item-description",
             });
         }
@@ -555,24 +703,32 @@ export class ConfigSyncTab {
         }
     }
 
-    /** Fetch the remote config path list, memoised for a short TTL. Returns
-     *  `ok: false` (and an empty list) when the remote is unreachable, so the
-     *  tree degrades to a local-only view instead of failing. */
-    private async fetchRemotePathsCached(): Promise<{ paths: string[]; ok: boolean }> {
+    /** Fetch the remote config path list, memoised for a short TTL per
+     *  binding. On failure returns an empty list plus the classified cause,
+     *  so the tree degrades to a local-only view and says why. While a config
+     *  op runs the server is not listed (ConfigSync reports `busy`): the last
+     *  listing of the same binding is shown instead, however old.
+     *
+     *  Returns null when the binding changed while the listing was being
+     *  read (it belongs to the previous DB / server): the result is dropped,
+     *  never cached or shown. */
+    private async fetchRemotePathsCached(): Promise<RemoteConfigListing | null> {
         const now = Date.now();
-        if (this.remoteCache && now - this.remoteCache.at < ConfigSyncTab.REMOTE_TTL_MS) {
-            return { paths: this.remoteCache.paths, ok: this.remoteCache.ok };
+        const key = this.deps.configSync.currentBinding()?.key ?? null;
+        const cached = this.remoteCache;
+        if (cached && cached.bindingKey === key && (
+            now - cached.at < ConfigSyncTab.REMOTE_TTL_MS
+            || this.deps.configSync.isInflight()
+        )) {
+            return { paths: cached.paths, failure: cached.failure, bindingKey: cached.bindingKey };
         }
-        let paths: string[] = [];
-        let ok = false;
-        try {
-            paths = await this.deps.configSync.listRemoteConfigPathsQuiet();
-            ok = true;
-        } catch {
-            // Offline / unreachable / auth — fall back to local-only.
-        }
-        this.remoteCache = { paths, ok, at: now };
-        return { paths, ok };
+        const listing = await this.deps.configSync.listRemoteConfigPathsQuiet();
+        const current = this.deps.configSync.currentBinding()?.key ?? null;
+        if (listing.bindingKey !== key || current !== key) return null;
+        // A `busy` answer says nothing about the server — never cache it.
+        const busy = listing.failure?.kind === "not-ready" && listing.failure.notReady === "busy";
+        if (!busy) this.remoteCache = { ...listing, at: now };
+        return listing;
     }
 
     private renderUnit(
@@ -712,10 +868,48 @@ export class ConfigSyncTab {
         this.deps.refresh();
     }
 
+    /** Track a ConfigSync op started from this tab so the Apply button is
+     *  disabled while it runs. ConfigSync registers the op synchronously, so
+     *  the state is refreshed right after the call and again when it ends. */
+    private async trackOp<T>(op: Promise<T>): Promise<T> {
+        this.updateDirtyState();
+        try {
+            return await op;
+        } finally {
+            this.updateDirtyState();
+        }
+    }
+
+    /**
+     * Apply = switch the config binding and persist the name, together:
+     * the name is saved by `rebind`'s `commit`, inside its lock, so the
+     * settings and the binding never disagree (invariant on
+     * `ConfigSync.rebind`). Rebinding closes the current DB's store /
+     * cursors / key memo and opens the new DB's, so the new name takes
+     * effect without a reload and nothing of the old DB is used against the
+     * new one.
+     *
+     * A busy refusal changes nothing (settings stay as they were). Any other
+     * rebind failure leaves config sync unbound; the name is still saved so
+     * ops report the failure against the name the user chose.
+     */
     private async handleApply(): Promise<void> {
-        await this.deps.updateSettings({
-            couchdbConfigDbName: this.draft.db.trim(),
-        });
+        const name = this.draft.db.trim();
+        this.applyBtn?.setDisabled(true);
+        try {
+            await this.deps.configSync.rebind(name || null, {
+                commit: () => this.deps.updateSettings({ couchdbConfigDbName: name }),
+            });
+        } catch (e: any) {
+            logWarn(`CouchSync: config database switch failed: ${e?.message ?? e}`);
+            new Notice(`CouchSync: could not switch the config database — ${e?.message ?? e}`, 10000);
+            if (e instanceof ConfigNotReadyError && e.kind === "busy") {
+                this.updateDirtyState();
+                return;
+            }
+        }
+        // The remote listing belonged to the previous DB.
+        this.remoteCache = null;
         this.testPassed = false;
         this.deps.refresh();
     }

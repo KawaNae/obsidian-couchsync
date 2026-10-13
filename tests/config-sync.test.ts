@@ -8,7 +8,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import "fake-indexeddb/auto";
-import { ConfigSync } from "../src/sync/config-sync.ts";
+import { ConfigSync, type ConfigSyncOptions } from "../src/sync/config-sync.ts";
 import { ConfigLocalDB } from "../src/db/config-local-db.ts";
 import { AuthGate } from "../src/db/sync/auth-gate.ts";
 import { ALWAYS_VISIBLE } from "../src/db/visibility-gate.ts";
@@ -19,6 +19,8 @@ import { makeSettings } from "./helpers/settings-factory.ts";
 import { makeConfigId } from "../src/types/doc-id.ts";
 import { makeConfigFixture } from "./helpers/config-fixture.ts";
 import type { CouchSyncDoc } from "../src/types.ts";
+import { FakeCouchClient } from "./helpers/fake-couch-client.ts";
+import { attachPlain } from "./helpers/config-attach.ts";
 
 let counter = 0;
 function uniqueName() { return `config-sync-test-${Date.now()}-${counter++}`; }
@@ -31,14 +33,30 @@ describe("ConfigSync", () => {
     let settings: ReturnType<typeof makeSettings>;
     let cs: ConfigSync;
 
-    beforeEach(() => {
+    /** An UNBOUND ConfigSync whose store factory hands out the test's `db`. */
+    function makeCs(opts: ConfigSyncOptions = {}): ConfigSync {
+        return new ConfigSync(
+            vault, modal, "test-vault", auth, ALWAYS_VISIBLE, NoopReconnectBridge,
+            () => settings,
+            { storeFactory: () => db, ...opts },
+        );
+    }
+
+    /** A ConfigSync bound to "vault-config" (store = the test's `db`). */
+    async function makeBoundCs(opts: ConfigSyncOptions = {}): Promise<ConfigSync> {
+        const c = makeCs(opts);
+        await c.rebind("vault-config");
+        return c;
+    }
+
+    beforeEach(async () => {
         vault = new FakeVaultIO();
         modal = new FakeModalPresenter();
         db = new ConfigLocalDB(uniqueName());
         db.open();
         auth = new AuthGate();
         settings = makeSettings({ deviceId: "dev-A" });
-        cs = new ConfigSync(vault, modal, db, auth, ALWAYS_VISIBLE, NoopReconnectBridge, () => settings);
+        cs = await makeBoundCs();
     });
 
     afterEach(async () => {
@@ -48,30 +66,40 @@ describe("ConfigSync", () => {
     // ── Configuration gates ──────────────────────────────
 
     describe("configuration gates", () => {
-        it("isConfigured: false when couchdbConfigDbName empty", () => {
-            expect(cs.isConfigured()).toBe(false);
+        it("isConfigured: false before any rebind (no config DB applied)", () => {
+            expect(makeCs().isConfigured()).toBe(false);
         });
 
-        it("isConfigured: true when dbName + configDb present", () => {
-            settings.couchdbUri = "http://localhost:5984";
-            settings.couchdbConfigDbName = "vault-config";
+        it("isConfigured: true once bound to a config DB", () => {
             expect(cs.isConfigured()).toBe(true);
+            expect(cs.currentStore()).toBe(db);
         });
 
-        it("isConfigured: false when configDb is null", () => {
-            const nullDb = new ConfigSync(vault, modal, null, auth, ALWAYS_VISIBLE, NoopReconnectBridge, () => settings);
+        it("isConfigured: false after rebind(null)", async () => {
+            await cs.rebind(null);
+            expect(cs.isConfigured()).toBe(false);
+            expect(cs.currentStore()).toBeNull();
+        });
+
+        it("scan throws not-configured when unbound", async () => {
+            const unbound = makeCs();
+            await expect(unbound.scan()).rejects.toMatchObject({
+                name: "ConfigNotReadyError",
+                kind: "not-configured",
+                message: expect.stringMatching(/not configured/),
+            });
+            // A name in settings without an open binding (the last rebind
+            // failed) says so instead of pretending nothing is configured.
             settings.couchdbConfigDbName = "vault-config";
-            expect(nullDb.isConfigured()).toBe(false);
+            await expect(unbound.scan()).rejects.toMatchObject({
+                kind: "not-configured",
+                message: expect.stringMatching(/not active on this device/),
+            });
         });
 
-        it("scan throws when configDb is null", async () => {
-            const nullDb = new ConfigSync(vault, modal, null, auth, ALWAYS_VISIBLE, NoopReconnectBridge, () => settings);
-            await expect(nullDb.scan()).rejects.toThrow(/no local config DB/);
-        });
-
-        it("push throws when couchdbConfigDbName empty but local has docs", async () => {
+        it("push throws when no config DB is applied but local has docs", async () => {
             vault.addFile(".obsidian/app.json", "{}");
-            await expect(cs.push()).rejects.toThrow(/not configured/);
+            await expect(makeCs().push()).rejects.toThrow(/not configured/);
         });
     });
 
@@ -128,9 +156,7 @@ describe("ConfigSync", () => {
             // hardcoded folder literal would miss the data.json (which holds the
             // plaintext password + passphrase) and push it to the config server.
             const renamed = ".obsidian/plugins/KawaNae-obsidian-couchsync/data.json";
-            const cs2 = new ConfigSync(
-                vault, modal, db, auth, ALWAYS_VISIBLE, NoopReconnectBridge,
-                () => settings,
+            const cs2 = await makeBoundCs(
                 { ownDataJsonPath: renamed }, // = manifest.dir + "/data.json"
             );
             vault.addFile(renamed, `{"couchdbPassword":"SECRET","encryptionPassphrase":"SECRET"}`);
@@ -230,7 +256,7 @@ describe("ConfigSync", () => {
             expect(doc!.vclock["dev-A"]).toBe(2);
         });
 
-        it("init() clears lastSynced so a subsequent scan rewrites unchanged files", async () => {
+        it("create() clears lastSynced so a subsequent scan rewrites unchanged files", async () => {
             // This guarantees PR5's destructive Init still rebuilds local
             // state correctly even before remote-side destroy is wired in.
             vault.addFile(".obsidian/app.json", `{"theme":"dark"}`);
@@ -244,7 +270,7 @@ describe("ConfigSync", () => {
             // exercised only via integration tests; here we just verify
             // the local clearing→rescan path.)
             try {
-                await cs.init({encryption:false,compression:false});
+                await cs.create();
             } catch {
                 // remote-side phases will fail with no client, but the
                 // local clearing happens first. Tolerate the error.
@@ -328,11 +354,7 @@ describe("ConfigSync", () => {
         });
 
         it("does not materialise a desktop-only plugin's data.json on mobile", async () => {
-            const mobileCs = new ConfigSync(
-                vault, modal, db, auth, ALWAYS_VISIBLE, NoopReconnectBridge,
-                () => settings,
-                { getIsMobile: () => true },
-            );
+            const mobileCs = await makeBoundCs({ getIsMobile: () => true });
             // plugin present locally, but its local manifest is desktop-only
             vault.addFile(".obsidian/plugins/term/manifest.json", `{"id":"term","isDesktopOnly":true}`);
             await seedConfigDoc(".obsidian/plugins/term/data.json", `{"k":1}`);
@@ -404,11 +426,6 @@ describe("ConfigSync", () => {
     // ── withConfigRemote error gates ────────────────────
 
     describe("auth gate", () => {
-        it("testConnection returns error message when not configured", async () => {
-            const msg = await cs.testConnection();
-            expect(msg).toBe("Config sync is not configured");
-        });
-
         it("push throws immediately when auth is blocked", async () => {
             settings.couchdbUri = "http://localhost:5984";
             settings.couchdbConfigDbName = "vault-config";
@@ -421,43 +438,62 @@ describe("ConfigSync", () => {
         });
     });
 
-    // ── codec dirty gate (#config-codec, M-1) ───────────
+    // ── Step 1 codec vs the joined DB (#config-codec) ────
     //
-    // The dirty/not-dirty resolution itself is covered as a pure function in
-    // config-codec-policy.test; here we assert assertConfigReady wires that
-    // result into push/pull, symmetric with the configSettingUp gate.
-    describe("codec dirty gate", () => {
-        it("push refuses when the codec drifted from the Init-applied baseline", async () => {
-            // Applied plaintext ("0:0:0"), but encryption was since toggled on.
-            settings.configCodecApplied = "0:0:0";
+    // Push and Pull encode with the codec recorded in the store when the
+    // device created or joined the DB; Step 1 is only the input of the next
+    // Create. A Step 1 toggle therefore never stops sync (it used to be
+    // `codec-changed`) and never changes how data reaches the server.
+    describe("Step 1 codec changes never stop sync", () => {
+        let remote: FakeCouchClient;
+        let bound: ConfigSync;
+        beforeEach(async () => {
+            settings.couchdbUri = "http://localhost:5984";
+            settings.couchdbConfigDbName = "vault-config";
+            settings.compressionEnabled = false; // joined as plaintext, uncompressed
+            remote = new FakeCouchClient();
+            bound = await makeBoundCs({ rawClientFactory: () => remote });
+            await attachPlain(settings, remote, db);
+        });
+
+        it("encryption toggled on in Step 1: Push still succeeds, and sends plaintext as joined", async () => {
             settings.configEncryptionEnabled = true;
             settings.configEncryptionPassphrase = "secret";
-            await expect(cs.push()).rejects.toThrow(/codec changed/i);
+            vault.addFile(".obsidian/app.json", `{"theme":"dark"}`);
+            expect(await bound.push()).toBe(1);
+            // The server copy is a plaintext ConfigDoc under its path id —
+            // the joined codec, not Step 1, decided the encoding.
+            const doc = await remote.getDoc<any>(makeConfigId(".obsidian/app.json"));
+            expect(doc).toMatchObject({ type: "config", chunks: expect.any(Array) });
         });
 
-        it("pull refuses when the codec drifted from the Init-applied baseline", async () => {
-            settings.configCodecApplied = "0:0:0";
-            settings.configCompressionEnabled = true; // vault default is true → flips shape
-            await expect(cs.pull()).rejects.toThrow(/codec changed/i);
+        it("compression flipped in Step 1: Pull and Push still succeed", async () => {
+            vault.addFile(".obsidian/hotkeys.json", `{"k":1}`);
+            expect(await bound.push()).toBe(1);
+            settings.configCompressionEnabled = true;
+            await expect(bound.pull()).resolves.toBeGreaterThanOrEqual(0);
+            vault.addFile(".obsidian/hotkeys.json", `{"k":2}`);
+            expect(await bound.push()).toBe(1);
         });
 
-        it("does NOT gate when the live codec matches the applied baseline", async () => {
-            // plaintext + no compression + no passphrase → "0:0:0", matches applied.
-            settings.compressionEnabled = false;
-            settings.configCodecApplied = "0:0:0";
+        it("an unattached device (no attachment) is reported as unattached", async () => {
+            const fresh = new ConfigLocalDB(uniqueName());
+            const other = new ConfigSync(
+                vault, modal, "test-vault", auth, ALWAYS_VISIBLE, NoopReconnectBridge,
+                () => settings,
+                { storeFactory: () => fresh, rawClientFactory: () => remote },
+            );
+            await other.rebind("vault-config");
             vault.addFile(".obsidian/app.json", "{}");
-            // Passes the codec gate; fails later for an unrelated reason
-            // (no config DB name configured) — proving the gate let it through.
-            await expect(cs.push()).rejects.toThrow(/not configured/i);
+            await expect(other.push()).rejects.toMatchObject({ kind: "unattached" });
+            await other.close();
+            await fresh.destroy();
         });
 
-        it("does NOT gate a pre-v0.27.2 install with no recorded baseline", async () => {
-            // configCodecApplied undefined → permissive even with a drifting override.
-            settings.compressionEnabled = false;
-            settings.configEncryptionEnabled = true;
-            settings.configEncryptionPassphrase = "secret";
-            vault.addFile(".obsidian/app.json", "{}");
-            await expect(cs.push()).rejects.toThrow(/not configured/i);
+        it("the auth latch still comes first", async () => {
+            settings.configCompressionEnabled = true;
+            auth.raise(401, "bad creds");
+            await expect(bound.push()).rejects.toThrow(/Auth blocked/);
         });
     });
 });

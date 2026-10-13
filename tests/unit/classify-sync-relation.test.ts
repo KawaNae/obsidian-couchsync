@@ -204,7 +204,7 @@ describe("classifySyncRelation", () => {
     // ── true-divergent (pull-site vclock tie) ──────────────
     // A PULL call site compares two REAL doc vclocks (leftVCAttributed falsy).
     // An equal vclock with differing content cannot come from a legit local
-    // edit (that bumps the clock) — it is the Config-Init stale-collision
+    // edit (that bumps the clock) — it is the config-Create stale-collision
     // anomaly (zombie {device:1} vs a freshly-reset {device:1}). It must be
     // surfaced, not silently kept (the 2026-06-14 non-propagation bug).
     describe("true-divergent (pull-site vclock tie)", () => {

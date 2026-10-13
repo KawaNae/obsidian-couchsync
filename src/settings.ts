@@ -27,6 +27,25 @@ export interface MobileStatusPosition {
     offset: number;
 }
 
+/**
+ * The part of a config binding that must outlive its local store
+ * (config-binding design, 状態モデル). Keyed by `configBindingKey`.
+ *
+ * Whether the device is attached, the codec it syncs with and the root it
+ * joined live INSIDE the binding's local store (`ConfigAttachment`), so
+ * deleting the store detaches the device. What stays here is what deleting
+ * the store must not reset: the trust floor and an interrupted Create.
+ */
+export interface ConfigBindingRecord {
+    /** Locally-anchored cipherVersion floor for this DB (TOFU). Set by
+     *  Create / Join, ratcheted up by later unlocks, never lowered by a
+     *  sync op. `undefined` for a plaintext DB. */
+    cipherFloor?: number;
+    /** This device's Create is in progress; true between the destructive
+     *  wipe and the commit (Invariant C, #err-9). */
+    settingUp: boolean;
+}
+
 export interface CouchSyncSettings {
     // Connection (shared between vault and config sync)
     couchdbUri: string;
@@ -107,17 +126,6 @@ export interface CouchSyncSettings {
     configEncryptionPassphrase?: string;
     configCompressionEnabled?: boolean;
 
-    /** Structural fingerprint of the config codec that the last successful
-     *  Config Init actually applied to the remote (see
-     *  `codecFingerprint` / `isConfigCodecDirty`). When the live resolved
-     *  codec no longer matches this, the config DB on the server was built
-     *  with a different codec and live push/pull/write are refused until a
-     *  fresh Config Init re-applies the new policy — symmetric with vault
-     *  sync, where a codec change demands a destructive re-init (#config-codec).
-     *  `undefined` = never Init'd (or a pre-v0.27.2 install): permissive, no
-     *  baseline to drift from. */
-    configCodecApplied?: string;
-
     /** Locally-anchored cipherVersion policy floor (TOFU — trust on first
      *  unlock). Recorded the first time this device trust-unlocks the vault
      *  (Init/Clone/first-unlock) and ratcheted up on re-init; it never
@@ -129,21 +137,17 @@ export interface CouchSyncSettings {
      *  rewriting meta (closes the v3 downgrade hole, #1/#3). `undefined` on a
      *  not-yet-observed or plaintext vault — permissive (legacy dual-read). */
     vaultCipherVersion?: number;
-    /** Config-DB equivalent of `vaultCipherVersion` (invariant 18: each DB is
-     *  its own crypto root). */
-    configCipherVersion?: number;
+    /** Per-config-DB cipher floor and Create-interrupted flag, keyed by
+     *  `configBindingKey` (normalised server URI + config DB name).
+     *  Replaces the former global `configCipherVersion` / `configSettingUp`,
+     *  which ignored the DB name and leaked from one config DB to another.
+     *  Attachment itself is recorded in the binding's local store. */
+    configBindings: Record<string, ConfigBindingRecord>;
 
     // Internal
     /** Server reachable + auth verified (CouchDB tab Test+Apply). */
     serverTested: boolean;
     connectionState: ConnectionState;
-    /** Config-sync equivalent of `connectionState`'s `settingUp` transient
-     *  (Invariant C). Set true before ConfigSetupService destroys the local
-     *  config DB and cleared only on a fully-successful init; if init dies
-     *  mid-flight it stays true, so config push/pull/write refuse to run
-     *  against a half-built config DB until a fresh Config Init completes
-     *  (#err-9). */
-    configSettingUp: boolean;
     /** Human-readable device name used as the vclock key (e.g. "desktop", "iphone"). */
     deviceId: string;
     /** Old deviceIds this device has used (UUIDs from pre-v0.12, renamed names).
@@ -190,7 +194,7 @@ export const DEFAULT_SETTINGS: CouchSyncSettings = {
 
     serverTested: false,
     connectionState: "editing",
-    configSettingUp: false,
+    configBindings: {},
     deviceId: "",
     previousDeviceIds: [],
 };

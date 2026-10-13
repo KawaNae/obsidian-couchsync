@@ -17,7 +17,15 @@ export class ConfirmModal extends Modal {
     onOpen(): void {
         const { contentEl } = this;
         contentEl.createEl("h3", { text: this.title });
-        contentEl.createEl("p", { text: this.message });
+        // A blank line in the message starts a new paragraph. A paragraph
+        // that starts with "⚠" is a warning and is emphasised.
+        for (const para of this.message.split(/\n\s*\n/)) {
+            const p = contentEl.createEl("p", { text: para });
+            if (para.startsWith("⚠")) {
+                p.style.color = "var(--text-error)";
+                p.style.fontWeight = "var(--font-bold)";
+            }
+        }
 
         new Setting(contentEl)
             .addButton((btn) => {

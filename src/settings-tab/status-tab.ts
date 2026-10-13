@@ -19,6 +19,8 @@ import {
     type ServerInfo, type DbInfo,
 } from "./couch-fetch.ts";
 import { addPasswordToggle } from "./vault-sync-tab.ts";
+import { applyServerSettings, type ConfigServerSwitch } from "./server-apply.ts";
+import { logWarn } from "../ui/log.ts";
 
 class TypeToConfirmModal extends Modal {
     private resolved = false;
@@ -87,6 +89,10 @@ export interface CouchDbTabDeps {
     updateSettings: (patch: Partial<CouchSyncSettings>) => Promise<void>;
     replicator: SyncEngine;
     auth: AuthGate;
+    /** The config binding is keyed by (server, config DB), so a server
+     *  change must switch it. Omitted → the server is saved directly (no
+     *  config sync wired, e.g. tests). */
+    configBinding?: ConfigServerSwitch;
     refresh: () => void;
 }
 
@@ -131,13 +137,23 @@ export class CouchDbTab {
             pencilEl.style.display = this.isFieldDirty(field) ? "inline" : "none";
         }
         if (this.applyBtn) {
-            this.applyBtn.setDisabled(!this.testPassed);
+            this.applyBtn.setDisabled(!this.canApply());
         }
         if (this.applyDesc) {
-            this.applyDesc.textContent = this.testPassed
-                ? "Save server connection."
-                : "Test connection first.";
+            this.applyDesc.textContent = this.applyDescText();
         }
+    }
+
+    /** Apply needs a passed Test, and no running config op: the config
+     *  binding follows the server and cannot switch under an op. */
+    private canApply(): boolean {
+        return this.testPassed && !this.deps.configBinding?.changeBlocker();
+    }
+
+    private applyDescText(): string {
+        const blocked = this.deps.configBinding?.changeBlocker();
+        if (blocked) return blocked;
+        return this.testPassed ? "Save server connection." : "Test connection first.";
     }
 
     render(el: HTMLElement): void {
@@ -174,16 +190,12 @@ export class CouchDbTab {
 
         const applySetting = new Setting(el)
             .setName("Apply")
-            .setDesc(
-                this.testPassed
-                    ? "Save server connection."
-                    : "Test connection first."
-            )
+            .setDesc(this.applyDescText())
             .addButton((btn) => {
                 this.applyBtn = btn;
                 btn
                     .setButtonText("Apply")
-                    .setDisabled(locked || !this.testPassed)
+                    .setDisabled(locked || !this.canApply())
                     .onClick(async () => this.handleApply());
             });
         this.applyDesc = applySetting.settingEl.querySelector(
@@ -274,7 +286,29 @@ export class CouchDbTab {
             patch.connectionState = "editing";
         }
 
-        await this.deps.updateSettings(patch);
+        // Settings are saved inside the config binding switch, never before
+        // it (server-apply.ts): refused while a config op runs → nothing is
+        // saved, so the server the settings name is always the one the
+        // config binding talks to.
+        const result = await applyServerSettings({
+            configBinding: this.deps.configBinding,
+            oldUri: saved.uri,
+            newUri: this.draft.uri,
+            save: () => this.deps.updateSettings(patch),
+        });
+        if (result.kind === "refused-busy") {
+            new Notice(
+                "CouchSync: a config operation is running — the server was not " +
+                    "changed. Apply again when it finishes.",
+                10000,
+            );
+            this.updateDirtyState();
+            return;
+        }
+        if (result.kind === "saved-config-unbound") {
+            const e: any = result.error;
+            logWarn(`CouchSync: config store for the new server could not be opened: ${e?.message ?? e}`);
+        }
         this.testPassed = false;
         this.deps.refresh();
     }

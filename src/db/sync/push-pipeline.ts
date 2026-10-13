@@ -599,7 +599,7 @@ export class PushPipeline {
             if (rel === "equal") {
                 // Content-truthful skip: a vclock tie is only "converged" when
                 // chunks AND the deleted flag also match. A tie with differing
-                // content is the Config-Init stale-collision anomaly — the
+                // content is the config-Create stale-collision anomaly — the
                 // vclock cannot order the two, so silently dropping the local
                 // content is the non-propagation bug. Surface it as divergent
                 // (concurrent) so the conflict path arbitrates. Symmetric with

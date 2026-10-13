@@ -13,8 +13,13 @@ interface MaintenanceTabDeps {
     getSettings: () => CouchSyncSettings;
     updateSettings: (patch: Partial<CouchSyncSettings>) => Promise<void>;
     localDb: LocalDB;
-    /** Null when config sync is not configured (`couchdbConfigDbName === ""`) */
-    configLocalDb: ConfigLocalDB | null;
+    /** The current config binding's store; null when config sync is not
+     *  configured. A getter because Apply can switch the store at runtime —
+     *  never hold on to a store read earlier. */
+    getConfigLocalDb: () => ConfigLocalDB | null;
+    /** Runs local config-store work under ConfigSync's op lock (refused
+     *  while a config op runs; a rebind cannot close the store mid-way). */
+    runConfigExclusive: <T>(fn: (store: ConfigLocalDB) => Promise<T>) => Promise<T>;
     replicator: SyncEngine;
     statusBar: StatusBar;
     modalPresenter: IModalPresenter;
@@ -236,7 +241,7 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
                     "Clean up legacy configs",
                     "Delete all `config:*` documents from the vault database? " +
                         "This is a one-time migration step after the v0.11.0 config-DB split. " +
-                        "Make sure you've already run Config Init in the Config Sync tab so " +
+                        "Make sure you've already run Create and Push in the Config Sync tab so " +
                         "the new config DB has been seeded.",
                     "Clean up",
                     true,
@@ -272,7 +277,7 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
             if (offending.startsWith("config:")) {
                 migrationSetting.setDesc(
                     `Found legacy config docs in the vault DB (e.g. ${offending}). ` +
-                        "Click to remove them after running Config Init in Config Sync.",
+                        "Click to remove them after running Create and Push in Config Sync.",
                 );
                 migrationBtnComponent?.setDisabled(false);
                 return;
@@ -362,14 +367,15 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
                 })
         );
 
-    if (deps.configLocalDb) {
+    if (deps.getConfigLocalDb()) {
         const configDbName = settings.couchdbConfigDbName;
         new Setting(el)
             .setName("Delete local config database")
             .setDesc(
-                `Destroy the local config database (${configDbName}) and restart. ` +
-                    "Remote config data is preserved. Mostly useful for cleaning up unused " +
-                    "local stores left behind by past device-pool reconfigurations.",
+                `Delete this device's local store for config database "${configDbName}" ` +
+                    "and restart. The server and the .obsidian files are not touched. " +
+                    "The store holds this device's Join, so afterwards the device is " +
+                    "not joined: press Join in Config Sync (Step 3), then Pull.",
             )
             .addButton((btn) =>
                 btn
@@ -378,15 +384,21 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
                     .onClick(async () => {
                         const ok = await deps.modalPresenter.showConfirmModal(
                             "Delete local config database",
-                            `Destroy the local config database (${configDbName}) on this ` +
-                                "device and restart the plugin? Remote config data is " +
-                                "preserved — config will re-download on next start.",
+                            `Delete this device's local store for config database ` +
+                                `"${configDbName}" and restart the plugin? The server and ` +
+                                "the .obsidian files are not touched. This device will no " +
+                                "longer be joined: after the restart, press Join in Config " +
+                                "Sync (Step 3), then Pull to download the config again.",
                             "Delete",
                             true,
                         );
                         if (!ok) return;
+                        // The store is read under the op lock, after the
+                        // modal: the one shown when the tab rendered may
+                        // have been replaced since, and a running config op
+                        // must not have its store destroyed underneath it.
                         try {
-                            await deps.configLocalDb!.destroy();
+                            await deps.runConfigExclusive((store) => store.destroy());
                             new Notice(
                                 "CouchSync: Local config database deleted. Restarting...",
                             );
