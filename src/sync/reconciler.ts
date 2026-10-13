@@ -11,7 +11,7 @@ import { chunkListsEqual } from "./chunk-equality.ts";
 import { filePathFromId } from "../types/doc-id.ts";
 import { toPathKey, type PathKey } from "../utils/path.ts";
 import { logDebug, logInfo, logWarn, logError } from "../ui/log.ts";
-import type { EnsureChunksResult } from "../db/sync-engine.ts";
+import { PendingApply, type ApplyOutcome } from "../db/sync/pending-apply.ts";
 
 /**
  * Margin absorbing local filesystem clock jitter when asking "has any vault
@@ -68,8 +68,8 @@ export interface ReconcileReport {
     /** Files restored from DB because another device created them (case D restore). */
     restored: string[];
     /** Files quarantined because their chunks are unavailable on this device
-     *  AND the server (broken / missingReferenced). Restore is suppressed
-     *  until the chunks arrive — no infinite retry. */
+     *  AND the server (broken / missingReferenced). Recorded in the pending
+     *  set and retried by every reconcile until the chunks arrive. */
     quarantined: string[];
     /** Canonical paths kept after resolving a PathKey collision (two
      *  case/NFC variants of one logical file de-duplicated to a
@@ -122,6 +122,15 @@ export function totalDiscrepancies(report: ReconcileReport): number {
  * signature (see `DocsChangeSignature`) tracks the docs row set only —
  * checkpoint/vclock/manifest bookkeeping, including this reconciler's
  * own cursor writes, cannot invalidate the fast path.
+ *
+ * The cursor moves past a path only when the path converged or was
+ * recorded in `PendingApply`. A remote doc this run could not write — its
+ * chunks missing here and on the server, the device offline, or the write
+ * failing — is recorded there, and every run (the fast path included)
+ * drains that set. Its outcome depends on where the chunks are, which the
+ * docs signature does not see, so the set and not a full scan carries the
+ * retry: a file that stays broken costs one probe per run, not a re-read
+ * of the vault.
  */
 export class Reconciler {
     private currentRun: Promise<ReconcileReport> | null = null;
@@ -144,9 +153,18 @@ export class Reconciler {
         private vaultSync: VaultSync,
         private getSettings: () => CouchSyncSettings,
         private notify: ReconcileNotify = () => {},
-        private ensureChunks: (doc: FileDoc) => Promise<EnsureChunksResult> =
-            async () => ({ stillMissing: [], remoteConsulted: false }),
-    ) {}
+        pendingApply?: Pick<PendingApply, "apply" | "drain">,
+    ) {
+        // Without a sync engine (tests, tools) there is no server to fetch
+        // chunks from: apply what is local and record what is not.
+        this.pendingApply = pendingApply ?? new PendingApply({
+            localDb,
+            ensureChunks: async () => ({ stillMissing: [], remoteConsulted: false }),
+            write: (doc) => vaultSync.dbToFile(doc),
+        });
+    }
+
+    private readonly pendingApply: Pick<PendingApply, "apply" | "drain">;
 
     /**
      * Late-binding setter for `conflictOrchestrator`. Reconciler is
@@ -251,6 +269,13 @@ export class Reconciler {
 
             if (cursor && !hasMtimeChanges && manifestMatchesVault && dbUnchanged
                 && !vaultHasDup) {
+                // Nothing in the vault or the docs moved, but a recorded doc
+                // may have become applicable (its chunks reached the server).
+                if (!this.disposed) {
+                    const drained = await this.pendingApply.drain();
+                    report.restored.push(...drained.applied);
+                    report.quarantined.push(...drained.quarantined);
+                }
                 await this.localDb.putScanCursor({
                     lastScanStartedAt: startedAt,
                     lastScanCompletedAt: Date.now(),
@@ -620,7 +645,7 @@ export class Reconciler {
             this.notify(msg);
         }
 
-        // Quarantine is not a "change applied" (recordQuarantined notifies
+        // Quarantine is not a "change applied" (PendingApply notifies
         // once on its own), but surface the count in the console summary so a
         // persistent broken file is observable without log spam.
         if (report.quarantined.length > 0) {
@@ -702,54 +727,30 @@ export class Reconciler {
     }
 
     /**
-     * Apply a remote FileDoc to the vault (restore/pull) with broken-chunk
-     * quarantine. Returns the outcome so the caller records it
-     * in the right report bucket.
+     * Apply a remote FileDoc to the vault (restore/pull) through
+     * `PendingApply`, which fetches missing chunks, writes, and records a doc
+     * it could not write so the cursor may still advance:
      *
      *  - "applied": chunks available, file written.
      *  - "quarantined": chunks unavailable on this device AND the server
-     *    (broken). Recorded once, restore suppressed — no infinite retry.
-     *  - "skipped": transient (offline / shutdown / error) — retried later.
+     *    (broken). Recorded, the user told once; never reaches dbToFile, so
+     *    there is no restore ping-pong.
+     *  - "skipped": transient (offline / write error) — recorded — or the
+     *    run is shutting down.
      *
-     * Recovery: `ensureChunks` only hits the network when a chunk is actually
-     * missing, so a healthy file never probes. A quarantined file re-probes
-     * once per reconcile (cheap, quiet — recordQuarantined's isNew guard
-     * suppresses repeat notices) and clears the moment its chunks reappear
-     * anywhere. No restore ping-pong: a still-broken file never reaches
-     * dbToFile, so it can't throw or loop.
+     * Every later reconcile drains the record, so the file recovers once
+     * its chunks are available anywhere.
      */
     private async applyRemoteToVault(
         displayPath: string,
         doc: FileDoc,
         label: string,
         mode: ReconcileMode,
-    ): Promise<"applied" | "quarantined" | "skipped"> {
+    ): Promise<ApplyOutcome> {
         if (mode !== "apply") return "applied";
         if (this.disposed) return "skipped";
-
-        let res: EnsureChunksResult;
         try {
-            res = await this.ensureChunks(doc);
-        } catch (e) {
-            this.logStepError(label, displayPath, e);
-            return "skipped";
-        }
-        if (res.stillMissing.length > 0) {
-            if (res.remoteConsulted) {
-                // Unavailable here AND on the server → broken. Quarantine to
-                // end the restore ping-pong; recovers when chunks reappear.
-                await this.vaultSync.recordQuarantined(displayPath, res.stillMissing);
-                return "quarantined";
-            }
-            return "skipped"; // offline — transient, retry when online
-        }
-        // All chunks available — recover from any prior quarantine, then apply.
-        if (await this.vaultSync.wasQuarantined(displayPath)) {
-            await this.vaultSync.clearQuarantined(displayPath);
-        }
-        try {
-            await this.vaultSync.dbToFile(doc);
-            return "applied";
+            return await this.pendingApply.apply(doc);
         } catch (e) {
             this.logStepError(label, displayPath, e);
             return "skipped";

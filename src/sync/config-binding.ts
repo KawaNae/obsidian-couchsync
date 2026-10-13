@@ -56,6 +56,7 @@ import {
 } from "./config-errors.ts";
 import {
     fetchConfigMeta,
+    metaFingerprint,
     unlockConfigMeta,
     type ConfigMetaDoc,
 } from "../db/vault-meta.ts";
@@ -63,7 +64,6 @@ import { classifyError } from "../db/sync/errors.ts";
 import {
     CONFIG_ATTACHMENT_KEY,
     configBindingKey,
-    configMetaFingerprint,
     configStoreName,
     describeCodec,
     metaCodec,
@@ -72,6 +72,7 @@ import {
     type ConfigCodec,
 } from "./config-binding-record.ts";
 import { logWarn } from "../ui/log.ts";
+import { OutcomeLedger, type OpOutcome } from "./op-outcome.ts";
 
 /** Builds (but does not open) the local store with the given IndexedDB
  *  name (`configStoreName`). Production uses `defaultConfigStoreFactory`;
@@ -93,20 +94,11 @@ export interface ConfigBindingHost {
  *  `inspect` + listing (no op lock); the others run under the lock. */
 export type ConfigOpName = "push" | "pull" | "join" | "create" | "check";
 
-/** How one operation on this binding ended. */
-export interface ConfigOutcome {
-    op: ConfigOpName;
-    /** When the operation started (ms since epoch). A result that started
-     *  earlier than the one recorded in its slot is older news and is
-     *  dropped. */
-    at: number;
-    /** `metaFingerprint` of the attachment the operation evaluated — for a
-     *  locked op, the one in place when it ended (Join / Create replace
-     *  it) — or null when the device was not attached. */
-    against: string | null;
-    /** What it threw, or null on success. */
-    error: unknown | null;
-}
+/** How one operation on this binding ended. `against` is the
+ *  `metaFingerprint` of the attachment the operation evaluated — for a
+ *  locked op, the one in place when it ended (Join / Create replace it) —
+ *  or null when the device was not attached. */
+export type ConfigOutcome = OpOutcome<ConfigOpName>;
 
 /** Snapshot of this device's relation to the config DB, for the status
  *  line. Not persisted: after a reload the last outcomes are unknown until
@@ -205,8 +197,7 @@ export class ConfigBinding {
 
     private checkpointsLoaded = false;
     private closed = false;
-    private lastOp: ConfigOutcome | null = null;
-    private lastCheck: ConfigOutcome | null = null;
+    private readonly outcomes = new OutcomeLedger<ConfigOpName>((op) => op === "check");
 
     /** Result of the last passphrase check against one `config:meta` root.
      *  A memo of PBKDF2 results, not binding state: negative results are
@@ -306,41 +297,22 @@ export class ConfigBinding {
 
     /** Record how an operation ended. Called by the op runner (Push, Pull,
      *  Join, Create — not for a busy refusal or a cancellation) and by the
-     *  filter tree's check. User operations and checks have a slot each;
-     *  in its slot, only an outcome that started no earlier than the
-     *  recorded one replaces it, so an overtaken result cannot overwrite a
-     *  newer one.
-     *
-     *  - A failed operation is cleared only by a later operation that
-     *    succeeds. A check reads and never writes, so its success does not
-     *    show that a failed Push or Create would now go through.
-     *  - A failed check is cleared by a later check that succeeds, or by a
-     *    later operation that succeeds: every operation reached the server
-     *    and read its `config:meta` with this device's key. */
+     *  filter tree's check. The rules are `OutcomeLedger`'s: a check reads
+     *  and never writes, so its success does not clear a failed Push or
+     *  Create; a successful operation read the server's `config:meta` with
+     *  this device's key, so it clears a failed check. */
     record(o: ConfigOutcome): void {
         if (this.closed) return;
-        if (o.op === "check") {
-            if (this.lastCheck && o.at < this.lastCheck.at) return;
-            this.lastCheck = o;
-            return;
-        }
-        if (this.lastOp && o.at < this.lastOp.at) return;
-        this.lastOp = o;
-        if (o.error === null && this.lastCheck?.error && this.lastCheck.at <= o.at) {
-            this.lastCheck = null;
-        }
+        this.outcomes.record(o);
     }
 
     /** This device's relation to the config DB now. */
     relation(): ConfigRelation {
-        const fp = this.att?.metaFingerprint ?? null;
-        const current = (o: ConfigOutcome | null) => (o && o.against === fp ? o : null);
         return {
             dbName: this.dbName,
             attachment: this.att,
             settingUp: this.entry()?.settingUp === true,
-            lastOp: current(this.lastOp),
-            lastCheck: current(this.lastCheck),
+            ...this.outcomes.view(this.att?.metaFingerprint ?? null),
         };
     }
 
@@ -472,7 +444,7 @@ export class ConfigBinding {
         if (att.codec.encryption && !meta.encryption.enabled) {
             throw configNotReady("encryption-removed", this.ctx());
         }
-        const metaFp = await configMetaFingerprint(meta);
+        const metaFp = await metaFingerprint(meta);
         if (att.metaFingerprint !== metaFp) {
             throw configNotReady("root-changed", this.ctx());
         }
@@ -590,7 +562,7 @@ export class ConfigBinding {
         if (meta.schemaVersion !== 2) {
             throw configNotReady("legacy-meta", this.ctx({ schemaVersion: meta.schemaVersion }));
         }
-        const metaFp = await configMetaFingerprint(meta);
+        const metaFp = await metaFingerprint(meta);
         const codec = metaCodec(meta);
 
         // 2. Weaker than trusted?
@@ -735,7 +707,7 @@ export class ConfigBinding {
         crypto: CryptoProvider | null,
         passphrase: string,
     ): Promise<void> {
-        const metaFp = await configMetaFingerprint(meta);
+        const metaFp = await metaFingerprint(meta);
         await this.putEntry({
             ...(meta.encryption.enabled
                 ? { cipherFloor: meta.encryption.cipherVersion, passphrase } : {}),

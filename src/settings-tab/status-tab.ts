@@ -20,8 +20,10 @@ import {
 } from "./couch-fetch.ts";
 import { addPasswordToggle } from "./vault-sync-tab.ts";
 import { applyServerSettings, type ConfigServerSwitch } from "./server-apply.ts";
+import type { VaultBinding } from "../sync/vault-binding.ts";
 import { logWarn } from "../ui/log.ts";
-import { showNotice } from "../ui/notices.ts";
+import { ProgressNotice, showNotice } from "../ui/notices.ts";
+import { UserFacingError } from "../ui/describe-error.ts";
 
 class TypeToConfirmModal extends Modal {
     private resolved = false;
@@ -90,6 +92,9 @@ export interface CouchDbTabDeps {
     updateSettings: (patch: Partial<CouchSyncSettings>) => Promise<void>;
     replicator: SyncEngine;
     auth: AuthGate;
+    /** The vault setup: a server change sends it back to Step 2, through
+     *  the binding (refused while Init or Clone runs). */
+    vault: Pick<VaultBinding, "changeBlocker" | "applyServer">;
     /** The config binding is keyed by (server, config DB), so a server
      *  change must switch it. Omitted → the server is saved directly (no
      *  config sync wired, e.g. tests). */
@@ -145,14 +150,18 @@ export class CouchDbTab {
         }
     }
 
-    /** Apply needs a passed Test, and no running config op: the config
-     *  binding follows the server and cannot switch under an op. */
+    /** Apply needs a passed Test, and no running config op or vault
+     *  Init / Clone: both follow the server and cannot switch under a run. */
     private canApply(): boolean {
-        return this.testPassed && !this.deps.configBinding?.changeBlocker();
+        return this.testPassed && !this.applyBlocker();
+    }
+
+    private applyBlocker(): string | null {
+        return this.deps.vault.changeBlocker() ?? this.deps.configBinding?.changeBlocker() ?? null;
     }
 
     private applyDescText(): string {
-        const blocked = this.deps.configBinding?.changeBlocker();
+        const blocked = this.applyBlocker();
         if (blocked) return blocked;
         return this.testPassed ? "Save server connection." : "Test connection first.";
     }
@@ -244,27 +253,18 @@ export class CouchDbTab {
         btn.setButtonText("Testing...");
         btn.setDisabled(true);
 
-        const baseUri = this.draft.uri.replace(/\/+$/, "");
-        if (!baseUri) {
-            this.testPassed = false;
-            showNotice("Server URI is required.", 5000);
-            this.deps.refresh();
-            return;
-        }
-
+        const progress = new ProgressNotice("Test connection");
         try {
+            const baseUri = this.draft.uri.replace(/\/+$/, "");
+            if (!baseUri) throw new UserFacingError("Enter the server URI first.");
             await fetchJson(baseUri, this.draft.user, this.draft.pass);
             this.testPassed = true;
             this.deps.auth.clear();
-            showNotice("Server connection successful!", 3000);
-        } catch (e: any) {
+            progress.done("the server accepted the connection.", 3000);
+        } catch (e) {
             this.testPassed = false;
-            if (e instanceof AuthError) {
-                this.deps.auth.raise(e.status, e.message);
-                showNotice(`Authentication failed (${e.status}): ${e.message}`, 8000);
-            } else {
-                showNotice(`Connection failed: ${e.message}`, 8000);
-            }
+            if (e instanceof AuthError) this.deps.auth.raise(e.status, e.message);
+            progress.fail(e);
         }
         this.deps.refresh();
     }
@@ -276,15 +276,18 @@ export class CouchDbTab {
             || this.draft.user !== saved.user
             || this.draft.pass !== saved.pass;
 
-        const patch: Partial<CouchSyncSettings> = {
+        const patch = {
             couchdbUri: this.draft.uri,
             couchdbUser: this.draft.user,
             couchdbPassword: this.draft.pass,
             serverTested: true,
         };
 
-        if (credentialsChanged) {
-            patch.connectionState = "editing";
+        const vaultBlocked = this.deps.vault.changeBlocker();
+        if (vaultBlocked) {
+            showNotice(`${vaultBlocked} The server was not changed.`, 10000);
+            this.updateDirtyState();
+            return;
         }
 
         // Settings are saved inside the config binding switch, never before
@@ -295,7 +298,7 @@ export class CouchDbTab {
             configBinding: this.deps.configBinding,
             oldUri: saved.uri,
             newUri: this.draft.uri,
-            save: () => this.deps.updateSettings(patch),
+            save: () => this.deps.vault.applyServer(patch, credentialsChanged),
         });
         if (result.kind === "refused-busy") {
             showNotice(
@@ -529,13 +532,15 @@ export class CouchDbTab {
         const typed = await new TypeToConfirmModal(this.deps.app, dbName).waitForResult();
         if (!typed) return;
 
+        const progress = new ProgressNotice("Delete database");
         try {
             await deleteDb(baseUri, user, pass, dbName);
-            showNotice(`Database "${dbName}" deleted.`);
-            this.deps.refresh();
-        } catch (e: any) {
-            showNotice(`Failed to delete "${dbName}": ${e.message}`);
+        } catch (e) {
+            progress.fail(e);
+            return;
         }
+        progress.done(`"${dbName}" deleted.`);
+        this.deps.refresh();
     }
 }
 

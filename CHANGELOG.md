@@ -6,6 +6,109 @@ All notable changes to obsidian-couchsync.
 
 ### Fixed
 
+- **Vault Init and Clone failures are always reported, and a failure before
+  anything is changed leaves the setup as it was.** A Clone that failed while
+  reading `vault:meta` or unlocking the vault (an unreachable server, a
+  wrong passphrase) showed nothing — no notice, no log line. Init and Clone
+  now show their notice from the first step and word every failure with its
+  cause and fix. Both first check that the server answers and prepare
+  everything that needs no change (the metadata, the key); only then do they
+  stop live sync and mark the setup unfinished. Before, Init did that before
+  checking the passphrase, so a missing passphrase disabled Live Sync
+  although nothing had been touched. A second Init or Clone while one runs,
+  and a run while the server rejects the credentials, are refused.
+- **A device stops syncing with a vault database that another device's Init
+  re-created.** A device still set up against the old database kept its live
+  sync running and could pull the new database's documents into its own
+  vault, or push its documents into the new one — encrypted with the old key,
+  which no other device can read. Each Init now writes a new generation id
+  into `vault:meta`, first, right after re-creating the database. Every
+  device remembers the `vault:meta` its last Init or Clone was set up with
+  and compares it when sync starts, and during live sync whenever the pull
+  sees `vault:meta` change, a document that does not decrypt, or the
+  database's sequence go backwards. On a difference, sync pauses before
+  anything of the new database is applied, and Vault Sync (Step 3) says to
+  run Clone. Existing setups need no action: a device set up before this
+  release takes the server's `vault:meta` as its own the first time sync
+  starts. Init and Config Create also wait until the re-created database
+  answers, instead of failing when CouchDB was still removing the old one.
+- **A same-size rewrite right after a sync is no longer missed.** To skip
+  reading unchanged files, the startup scan and reconcile trust a file whose
+  modification time and size match what was recorded when it last synced.
+  On a filesystem that records modification times coarsely (2 s on FAT32,
+  1 s on HFS+ and ext3, some network shares), a file rewritten with the same
+  size just after it was recorded kept the same time, so the rewrite was
+  neither pushed nor overwritten by a pulled version. A modification time
+  less than 3 seconds older than the moment of recording is no longer
+  trusted: such a file is read again on the next check, and recorded once
+  its time is old enough.
+- **Clone of an encrypted vault works when Step 1 has encryption off.** Step 1
+  says the remote's encryption is detected on Clone, but the pull applied the
+  decrypt layer only when Step 1's switch was on, so such a Clone failed
+  ("cannot decompress still-encrypted body"). Clone now pulls with the
+  cloned vault's encryption, like its compression, and saves both only when
+  it succeeds.
+- **A quarantined file recovers when its chunks reach the server again.**
+  A file whose chunks were missing here and on the server stayed missing
+  after another device pushed the chunks, because a reconcile that saw no
+  change in the local database skipped it. The same held for a file whose
+  restore was skipped while offline and for a file cloned without its
+  chunks. Such files are now recorded with the pulled files that could not
+  be written yet, and both live sync and every reconcile retry that record,
+  without rescanning the vault.
+- **Init encrypts the new vault with the Step 1 passphrase.** When the vault
+  key was already unlocked in the session, Init kept the previous
+  `vault:meta`'s salt and key, so a passphrase changed in Step 1 was ignored
+  and sync paused with a passphrase mismatch on the next start. Init now
+  builds `vault:meta` from Step 1 alone, with a fresh salt, as Config Create
+  does. Other devices Clone the new vault as before.
+- **Clone asks for the passphrase the way Config Join does.** When the Step 1
+  passphrase is missing or does not unlock the vault, Clone asks for it,
+  saying which of the two it is; a wrong answer keeps the prompt open with an
+  error. Cancelling ends with "Clone cancelled — nothing was changed." The
+  prompt that live sync shows when an encrypted vault has no stored
+  passphrase also stays open on a wrong answer.
+- **Vault Sync's Step 3 shows what last went wrong.** The status line now
+  says why sync paused on encryption (e.g. "Last encryption check: Sync
+  paused — another device turned vault encryption on. …") instead of "Choose
+  how to initialize this vault.", and shows the last failed Init or Clone.
+  The pause reason is saved with the setup state, so it is still shown
+  after Obsidian restarts, until the encryption check passes or an Init or
+  Clone succeeds. Rejected credentials are shown while requests are on hold
+  and no longer after a Test clears the hold. The open settings tab redraws
+  when Init or Clone starts and ends and when sync pauses. While Init or
+  Clone runs, Init, Clone and Live Sync are disabled, and Step 2 Apply, the
+  Step 1 switches and the CouchDB tab's Apply are refused.
+- **Clone no longer needs a Check first.** After reopening the settings or
+  restarting Obsidian, Clone said "Database is empty — use Init" and stayed
+  disabled until Step 2's Check was pressed again, although the notice of a
+  paused sync only says to run Clone. Clone now reads the database itself
+  before it changes anything: it is enabled without a Check, and refuses an
+  empty database with "The database is empty — use Init to push your
+  vault." What Check, Clone and Init last found in each database is kept
+  until Obsidian restarts, so checking another name does not drop the
+  applied database's, and Clone stays disabled only for a database known to
+  be empty. Init reads its database back and Clone records what it read,
+  so the document count shown after either is current.
+- **Clone reports the files it wrote.** "Clone — N files written." counted
+  every file document in the database, including files deleted on another
+  device and files this device's filters keep out, so it could say 10 for a
+  vault that received 2. It now counts only the files written to the vault.
+- **Live sync no longer re-sends chunks the server already holds.** The first
+  live sync after an Init or Clone wrote every chunk to the server again as
+  a new revision of the same content, which advanced the database's
+  sequence and woke every other device's pull. A chunk the server holds is
+  now skipped.
+- **More failures are worded with their cause and fix.** Step 2's Check (in
+  Vault Sync and Config Sync), the CouchDB tab's Test and database delete,
+  Verify's Repair, the chunk repair and its retry, and the Maintenance
+  actions (legacy config cleanup, deleting the local vault, config and log
+  databases, log export and clear) now report through the same notice as
+  Init and Clone. A chunk repair or retry that fails no longer leaves its
+  progress notice on screen, and deleting the local vault database is
+  refused while Init or Clone runs. Deleting a server database without
+  admin rights says so instead of pausing sync for rejected credentials.
+
 - **Clone no longer aborts on a single transient network failure.** A Clone
   issues thousands of read requests (paginated `_all_docs` plus one GET per
   chunk attachment); one dropped request (`Failed to fetch`, a request

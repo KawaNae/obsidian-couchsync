@@ -37,6 +37,7 @@ import { makeFileId } from "../../src/types/doc-id.ts";
 import { toPathKey } from "../../src/utils/path.ts";
 import type { FileDoc, CouchSyncDoc } from "../../src/types.ts";
 import { FILE_SCHEMA_VERSION } from "../../src/types.ts";
+import { makePendingApply } from "../helpers/pending-apply.ts";
 
 let counter = 0;
 function uniqueDbName() { return `phantom-test-${Date.now()}-${counter++}`; }
@@ -257,6 +258,7 @@ describe("regression: pull-skipped event triggers reconcile schedule", () => {
             checkpoints,
             getConflictResolver: () => undefined,
             ensureChunks: async () => {},
+            pendingApply: makePendingApply(localDb),
             applyPullWrite: async () => ({ applied: false, reason: "test-skip" }),
         });
 
@@ -302,6 +304,7 @@ describe("regression: pull-skipped event triggers reconcile schedule", () => {
             checkpoints,
             getConflictResolver: () => undefined,
             ensureChunks: async () => {},
+            pendingApply: makePendingApply(localDb),
             applyPullWrite: async () => ({ applied: true }),
         });
 

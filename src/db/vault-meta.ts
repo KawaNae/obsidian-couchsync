@@ -114,6 +114,20 @@ export interface VaultMetaDoc {
             /** Algorithm-revision marker. Currently 1 (vanilla DEFLATE/gzip). */
             version: 1;
         };
+
+    /** Random id minted by every build of a meta (vault Init, config
+     *  Create; 128 bits, hex). Identifies ONE incarnation of the DB, so a
+     *  device can tell that the DB was re-created elsewhere even when
+     *  nothing else in the meta differs — a plaintext root has no salt,
+     *  and two plaintext roots with the same compression flag were
+     *  otherwise identical (`metaFingerprint`).
+     *
+     *  Optional: metas written before it existed have none, and readers
+     *  fall back to the salt-based fingerprint. Additive and not part of
+     *  `schemaVersion` — older builds read the meta field by field
+     *  (`encryption`, `compression`, `schemaVersion`, `type`) and never
+     *  reject unknown fields. */
+    generationId?: string;
 }
 
 /** v1 -> v2 migration shim: `encryption:meta` documents written by
@@ -160,18 +174,7 @@ export interface ConfigMetaDoc {
     schemaVersion: 2;
     encryption: VaultMetaDoc["encryption"];
     compression: VaultMetaDoc["compression"];
-    /** Random id minted by every Create (128 bits, hex). Identifies ONE
-     *  incarnation of the config DB, so a device can tell that the DB was
-     *  re-created elsewhere even when nothing else in the meta differs — a
-     *  plaintext root has no salt, and two plaintext roots with the same
-     *  compression flag were otherwise identical
-     *  (`configMetaFingerprint`, `root-changed`).
-     *
-     *  Optional: metas written before it existed have none, and readers
-     *  fall back to the salt-based fingerprint. Additive and not part of
-     *  `schemaVersion` — older builds read `config:meta` field by field
-     *  (`encryption`, `compression`, `schemaVersion`, `type`) and never
-     *  reject unknown fields. `vault:meta` has no counterpart. */
+    /** See `VaultMetaDoc.generationId`; minted by every Create. */
     generationId?: string;
 }
 
@@ -190,8 +193,7 @@ export async function fetchConfigMeta(
  * Build an initial config:meta doc as a self-contained crypto root.
  * Mirrors `buildInitialVaultMeta`'s shape: fresh salt → derive keys →
  * compute keyCheck. The returned `crypto` is what the host pipes into
- * `ConfigBinding.wrapClient` and its chunk hasher. Every call also mints a
- * fresh `generationId`, encrypted or not.
+ * `ConfigBinding.wrapClient` and its chunk hasher.
  *
  * Signature change in v0.26: previously this cloned from `vault:meta`
  * (`buildInitialConfigMeta(vaultMeta)`). That coupling broke
@@ -211,16 +213,7 @@ export async function buildInitialConfigMeta(opts: {
         passphrase: opts.passphrase,
         compression: opts.compression,
     });
-    const meta = inner.meta as ConfigMetaDoc;
-    meta.generationId = newGenerationId();
-    return { meta, keys: inner.keys, crypto: inner.crypto };
-}
-
-/** 128 random bits as lowercase hex — a fresh `ConfigMetaDoc.generationId`. */
-function newGenerationId(): string {
-    const bytes = new Uint8Array(16);
-    crypto.getRandomValues(bytes);
-    return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+    return { meta: inner.meta as ConfigMetaDoc, keys: inner.keys, crypto: inner.crypto };
 }
 
 export async function pushConfigMeta(
@@ -318,7 +311,8 @@ interface BuildMetaResult<T extends DbMetaDoc> {
  *
  * Two metas built from the same passphrase but different `docId` produce
  * **different** salts (and therefore different keys) — that is the
- * structural mechanism that keeps the cryptoProvider per-DB.
+ * structural mechanism that keeps the cryptoProvider per-DB. Every call
+ * also mints a fresh `generationId`, encrypted or not.
  */
 export async function buildInitialMeta(opts: BuildMetaOpts): Promise<BuildMetaResult<DbMetaDoc>> {
     if (opts.encryption) {
@@ -345,6 +339,7 @@ export async function buildInitialMeta(opts: BuildMetaOpts): Promise<BuildMetaRe
             compression: opts.compression
                 ? { enabled: true, algorithm: "gzip", version: 1 }
                 : { enabled: false },
+            generationId: newGenerationId(),
         } as DbMetaDoc;
         return { meta, keys, crypto: createCryptoProvider(keys) };
     }
@@ -356,8 +351,57 @@ export async function buildInitialMeta(opts: BuildMetaOpts): Promise<BuildMetaRe
         compression: opts.compression
             ? { enabled: true, algorithm: "gzip", version: 1 }
             : { enabled: false },
+        generationId: newGenerationId(),
     } as DbMetaDoc;
     return { meta, keys: null, crypto: null };
+}
+
+/** 128 random bits as lowercase hex — a fresh `generationId`. */
+function newGenerationId(): string {
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * Fingerprint of a `*:meta` root, hashed (SHA-256, first 128 bits): the
+ * identity of one incarnation of the DB, which a device records when it
+ * sets the DB up (config Create / Join, vault Init / Clone) and compares
+ * the server's meta against afterwards.
+ *
+ * Building a meta mints a fresh `generationId` (and, when encrypted, a
+ * fresh salt and keyCheck), so re-creating the DB on another device
+ * changes the fingerprint — for plaintext DBs too.
+ *
+ *   - with `generationId`: the generation id plus the codec parts below
+ *   - without (a meta written before generation ids, by an older build):
+ *     encryption on/off, KDF version, salt, keyCheck and compression
+ *     on/off — exactly the pre-generation fingerprint of `config:meta`,
+ *     so config attachments anchored to such a meta keep matching it.
+ *     Limitation of this fallback: two plaintext roots with the same
+ *     compression flag are indistinguishable (no salt), so a plaintext
+ *     re-creation by an older build is not detected.
+ *
+ * cipherVersion is deliberately NOT part of it: a lowered cipherVersion is
+ * reported as a cipher downgrade, not as a re-creation.
+ */
+export async function metaFingerprint(meta: DbMetaDoc): Promise<string> {
+    const enc = meta.encryption;
+    const codec = enc.enabled
+        ? ["e", enc.kdfVersion, enc.salt, enc.keyCheck, meta.compression.enabled]
+        : ["p", meta.compression.enabled];
+    const canonical = JSON.stringify(
+        typeof meta.generationId === "string" && meta.generationId !== ""
+            ? ["g", meta.generationId, ...codec]
+            : codec,
+    );
+    const digest = await crypto.subtle.digest(
+        "SHA-256", new TextEncoder().encode(canonical),
+    );
+    const hex = Array.from(new Uint8Array(digest).slice(0, 16))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+    return `sha256:${hex}`;
 }
 
 /** Unlock any `*:meta` against a passphrase. Returns null on keyCheck

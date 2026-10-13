@@ -13,13 +13,38 @@ export class CouchSyncSettingTab extends PluginSettingTab {
     private couchDbTab: CouchDbTab | null = null;
     private vaultSyncTab: VaultSyncTab | null = null;
     private configSyncTab: ConfigSyncTab | null = null;
+    /** Unsubscribers of the sources the open tab is drawn from. */
+    private unsubscribers: (() => void)[] = [];
+    private redrawQueued = false;
 
     constructor(app: App, plugin: CouchSyncPlugin) {
         super(app, plugin);
         this.plugin = plugin;
     }
 
+    /**
+     * Redraw while the tab is open whenever the vault setup or the auth
+     * latch changes: an Init or Clone starts or ends, the live session
+     * pauses, a Test clears the latch. Changes in one task are drawn once.
+     */
+    private subscribe(): void {
+        if (this.unsubscribers.length > 0) return;
+        const queueRedraw = () => {
+            if (this.redrawQueued) return;
+            this.redrawQueued = true;
+            window.setTimeout(() => {
+                this.redrawQueued = false;
+                if (this.unsubscribers.length > 0) this.display();
+            }, 0);
+        };
+        this.unsubscribers.push(
+            this.plugin.vaultBinding.onChange(queueRedraw),
+            this.plugin.auth.onChange(queueRedraw),
+        );
+    }
+
     display(): void {
+        this.subscribe();
         const { containerEl } = this;
         const scrollEl = containerEl.closest(".vertical-tab-content") as HTMLElement | null;
         const savedScroll = scrollEl?.scrollTop ?? 0;
@@ -88,6 +113,7 @@ export class CouchSyncSettingTab extends PluginSettingTab {
             app: this.app,
             replicator: this.plugin.replicator,
             auth: this.plugin.auth,
+            vault: this.plugin.vaultBinding,
             // The config binding is (server, config DB): a server change
             // switches it, with the settings saved inside the switch
             // (invariant on ConfigSync.rebind). Refused — nothing saved —
@@ -117,14 +143,9 @@ export class CouchSyncSettingTab extends PluginSettingTab {
             app: this.app,
             replicator: this.plugin.replicator,
             auth: this.plugin.auth,
-            remoteOps: this.plugin.remoteOps,
             localDb: this.plugin.localDb,
-            initVault: () => this.plugin.initVault(),
-            cloneFromRemote: () => this.plugin.cloneFromRemote(),
-            startSync: () => this.plugin.startSync(),
-            stopSync: () => this.plugin.stopSync(),
+            vault: this.plugin.vaultBinding,
             refresh: () => this.display(),
-            encryptionMismatch: this.plugin.encryptionMismatch,
         };
         if (!this.vaultSyncTab) {
             this.vaultSyncTab = new VaultSyncTab(vaultSyncDeps);
@@ -174,6 +195,7 @@ export class CouchSyncSettingTab extends PluginSettingTab {
                 runConfigExclusive: (fn) =>
                     this.plugin.configSync.runExclusive((binding) => fn(binding.store)),
                 replicator: this.plugin.replicator,
+                vault: this.plugin.vaultBinding,
                 statusBar: this.plugin.statusBar,
                 modalPresenter: this.plugin.modalPresenter,
                 logManager: this.plugin.logManager,
@@ -196,6 +218,8 @@ export class CouchSyncSettingTab extends PluginSettingTab {
     }
 
     hide(): void {
+        for (const unsubscribe of this.unsubscribers) unsubscribe();
+        this.unsubscribers = [];
         this.couchDbTab?.resetDraft();
         this.vaultSyncTab?.resetDraft();
         this.configSyncTab?.resetDraft();

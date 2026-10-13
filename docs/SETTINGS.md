@@ -88,8 +88,9 @@ The main tab, organized as steps.
   database from this vault and seeds it.
 - **Clone** (subsequent devices) — pulls the whole remote into a fresh local
   DB and writes the vault files; prompts for the passphrase if the vault is
-  encrypted. Enabled only after a Check in Step 2 has found the database
-  with documents in it.
+  encrypted. It reads the database before changing anything and refuses an
+  empty one; it is disabled only while the database is known to be empty
+  (from Step 2's Check or an earlier Init or Clone).
 
 **Step 4: Sync**
 - **Live Sync** — toggle continuous sync on/off. Enabled after Init or

@@ -12,6 +12,21 @@ import {
 } from "../src/db/sync/pending-conflict.ts";
 import type { FileDoc, CouchSyncDoc, ChunkDoc } from "../src/types.ts";
 
+/**
+ * Serve the docs' chunks from memory. The orchestrator reads both sides'
+ * chunks before it queues a conflict, and the drain timer starts at the
+ * first queued conflict. Reads through fake-indexeddb cross macrotasks, so
+ * under load a read can finish after a 0 ms timer and a burst splits into
+ * several groups. Reads that resolve as microtasks all finish before any
+ * timer, so the burst is queued whole, as a test of batching needs.
+ */
+async function serveChunksFromMemory(db: LocalDB, docs: FileDoc[]): Promise<void> {
+    const ids = [...new Set(docs.flatMap((d) => d.chunks))];
+    const byId = new Map((await db.getChunks(ids)).map((c) => [c._id, c]));
+    (db as any).getChunks = (want: string[]) =>
+        Promise.resolve(want.map((id) => byId.get(id)).filter((c) => c !== undefined));
+}
+
 let counter = 0;
 function uniqueDbName() { return `conflict-orch-test-${Date.now()}-${counter++}`; }
 
@@ -289,6 +304,8 @@ describe("ConflictOrchestrator", () => {
             docs.push({ local, remote, path });
         }
 
+        await serveChunksFromMemory(db, docs.flatMap((d) => [d.local, d.remote]));
+
         // Batch decision: take all remote (with confirm).
         modal.batchResponses.push({ kind: "all-take-remote" });
         modal.confirmResponses.push(true);
@@ -333,6 +350,7 @@ describe("ConflictOrchestrator", () => {
             });
             docs.push({ local, remote, path });
         }
+        await serveChunksFromMemory(db, docs.flatMap((d) => [d.local, d.remote]));
         modal.batchResponses.push({ kind: "all-defer" });
         // Fire all 4 in a synchronous burst so they coalesce into one batch.
         await Promise.all(docs.map((d) =>

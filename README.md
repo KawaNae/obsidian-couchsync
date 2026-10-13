@@ -130,17 +130,8 @@ The next Pull downloads the config again.
 
 ## Development
 
-```bash
-npm install
-npm run dev    # Watch mode, outputs to dev vault
-npm run build  # Type-check + production build
-npm test       # Unit + integration tests (vitest)
-```
-
-Built files are written to
-`{OBSIDIAN_VAULT_PATH}/.obsidian/plugins/obsidian-couchsync/`. Set the
-`OBSIDIAN_VAULT_PATH` environment variable to your vault path (defaults to
-`~/Develop/Obsidian/Dev`, under your home directory).
+See [DEVELOPER.md](DEVELOPER.md) for building, the build output location,
+and running the unit and e2e tests.
 
 ## License
 

@@ -7,11 +7,18 @@
  * not CouchClient, which is purpose-built for per-database operations.
  */
 
-export class AuthError extends Error {
-    constructor(public status: number, reason: string) {
-        super(reason);
+import { UserFacingError } from "../ui/describe-error.ts";
+
+/** A non-2xx response. Carries `status`, so `classifyError` tells a
+ *  missing DB, a server error and a rejected login apart. */
+export class HttpStatusError extends Error {
+    constructor(public status: number, message: string) {
+        super(message);
     }
 }
+
+/** 401 / 403: the server rejected the credentials. */
+export class AuthError extends HttpStatusError {}
 
 export async function fetchJson(url: string, user: string, pass: string): Promise<any> {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
@@ -27,7 +34,7 @@ export async function fetchJson(url: string, user: string, pass: string): Promis
         } catch { /* ignore */ }
         throw new AuthError(res.status, reason);
     }
-    if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+    if (!res.ok) throw new HttpStatusError(res.status, `HTTP ${res.status}: ${res.statusText}`);
     return res.json();
 }
 
@@ -44,7 +51,16 @@ export async function deleteDb(
     });
     if (!res.ok) {
         const body = await res.json().catch(() => ({}));
-        throw new Error(body.reason || `HTTP ${res.status}`);
+        const reason = body.reason || `HTTP ${res.status}`;
+        if (res.status === 401 || res.status === 403) {
+            // Not a rejected login (the dashboard listed the DBs with these
+            // credentials): deleting a database needs a server admin.
+            throw new UserFacingError(
+                `The server refused to delete "${dbName}" (${res.status}: ${reason}) — ` +
+                    "deleting a database needs a server admin account.",
+            );
+        }
+        throw new HttpStatusError(res.status, reason);
     }
 }
 

@@ -16,12 +16,21 @@ set -euo pipefail
 
 if ! command -v docker >/dev/null 2>&1; then
     echo "integ-start: docker is not installed or not on PATH." >&2
-    echo "Install Docker Desktop (Windows/Mac) or docker.io (Linux) before running E2E tests." >&2
+    echo "Install Docker Desktop (Windows), colima + docker + docker-compose via Homebrew (macOS)," >&2
+    echo "or docker.io (Linux) before running E2E tests. See DEVELOPER.md." >&2
     exit 1
 fi
 
 if ! docker compose version >/dev/null 2>&1; then
     echo "integ-start: 'docker compose' plugin missing (requires Docker 20.10+)." >&2
+    echo "On macOS with Homebrew, add its plugin directory to cliPluginsExtraDirs in" >&2
+    echo "~/.docker/config.json. See DEVELOPER.md." >&2
+    exit 1
+fi
+
+if ! docker info >/dev/null 2>&1; then
+    echo "integ-start: the docker daemon is not reachable." >&2
+    echo "Start Docker Desktop (Windows) or run 'colima start --cpu 2 --memory 2' (macOS)." >&2
     exit 1
 fi
 

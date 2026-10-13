@@ -41,23 +41,32 @@ import { DbError } from "./write-transaction.ts";
 import { AuthGate } from "./sync/auth-gate.ts";
 import { SyncEvents } from "./sync/sync-events.ts";
 import { Checkpoints } from "./sync/checkpoints.ts";
+import { PendingApply, type EnsureChunksResult } from "./sync/pending-apply.ts";
 import { SyncSession } from "./sync/sync-session.ts";
 import { BackoffSchedule } from "./sync/backoff.ts";
 import { classifyError } from "./sync/errors.ts";
 import { BrowserVisibilityGate, ALWAYS_VISIBLE, type VisibilityGate } from "./visibility-gate.ts";
+import type { VaultMetaDoc } from "./vault-meta.ts";
 
 // ── Types ────────────────────────────────────────────────
 
-/** Residual availability after an ensure-chunks attempt.
- *  `stillMissing` lists chunk ids unavailable after the attempt; when
- *  `remoteConsulted` is true those are missing on the server too = broken
- *  (reconciler quarantines), when false the device was offline = transient. */
-export interface EnsureChunksResult {
-    stillMissing: string[];
-    remoteConsulted: boolean;
-}
+export type { EnsureChunksResult } from "./sync/pending-apply.ts";
 
 // ── Constants ────────────────────────────────────────────
+
+/**
+ * The vault setup's agreement with the remote DB, judged by its owner
+ * (`VaultBinding`). Both throw a terminal pause (`encryption-paused`) for a
+ * state the user has to act on.
+ */
+export interface RemoteAgreement {
+    /** Before every session's catchup. A transient failure is thrown as is
+     *  and retried by the supervisor. */
+    check(signal: AbortSignal): Promise<void>;
+    /** During a session, on a sign that the remote DB was re-created (see
+     *  `PullPipeline`). Throws nothing but the pause. */
+    recheckRoot(observed?: VaultMetaDoc | null): Promise<void>;
+}
 
 const HEALTH_CHECK_INTERVAL = 30000; // 30s
 
@@ -224,6 +233,10 @@ export class SyncEngine {
     /** Persistent sync progress markers (remoteSeq, lastPushedSeq).
      *  Owned by SyncEngine because they survive across sessions. */
     private readonly checkpoints: Checkpoints;
+    /** Docs committed to LocalDB but not yet reflected in the vault. The
+     *  pull records and drains it every cycle; the Reconciler records and
+     *  drains it on every reconcile. */
+    readonly pendingApply: PendingApply;
 
     // ── Constructor ───────────────────────────────────────
 
@@ -254,7 +267,9 @@ export class SyncEngine {
         private isMobile: boolean = false,
         auth?: AuthGate,
         clientFactory?: (s: CouchSyncSettings) => ICouchClient,
-        private preCatchupCheck?: (signal: AbortSignal) => Promise<void>,
+        /** The vault setup's agreement with the remote DB
+         *  (`VaultBinding`). Absent: sessions open unchecked (tests). */
+        private agreement?: RemoteAgreement,
         private stampVaultDrift?: () => Promise<void>,
     ) {
         this.auth = auth ?? new AuthGate();
@@ -262,6 +277,13 @@ export class SyncEngine {
             makeCouchClient(s.couchdbUri, s.couchdbDbName, s.couchdbUser, s.couchdbPassword)
         );
         this.checkpoints = new Checkpoints(localDb);
+        this.pendingApply = new PendingApply({
+            localDb,
+            ensureChunks: (doc) => this.ensureFileChunks(doc),
+            write: (doc) => this.applyPullWrite(doc),
+            onRecovered: (filePath) => this.events.emit("auto-resolve", { filePath }),
+            notify: (message) => notify(message, 8000),
+        });
         this.visibility = (isMobile && typeof document !== "undefined")
             ? new BrowserVisibilityGate(document)
             : ALWAYS_VISIBLE;
@@ -596,10 +618,12 @@ export class SyncEngine {
             `transient error: kind=${detail.kind} code=${detail.code ?? "-"} msg=${detail.message}`,
         );
 
-        if (detail.kind === "auth" || detail.kind === "schema-mismatch") {
+        if (detail.kind === "auth" || detail.kind === "schema-mismatch"
+            || detail.kind === "encryption-paused") {
             // auth is user-gated; schema-mismatch (a doc shape this build can't
             // read, or a non-retriable EncryptionError = cipherVersion
-            // downgrade gate) is terminal. Both must halt immediately rather
+            // downgrade gate) and encryption-paused (the pull found the remote
+            // DB re-created) are terminal. All must halt immediately rather
             // than burn the 10s transient grace window — enterError handles
             // each terminal class.
             this.enterError(detail);
@@ -773,8 +797,8 @@ export class SyncEngine {
         const gen = this.lifecycleGeneration;
         this.openingSession = true;
         try {
-            if (this.preCatchupCheck) {
-                await this.preCatchupCheck(new AbortController().signal);
+            if (this.agreement) {
+                await this.agreement.check(new AbortController().signal);
             }
         } catch (e) {
             this.openingSession = false;
@@ -804,6 +828,7 @@ export class SyncEngine {
             return;
         }
         const epoch = ++this.sessionEpoch;
+        this.pendingApply.invalidate();
         const session = new SyncSession({
             epoch,
             client,
@@ -814,10 +839,12 @@ export class SyncEngine {
             // Pull-side ensureChunks only needs the side effect (fetch + persist);
             // discard the EnsureChunksResult to keep the session contract void.
             ensureChunks: async (doc) => { await this.ensureChunksInternal(client, doc); },
+            pendingApply: this.pendingApply,
             applyPullWrite: (doc) => this.applyPullWrite(doc),
             probeUnpushed: (path) => this.probeUnpushed(path),
             handleLocalDbError: (e, ctx) => this.handleLocalDbError(e, ctx),
             onTransientError: (err) => this.handleTransientError(err),
+            recheckRoot: async (observed) => { await this.agreement?.recheckRoot(observed); },
             visibility: this.visibility,
         });
         this.session = session;

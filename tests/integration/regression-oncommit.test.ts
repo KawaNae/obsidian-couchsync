@@ -27,6 +27,7 @@ import { SyncEvents } from "../../src/db/sync/sync-events.ts";
 import { makeFileId } from "../../src/types/doc-id.ts";
 import type { FileDoc, CouchSyncDoc } from "../../src/types.ts";
 import type { ChangesResult } from "../../src/db/interfaces.ts";
+import { makePendingApply } from "../helpers/pending-apply.ts";
 
 describe("Regression: onCommit must fire after pull write", () => {
     let h: SyncHarness;
@@ -66,6 +67,7 @@ describe("Regression: onCommit must fire after pull write", () => {
             getConflictResolver: () => b.resolver,
             // chunks already shipped via the harness transfer below
             ensureChunks: async () => {},
+            pendingApply: makePendingApply(b.db),
             applyPullWrite: (doc) => b.vs.dbToFile(doc),
         });
 

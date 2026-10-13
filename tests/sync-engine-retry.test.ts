@@ -19,6 +19,7 @@
 import "fake-indexeddb/auto";
 import { describe, it, expect, afterEach, beforeAll, vi } from "vitest";
 import { createSyncHarness, type SyncHarness } from "./harness/sync-harness.ts";
+import { VaultEncryptionPausedError } from "../src/sync/vault-binding.ts";
 import { DbError } from "../src/db/write-transaction.ts";
 
 const noop = () => {};
@@ -333,11 +334,11 @@ describe("SyncEngine retry supervisor", () => {
         h = createSyncHarness();
         const a = h.addDevice("dev-A");
 
-        // Inject a controllable encryption gate (preCatchupCheck) so we can
+        // Inject a controllable agreement check so we can
         // hold openSession in the pre-session await window, then stop() mid-gate.
         let release: () => void = () => {};
         const gate = new Promise<void>((r) => { release = r; });
-        (a.engine as any).preCatchupCheck = () => gate;
+        (a.engine as any).agreement = { check: () => gate, recheckRoot: async () => {} };
 
         // Kick openSession but don't await — it parks in the gate await.
         const opening = (a.engine as any).openSession();
@@ -359,7 +360,7 @@ describe("SyncEngine retry supervisor", () => {
 
         let reject: (e: any) => void = () => {};
         const gate = new Promise<void>((_r, rej) => { reject = rej; });
-        (a.engine as any).preCatchupCheck = () => gate;
+        (a.engine as any).agreement = { check: () => gate, recheckRoot: async () => {} };
 
         const opening = (a.engine as any).openSession();
         a.engine.stop(); // clears timers + bumps lifecycle generation
@@ -370,6 +371,17 @@ describe("SyncEngine retry supervisor", () => {
         // re-arm it (that would reconnect into a closing localDb).
         expect((a.engine as any).retryTimer).toBeNull();
         expect(a.engine.getState()).toBe("disconnected");
+    });
+
+    it("a pause the pull reports mid-session halts at once: no grace window, no retry", async () => {
+        h = createSyncHarness();
+        const a = h.addDevice("dev-A");
+
+        (a.engine as any).handleTransientError(new VaultEncryptionPausedError("root-changed"));
+        expect(a.engine.getState()).toBe("error");
+        expect(a.engine.getLastErrorDetail()?.kind).toBe("encryption-paused");
+        expect((a.engine as any).transientTimer).toBeNull();
+        expect((a.engine as any).retryTimer).toBeNull();
     });
 
     it("enterError(auth) stops the retry timer and raises the auth latch (I5)", async () => {

@@ -582,6 +582,26 @@ describe("PushPipeline integration", () => {
             fileSpy.mockRestore();
         });
 
+        it("does not re-send a chunk the remote already holds, and ships the file", async () => {
+            h = createSyncHarness();
+            const a = h.addDevice("dev-A");
+            const rig = attachPushPipeline({ device: a, couch: h.couch });
+
+            await rig.pipeline.pushDocs([makeChunkDoc()]);
+            const before = await h.couch.getDoc<CouchSyncDoc & { _rev: string }>(chunkId);
+
+            const attSpy = vi.spyOn(h.couch, "bulkDocsWithAttachments");
+            const fileId = makeFileId("note.md");
+            const result = await rig.pipeline.pushDocs([makeChunkDoc(), makeFileDoc("note.md")]);
+
+            expect(attSpy).not.toHaveBeenCalled();
+            const after = await h.couch.getDoc<CouchSyncDoc & { _rev: string }>(chunkId);
+            expect(after?._rev).toBe(before?._rev);
+            expect(result.pushed).toEqual(expect.arrayContaining([chunkId, fileId]));
+            expect(await h.couch.getDoc(fileId)).not.toBeNull();
+            attSpy.mockRestore();
+        });
+
         it("does NOT withhold a file when its chunk returns a 409 conflict (already durable)", async () => {
             h = createSyncHarness();
             const a = h.addDevice("dev-A");

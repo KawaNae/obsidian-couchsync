@@ -30,7 +30,8 @@ export type ProgressCallback = (docId: string, count: number) => void;
 export type DbCheckResult =
     | { status: "exists"; docCount: number }
     | { status: "created" }
-    | { status: "error"; message: string };
+    /** What was thrown, for `describeError` to word. */
+    | { status: "error"; error: unknown };
 
 export class VaultRemoteOps {
     constructor(
@@ -73,14 +74,9 @@ export class VaultRemoteOps {
         return remoteCouch.pullAll(this.localDb, this.makeDataClient(), this.chunkHasher, onProgress);
     }
 
-    /** Destroy the vault remote database (auto-recreated on next push). */
-    async destroyRemote(): Promise<void> {
-        await remoteCouch.destroyRemote(this.makeClient());
-    }
-
-    /** Create the vault remote database if it doesn't exist. */
-    async ensureRemoteDb(): Promise<void> {
-        await this.makeClient().ensureDb();
+    /** Destroy the vault remote database and create it empty. */
+    async recreateRemote(): Promise<void> {
+        await remoteCouch.recreateRemote(this.makeClient());
     }
 
     /**
@@ -135,16 +131,13 @@ export class VaultRemoteOps {
                     if (createErr?.status === 401 || createErr?.status === 403) {
                         this.auth.raise(createErr.status, createErr?.message);
                     }
-                    return {
-                        status: "error",
-                        message: createErr?.message || "Failed to create database",
-                    };
+                    return { status: "error", error: createErr };
                 }
             }
             if (e?.status === 401 || e?.status === 403) {
                 this.auth.raise(e.status, e?.message);
             }
-            return { status: "error", message: e?.message || "Connection failed" };
+            return { status: "error", error: e };
         }
     }
 

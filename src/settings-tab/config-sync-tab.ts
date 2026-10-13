@@ -69,7 +69,7 @@ import {
 } from "../sync/config-codec-policy.ts";
 import { describeCodec, sameCodec } from "../sync/config-binding-record.ts";
 import { CURRENT_CIPHER_VERSION } from "../db/vault-meta.ts";
-import { showNotice } from "../ui/notices.ts";
+import { ProgressNotice, showNotice } from "../ui/notices.ts";
 
 export interface ConfigSyncTabDeps {
     app: App;
@@ -834,6 +834,7 @@ export class ConfigSyncTab {
             return;
         }
 
+        const progress = new ProgressNotice("Database check");
         const result = await this.deps.remoteOps.checkDatabaseWith(
             settings.couchdbUri,
             settings.couchdbUser,
@@ -843,18 +844,13 @@ export class ConfigSyncTab {
 
         if (result.status === "error") {
             this.testPassed = false;
-            showNotice(`Database check failed: ${result.message}`, 8000);
+            progress.fail(result.error);
         } else {
             this.testPassed = true;
             this.deps.auth.clear();
-            if (result.status === "created") {
-                showNotice(`Database "${this.draft.db}" created.`, 3000);
-            } else {
-                showNotice(
-                    `Database "${this.draft.db}" found — ${result.docCount.toLocaleString()} docs.`,
-                    3000,
-                );
-            }
+            progress.done(result.status === "created"
+                ? `"${this.draft.db}" created.`
+                : `"${this.draft.db}" found — ${result.docCount.toLocaleString()} docs.`);
         }
         this.deps.refresh();
     }

@@ -11,7 +11,8 @@ import { showNotice } from "./notices.ts";
 /**
  * Invoked by the repair button. Receives the currently displayed
  * report (so the caller derives the plan from fresh state), performs
- * the repair, and returns a freshly-generated post-repair result; the
+ * the repair, and returns a freshly-generated post-repair result. It
+ * reports its own failure (ProgressNotice) before throwing; the
  * Modal swaps its display in place so the user sees immediate
  * confirmation. The post-repair result may itself be either a new
  * converged report or a needs-convergence state, so the return type
@@ -23,7 +24,8 @@ export type ChunkRepairInvoker = (
 
 /**
  * Invoked by the "Wait for sync & retry" button in needs-convergence
- * state. Expected to run a one-shot pull + re-analyse. Returning a
+ * state. Expected to run a one-shot pull + re-analyse, reporting its own
+ * failure before throwing. Returning a
  * fresh `ChunkConsistencyResult` lets the Modal re-render without
  * needing to know how the retry was performed.
  */
@@ -104,8 +106,8 @@ export class ChunkConsistencyReportModal extends Modal {
                             const next = await this.onRepair!(this.result.report);
                             this.result = next;
                             this.render();
-                        } catch (e: any) {
-                            showNotice(`Repair failed: ${e?.message ?? e}`, 6000);
+                        } catch {
+                            // The invoker reported the failure.
                             btn.setDisabled(false);
                             btn.setButtonText(label);
                         }
@@ -145,8 +147,8 @@ export class ChunkConsistencyReportModal extends Modal {
                             const next = await this.onRetry!();
                             this.result = next;
                             this.render();
-                        } catch (e: any) {
-                            showNotice(`Retry failed: ${e?.message ?? e}`, 6000);
+                        } catch {
+                            // The invoker reported the failure.
                             btn.setDisabled(false);
                             btn.setButtonText("Wait for sync & retry");
                         }

@@ -1,7 +1,6 @@
 /**
  * config-binding-record.ts — identity of a config binding, the name of its
- * local store, the participation record kept INSIDE that store, and the
- * fingerprint of the `config:meta` root a device joined.
+ * local store, and the participation record kept INSIDE that store.
  *
  * One key identifies a binding everywhere: `configBindingKey(server, db)`.
  * The settings entry (`configBindings[key]`: cipher floor, setup flag) and
@@ -42,45 +41,6 @@ export function normalizeServerUri(uri: string): string {
  *  unambiguous. */
 export function configBindingKey(serverUri: string, dbName: string): string {
     return `${normalizeServerUri(serverUri)}|${dbName}`;
-}
-
-/**
- * Fingerprint of a `config:meta` root, hashed (SHA-256, first 128 bits).
- *
- * A Create mints a fresh `generationId` (and, when encrypted, a fresh salt
- * and keyCheck), so a Create on another device changes the fingerprint and
- * this device's attachment no longer matches (`root-changed`) — for
- * plaintext DBs too.
- *
- *   - with `generationId`: the generation id plus the codec parts below
- *   - without (a meta written before generation ids, e.g. by an older
- *     build's Create): encryption on/off, KDF version, salt, keyCheck and
- *     compression on/off — exactly the pre-generation fingerprint, so
- *     attachments anchored to such a meta keep matching it. Limitation of this
- *     fallback: two plaintext roots with the same compression flag are
- *     indistinguishable (no salt), so a plaintext re-Create by an older
- *     build is not detected as a reset.
- *
- * cipherVersion is deliberately NOT part of it: a lowered cipherVersion is
- * reported as `cipher-downgrade`, not as a reset.
- */
-export async function configMetaFingerprint(meta: ConfigMetaDoc): Promise<string> {
-    const enc = meta.encryption;
-    const codec = enc.enabled
-        ? ["e", enc.kdfVersion, enc.salt, enc.keyCheck, meta.compression.enabled]
-        : ["p", meta.compression.enabled];
-    const canonical = JSON.stringify(
-        typeof meta.generationId === "string" && meta.generationId !== ""
-            ? ["g", meta.generationId, ...codec]
-            : codec,
-    );
-    const digest = await crypto.subtle.digest(
-        "SHA-256", new TextEncoder().encode(canonical),
-    );
-    const hex = Array.from(new Uint8Array(digest).slice(0, 16))
-        .map((b) => b.toString(16).padStart(2, "0"))
-        .join("");
-    return `sha256:${hex}`;
 }
 
 /**
@@ -128,7 +88,7 @@ export interface ConfigAttachment {
      *  the `config:meta` codec at Create / Join. Step 1 settings are only
      *  the input of the next Create. */
     codec: ConfigCodec;
-    /** `configMetaFingerprint` of the root this device joined; a different
+    /** `metaFingerprint` of the root this device joined; a different
      *  root on the server is `root-changed` (or `encryption-removed`). */
     metaFingerprint: string;
 }
