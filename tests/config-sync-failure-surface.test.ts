@@ -1,15 +1,15 @@
 /**
- * Config sync failures must never be silent (config-binding design, stage 1).
+ * Config sync failures must never be silent.
  *
  * The bug: Push / Pull ran their pre-checks (not configured, setup flag,
  * codec, another op in flight) BEFORE the ProgressNotice existed, and the
  * settings tab swallowed the throw — pressing Pull did nothing, with no
  * notice and no log line. Every pre-check now throws a typed
  * `ConfigNotReadyError` from inside the op runner, so the failure always
- * reaches `ProgressNotice.fail`, which writes the error log.
+ * reaches `ProgressNotice.fail`, which words it and writes the error log.
  *
- * Also covers the filter tree's remote-listing classification (it used to
- * report every failure as "Server not reachable").
+ * Also covers what the op runner and the filter tree's listing record on
+ * the binding for the Step 3 status line.
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
@@ -39,6 +39,7 @@ import { FakeModalPresenter } from "./helpers/fake-modal-presenter.ts";
 import { makeSettings } from "./helpers/settings-factory.ts";
 import { makeConfigFixture } from "./helpers/config-fixture.ts";
 import { attachPlain, putEntry } from "./helpers/config-attach.ts";
+import { configMetaFingerprint } from "../src/sync/config-binding-record.ts";
 
 let counter = 0;
 function uniqueName() { return `cs-fail-${Date.now()}-${counter++}`; }
@@ -260,9 +261,10 @@ describe("configNotReady messages — where Create is advised", () => {
     });
 });
 
-describe("filter tree remote listing — classified failures", () => {
+describe("filter tree remote listing — the tab's check of the relation", () => {
     let settings: ReturnType<typeof makeSettings>;
     let stores: ConfigLocalDB[];
+    let raw: FakeCouchClient;
 
     beforeEach(() => {
         clearLog();
@@ -273,6 +275,7 @@ describe("filter tree remote listing — classified failures", () => {
             compressionEnabled: false,
         });
         stores = [];
+        raw = new FakeCouchClient();
     });
 
     afterEach(async () => {
@@ -280,56 +283,55 @@ describe("filter tree remote listing — classified failures", () => {
         for (const s of stores) await s.destroy().catch(() => {});
     });
 
-    /** A ConfigSync whose preflight runs against an attached plaintext
-     *  remote (`raw`) and whose wrapped client is `clientFactory`'s. */
-    async function quietSync(clientFactory: () => ICouchClient | null): Promise<ConfigSync> {
-        const raw = new FakeCouchClient();
+    /** A ConfigSync whose preflight runs against a plaintext remote
+     *  (`raw`) this device joined (unless `attach` is false) and whose
+     *  wrapped client is `clientFactory`'s. */
+    async function quietSync(
+        clientFactory: () => ICouchClient | null,
+        attach = true,
+    ): Promise<ConfigSync> {
+        const store = new ConfigLocalDB(uniqueName());
+        stores.push(store);
+        store.open();
+        if (attach && settings.couchdbConfigDbName) await attachPlain(settings, raw, store);
         const cs = new ConfigSync(
             new FakeVaultIO(), new FakeModalPresenter(), "test-vault", new AuthGate(),
             ALWAYS_VISIBLE, { notifyTransient: () => {} }, () => settings,
-            {
-                storeFactory: () => {
-                    const s = new ConfigLocalDB(uniqueName());
-                    stores.push(s);
-                    return s;
-                },
-                clientFactory,
-                rawClientFactory: () => raw,
-            },
+            { storeFactory: () => store, clientFactory, rawClientFactory: () => raw },
         );
         await cs.rebind(settings.couchdbConfigDbName || null);
-        if (settings.couchdbConfigDbName) await attachPlain(settings, raw, cs.currentStore()!);
         return cs;
     }
 
     it.each([
         ["unreachable", new TypeError("Failed to fetch")],
-        ["unreachable", new Error("Request timed out")],
+        ["timeout", new Error("Request timed out")],
         ["auth", httpError(401, "unauthorized")],
         ["not-found", httpError(404, "not_found")],
         ["other", new Error("boom")],
-    ])("classifies a listing failure as %s", async (kind, err) => {
-        const res = await (await quietSync(() => new FailingListClient(err))).listRemoteConfigPathsQuiet();
-        expect(res.paths).toEqual([]);
-        expect(res.failure?.kind).toBe(kind);
-        // Logged, not silently dropped.
+    ])("a listing failure (%s) is recorded as a failed check and logged", async (_k, err) => {
+        const cs = await quietSync(() => new FailingListClient(err));
+        const res = await cs.listRemoteConfigPathsQuiet();
+        expect(res).toEqual({ paths: [], ok: false, bindingKey: cs.currentBinding()!.key });
+        const last = cs.currentBinding()!.relation().last;
+        expect(last).toMatchObject({ op: "check", error: err });
+        // Logged with the worded cause, not silently dropped.
         expect(getLogEntries().some(
-            (e) => e.level === "warn" && e.message.includes(`config remote listing failed (${kind})`),
+            (e) => e.level === "warn" && e.message.includes("config remote listing failed")
+                && e.message.includes((err as Error).message),
         )).toBe(true);
     });
 
-    it("classifies a missing config key as not-ready / key-missing", async () => {
-        const res = await (await quietSync(() => {
-            throw new ConfigNotReadyError("key-missing", "key not unlocked");
-        })).listRemoteConfigPathsQuiet();
-        expect(res.failure).toEqual({
-            kind: "not-ready", notReady: "key-missing", message: "key not unlocked",
-        });
+    it("a missing config key is recorded as the check's failure", async () => {
+        const keyMissing = new ConfigNotReadyError("key-missing", "key not unlocked");
+        const cs = await quietSync(() => { throw keyMissing; });
+        const res = await cs.listRemoteConfigPathsQuiet();
+        expect(res.ok).toBe(false);
+        expect(cs.currentBinding()!.relation().last?.error).toBe(keyMissing);
     });
 
     it("reads encrypted `config:<hmac>` ids through the wrapped client as plaintext paths", async () => {
         const crypto = createCryptoProvider(await deriveKeys("pw", generateSalt()));
-        const raw = new FakeCouchClient();
         const enc = new EncryptingCouchClient(raw, crypto, 3);
         const { doc } = await makeConfigFixture(".obsidian/app.json", "{}");
         await enc.bulkDocs([doc]);
@@ -343,38 +345,120 @@ describe("filter tree remote listing — classified failures", () => {
         const cs = await quietSync(() => enc);
         const res = await cs.listRemoteConfigPathsQuiet();
         expect(res).toEqual({
-            paths: [".obsidian/app.json"], failure: null, bindingKey: cs.currentBinding()!.key,
+            paths: [".obsidian/app.json"], ok: true, bindingKey: cs.currentBinding()!.key,
         });
+        expect(cs.currentBinding()!.relation().last).toMatchObject({ op: "check", error: null });
     });
 
     it("an unconfigured DB name is not a failure (empty listing)", async () => {
         settings.couchdbConfigDbName = "";
         const res = await (await quietSync(() => null)).listRemoteConfigPathsQuiet();
-        expect(res).toEqual({ paths: [], failure: null, bindingKey: null });
+        expect(res).toEqual({ paths: [], ok: true, bindingKey: null });
+    });
+
+    it("a device that has not joined is not checked: no server request, no warning, nothing recorded", async () => {
+        const cs = await quietSync(() => new FakeCouchClient(), false);
+        const info = vi.spyOn(raw, "info");
+        const getDoc = vi.spyOn(raw, "getDoc");
+        const res = await cs.listRemoteConfigPathsQuiet();
+        expect(res).toEqual({ paths: [], ok: false, bindingKey: cs.currentBinding()!.key });
+        expect(info).not.toHaveBeenCalled();
+        expect(getDoc).not.toHaveBeenCalled();
+        expect(getLogEntries().filter((e) => e.level === "warn")).toEqual([]);
+        expect(cs.currentBinding()!.relation().last).toBeNull();
+    });
+
+    it("an unfinished Create is not checked either", async () => {
+        putEntry(settings, { settingUp: true });
+        const cs = await quietSync(() => new FakeCouchClient());
+        const getDoc = vi.spyOn(raw, "getDoc");
+        const res = await cs.listRemoteConfigPathsQuiet();
+        expect(res.ok).toBe(false);
+        expect(getDoc).not.toHaveBeenCalled();
     });
 });
 
-describe("describeConfigRemoteFailure", () => {
-    it("names the cause instead of always saying 'Server not reachable'", () => {
-        const f = classifyConfigRemoteFailure;
-        expect(describeConfigRemoteFailure(f(new TypeError("Failed to fetch"))))
-            .toMatch(/^Server not reachable/);
-        expect(describeConfigRemoteFailure(f(httpError(403, "forbidden"))))
-            .toMatch(/CouchDB tab/);
-        expect(describeConfigRemoteFailure(f(httpError(404, "missing"))))
-            .toMatch(/not found on the server/);
-        const keyLine = describeConfigRemoteFailure(
-            f(new ConfigNotReadyError("key-missing", "Config key not unlocked.")),
-        );
-        expect(keyLine).toMatch(/^Config key not unlocked\./);
-        expect(keyLine).not.toMatch(/not reachable/);
-        expect(describeConfigRemoteFailure(f(new Error("boom")))).toMatch(/boom/);
+describe("the op runner records outcomes on the binding", () => {
+    let settings: ReturnType<typeof makeSettings>;
+    let db: ConfigLocalDB;
+
+    beforeEach(() => {
+        clearLog();
+        vi.spyOn(console, "error").mockImplementation(() => {});
+        vi.spyOn(console, "warn").mockImplementation(() => {});
+        db = new ConfigLocalDB(uniqueName());
+        settings = makeSettings({
+            deviceId: "dev-A",
+            couchdbUri: "http://localhost:5984",
+            couchdbConfigDbName: "config-test",
+            compressionEnabled: false,
+        });
     });
 
-    it("always states the local-only fallback", () => {
-        for (const err of [new TypeError("Failed to fetch"), httpError(401, "x"), new Error("y")]) {
-            expect(describeConfigRemoteFailure(classifyConfigRemoteFailure(err)))
-                .toMatch(/this device's config only/);
-        }
+    afterEach(async () => {
+        vi.restoreAllMocks();
+        await db.destroy().catch(() => {});
+    });
+
+    function makeCs(remote: ICouchClient): ConfigSync {
+        return new ConfigSync(
+            new FakeVaultIO(), new FakeModalPresenter(), "test-vault", new AuthGate(),
+            ALWAYS_VISIBLE, { notifyTransient: () => {} }, () => settings,
+            { storeFactory: () => db, clientFactory: () => remote, rawClientFactory: () => remote },
+        );
+    }
+
+    it("a failed Pull is the last outcome, against the attachment it evaluated", async () => {
+        const remote = new FakeCouchClient();
+        db.open();
+        const meta = await attachPlain(settings, remote, db);
+        const cs = makeCs(remote);
+        await cs.rebind("config-test");
+        remote.info = async () => { throw new TypeError("Failed to fetch"); };
+        const before = Date.now();
+        await expect(cs.pull()).rejects.toThrow(/Failed to fetch/);
+        const last = cs.currentBinding()!.relation().last!;
+        expect(last.op).toBe("pull");
+        expect(last.at).toBeGreaterThanOrEqual(before);
+        expect(last.against).toBe(await configMetaFingerprint(meta));
+        expect((last.error as Error).message).toBe("Failed to fetch");
+    });
+
+    it("a successful Push replaces it", async () => {
+        const remote = new FakeCouchClient();
+        db.open();
+        await attachPlain(settings, remote, db);
+        const cs = makeCs(remote);
+        await cs.rebind("config-test");
+        await cs.push();
+        expect(cs.currentBinding()!.relation().last).toMatchObject({ op: "push", error: null });
+    });
+
+    it("a busy refusal is not recorded", async () => {
+        const remote = new ParkedCouchClient();
+        db.open();
+        await attachPlain(settings, remote, db);
+        const cs = makeCs(remote);
+        await cs.rebind("config-test");
+        const first = cs.pull();
+        await vi.waitFor(() => expect(remote.parked).toBe(true));
+        await expect(cs.push()).rejects.toMatchObject({ kind: "busy" });
+        expect(cs.currentBinding()!.relation().last).toBeNull();
+        remote.unpark();
+        await first;
+        expect(cs.currentBinding()!.relation().last).toMatchObject({ op: "pull", error: null });
+    });
+
+    it("a cancelled op is not recorded and logs no error", async () => {
+        const remote = new FakeCouchClient();
+        db.open();
+        await attachPlain(settings, remote, db);
+        const cs = makeCs(remote);
+        await cs.rebind("config-test");
+        const p = cs.pull();
+        cs.cancelCurrent();
+        await expect(p).rejects.toMatchObject({ name: "AbortError" });
+        expect(cs.currentBinding()!.relation().last).toBeNull();
+        expect(getLogEntries().filter((e) => e.level === "error")).toEqual([]);
     });
 });

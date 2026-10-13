@@ -6,6 +6,7 @@ import {
     defaultConfigStoreFactory,
     makeConfigOpKeys,
     type ConfigOpKeys,
+    type ConfigOpName,
     type ConfigStoreFactory,
 } from "./config-binding.ts";
 import { configBindingKey } from "./config-binding-record.ts";
@@ -62,11 +63,7 @@ import type { ConfigCreatePreview } from "./config-create-preview.ts";
 import { fetchConfigMeta } from "../db/vault-meta.ts";
 import { classifyError } from "../db/sync/errors.ts";
 import { resolveConfigCodec } from "./config-codec-policy.ts";
-import {
-    configNotReady,
-    classifyConfigRemoteFailure,
-    type ConfigRemoteFailure,
-} from "./config-errors.ts";
+import { configNotReady } from "./config-errors.ts";
 
 /**
  * ConfigSync — scan-based replication of `.obsidian/` configuration files
@@ -144,14 +141,16 @@ export interface ConfigSyncOptions {
     getIsMobile?: () => boolean;
 }
 
-/** Result of the filter tree's best-effort remote listing. `failure` is null
- *  on success; otherwise `paths` is empty and `failure` says why.
- *  `bindingKey` is the binding the listing was read for (null: none) — the
- *  listing runs outside the op lock, so a caller compares it with the
- *  current binding and drops a listing that belongs to a replaced one. */
+/** Result of the filter tree's best-effort remote listing. `ok` is false
+ *  when the server was not listed (failed, not joined, or an op running);
+ *  `paths` is then empty. Why is the status line's business — a failed
+ *  check is recorded on the binding. `bindingKey` is the binding the listing
+ *  was read for (null: none) — the listing runs outside the op lock, so a
+ *  caller compares it with the current binding and drops a listing that
+ *  belongs to a replaced one. */
 export interface RemoteConfigListing {
     paths: string[];
-    failure: ConfigRemoteFailure | null;
+    ok: boolean;
     bindingKey: string | null;
 }
 
@@ -168,6 +167,17 @@ export interface ConfigRebindOptions {
      *  See the invariant on `ConfigSync.rebind`. */
     commit?: () => Promise<void>;
 }
+
+/** Config ops that run under the op lock (everything but the filter
+ *  tree's check). */
+type LockedConfigOp = Exclude<ConfigOpName, "check">;
+
+const OP_LABELS: Record<LockedConfigOp, string> = {
+    push: "Config Push",
+    pull: "Config Pull",
+    join: "Config Join",
+    create: "Config Create",
+};
 
 export class ConfigSync {
     private static readonly SKIP_DIRS = new Set(["node_modules", ".git"]);
@@ -394,61 +404,75 @@ export class ConfigSync {
      *   3. The binding (it always matches the settings — see `rebind`) and
      *      the caller's synchronous `gate` (e.g. Push's device name).
      *   4. ConfigOperation — auth, visibility, raw client, reachability
-     *      probe, then (sync ops) the binding's preflight, which freezes the
-     *      op's keys, and the codec wrap with them, then the body.
+     *      probe, then (Push, Pull) the binding's preflight, which freezes
+     *      the op's keys, and the codec wrap with them, then the body.
      *
-     * Every throw from 2–4 lands in `progress.fail` — the one place a config
-     * op's failure is worded (`describeError`), shown and logged — and is
-     * rethrown, so the settings tab's catch only has to restore its button.
+     * The catch below is the one exit of a config op's failure: it records
+     * the outcome on the binding (the status line reads it) and hands the
+     * error to `progress.fail`, which words it (`describeError`), shows and
+     * logs it. The error is rethrown, so the settings tab's catch only has
+     * to restore its button. A success is recorded too. Neither a busy
+     * refusal (nothing ran) nor a cancellation (the user chose it) is an
+     * outcome of the relation, so neither is recorded.
      *
-     * `mode`:
-     *   - "sync": preflight + wrapped client (Push, Pull); the body
-     *     gets the frozen keys (its chunk hasher included)
-     *   - "join": raw client, no preflight — Join is what attaches
-     *   - "create": raw client, no preflight, a missing DB is fine
+     * Per op:
+     *   - push / pull: preflight + wrapped client; the body gets the frozen
+     *     keys (its chunk hasher included)
+     *   - join: raw client, no preflight — Join is what attaches
+     *   - create: raw client, no preflight, a missing DB is fine
      */
     private async runOperation<T>(
-        label: string,
+        opName: LockedConfigOp,
         body: (
             ctx: ConfigOpContext,
             progress: ProgressNotice,
             binding: ConfigBinding,
             keys: ConfigOpKeys | undefined,
         ) => Promise<T>,
-        opts: { mode?: "sync" | "join" | "create"; gate?: (binding: ConfigBinding) => void } = {},
+        opts: { gate?: (binding: ConfigBinding) => void } = {},
     ): Promise<T> {
-        const mode = opts.mode ?? "sync";
-        const progress = new ProgressNotice(label);
+        const progress = new ProgressNotice(OP_LABELS[opName]);
         if (this.inflight !== null || this.rebinding !== null) {
             // Nothing was started — the running op (if any) keeps its lock.
             const e = configNotReady("busy");
             progress.fail(e);
             throw e;
         }
+        const at = Date.now();
         let op: ConfigOperation | null = null;
         let cancelled = false;
+        let binding: ConfigBinding | null = null;
         this.inflight = { cancel: () => { cancelled = true; op?.cancel(); } };
         try {
-            const binding = this.requireBinding();
-            opts.gate?.(binding);
+            const b = this.requireBinding();
+            binding = b;
+            opts.gate?.(b);
             if (cancelled) throw abortError();
             let keys: ConfigOpKeys | undefined;
+            const sync = opName === "push" || opName === "pull";
             op = new ConfigOperation({
                 auth: this.auth,
                 visibility: this.visibility,
                 reconnectBridge: this.reconnectBridge,
-                makeClient: () => this.makeRawClient(binding),
-                prepare: mode === "sync"
+                makeClient: () => this.makeRawClient(b),
+                prepare: sync
                     ? async (raw, signal) => {
-                        keys = await binding.preflight(raw, signal);
-                        return this.wrapFor(binding, raw, keys);
+                        keys = await b.preflight(raw, signal);
+                        return this.wrapFor(b, raw, keys);
                     }
                     : undefined,
-                allowMissingDb: mode === "create",
-                dbName: binding.dbName,
+                allowMissingDb: opName === "create",
+                dbName: b.dbName,
             });
-            return await op.run((ctx) => body(ctx, progress, binding, keys));
+            const result = await op.run((ctx) => body(ctx, progress, b, keys));
+            b.record({ op: opName, at, against: b.attachment?.metaFingerprint ?? null, error: null });
+            return result;
         } catch (e) {
+            if (binding && !describeError(e).cancelled) {
+                binding.record({
+                    op: opName, at, against: binding.attachment?.metaFingerprint ?? null, error: e,
+                });
+            }
             progress.fail(e);
             throw e;
         } finally {
@@ -505,7 +529,7 @@ export class ConfigSync {
      * passphrase stops as `passphrase-missing` before anything is destroyed.
      */
     async create(): Promise<void> {
-        return this.runOperation("Config Create", async (ctx, progress, binding) => {
+        return this.runOperation("create", async (ctx, progress, binding) => {
             const codec = resolveConfigCodec(this.getSettings());
             if (codec.encryption && !codec.passphrase) {
                 throw configNotReady("passphrase-missing", { db: binding.dbName });
@@ -523,22 +547,17 @@ export class ConfigSync {
                     commit: (meta, crypto) => binding.commitCreate(meta, crypto, codec.passphrase),
                 },
             );
-            try {
-                await setup.create(
-                    ctx.client,
-                    ctx.signal,
-                    (msg) => progress.update(msg),
-                    codec,
-                );
-            } catch (e) {
-                binding.noteFailure(e);
-                throw e;
-            }
+            await setup.create(
+                ctx.client,
+                ctx.signal,
+                (msg) => progress.update(msg),
+                codec,
+            );
             progress.done(
                 "Config DB created. Now run Push to send this device's config. " +
                 "Other devices must Join again.",
             );
-        }, { mode: "create" });
+        });
     }
 
     /**
@@ -611,7 +630,7 @@ export class ConfigSync {
      * adopting a codec weaker than this device trusted for the DB.
      */
     async join(): Promise<void> {
-        return this.runOperation("Config Join", async (ctx, progress, binding) => {
+        return this.runOperation("join", async (ctx, progress, binding) => {
             await binding.join(ctx.client, ctx.signal, {
                 promptPassphrase: this.promptPassphrase,
                 confirmWeaker: (title, message) =>
@@ -619,7 +638,7 @@ export class ConfigSync {
                 onProgress: (msg) => progress.update(msg),
             });
             progress.done(`Joined config database "${binding.dbName}". Run Pull to receive its config.`);
-        }, { mode: "join" });
+        });
     }
 
     /** Push: scan .obsidian/ → enumerate local delta via changes feed →
@@ -631,7 +650,7 @@ export class ConfigSync {
      *  confirm-and-overwrite (matches the prior UX). Confirmed → bump
      *  local vclocks above remote and re-run the pipeline. */
     async push(): Promise<number> {
-        return this.runOperation("Config Push", async (ctx, progress, binding, keys) => {
+        return this.runOperation("push", async (ctx, progress, binding, keys) => {
             await binding.ensureCheckpointsLoaded();
 
             // Chunk ids are minted with the op's frozen hasher: the same key
@@ -687,7 +706,7 @@ export class ConfigSync {
      *  and the cursor advances past them, so re-running pull() will surface
      *  them again until manually resolved (matches vault-sync semantics). */
     async pull(): Promise<number> {
-        return this.runOperation("Config Pull", async (ctx, progress, binding, keys) => {
+        return this.runOperation("pull", async (ctx, progress, binding, keys) => {
             await binding.ensureCheckpointsLoaded();
 
             const writer = new ConfigPullWriter({
@@ -1073,36 +1092,46 @@ export class ConfigSync {
      *  no ProgressNotice (the tree fetches this on every render) and no op
      *  lock.
      *
+     *  It is also the tab's check of the relation: its outcome is recorded
+     *  on the binding as a `check`, so the Step 3 status line shows a
+     *  server that cannot be reached, a changed root or a wrong passphrase
+     *  before the next Push or Pull. A device that has not joined, or whose
+     *  Create did not finish, has nothing to check — the status line already
+     *  says so — and the server is not contacted.
+     *
      *  Without the lock it must not change the binding: it runs the
      *  read-only `inspect` (never `preflight`) and reads through a client
-     *  wrapped with the verdict's own keys, leaving the floor and the status
-     *  alone. The result names the binding it read (`bindingKey`). While an op (or a rebind) runs it does not touch the
-     *  server at all and reports `busy`; the tree keeps its cached listing.
+     *  wrapped with the verdict's own keys, leaving the floor alone. While an
+     *  op (or a rebind) runs it does not touch the server at all; the tree
+     *  keeps its cached listing.
      *
      *  Reads through the WRAPPED client: when the config DB is encrypted,
      *  remote doc ids are `config:<hmac>` (EncryptingCouchClient HMACs the
      *  path), and only the wrapped allDocs decrypts the bodies back to
      *  `config:<path>` ids. A raw client would only see hashes.
      *
-     *  Best-effort and non-throwing: a failure is classified (unreachable /
-     *  auth / not-found / not-ready with the check's kind / other) and
-     *  logged, and the tree falls back to the local-only view with the cause
-     *  shown. */
+     *  Non-throwing: a failure is recorded, logged as a warning, and the tree
+     *  falls back to the local-only view. */
     async listRemoteConfigPathsQuiet(): Promise<RemoteConfigListing> {
-        const bindingKey = this.binding?.key ?? null;
-        // Config sync disabled: nothing to list, and nothing failed.
-        if (!this.binding && !this.getSettings().couchdbConfigDbName) {
-            return { paths: [], failure: null, bindingKey };
+        const binding = this.binding;
+        const bindingKey = binding?.key ?? null;
+        if (!binding) {
+            // Config sync disabled: nothing to list, and nothing failed. A
+            // name without a binding (its store failed to open) is shown by
+            // the status line.
+            return { paths: [], ok: !this.getSettings().couchdbConfigDbName, bindingKey };
         }
         if (this.inflight !== null || this.rebinding !== null) {
-            return {
-                paths: [], failure: classifyConfigRemoteFailure(configNotReady("busy")), bindingKey,
-            };
+            return { paths: [], ok: false, bindingKey };
         }
+        const rel = binding.relation();
+        if (!rel.attachment || rel.settingUp) return { paths: [], ok: false, bindingKey };
+
+        const at = Date.now();
+        const against = rel.attachment.metaFingerprint;
         try {
-            const binding = this.requireBinding();
             const raw = this.makeRawClient(binding);
-            if (!raw) return { paths: [], failure: null, bindingKey };
+            if (!raw) throw configNotReady("not-configured");
             const quick = raw.withTimeout(CONFIG_TIMEOUTS.reachability);
             const signal = new AbortController().signal;
             const verdict = await binding.inspect(quick, signal);
@@ -1112,19 +1141,18 @@ export class ConfigSync {
             );
             const client = this.wrapFor(binding, quick, keys);
             const ids = await remoteCouch.listRemoteByPrefix(client, DOC_ID.CONFIG, signal);
+            binding.record({ op: "check", at, against, error: null });
             return {
-                failure: null,
+                ok: true,
                 bindingKey,
                 paths: ids
                     .map(configPathFromId)
                     .filter((p) => p.startsWith(".obsidian/")),
             };
-        } catch (e: any) {
-            const failure = classifyConfigRemoteFailure(e);
-            logWarn(
-                `CouchSync: config remote listing failed (${failure.kind}): ${e?.message ?? e}`,
-            );
-            return { paths: [], failure, bindingKey };
+        } catch (e) {
+            binding.record({ op: "check", at, against, error: e });
+            logWarn(`CouchSync: config remote listing failed: ${describeError(e).text}`);
+            return { paths: [], ok: false, bindingKey };
         }
     }
 

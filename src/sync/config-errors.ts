@@ -1,6 +1,5 @@
 /**
- * config-errors.ts — typed "not ready" failures for config sync, plus the
- * classifier the settings filter tree uses for its best-effort remote list.
+ * config-errors.ts — typed "not ready" failures for config sync.
  *
  * Why a typed error: config ops used to throw plain `Error`s from their
  * pre-checks BEFORE a ProgressNotice existed, and the settings tab swallowed
@@ -18,7 +17,6 @@
  * The user-facing wording of every kind lives in `configNotReady` below, so
  * the preflight, Join, Create and the settings tab all say the same thing.
  */
-import { classifyError } from "../db/sync/errors.ts";
 
 export type ConfigNotReadyKind =
     /** No config DB name, or the local config store is not open. */
@@ -165,54 +163,4 @@ export function configNotReady(
         }
     })();
     return new ConfigNotReadyError(kind, msg);
-}
-
-// ── Remote list classification (settings filter tree) ──
-
-/** Why the filter tree's remote config listing failed. `not-ready` carries
- *  the precondition kind (e.g. `key-missing`) and its user-facing message. */
-export type ConfigRemoteFailure =
-    | { kind: "unreachable"; message: string }
-    | { kind: "auth"; message: string }
-    | { kind: "not-found"; message: string }
-    | { kind: "not-ready"; notReady: ConfigNotReadyKind; message: string }
-    | { kind: "other"; message: string };
-
-/** Map an error thrown while listing remote config paths onto the causes the
- *  filter tree distinguishes. Pure — no I/O. */
-export function classifyConfigRemoteFailure(err: unknown): ConfigRemoteFailure {
-    if (err instanceof ConfigNotReadyError) {
-        return { kind: "not-ready", notReady: err.kind, message: err.message };
-    }
-    const d = classifyError(err);
-    switch (d.kind) {
-        case "network":
-        case "timeout":
-        case "aborted":
-            return { kind: "unreachable", message: d.message };
-        case "auth":
-            return { kind: "auth", message: d.message };
-        case "not-found":
-            return { kind: "not-found", message: d.message };
-        default:
-            return { kind: "other", message: d.message };
-    }
-}
-
-/** User-facing line for the filter tree when the remote listing failed. The
- *  tree always degrades to this device's config, so every line says so. */
-export function describeConfigRemoteFailure(f: ConfigRemoteFailure): string {
-    const fallback = "Showing this device's config only (no “on server” status).";
-    switch (f.kind) {
-        case "unreachable":
-            return `Server not reachable — ${fallback}`;
-        case "auth":
-            return `Server rejected the credentials — fix authentication in the CouchDB tab. ${fallback}`;
-        case "not-found":
-            return `Config database not found on the server — run Check in Step 2 to create it. ${fallback}`;
-        case "not-ready":
-            return `${f.message} ${fallback}`;
-        case "other":
-            return `Could not list server config: ${f.message} — ${fallback}`;
-    }
 }

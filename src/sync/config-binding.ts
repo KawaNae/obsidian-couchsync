@@ -29,11 +29,14 @@
  * whole run, so nothing that runs alongside it can switch its encryption or
  * chunk-id space mid-op.
  *
- * State is evaluated per op, never persisted as a state machine (design
- * 状態モデル): Disabled (no binding), Unattached (no attachment in the
- * store), SettingUp (the setup flag), Blocked (a `ConfigNotReadyError`
- * kind) or Ready. The key never depends on the vault's connectionState
- * (invariant 18).
+ * Readiness is evaluated per op, never persisted as a state machine:
+ * Disabled (no binding), Unattached (no attachment in the store),
+ * SettingUp (the setup flag), Blocked (the op throws a
+ * `ConfigNotReadyError`) or Ready. A persisted state could disagree with
+ * the store and the server it summarises; re-evaluating cannot. What the
+ * settings tab shows is `relation()`: the attachment, the setup flag and
+ * the outcome of the last op (in memory only). The key never depends on the
+ * vault's connectionState (invariant 18).
  */
 import { ConfigLocalDB } from "../db/config-local-db.ts";
 import type { ICouchClient } from "../db/interfaces.ts";
@@ -49,7 +52,6 @@ import {
     ConfigNotReadyError,
     configNotReady,
     type ConfigNotReadyContext,
-    type ConfigNotReadyKind,
 } from "./config-errors.ts";
 import {
     fetchConfigMeta,
@@ -85,11 +87,39 @@ export interface ConfigBindingHost {
     saveSettings: () => Promise<void>;
 }
 
-/** Result of the latest preflight / Join / Create on this binding, for the
- *  settings tab's status line. */
-export type ConfigBindingStatus =
-    | { state: "ready"; at: number }
-    | { state: "blocked"; kind: ConfigNotReadyKind; message: string; at: number };
+/** The config operations whose outcome describes this device's relation
+ *  to the config DB. `check` is the settings filter tree's read-only
+ *  `inspect` + listing (no op lock); the others run under the lock. */
+export type ConfigOpName = "push" | "pull" | "join" | "create" | "check";
+
+/** How one operation on this binding ended. */
+export interface ConfigOutcome {
+    op: ConfigOpName;
+    /** When the operation started (ms since epoch). A result that started
+     *  earlier than the recorded one is older news and is dropped. */
+    at: number;
+    /** `metaFingerprint` of the attachment the operation evaluated — for a
+     *  locked op, the one in place when it ended (Join / Create replace
+     *  it) — or null when the device was not attached. */
+    against: string | null;
+    /** What it threw, or null on success. */
+    error: unknown | null;
+}
+
+/** Snapshot of this device's relation to the config DB, for the status
+ *  line. Not persisted: after a reload the last outcome is unknown until
+ *  the next operation or check. */
+export interface ConfigRelation {
+    dbName: string;
+    /** The participation record, or null when not joined. */
+    attachment: ConfigAttachment | null;
+    /** A Create of this device did not finish. */
+    settingUp: boolean;
+    /** The last outcome, only when it was evaluated against the attachment
+     *  in place now — a result about another root (or about not being
+     *  joined) no longer describes the relation. */
+    last: ConfigOutcome | null;
+}
 
 /**
  * Everything an op encodes and decodes with, fixed for the op's whole run:
@@ -153,7 +183,7 @@ export class ConfigBinding {
 
     private checkpointsLoaded = false;
     private closed = false;
-    private lastStatus: ConfigBindingStatus | undefined;
+    private lastOutcome: ConfigOutcome | null = null;
 
     /** Result of the last passphrase check against one `config:meta` root.
      *  A memo of PBKDF2 results, not binding state: negative results are
@@ -254,9 +284,27 @@ export class ConfigBinding {
         this.att = att;
     }
 
-    /** Latest preflight / Join / Create outcome, or undefined when none ran. */
-    get status(): ConfigBindingStatus | undefined {
-        return this.lastStatus;
+    /** Record how an operation ended. Called by the op runner (Push, Pull,
+     *  Join, Create — not for a busy refusal or a cancellation) and by the
+     *  filter tree's check. Only an outcome that started no earlier than the
+     *  recorded one replaces it, so a check that was overtaken by an op
+     *  cannot overwrite that op's result. */
+    record(o: ConfigOutcome): void {
+        if (this.closed) return;
+        if (this.lastOutcome && o.at < this.lastOutcome.at) return;
+        this.lastOutcome = o;
+    }
+
+    /** This device's relation to the config DB now. */
+    relation(): ConfigRelation {
+        const fp = this.att?.metaFingerprint ?? null;
+        const last = this.lastOutcome;
+        return {
+            dbName: this.dbName,
+            attachment: this.att,
+            settingUp: this.entry()?.settingUp === true,
+            last: last && last.against === fp ? last : null,
+        };
     }
 
     // ── Keys ───────────────────────────────────────────
@@ -404,19 +452,12 @@ export class ConfigBinding {
 
     /**
      * Per-op readiness check for ops holding the op lock (Push, Pull):
-     * `inspect`, then apply the verdict — ratchet the cipher floor (TOFU)
-     * and record the status. Returns the keys the op must use for its whole
-     * run. On a not-ready verdict the status records the cause.
+     * `inspect`, then apply the verdict — ratchet the cipher floor (TOFU).
+     * Returns the keys the op must use for its whole run.
      */
     async preflight(raw: ICouchClient, signal?: AbortSignal): Promise<ConfigOpKeys> {
-        let verdict: ConfigVerdict;
-        try {
-            if (!this.closed) this.att = await this.readAttachment();
-            verdict = await this.inspect(raw, signal);
-        } catch (e) {
-            this.recordFailure(e);
-            throw e;
-        }
+        if (!this.closed) this.att = await this.readAttachment();
+        const verdict = await this.inspect(raw, signal);
         const entry = this.entry();
         let floor = entry?.cipherFloor;
         const cv = verdict.meta.encryption.enabled
@@ -425,14 +466,7 @@ export class ConfigBinding {
             floor = cv;
             await this.putEntry({ ...(entry ?? { settingUp: false }), cipherFloor: cv });
         }
-        this.lastStatus = { state: "ready", at: Date.now() };
         return makeConfigOpKeys(verdict.attachment.codec, verdict.crypto, floor, this.dbName);
-    }
-
-    private recordFailure(e: unknown): void {
-        if (e instanceof ConfigNotReadyError) {
-            this.lastStatus = { state: "blocked", kind: e.kind, message: e.message, at: Date.now() };
-        }
     }
 
     /** `config:meta` is absent: tell an empty DB (never set up) from one
@@ -510,16 +544,6 @@ export class ConfigBinding {
      * 4–6 leaves the device Unattached with an empty store: Join again.
      */
     async join(raw: ICouchClient, signal: AbortSignal, opts: ConfigJoinOptions = {}): Promise<void> {
-        try {
-            await this.runJoin(raw, signal, opts);
-            this.lastStatus = { state: "ready", at: Date.now() };
-        } catch (e) {
-            this.recordFailure(e);
-            throw e;
-        }
-    }
-
-    private async runJoin(raw: ICouchClient, signal: AbortSignal, opts: ConfigJoinOptions): Promise<void> {
         const progress = opts.onProgress ?? (() => {});
         const s = this.host.getSettings();
 
@@ -645,12 +669,6 @@ export class ConfigBinding {
         }, meta.encryption.enabled ? passphrase : undefined);
         await this.writeAttachment({ codec: metaCodec(meta), metaFingerprint: metaFp });
         if (!this.closed && crypto) this.keyCache = { metaFp, passphrase, crypto };
-        this.lastStatus = { state: "ready", at: Date.now() };
-    }
-
-    /** Record a Create failure for the status line. */
-    noteFailure(e: unknown): void {
-        this.recordFailure(e);
     }
 
     // ── Codec stack ────────────────────────────────────

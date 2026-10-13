@@ -62,6 +62,7 @@ import {
 } from "../helpers/config-attach.ts";
 import { resolveConfigCodec } from "../../src/sync/config-codec-policy.ts";
 import { sameCodec } from "../../src/sync/config-binding-record.ts";
+import { configRelationView } from "../../src/settings-tab/config-relation-view.ts";
 import {
     applyServerSettings,
     type ConfigServerSwitch,
@@ -282,7 +283,7 @@ describe("config binding lifecycle", () => {
             expect(binding.keyDerivations).toBe(1);
             expect(await dev.cs.pull()).toBe(1);
             expect(binding.keyDerivations).toBe(1);
-            expect(binding.status).toMatchObject({ state: "ready" });
+            expect(binding.relation().last).toMatchObject({ op: "pull", error: null });
         });
     });
 
@@ -615,8 +616,8 @@ describe("config binding lifecycle", () => {
             const err = await b.cs.pull().catch((e) => e);
             expect(err).toMatchObject({ kind: "cipher-downgrade" });
             expect(err.message).not.toMatch(/Create/);
-            expect(b.cs.currentBinding()!.status).toMatchObject({
-                state: "blocked", kind: "cipher-downgrade",
+            expect(b.cs.currentBinding()!.relation().last).toMatchObject({
+                op: "pull", error: { kind: "cipher-downgrade" },
             });
         });
     });
@@ -711,24 +712,31 @@ describe("config binding lifecycle", () => {
             expect(getEntry(dev.settings, "cfg-B")).toBeUndefined();
             // The wipe emptied the store: no attachment either.
             expect(await attachmentOf(dev)).toBeNull();
-            expect(dev.cs.currentBinding()!.status).toBeUndefined();
+            // The failure is recorded; the status line shows the unfinished
+            // Create first (the setup flag), which is what the user must fix.
+            expect(dev.cs.currentBinding()!.relation()).toMatchObject({
+                settingUp: true, attachment: null,
+                last: { op: "create", error: { message: "network down" } },
+            });
         });
     });
 
     describe("filter tree listing", () => {
-        it("encrypted DB: shows the classified cause before Join, decrypted paths after", async () => {
+        it("encrypted DB: not listed (nor contacted) before Join, decrypted paths after", async () => {
             await seed("cfg-enc", { ".obsidian/app.json": "{}", ".obsidian/hotkeys.json": "{}" }, ENC);
             const b = makeDevice("dev-B", ENC);
             await apply(b, "cfg-enc");
 
+            const getDoc = vi.spyOn(remote("cfg-enc"), "getDoc");
             const before = await b.cs.listRemoteConfigPathsQuiet();
-            expect(before.paths).toEqual([]);
-            expect(before.failure).toMatchObject({ kind: "not-ready", notReady: "unattached" });
+            expect(before).toMatchObject({ paths: [], ok: false });
+            expect(getDoc).not.toHaveBeenCalled();
 
             await b.cs.join();
             const after = await b.cs.listRemoteConfigPathsQuiet();
-            expect(after.failure).toBeNull();
+            expect(after.ok).toBe(true);
             expect(after.paths.sort()).toEqual([".obsidian/app.json", ".obsidian/hotkeys.json"]);
+            expect(b.cs.currentBinding()!.relation().last).toMatchObject({ op: "check", error: null });
         });
     });
 
@@ -964,16 +972,15 @@ describe("config binding lifecycle", () => {
             // the op lock and drop the key on failure — mid-scan.
             b.settings.configEncryptionPassphrase = "wrong";
             const getDoc = vi.spyOn(remote("cfg-enc"), "getDoc");
+            const lastBefore = binding.relation().last;
             const listing = await b.cs.listRemoteConfigPathsQuiet();
-            expect(listing).toMatchObject({
-                paths: [], failure: { kind: "not-ready", notReady: "busy" },
-            });
+            expect(listing).toMatchObject({ paths: [], ok: false });
             expect(getDoc).not.toHaveBeenCalled();
             // Even the read-only check, failing, leaves the binding alone.
             await expect(binding.inspect(remote("cfg-enc"))).rejects.toMatchObject({
                 kind: "passphrase-mismatch",
             });
-            expect(binding.status).toMatchObject({ state: "ready" });
+            expect(binding.relation().last).toBe(lastBefore);
 
             release();
             expect(await running).toBe(2);
@@ -1219,7 +1226,7 @@ describe("config binding lifecycle", () => {
             const listing = await d.cs.listRemoteConfigPathsQuiet();
             expect(d.settings.couchdbUri).toBe(X);
             expect(listing).toEqual({
-                paths: [".obsidian/app.json"], failure: null,
+                paths: [".obsidian/app.json"], ok: true,
                 bindingKey: d.cs.currentBinding()!.key,
             });
 
@@ -1277,6 +1284,44 @@ describe("config binding lifecycle", () => {
             expect(settings.couchdbUri).toBe(Y);
             expect(cs.currentBinding()).toBeNull();
             await expect(cs.pull()).rejects.toMatchObject({ kind: "not-configured" });
+        });
+    });
+
+    describe("the Step 3 status line follows the relation", () => {
+        const view = (d: Device) => configRelationView(
+            { enabled: true, relation: d.cs.currentBinding()!.relation() }, null,
+        );
+
+        it("a failed Join on a device that has not joined says why, not 'Not joined yet'", async () => {
+            await seed("cfg-enc", { ".obsidian/app.json": "{}" }, ENC);
+            const b = makeDevice("dev-B", { ...ENC, configEncryptionPassphrase: "wrong" });
+            await apply(b, "cfg-enc");
+            expect(view(b).text).toMatch(/^Not joined yet/);
+
+            await expect(b.cs.join()).rejects.toMatchObject({ kind: "passphrase-mismatch" });
+            expect(b.cs.currentBinding()!.relation()).toMatchObject({
+                attachment: null, last: { op: "join", against: null },
+            });
+            const v = view(b);
+            expect(v.tone).toBe("error");
+            expect(v.text).toMatch(/^Last Join: The passphrase does not unlock/);
+            expect(v.text).not.toMatch(/\bCreate\b/);
+        });
+
+        it("a result about another root is dropped once the device joins a new one", async () => {
+            const a = await creator("cfg-A", { ".obsidian/app.json": "{}" });
+            const b = makeDevice("dev-B");
+            await apply(b, "cfg-A");
+            await b.cs.join();
+            // A re-creates: B's Pull fails against the root it joined.
+            await a.cs.create();
+            await expect(b.cs.pull()).rejects.toMatchObject({ kind: "root-changed" });
+            expect(view(b).text).toMatch(/^Last Pull: .*re-created on another device/);
+            // Joining the new root replaces the attachment; the old failure
+            // no longer describes the relation.
+            await b.cs.join();
+            expect(view(b)).toEqual({ text: 'Joined "cfg-A" — ready to Push and Pull.', tone: "ok" });
+            await a.cs.close();
         });
     });
 

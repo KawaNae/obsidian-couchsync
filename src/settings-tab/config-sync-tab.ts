@@ -32,7 +32,8 @@ import type { VaultRemoteOps } from "../db/sync/vault-remote-ops.ts";
 import type { IModalPresenter } from "../types/modal-presenter.ts";
 import { addPasswordToggle } from "./vault-sync-tab.ts";
 import { logWarn } from "../ui/log.ts";
-import { ConfigNotReadyError, describeConfigRemoteFailure } from "../sync/config-errors.ts";
+import { ConfigNotReadyError } from "../sync/config-errors.ts";
+import { configRelationView } from "./config-relation-view.ts";
 import { describeCreateConfirm } from "../sync/config-create-preview.ts";
 import {
     classifyConfigPath,
@@ -105,6 +106,9 @@ export class ConfigSyncTab {
     private testBtn: ButtonComponent | null = null;
     private applyBtn: ButtonComponent | null = null;
     private applyDesc: HTMLElement | null = null;
+    /** The Step 3 status line, repainted in place when the filter tree's
+     *  check records a new outcome. */
+    private setupStateEl: HTMLElement | null = null;
 
     /** Short-lived cache of the remote config path list so re-rendering the
      *  tree (every settings refresh, incl. after each checkbox toggle) does
@@ -295,6 +299,7 @@ export class ConfigSyncTab {
         this.testBtn = null;
         this.applyBtn = null;
         this.applyDesc = null;
+        this.setupStateEl = null;
 
         // ── Device Name (inherited) ────────────────────────
         el.createEl("h3", { text: "Device Name" });
@@ -360,7 +365,7 @@ export class ConfigSyncTab {
         el.createEl("h3", { text: "Step 3: Setup" });
 
         const configEnabled = settings.couchdbConfigDbName.trim() !== "";
-        this.renderSetupState(el, configEnabled);
+        this.renderSetupState(el);
 
         new Setting(el)
             .setName("Create")
@@ -429,7 +434,7 @@ export class ConfigSyncTab {
                         } catch {
                             // Reported by ConfigSync (ProgressNotice + log).
                         }
-                        // The status line reflects this op's preflight.
+                        // The status line shows this op's outcome.
                         this.remoteCache = null;
                         this.deps.refresh();
                     })
@@ -463,56 +468,32 @@ export class ConfigSyncTab {
     }
 
     /**
-     * Step 3 state line: this device's relation to the bound config DB.
-     *
-     * The local half is evaluated now (`assertLocalReady`, no I/O), so an
-     * unfinished Create or a missing Join shows immediately. When
-     * that passes, the latest server-side result (preflight / Join / Create)
-     * is shown; before any op ran this session, the line says the server is
-     * checked on the next one. Colours follow Vault Sync's check result:
-     * green for ready, red for a problem.
+     * Step 3 state line: this device's relation to the bound config DB, as
+     * `configRelationView` words it (the binding's `relation()` and the auth
+     * latch). Colours follow Vault Sync's check result: green for ready, red
+     * for a problem.
      */
-    private renderSetupState(el: HTMLElement, configEnabled: boolean): void {
-        let text: string;
-        let tone: "ok" | "error" | null = null;
-        const binding = configEnabled ? this.deps.configSync.currentBinding() : null;
-        if (!configEnabled) {
-            text = "Apply a config database name in Step 2 first.";
-        } else if (!binding) {
-            text = "The local config store could not be opened — see the log, then " +
-                "Apply the database name again.";
-            tone = "error";
-        } else {
-            let local: ConfigNotReadyError | null = null;
-            try {
-                binding.assertLocalReady({ requireAttached: true });
-            } catch (e) {
-                if (e instanceof ConfigNotReadyError) local = e;
-                else throw e;
-            }
-            const st = binding.status;
-            if (local?.kind === "unattached") {
-                text = "Not joined yet. First device: Create. Other devices: Join.";
-            } else if (local) {
-                text = local.message;
-                tone = "error";
-            } else if (st?.state === "blocked") {
-                text = `Last check: ${st.message}`;
-                tone = "error";
-            } else if (st?.state === "ready") {
-                text = `Joined "${binding.dbName}" — ready to Push and Pull.`;
-                tone = "ok";
-            } else {
-                text = `Joined "${binding.dbName}". The server is checked on the next ` +
-                    "Push or Pull.";
-            }
-        }
-        const p = el.createEl("p", {
-            text,
-            cls: tone === "error" ? "setting-item-description mod-warning" : "setting-item-description",
-        });
-        if (tone === "ok") p.style.color = "var(--text-success)";
-        if (tone === "error") p.style.color = "var(--text-error)";
+    private renderSetupState(el: HTMLElement): void {
+        this.setupStateEl = el.createEl("p");
+        this.paintSetupState();
+    }
+
+    private paintSetupState(): void {
+        const p = this.setupStateEl;
+        if (!p) return;
+        const settings = this.deps.getSettings();
+        const enabled = settings.couchdbConfigDbName.trim() !== "";
+        const binding = enabled ? this.deps.configSync.currentBinding() : null;
+        const auth = this.deps.auth;
+        const view = configRelationView(
+            { enabled, relation: binding?.relation() ?? null },
+            auth.isBlocked() ? auth.blockedError() : null,
+        );
+        p.textContent = view.text;
+        p.className = view.tone === "error"
+            ? "setting-item-description mod-warning" : "setting-item-description";
+        p.style.color = view.tone === "ok" ? "var(--text-success)"
+            : view.tone === "error" ? "var(--text-error)" : "";
     }
 
     /** Create: show what it would delete (read from the server now, never
@@ -651,7 +632,9 @@ export class ConfigSyncTab {
             // the current one (bindings change only on Apply, so this ends).
             return this.populateFilterTree(treeEl);
         }
-        const { paths: remotePaths, failure: remoteFailure } = listing;
+        const { paths: remotePaths, ok: remoteOk } = listing;
+        // A fresh listing recorded a check on the binding.
+        this.paintSetupState();
 
         treeEl.empty();
         const policy = this.deps.getSettings().configSyncPolicy;
@@ -676,11 +659,11 @@ export class ConfigSyncTab {
             arr.sort((a, b) => a.c.path.localeCompare(b.c.path));
         }
 
-        if (remoteFailure) {
-            // Show the classified cause — "Server not reachable" for every
-            // failure hid auth errors and a missing config key.
+        if (!remoteOk) {
+            // Why the server was not listed is the status line's to say
+            // (Step 3); repeating it here would be a second wording of it.
             treeEl.createEl("p", {
-                text: describeConfigRemoteFailure(remoteFailure),
+                text: "Showing this device's config only — see Step 3.",
                 cls: "setting-item-description",
             });
         }
@@ -704,10 +687,10 @@ export class ConfigSyncTab {
     }
 
     /** Fetch the remote config path list, memoised for a short TTL per
-     *  binding. On failure returns an empty list plus the classified cause,
-     *  so the tree degrades to a local-only view and says why. While a config
-     *  op runs the server is not listed (ConfigSync reports `busy`): the last
-     *  listing of the same binding is shown instead, however old.
+     *  binding. On failure returns an empty list (`ok: false`), so the tree
+     *  degrades to a local-only view. While a config op runs the server is
+     *  not listed: the last listing of the same binding is shown instead,
+     *  however old.
      *
      *  Returns null when the binding changed while the listing was being
      *  read (it belongs to the previous DB / server): the result is dropped,
@@ -720,14 +703,15 @@ export class ConfigSyncTab {
             now - cached.at < ConfigSyncTab.REMOTE_TTL_MS
             || this.deps.configSync.isInflight()
         )) {
-            return { paths: cached.paths, failure: cached.failure, bindingKey: cached.bindingKey };
+            return { paths: cached.paths, ok: cached.ok, bindingKey: cached.bindingKey };
         }
+        const busyBefore = this.deps.configSync.bindingChangeBlocker() !== null;
         const listing = await this.deps.configSync.listRemoteConfigPathsQuiet();
         const current = this.deps.configSync.currentBinding()?.key ?? null;
         if (listing.bindingKey !== key || current !== key) return null;
-        // A `busy` answer says nothing about the server — never cache it.
-        const busy = listing.failure?.kind === "not-ready" && listing.failure.notReady === "busy";
-        if (!busy) this.remoteCache = { ...listing, at: now };
+        // An answer given while an op ran says nothing about the server —
+        // never cache it.
+        if (!busyBefore) this.remoteCache = { ...listing, at: now };
         return listing;
     }
 
