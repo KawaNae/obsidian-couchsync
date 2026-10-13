@@ -32,6 +32,16 @@ All notable changes to obsidian-couchsync.
   release takes the server's `vault:meta` as its own the first time sync
   starts. Init and Config Create also wait until the re-created database
   answers, instead of failing when CouchDB was still removing the old one.
+- **A same-size rewrite right after a sync is no longer missed.** To skip
+  reading unchanged files, the startup scan and reconcile trust a file whose
+  modification time and size match what was recorded when it last synced.
+  On a filesystem that records modification times coarsely (2 s on FAT32,
+  1 s on HFS+ and ext3, some network shares), a file rewritten with the same
+  size just after it was recorded kept the same time, so the rewrite was
+  neither pushed nor overwritten by a pulled version. A modification time
+  less than 3 seconds older than the moment of recording is no longer
+  trusted: such a file is read again on the next check, and recorded once
+  its time is old enough.
 - **Clone of an encrypted vault works when Step 1 has encryption off.** Step 1
   says the remote's encryption is detected on Clone, but the pull applied the
   decrypt layer only when Step 1's switch was on, so such a Clone failed

@@ -41,6 +41,7 @@ import {
     type WriteSnapshot,
 } from "./write-transaction.ts";
 import type { VectorClock } from "../sync/vector-clock.ts";
+import { stampableMtime } from "../sync/last-synced.ts";
 import { logWarn } from "../ui/log.ts";
 
 // ── Stored document shape ───────────────────────────────
@@ -411,11 +412,12 @@ export class DexieStore<T extends { _id: string; _rev?: string } = any>
                 for (const v of tx.vclocks) {
                     const key = vclockMetaKey(v.path);
                     if (v.op === "set") {
+                        const mtime = stampableMtime(v.mtime);
                         await this.db.meta.put({
                             key,
                             value: {
                                 vclock: v.clock, chunks: v.chunks, size: v.size,
-                                ...(v.mtime !== undefined ? { mtime: v.mtime } : {}),
+                                ...(mtime !== undefined ? { mtime } : {}),
                                 ...(v.deleted === true ? { deleted: true } : {}),
                             },
                         });

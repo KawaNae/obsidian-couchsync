@@ -8,7 +8,7 @@ import { splitIntoChunks, joinChunks, type ChunkHasher } from "../db/chunker.ts"
 import { notify } from "../ui/log.ts";
 import { compareVC, incrementVC, mergeVC } from "./vector-clock.ts";
 import type { VectorClock } from "./vector-clock.ts";
-import type { LastSynced } from "./last-synced.ts";
+import { storableLastSynced, type LastSynced } from "./last-synced.ts";
 import { classifySyncRelation, type SyncRelation } from "./classify-sync-relation.ts";
 import { chunkListsEqual } from "./chunk-equality.ts";
 import { makeFileId, filePathFromId } from "../types/doc-id.ts";
@@ -83,7 +83,7 @@ export class VaultSync {
      * skip" by the divergent-edit guard until the next push/pull
      * rewrites them in full shape.
      */
-    private lastSynced = new Map<PathKey, LastSynced>();
+    private lastSynced = new LastSyncedCache();
 
     /**
      * In-memory mirror of `_local/skipped-files` paths. Lets the hot path
@@ -1522,5 +1522,14 @@ export class VaultSync {
             if (dir !== targetPath && toPathKey(dir) === key) return dir;
         }
         return null;
+    }
+}
+
+/** The in-memory `lastSynced` cache. Every entry goes in through `set`,
+ *  which drops an mtime stamp too recent to trust (`storableLastSynced`) —
+ *  the same rule the store applies to the persisted entry. */
+class LastSyncedCache extends Map<PathKey, LastSynced> {
+    override set(key: PathKey, entry: LastSynced): this {
+        return super.set(key, storableLastSynced(entry));
     }
 }

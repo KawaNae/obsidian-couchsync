@@ -34,6 +34,15 @@ import type { VectorClock } from "./vector-clock.ts";
  * destructive-judgment oracle `hasUnpushedChanges`) must hash for real.
  * Entries written before this field carry undefined → cache miss → the
  * next integration (or a reconcile align) stamps it.
+ *
+ * A stamp is kept only when the file's mtime is older than the moment of
+ * recording by `RACY_MTIME_WINDOW_MS` (`stampableMtime`, applied where the
+ * entry is stored: the in-memory cache and the store). A file rewritten
+ * right after it was read can keep the same mtime on a filesystem that
+ * records mtime coarsely (2 s on FAT32, 1 s on HFS+ and ext3, some network
+ * shares), and with the same size the stat would match a fingerprint of the
+ * old content. Without the stamp the next check hashes the file; the
+ * reconcile align stamps it once the mtime is old enough.
  */
 export interface LastSynced {
     vclock: VectorClock;
@@ -41,6 +50,27 @@ export interface LastSynced {
     size?: number;
     mtime?: number;
     deleted?: true;
+}
+
+/** How much older than the moment of recording a file's mtime must be to
+ *  be stamped: the coarsest common mtime resolution (2 s, FAT32) plus the
+ *  time between reading the file and recording what was read. */
+export const RACY_MTIME_WINDOW_MS = 3000;
+
+/** The mtime to stamp on a baseline recorded at `now`, or undefined when it
+ *  is too recent to tell a later rewrite apart (see `LastSynced.mtime`). */
+export function stampableMtime(mtime: number | undefined, now: number = Date.now()): number | undefined {
+    if (mtime === undefined) return undefined;
+    return mtime <= now - RACY_MTIME_WINDOW_MS ? mtime : undefined;
+}
+
+/** `entry` as it may be stored at `now`: the mtime stamp dropped when it is
+ *  too recent (`stampableMtime`). */
+export function storableLastSynced(entry: LastSynced, now: number = Date.now()): LastSynced {
+    if (entry.mtime === undefined || stampableMtime(entry.mtime, now) !== undefined) return entry;
+    const { mtime: _dropped, ...rest } = entry;
+    void _dropped;
+    return rest;
 }
 
 /** Parse a raw on-disk meta value into a `LastSynced`. Accepts both the
