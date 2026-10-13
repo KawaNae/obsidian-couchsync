@@ -37,12 +37,7 @@ import { ChangeTracker } from "../../src/sync/change-tracker.ts";
 import { Reconciler } from "../../src/sync/reconciler.ts";
 import { SetupService } from "../../src/sync/setup.ts";
 import { VaultRemoteOps } from "../../src/db/sync/vault-remote-ops.ts";
-import {
-    buildInitialVaultMeta,
-    pushVaultMeta,
-    fetchVaultMeta,
-    unlockVaultMeta,
-} from "../../src/db/vault-meta.ts";
+import { VaultBinding } from "../../src/sync/vault-binding.ts";
 import { ConflictResolver } from "../../src/conflict/conflict-resolver.ts";
 import { FilesystemVaultWriter } from "../../src/sync/vault-writer.ts";
 import { CouchClient, makeCouchClient } from "../../src/db/couch-client.ts";
@@ -158,17 +153,18 @@ export interface E2EDeviceHarness {
     /** The client pointing at the shared test CouchDB. */
     readonly client: CouchClient;
     /**
-     * Init this device's vault onto the remote (mirrors main.ts initVault):
-     * build vault:meta (deriving crypto when encryption is on), wipe + push
-     * the whole local vault through the real codec stack, then publish the
-     * meta. Leaves the device live-syncable.
+     * Init this device's vault onto the remote through the production
+     * `VaultBinding.init`: build vault:meta (deriving the key when
+     * encryption is on), wipe + push the whole local vault through the real
+     * codec stack, then publish the meta. Leaves the device live-syncable.
      */
     runInit(opts: { encryption: boolean; passphrase?: string; compression: boolean }): Promise<void>;
     /**
-     * Clone this device from the remote (mirrors main.ts cloneFromRemote):
-     * fetch vault:meta, unlock crypto with the passphrase, pull everything and
-     * write the vault. Throws on a wrong/missing passphrase for an encrypted
-     * remote — exactly like production.
+     * Clone this device from the remote through the production
+     * `VaultBinding.clone`: fetch vault:meta, unlock the key with the
+     * passphrase, pull everything and write the vault. A wrong or missing
+     * passphrase for an encrypted remote ends as a cancelled prompt — the
+     * harness answers no prompt.
      */
     runClone(opts?: { passphrase?: string }): Promise<void>;
     destroy(): Promise<void>;
@@ -275,29 +271,34 @@ export async function createE2EHarness(opts: CreateE2EHarnessOpts = {}): Promise
         );
 
         const auth = new AuthGate();
-        // Per-device crypto provider (mirrors main.ts `vaultCryptoProvider`):
-        // mutable so runInit/runClone can derive and install it dynamically.
-        // Seeded from the harness shared provider for codec-enabled harnesses.
-        let deviceCrypto: CryptoProvider | undefined = sharedCrypto;
-        // Local cipherVersion floor (mirrors main.ts `activeCipherVersion`):
-        // installed by runInit/runClone so the decode layer enforces the
-        // downgrade floor end-to-end.
-        let deviceCipherVersion: number | undefined = sharedCrypto ? 3 : undefined;
-        // Codec stack mirrors main.ts wrapVaultClient: Compressing(Encrypting(raw)).
-        // Encrypt iff a crypto provider is installed; compress per the persisted
-        // flag — the exact two-source composition under which still-encrypted
-        // bytes once reached decompress.
+        // The production owner of the vault codec state, Init and Clone. A
+        // codec harness starts every device with the shared key instead
+        // (`seeded`), standing in for a device that is already set up; the
+        // first runInit / runClone hands the codec over to the binding.
+        let setupService!: SetupService;
+        const binding = new VaultBinding({
+            getSettings,
+            saveSettings: async () => {},
+            auth,
+            makeRawClient: () => client,
+            setup: () => setupService,
+            stopLive: () => { engine.stop(); ct.stop(); },
+            openProgress: () => ({ update: () => {}, done: () => {}, fail: () => {} }),
+            askPassphrase: async (reason) => {
+                throw new Error(`the harness answers no passphrase prompt (${reason} passphrase)`);
+            },
+        });
+        let seeded: CryptoProvider | undefined = sharedCrypto;
         const wrapVaultClient = (raw: ICouchClient): ICouchClient => {
-            let c: ICouchClient = raw;
-            if (deviceCrypto) c = new EncryptingCouchClient(c, deviceCrypto, deviceCipherVersion);
+            if (!seeded) return binding.wrapClient(raw);
+            let c: ICouchClient = new EncryptingCouchClient(raw, seeded, 3);
             if (settingsRef.current.compressionEnabled) c = new CompressingCouchClient(c);
             return c;
         };
         const clientFactory = (_s: CouchSyncSettings): ICouchClient => wrapVaultClient(client);
-        // ChunkHasher mirrors main.ts: hmac ids under encryption, x64 otherwise.
         const hasher: ChunkHasher = {
-            get alg() { return deviceCrypto ? "hmac" : "x64"; },
-            hash: (data) => deviceCrypto ? deviceCrypto.hmacHash(data) : computeHash(data),
+            get alg() { return seeded ? "hmac" : binding.chunkHasher.alg; },
+            hash: (data) => seeded ? seeded.hmacHash(data) : binding.chunkHasher.hash(data),
         };
 
         // VaultSync を SyncEngine より先に構築 (production と同じ順序)。
@@ -334,51 +335,23 @@ export async function createE2EHarness(opts: CreateE2EHarnessOpts = {}): Promise
 
         // SetupService drives Init/Clone exactly as production does (wipe →
         // scan/pull → push/write → reconcile), through the real codec stack.
-        const setupService = new SetupService(vault, db, remoteOps, vs, reconciler);
+        setupService = new SetupService(vault, db, remoteOps, vs, reconciler);
 
         async function runInit(o: { encryption: boolean; passphrase?: string; compression: boolean }): Promise<void> {
-            // Mirror main.ts initVault: build meta (+ derive crypto), push the
-            // whole vault, then publish vault:meta.
+            seeded = undefined;
             settingsRef.current.encryptionEnabled = o.encryption;
             settingsRef.current.compressionEnabled = o.compression;
             settingsRef.current.encryptionPassphrase = o.passphrase ?? "";
-            const built = await buildInitialVaultMeta({
-                encryption: o.encryption,
-                passphrase: o.passphrase,
-                compression: o.compression,
-            });
-            deviceCrypto = built.crypto ?? undefined; // install before any push
-            deviceCipherVersion = built.meta.encryption.enabled
-                ? built.meta.encryption.cipherVersion : undefined;
-            settingsRef.current.vaultCipherVersion = deviceCipherVersion;
-            await setupService.init(() => {});
-            await pushVaultMeta(remoteOps.makeClient(), built.meta);
+            settingsRef.current.connectionState = "tested";
+            await binding.init();
             settingsRef.current.connectionState = "syncing";
         }
 
         async function runClone(o: { passphrase?: string } = {}): Promise<void> {
-            // Mirror main.ts cloneFromRemote: read meta, unlock crypto, pull.
-            const meta = await fetchVaultMeta(remoteOps.makeClient());
-            if (!meta) throw new Error("runClone: no vault:meta on remote");
-            if (meta.encryption.enabled) {
-                if (!o.passphrase) throw new Error("runClone: passphrase required for encrypted vault");
-                const unlocked = await unlockVaultMeta(meta, o.passphrase);
-                if (!unlocked) throw new Error("runClone: wrong passphrase");
-                deviceCrypto = unlocked.crypto;
-                // Clone anchors the floor to the adopted vault's cipherVersion
-                // (in-memory before the pull, like main.ts cipherVersionOverride).
-                deviceCipherVersion = meta.encryption.cipherVersion;
-                settingsRef.current.encryptionEnabled = true;
-                settingsRef.current.encryptionPassphrase = o.passphrase;
-                settingsRef.current.vaultCipherVersion = deviceCipherVersion;
-            } else {
-                deviceCrypto = undefined;
-                deviceCipherVersion = undefined;
-                settingsRef.current.encryptionEnabled = false;
-                settingsRef.current.vaultCipherVersion = undefined;
-            }
-            settingsRef.current.compressionEnabled = meta.compression.enabled;
-            await setupService.clone(() => {});
+            seeded = undefined;
+            settingsRef.current.encryptionPassphrase = o.passphrase ?? "";
+            settingsRef.current.connectionState = "tested";
+            await binding.clone();
             settingsRef.current.connectionState = "syncing";
         }
 

@@ -35,21 +35,9 @@ import { ObsidianModalPresenter } from "./adapters/obsidian-modal-presenter.ts";
 import { ObsidianCompositionTracker } from "./adapters/obsidian-composition-tracker.ts";
 import { EditorAwareVaultWriter } from "./adapters/editor-aware-vault-writer.ts";
 import { CompositionGate } from "./sync/composition-gate.ts";
-import type { CryptoProvider } from "./db/crypto-provider.ts";
-import { computeHash, type ChunkHasher } from "./db/chunker.ts";
-import type { ChunkHashAlg } from "./types/doc-id.ts";
-import { EncryptingCouchClient } from "./db/encrypting-couch-client.ts";
-import { CompressingCouchClient } from "./db/compressing-couch-client.ts";
 import { makeCouchClient } from "./db/couch-client.ts";
-import {
-    fetchVaultMeta,
-    buildInitialVaultMeta,
-    pushVaultMeta,
-    unlockVaultMeta,
-    VAULT_META_DOC_ID,
-    type VaultMetaDoc,
-} from "./db/vault-meta.ts";
-import { checkEncryptionAgreement, type EncryptionAgreement } from "./db/encryption-agreement.ts";
+import type { EncryptionAgreement } from "./db/encryption-agreement.ts";
+import { VaultBinding } from "./sync/vault-binding.ts";
 import { PassphraseModal } from "./ui/passphrase-modal.ts";
 import type { ICouchClient } from "./db/interfaces.ts";
 
@@ -81,97 +69,11 @@ export default class CouchSyncPlugin extends Plugin {
     private compositionTracker!: ObsidianCompositionTracker;
     private compositionGate!: CompositionGate;
     private vaultWriter!: EditorAwareVaultWriter;
-    /** v0.26: per-DB crypto principals. Each
-     *  DB is its own crypto root — same passphrase + different salts →
-     *  different keys. vault:meta unlocks `vaultCryptoProvider`; the
-     *  config key lives on the current `ConfigBinding` (dropped whenever
-     *  the config DB name changes). */
-    private vaultCryptoProvider?: CryptoProvider;
-    /** Transient compression override active only during Clone, so that
-     *  a failed Clone leaves the persisted settings untouched. The vault decorator stack reads
-     *  `activeCompression`, not `settings.compressionEnabled` directly, so
-     *  Clone can run the remote's codec config in-memory and persist
-     *  `settings.compressionEnabled` only on success. Undefined at all
-     *  other times → the getter falls back to the persisted setting, so
-     *  the Step-1 toggle, onload reconcile, and Init all flow through
-     *  unchanged. Symmetric to how `vaultCryptoProvider` overrides the
-     *  persisted encryption flag. */
-    private compressionOverride?: boolean;
-    /** Transient cipherVersion floor active only during Clone, before
-     *  `settings.vaultCipherVersion` is persisted on success. Mirrors
-     *  `compressionOverride`: the vault decorator reads `activeCipherVersion`,
-     *  so Clone can decrypt with the just-unlocked remote meta's cipherVersion
-     *  in-memory while keeping the persisted floor atomic with the rest of the
-     *  clone commit. Undefined at all other times → the getter falls back to
-     *  the persisted floor. */
-    private cipherVersionOverride?: number;
-    encryptionMismatch?: EncryptionAgreement;
-
-    /**
-     * Wrap a raw CouchClient with the vault-DB decorator stack. Reads
-     * `vaultCryptoProvider` + `settings.compressionEnabled` via closure
-     * on every invocation, so Init/Clone state changes propagate to all
-     * vault-side consumers (VaultRemoteOps + SyncEngine) automatically.
-     *
-     * Compose order is `compress(encrypt(raw))`: compress runs first on
-     * push so the plain payload reaches gzip before the cipher renders
-     * the stream incompressible. Pull traverses the inverse order.
-     */
-    private wrapVaultClient = (raw: ICouchClient): ICouchClient => {
-        // Policy-gated codec stack (fail-closed). The encryption POLICY
-        // (`encryptionEnabled`) gates whether the encrypt layer is applied —
-        // not the provider's existence. A stale in-memory provider left over
-        // from a prior encrypted session must not activate the encrypt layer
-        // when the policy says plaintext. Symmetric with compression, which
-        // is already policy-gated via `activeCompression`.
-        let client: ICouchClient = raw;
-        if (this.settings.encryptionEnabled) {
-            if (!this.vaultCryptoProvider) {
-                throw new Error(
-                    "refusing to build vault client — vault is encrypted " +
-                        "but no crypto provider is unlocked (provisioning incomplete). " +
-                        "Re-run Init/Clone or unlock the vault.",
-                );
-            }
-            client = new EncryptingCouchClient(
-                client, this.vaultCryptoProvider, this.activeCipherVersion,
-            );
-        }
-        if (this.activeCompression) {
-            client = new CompressingCouchClient(client);
-        }
-        return client;
-    };
-
-    /** Compression flag the vault decorator stack actually uses. Equals
-     *  the persisted setting except during Clone, when the remote's flag
-     *  is applied in-memory before `settings.compressionEnabled` is
-     *  committed, so a failed Clone persists nothing. See
-     *  `compressionOverride`. */
-    private get activeCompression(): boolean {
-        return this.compressionOverride ?? this.settings.compressionEnabled;
-    }
-
-    /** cipherVersion policy floor the vault decorator stack enforces. Equals
-     *  the persisted floor (`settings.vaultCipherVersion`, TOFU) except during
-     *  Clone, when the just-unlocked remote meta's cipherVersion is applied
-     *  in-memory before the floor is committed, so a failed Clone
-     *  persists nothing. See `cipherVersionOverride`. */
-    private get activeCipherVersion(): number | undefined {
-        return this.cipherVersionOverride ?? this.settings.vaultCipherVersion;
-    }
-
-    /** TOFU ratchet for the vault cipherVersion floor: record the highest
-     *  cipherVersion observed at a trusted unlock. Never decreases (a server
-     *  cannot lower it — the agreement check refuses meta below the floor).
-     *  Mutates `this.settings` only; the caller owns `saveSettings()` so it can
-     *  batch with other Init/Clone writes. Returns true if the floor changed. */
-    private ratchetVaultCipherFloor(observed: number): boolean {
-        if (observed > (this.settings.vaultCipherVersion ?? 0)) {
-            this.settings.vaultCipherVersion = observed;
-            return true;
-        }
-        return false;
+    /** Owner of the vault DB's setup: the codec state, Init / Clone, the
+     *  encryption-agreement check and their outcomes. */
+    vaultBinding!: VaultBinding;
+    get encryptionMismatch(): EncryptionAgreement | undefined {
+        return this.vaultBinding?.encryptionMismatch;
     }
 
     /** Cross-platform OS label for the log frontmatter. Desktop uses Node
@@ -242,114 +144,6 @@ export default class CouchSyncPlugin extends Plugin {
         return d;
     }
 
-    /**
-     * The single, supervised encryption-agreement gate. Passed to
-     * SyncEngine as `preCatchupCheck`, so it runs inside openSession before
-     * catchup — and crucially, under the engine's retry supervision.
-     *
-     * Outcomes:
-     *   - agreed-encrypted/plaintext → unlock the vault crypto provider
-     *     (once; cached in `vaultCryptoProvider`), ratchet the cipher floor,
-     *     reconcile the compression flag. Returns normally → catchup proceeds.
-     *   - transient network/abort while checking → throws the raw error,
-     *     which openSession routes to `enterError` → retry-backoff. The
-     *     network's return auto-recovers it (the old
-     *     onload gate dead-`return`ed here and never retried).
-     *   - user-actionable state (server downgrade, cross-device mismatch,
-     *     pre-v2 legacy meta, wrong passphrase) → `encryptionPause()` sets
-     *     connectionState back to "tested" and throws an `encryptionPaused`
-     *     error → terminal kind (no retry), surfaced once by the host.
-     */
-    private async reconcileEncryptionAgreement(_signal: AbortSignal): Promise<void> {
-        const raw = makeCouchClient(
-            this.settings.couchdbUri, this.settings.couchdbDbName,
-            this.settings.couchdbUser, this.settings.couchdbPassword,
-        );
-        const agreement = await checkEncryptionAgreement(
-            raw, this.settings.encryptionEnabled,
-            VAULT_META_DOC_ID, this.settings.vaultCipherVersion,
-        );
-
-        if (agreement.status === "cipher-downgrade-detected") {
-            this.encryptionMismatch = agreement;
-            throw await this.encryptionPause(
-                "vault encryption was downgraded on the server " +
-                `(cipherVersion below this device's floor ${agreement.localFloor}). ` +
-                "Sync paused — verify the server has not been tampered with.",
-            );
-        }
-
-        if (agreement.status === "agreed-encrypted") {
-            if (!this.vaultCryptoProvider) {
-                let passphrase = this.settings.encryptionPassphrase;
-                if (!passphrase) {
-                    const modal = new PassphraseModal(this.app, false);
-                    passphrase = await modal.waitForResult() ?? "";
-                    if (!passphrase) {
-                        throw await this.encryptionPause(
-                            "passphrase required. Sync paused.",
-                        );
-                    }
-                }
-                const result = await unlockVaultMeta(agreement.meta as VaultMetaDoc, passphrase);
-                if (!result) {
-                    this.settings.encryptionPassphrase = "";
-                    await this.saveSettings();
-                    throw await this.encryptionPause(
-                        "wrong passphrase. Sync paused.",
-                    );
-                }
-                if (!this.settings.encryptionPassphrase) {
-                    this.settings.encryptionPassphrase = passphrase;
-                    await this.saveSettings();
-                }
-                this.vaultCryptoProvider = result.crypto;
-                // TOFU: anchor / ratchet the local cipherVersion floor.
-                const cv = agreement.meta.encryption.enabled
-                    ? agreement.meta.encryption.cipherVersion : 0;
-                if (this.ratchetVaultCipherFloor(cv)) await this.saveSettings();
-                // wrapVaultClient picks up the new provider on next invocation.
-            }
-        } else if (agreement.status === "remote-encrypted"
-            || agreement.status === "remote-plaintext") {
-            this.encryptionMismatch = agreement;
-            throw await this.encryptionPause(
-                "encryption state changed by another device. " +
-                "Open Settings → Vault Sync to re-run Init or Clone.",
-            );
-        } else if (agreement.status === "legacy-meta-only") {
-            // Pre-v2 `encryption:meta` doc found but no v2 `vault:meta`.
-            throw await this.encryptionPause(
-                "this vault was set up with a pre-v2 build. " +
-                "Open Settings → Vault Sync and re-run Init or Clone to migrate.",
-            );
-        }
-
-        // Compression flag is server-of-record — reconcile so the decorator
-        // stack is identical across devices.
-        const remoteMeta = (agreement.status === "agreed-encrypted"
-            || agreement.status === "agreed-plaintext") ? agreement.meta : null;
-        if (remoteMeta
-            && this.settings.compressionEnabled !== remoteMeta.compression.enabled) {
-            this.settings.compressionEnabled = remoteMeta.compression.enabled;
-            await this.saveSettings();
-        }
-        if (agreement.status === "agreed-encrypted" || agreement.status === "agreed-plaintext") {
-            this.encryptionMismatch = undefined;
-        }
-    }
-
-    /** Pause sync for a user-actionable encryption state: persist the
-     *  "tested" connectionState (so the next onload won't auto-sync and the
-     *  settings tab shows the re-Init affordance) and return a terminal
-     *  `encryptionPaused` error for the caller to throw. The host toasts the
-     *  message once via the "error" event. */
-    private async encryptionPause(message: string): Promise<Error> {
-        this.settings.connectionState = "tested";
-        await this.saveSettings();
-        return Object.assign(new Error(message), { encryptionPaused: true });
-    }
-
     async onload(): Promise<void> {
         await this.loadSettings();
 
@@ -388,29 +182,40 @@ export default class CouchSyncPlugin extends Plugin {
         const modalPresenter = this.modalPresenter;
 
         this.auth = new AuthGate();
-        // ChunkHasher: bundles the hash function with its own algorithm
-        // identity so the chunk id is stamped with the truly-used tag
-        // (`chunk:x64:<xxhash>` vs `chunk:hmac:<HMAC>`). There are
-        // two — vault and config each read their own
-        // cryptoProvider live via closure, so encryption-state changes
-        // propagate without rebuilding the hasher and the two DBs mint
-        // chunk ids in disjoint id spaces. Constructed here
-        // (before remoteOps) because VaultRemoteOps.pullAll now verifies
-        // pulled chunks with it — the authenticated Clone fetch boundary.
-        //
-        // Outer `this` is captured via local alias because the object
-        // literal's own `this` would refer to itself (not the plugin).
-        const plugin = this;
-        const vaultChunkHasher: ChunkHasher = {
-            get alg(): ChunkHashAlg {
-                return plugin.settings.encryptionEnabled && plugin.vaultCryptoProvider ? "hmac" : "x64";
-            },
-            hash: (data) => plugin.settings.encryptionEnabled && plugin.vaultCryptoProvider
-                ? plugin.vaultCryptoProvider.hmacHash(data)
-                : computeHash(data),
-        };
+        // The vault binding owns the vault codec state; its chunk hasher and
+        // client wrapper read the key on every call, so Init / Clone reach
+        // every vault-side user (VaultRemoteOps, VaultSync, SyncEngine).
+        // Vault and config each have their own hasher, so the two DBs mint
+        // chunk ids in disjoint id spaces. Built before remoteOps, whose
+        // pullAll verifies pulled chunks with the hasher.
+        this.vaultBinding = new VaultBinding({
+            getSettings: () => this.settings,
+            saveSettings: () => this.saveSettings(),
+            auth: this.auth,
+            makeRawClient: () => makeCouchClient(
+                this.settings.couchdbUri, this.settings.couchdbDbName,
+                this.settings.couchdbUser, this.settings.couchdbPassword,
+            ),
+            setup: () => this.setupService,
+            stopLive: () => this.stopSync(),
+            openProgress: (label) => new ProgressNotice(label),
+            askPassphrase: (reason, tryUnlock) => new PassphraseModal(
+                this.app, false,
+                (reason === "missing"
+                    ? "This vault is encrypted, and no passphrase is set on this device. "
+                    : "The passphrase set on this device does not unlock this vault. ") +
+                    "Enter the passphrase it was set up with.",
+                {
+                    validate: async (p) => (await tryUnlock(p))
+                        ? null
+                        : "This passphrase does not unlock the vault.",
+                },
+            ).waitForResult(),
+        });
+        const vaultChunkHasher = this.vaultBinding.chunkHasher;
+        const wrapVaultClient = this.vaultBinding.wrapClient;
         this.remoteOps = new VaultRemoteOps(
-            this.localDb, () => this.settings, this.auth, this.wrapVaultClient,
+            this.localDb, () => this.settings, this.auth, wrapVaultClient,
             vaultChunkHasher,
         );
         this.historyStorage = new HistoryStorage(this.app.vault.getName());
@@ -446,7 +251,7 @@ export default class CouchSyncPlugin extends Plugin {
         // the live session owns retry, and a second layer would delay error
         // surfacing and skew stall detection.
         const encClientFactory: (s: CouchSyncSettings) => ICouchClient = (s) =>
-            this.wrapVaultClient(
+            wrapVaultClient(
                 makeCouchClient(s.couchdbUri, s.couchdbDbName, s.couchdbUser, s.couchdbPassword),
             );
         this.replicator = new SyncEngine(
@@ -457,7 +262,7 @@ export default class CouchSyncPlugin extends Plugin {
             Platform.isMobile,
             this.auth,
             encClientFactory,
-            (signal) => this.reconcileEncryptionAgreement(signal),
+            (signal) => this.vaultBinding.checkAgreement(signal),
             async () => { await this.vaultSync.stampVaultDrift(); },
         );
         // Verify pulled chunk bodies hash to their content-addressed id
@@ -711,61 +516,18 @@ export default class CouchSyncPlugin extends Plugin {
                 );
             }
 
-            // E2E encryption: derive the vault cryptoProvider FIRST,
-            // before the legacy guard. The recovery action the legacy
-            // guard tells the user to perform (Vault Init) needs the
-            // chunk hasher to flip to HMAC mode — which only happens once
-            // `vaultCryptoProvider` is set. Without this early-derive, a
-            // user in legacy-blocked state who runs Init would
-            // unknowingly mint x64 (plaintext) chunk ids on an
-            // otherwise-encrypted vault.
+            // Unlock the vault key FIRST, before the legacy guard: the
+            // recovery the guard asks for (Vault Init) must mint HMAC chunk
+            // ids on an encrypted vault, which needs the key. A failure
+            // falls through — the guard runs anyway, and the live session's
+            // agreement check judges the vault.
             //
-            // Errors here fall through — the legacy guard runs anyway, the
-            // user just stays in a crypto-uninitialised state until they
-            // retry.
-            if (this.settings.connectionState === "syncing"
-                && this.settings.deviceId) {
-                try {
-                    const rawClient = makeCouchClient(
-                        this.settings.couchdbUri,
-                        this.settings.couchdbDbName,
-                        this.settings.couchdbUser,
-                        this.settings.couchdbPassword,
-                    );
-                    const agreement = await checkEncryptionAgreement(
-                        rawClient, this.settings.encryptionEnabled,
-                        VAULT_META_DOC_ID, this.settings.vaultCipherVersion,
-                    );
-                    if (agreement.status === "cipher-downgrade-detected") {
-                        logWarn(
-                            `vault:meta cipherVersion downgrade detected ` +
-                            `(below floor ${agreement.localFloor}) — refusing early unlock.`,
-                        );
-                        this.encryptionMismatch = agreement;
-                    } else if (agreement.status === "agreed-encrypted"
-                        && !this.vaultCryptoProvider
-                        && this.settings.encryptionPassphrase
-                        && agreement.meta && (agreement.meta as VaultMetaDoc).type === "vault-meta") {
-                        const result = await unlockVaultMeta(
-                            agreement.meta as VaultMetaDoc, this.settings.encryptionPassphrase,
-                        );
-                        if (result) {
-                            this.vaultCryptoProvider = result.crypto;
-                            // TOFU: anchor / ratchet the local cipherVersion floor.
-                            const cv = agreement.meta.encryption.enabled
-                                ? agreement.meta.encryption.cipherVersion : 0;
-                            if (this.ratchetVaultCipherFloor(cv)) await this.saveSettings();
-                        }
-                    }
-                } catch (e: any) {
-                    logWarn(
-                        `early vault crypto derivation failed (non-fatal): ${e?.message ?? e}`,
-                    );
-                }
-                // The config key is NOT derived here: config is an
-                // independent crypto principal and its key must
-                // not depend on the vault's connectionState. Every config op
-                // unlocks it in the binding's preflight (or Join / Create).
+            // The config key is not derived here: the config DB is its own
+            // crypto principal and its key must not depend on the vault's
+            // connectionState. Every config op unlocks it in the binding's
+            // preflight (or Join / Create).
+            if (this.settings.connectionState === "syncing" && this.settings.deviceId) {
+                await this.vaultBinding.unlockAtStartup();
             }
 
             // Schema guard. Two checks:
@@ -903,181 +665,12 @@ export default class CouchSyncPlugin extends Plugin {
         return /^[0-9a-f]{8}-/.test(id);
     }
 
-    async initVault(): Promise<void> {
-        this.replicator.stop();
-        this.changeTracker.stop();
-        // Setup atomicity: drop to a non-syncable state and persist it BEFORE
-        // setupService.init destroys the local DB. A failure (or a crash)
-        // mid-init then leaves "settingUp", never the prior setupDone/
-        // syncing — so the user can't start sync on a half-built DB.
-        this.settings.connectionState = "settingUp";
-        await this.saveSettings();
-        const progress = new ProgressNotice("Init");
-        try {
-            const enc = this.settings.encryptionEnabled;
-            const compress = this.settings.compressionEnabled;
-
-            if (enc && !this.settings.encryptionPassphrase) {
-                throw new Error("Encryption is enabled but no passphrase set. Enter a passphrase in Step 1.");
-            }
-
-            let meta: VaultMetaDoc;
-
-            if (enc && this.vaultCryptoProvider) {
-                // Re-init with existing keys: preserve salt + keyCheck
-                // so other devices can still decrypt with the same
-                // passphrase. Compression flag may change between inits.
-                const rawClient = makeCouchClient(
-                    this.settings.couchdbUri, this.settings.couchdbDbName,
-                    this.settings.couchdbUser, this.settings.couchdbPassword,
-                );
-                const existing = await fetchVaultMeta(rawClient);
-                if (!existing || !existing.encryption.enabled) {
-                    throw new Error("vault:meta with encryption not found on remote");
-                }
-                meta = {
-                    ...existing,
-                    // Preserve salt + keyCheck (same passphrase still unlocks),
-                    // but stamp the current cipher format: a re-init on a build
-                    // that writes encBody bodies produces a cipherVersion-3 vault.
-                    // Without this the marker would wrongly stay at the
-                    // value the vault was first created with.
-                    encryption: { ...existing.encryption, cipherVersion: 3 },
-                    compression: compress
-                        ? { enabled: true, algorithm: "gzip", version: 1 }
-                        : { enabled: false },
-                };
-            } else {
-                progress.update(enc ? "Deriving encryption keys..." : "Preparing vault metadata...");
-                const derived = await buildInitialVaultMeta({
-                    encryption: enc,
-                    passphrase: enc ? this.settings.encryptionPassphrase : undefined,
-                    compression: compress,
-                });
-                meta = derived.meta;
-                this.vaultCryptoProvider = derived.crypto ?? undefined;
-            }
-
-            const result = await this.setupService.init((msg) => progress.update(msg));
-
-            progress.update("Writing vault metadata...");
-            await pushVaultMeta(this.remoteOps.makeClient(), meta);
-
-            if (!enc) {
-                this.settings.encryptionPassphrase = "";
-            }
-            this.settings.connectionState = "setupDone";
-            this.encryptionMismatch = undefined;
-            // TOFU: anchor the local cipherVersion floor to the just-written
-            // meta (re-init stamps 3; fresh encrypted init also mints v3).
-            if (meta.encryption.enabled) {
-                this.ratchetVaultCipherFloor(meta.encryption.cipherVersion);
-            }
-            await this.saveSettings();
-            const modes: string[] = [];
-            if (enc) modes.push("encrypted");
-            if (compress) modes.push("compressed");
-            const tag = modes.length ? ` (${modes.join(", ")})` : "";
-            progress.done(`${result.vaultFiles} files, ${result.totalDocs} docs pushed${tag}.`);
-        } catch (e: any) {
-            if (this.settings.encryptionEnabled) {
-                this.vaultCryptoProvider = undefined;
-            }
-            progress.fail(e);
-            throw e;
-        }
+    initVault(): Promise<void> {
+        return this.vaultBinding.init();
     }
 
-    async cloneFromRemote(): Promise<void> {
-        const rawClient = makeCouchClient(
-            this.settings.couchdbUri, this.settings.couchdbDbName,
-            this.settings.couchdbUser, this.settings.couchdbPassword,
-        );
-        const meta = await fetchVaultMeta(rawClient);
-
-        // Clone is a transaction. We derive the remote's codec
-        // config into IN-MEMORY state only (vaultCryptoProvider for
-        // encryption, compressionOverride for compression) so the pull can
-        // decrypt/decompress, but we DO NOT touch persisted settings until
-        // the clone succeeds. The target values to persist on success are
-        // computed up front and held locally.
-        let targetEncryptionEnabled: boolean;
-        let targetPassphrase: string;
-        // Clone re-anchors the cipherVersion floor to the vault being adopted
-        // (set, NOT ratchet): a device re-cloning a legitimately-v2 vault must
-        // not inherit a stale v3 floor from a previously-cloned vault.
-        // `undefined` for a plaintext clone (no floor). This is the TOFU
-        // first-sight anchor — clone has the passphrase-holder present.
-        let targetCipherVersion: number | undefined;
-        if (meta && meta.encryption.enabled) {
-            let passphrase = this.settings.encryptionPassphrase;
-            if (!passphrase) {
-                const modal = new PassphraseModal(this.app, false);
-                passphrase = await modal.waitForResult() ?? "";
-                if (!passphrase) {
-                    throw new Error("Passphrase required to clone encrypted vault.");
-                }
-            }
-            const unlockResult = await unlockVaultMeta(meta, passphrase);
-            if (!unlockResult) throw new Error("Wrong passphrase.");
-
-            this.vaultCryptoProvider = unlockResult.crypto;
-            targetEncryptionEnabled = true;
-            targetPassphrase = passphrase;
-            targetCipherVersion = meta.encryption.cipherVersion;
-        } else {
-            this.vaultCryptoProvider = undefined;
-            targetEncryptionEnabled = false;
-            targetPassphrase = "";
-            targetCipherVersion = undefined;
-        }
-
-        // Clone-side: the server's compression flag wins. Apply it as an
-        // in-memory override so the decorator stack uses it during the
-        // pull; the persisted `compressionEnabled` is written only on
-        // success (below), keeping the setting atomic with the rest.
-        const targetCompression = meta
-            ? meta.compression.enabled
-            : this.settings.compressionEnabled;
-        this.compressionOverride = targetCompression;
-        // Same in-memory-during-clone treatment for the cipherVersion floor:
-        // the pull decrypts under the remote's declared cipherVersion before
-        // the floor is persisted on success.
-        this.cipherVersionOverride = targetCipherVersion;
-
-        this.replicator.stop();
-        this.changeTracker.stop();
-        // Persist the non-syncable transient before the destructive clone
-        // (see initVault). On failure we stay here, persisted settings
-        // untouched.
-        this.settings.connectionState = "settingUp";
-        await this.saveSettings();
-        const progress = new ProgressNotice("Clone");
-        try {
-            const result = await this.setupService.clone((msg) => progress.update(msg));
-
-            // Success: commit the codec config + setupDone in one save.
-            this.settings.encryptionEnabled = targetEncryptionEnabled;
-            this.settings.encryptionPassphrase = targetPassphrase;
-            this.settings.compressionEnabled = targetCompression;
-            this.settings.vaultCipherVersion = targetCipherVersion;
-            this.compressionOverride = undefined;
-            this.cipherVersionOverride = undefined;
-            this.settings.connectionState = "setupDone";
-            this.encryptionMismatch = undefined;
-            await this.saveSettings();
-            progress.done(`${result.vaultFiles} files written.`);
-        } catch (e: any) {
-            // Failure: roll back in-memory codec state. Persisted settings
-            // were never mutated; connectionState stays "settingUp".
-            this.compressionOverride = undefined;
-            this.cipherVersionOverride = undefined;
-            if (meta) {
-                this.vaultCryptoProvider = undefined;
-            }
-            progress.fail(e);
-            throw e;
-        }
+    cloneFromRemote(): Promise<void> {
+        return this.vaultBinding.clone();
     }
 
     async startSync(): Promise<void> {
