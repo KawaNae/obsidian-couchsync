@@ -1,6 +1,7 @@
 /**
  * E2E: PathKey (case) collision convergence through the REAL engine + real
- * CouchDB — the scripts/Scripts incident.
+ * CouchDB, for two docs whose paths differ only in case (`scripts/X` and
+ * `Scripts/X`).
  *
  * FakeVaultIO is case-SENSITIVE (exact-string Map keys), so it models an
  * Android-class FS where `scripts/X` and `Scripts/X` are two real files.
