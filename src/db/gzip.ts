@@ -4,7 +4,7 @@
  *   - `CompressingCouchClient` — gzips attachment bodies (chunk content).
  *   - `EncryptingCouchClient`  — gzips the encrypted doc body (`encBody`).
  *
- * Both must apply compression BEFORE encryption (invariant 10: ciphertext is
+ * Both must apply compression BEFORE encryption (ciphertext is
  * high-entropy and does not compress), so the primitive lives in one place
  * rather than being copy-pasted with a subtly different stream dance.
  *

@@ -38,7 +38,7 @@
  * settings tab shows is `relation()`: the attachment, the setup flag, the
  * outcome of the last user operation and that of the last check (in memory
  * only). The key never depends on the
- * vault's connectionState (invariant 18).
+ * vault's connectionState (the config DB is its own crypto principal).
  */
 import { ConfigLocalDB } from "../db/config-local-db.ts";
 import type { ICouchClient } from "../db/interfaces.ts";
@@ -131,8 +131,8 @@ export interface ConfigRelation {
  * Everything an op encodes and decodes with, fixed for the op's whole run:
  * the codec from the attachment, the unlocked key, the cipher floor, and a
  * chunk hasher built from those two (HMAC under the key when the DB is
- * encrypted, xxhash64 otherwise — invariant 18, config and vault mint chunk
- * ids in disjoint spaces).
+ * encrypted, xxhash64 otherwise — config and vault mint chunk ids in
+ * disjoint spaces).
  */
 export interface ConfigOpKeys {
     readonly codec: ConfigCodec;
@@ -231,7 +231,7 @@ export class ConfigBinding {
     }
 
     /** Open the store for (server, DB) and return a binding over it. The
-     *  schema stamp is checked here (invariant 15) and the attachment read;
+     *  schema stamp is checked here, before any content read, and the attachment read;
      *  on failure the store is closed again and the error propagates. */
     static async open(
         vaultName: string,
@@ -577,7 +577,7 @@ export class ConfigBinding {
      *      A plaintext root stores no passphrase.
      *   6. commit: the attachment is written into the store
      *
-     * Nothing is changed before 1–3 all succeeded (invariant C). A crash in
+     * Nothing is changed before 1–3 all succeeded. A crash in
      * 4–6 leaves the device Unattached with an empty store: Join again.
      */
     async join(raw: ICouchClient, signal: AbortSignal, opts: ConfigJoinOptions = {}): Promise<void> {
@@ -714,7 +714,7 @@ export class ConfigBinding {
     }
 
     /** Create, before its destructive wipe: flag this binding as mid-setup
-     *  (Invariant C, #err-9). Kept on the settings entry — it must survive
+     *  so an interrupted Create is never mistaken for a usable DB. Kept on the settings entry — it must survive
      *  the store being emptied — and blocks only THIS DB. */
     async beginCreate(): Promise<void> {
         await this.putEntry({ ...(this.entry() ?? {}), settingUp: true });
@@ -750,13 +750,13 @@ export class ConfigBinding {
     /**
      * Wrap a raw client for this config DB with the codec stack of `keys`
      * (an op's frozen keys, or an `inspect` verdict's), symmetric with
-     * the vault's `wrapVaultClient` (#12): the attachment's codec decides
+     * the vault's `wrapVaultClient`: the attachment's codec decides
      * whether the encrypt layer is applied, not the provider's existence.
      * Fail-closed: encrypted + no key → `key-missing`, never a plaintext
      * client against an encrypted DB.
      *
      * The cipher floor is client-local state (the settings entry), never
-     * the server-writable meta. Compose order is invariant 10:
+     * the server-writable meta. Compose order is
      * `compress(encrypt(raw))`.
      */
     wrapClient(raw: ICouchClient, keys: ConfigOpKeys): ICouchClient {

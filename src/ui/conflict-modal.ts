@@ -89,8 +89,7 @@ export class ConflictModal extends Modal {
             // Closed without choosing (× / Esc / click-outside) → DEFER, not
             // keep-local. Deferring applies nothing and keeps the conflict for
             // next session. Defaulting to keep-local here let closing a stale
-            // device's conflict overwrite newer remote content (the 2026-06-02
-            // data-loss incident).
+            // device's conflict overwrite newer remote content (data loss).
             this.resolve("defer");
         }
         this.contentEl.empty();

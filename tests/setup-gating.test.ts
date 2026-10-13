@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { setupGating } from "../src/settings-tab/setup-gating.ts";
 import type { ConnectionState } from "../src/settings.ts";
 
-describe("setupGating (Invariant C / Bug 1)", () => {
+describe("setupGating (setup atomicity)", () => {
     const cases: Array<[ConnectionState, boolean, { locked: boolean; init: boolean; clone: boolean; sync: boolean }]> = [
         ["editing",   true,  { locked: false, init: false, clone: false, sync: false }],
         ["tested",    true,  { locked: false, init: true,  clone: true,  sync: false }],
@@ -21,7 +21,7 @@ describe("setupGating (Invariant C / Bug 1)", () => {
         });
     }
 
-    it("settingUp NEVER enables Live Sync (the Bug 1 invariant)", () => {
+    it("settingUp NEVER enables Live Sync (no live sync over a half-built DB)", () => {
         expect(setupGating("settingUp", true).syncToggleEnabled).toBe(false);
         expect(setupGating("settingUp", true).initEnabled).toBe(true);
     });

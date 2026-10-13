@@ -64,7 +64,7 @@ export class ConfigLocalDB implements IDocStore<CouchSyncDoc> {
 
     /** Stamp the application-level schema version on first open, or
      *  assert it matches the build's expected version on subsequent
-     *  opens. Invariant 15. */
+     *  opens, before any content read. */
     async ensureSchemaVersion(): Promise<void> {
         await this.runOp((s) => s.ensureSchemaVersion(), "ensureSchemaVersion");
     }

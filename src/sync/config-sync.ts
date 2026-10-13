@@ -102,7 +102,7 @@ function defaultClientFactory(settings: CouchSyncSettings): ICouchClient | null 
 /** Optional ConfigSync wiring. Production sets `ownDataJsonPath` and the
  *  persistence hooks; tests inject `storeFactory` / `rawClientFactory` /
  *  `clientFactory` fakes. Bundled into one object so call sites name what
- *  they pass (#11).
+ *  they pass.
  *
  *  Every client factory receives the settings with `couchdbUri` and
  *  `couchdbConfigDbName` replaced by the CURRENT BINDING's server and DB
@@ -124,7 +124,7 @@ export interface ConfigSyncOptions {
      *  sets it. */
     clientFactory?: (settings: CouchSyncSettings) => ICouchClient | null;
     /** The plugin's real own-data.json path (host passes `manifest.dir` +
-     *  "/data.json"); excluded from replication (#14). Falls back to the
+     *  "/data.json"); excluded from replication. Falls back to the
      *  default-folder literal when omitted. */
     ownDataJsonPath?: string;
     /** Persist settings. Bindings write their settings entry
@@ -186,7 +186,7 @@ export class ConfigSync {
     private static readonly SKIP_FILES = new Set(["workspace.json", "workspace-mobile.json"]);
     /** Fallback own-data.json path, used only when the host does not supply
      *  the real install path. Fragile (assumes the default folder name) — see
-     *  `skipPaths`, which prefers the manifest-derived path (#14). */
+     *  `skipPaths`, which prefers the manifest-derived path. */
     private static readonly DEFAULT_OWN_DATA_PATH =
         ".obsidian/plugins/obsidian-couchsync/data.json";
 
@@ -195,7 +195,7 @@ export class ConfigSync {
      *  passphrase, so it must NEVER be pushed to the (untrusted) config server.
      *  Derived from the real install path the host passes in (`manifest.dir`),
      *  not a hardcoded folder name — a BRAT / manually-renamed plugin folder
-     *  still gets its data.json excluded (#14). */
+     *  still gets its data.json excluded. */
     private readonly skipPaths: Set<string>;
     private static readonly MAX_CONFIG_SIZE = 5 * 1024 * 1024; // 5MB
 
@@ -238,7 +238,7 @@ export class ConfigSync {
         private reconnectBridge: ReconnectBridge,
         private getSettings: () => CouchSyncSettings,
         // Optional wiring is bundled into one options object rather than a long
-        // positional tail — the latter was easy to mis-order (#11), since only
+        // positional tail — the latter was easy to mis-order, since only
         // tests ever supplied most of these and a slot could be silently skipped.
         opts: ConfigSyncOptions = {},
     ) {
@@ -519,7 +519,7 @@ export class ConfigSync {
      *
      * Destroys and re-creates the remote config DB, empties this binding's
      * local store, and pins a fresh SELF-CONTAINED `config:meta` (new generation id, fresh salt
-     * + own keyCheck, invariant 17) built from the current settings' codec.
+     * + own keyCheck, so it is the DB's own crypto root) built from the current settings' codec.
      * On success this device is joined (its record names the new root) and
      * the passphrase Create encrypted with is saved on the binding's entry
      * (`ConfigBinding.commitCreate`). Structural only: the user's next Push
@@ -649,7 +649,7 @@ export class ConfigSync {
      *  per-doc remote-rev fetch → bulkDocs.
      *
      *  Replaces the snapshot-style push (full `fetchRemoteConfigDocs` +
-     *  `pushDocs` by id list) in PR4 of the diff-sync plan. Divergence is
+     *  `pushDocs` by id list). Divergence is
      *  detected per pair via `compareVC`; on hit, the modal asks for
      *  confirm-and-overwrite (matches the prior UX). Confirmed → bump
      *  local vclocks above remote and re-run the pipeline. */
@@ -704,7 +704,7 @@ export class ConfigSync {
 
     /** Pull: incremental `_changes`-based delta + write the policy-selected config to filesystem.
      *
-     *  Replaces the snapshot-style pullByPrefix in PR3 of the diff-sync plan.
+     *  Replaces the snapshot-style pullByPrefix.
      *  Concurrent edits are surfaced AFTER the batch commit (informational),
      *  not pre-flight — the resolver classifies them as keep-local equivalents
      *  and the cursor advances past them, so re-running pull() will surface
@@ -770,7 +770,7 @@ export class ConfigSync {
         const more = entries.length > previewLimit ? ` (+${entries.length - previewLimit} more)` : "";
         // Fire-and-forget: this is informational, the op already completed.
         // Observe rejection so a modal-presentation failure lands in the log
-        // instead of an unhandled promise rejection (#err-1).
+        // instead of an unhandled promise rejection.
         this.modal.showConfirmModal(
             `Config pull: ${entries.length} concurrent edit(s) detected`,
             `Local copies of ${preview}${more} have diverged from remote. ` +
@@ -824,7 +824,7 @@ export class ConfigSync {
      *  `{size, chunks}`, skip the rewrite entirely. v0.26 symmetric to
      *  VaultSync.fileToDb's `chunksEqual` early-out — without it every
      *  scan rev-bumps every config doc, which inflates the remote rev
-     *  tree and produces phantom divergence for peers (audit 2026-05-08).
+     *  tree and produces phantom divergence for peers.
      *  Chunk-list comparison is O(N) over chunk ids; the full payload
      *  is never re-encoded for the equality check.
      *
@@ -971,7 +971,7 @@ export class ConfigSync {
         for (let i = 0; i < docs.length; i++) {
             const doc = docs[i];
             const path = configPathFromId(doc._id);
-            // Trust boundary (#3): config paths are written via the adapter
+            // Trust boundary: config paths are written via the adapter
             // (mkdir + writeBinary) with no index mediation — the most direct
             // traversal vector. Reject vault-escaping paths before ensureDir.
             const pathViolation = unsafeVaultPathReason(path);
@@ -986,7 +986,7 @@ export class ConfigSync {
             try {
                 onProgress?.(path, i + 1, docs.length);
                 const chunks = await db.getChunks(doc.chunks);
-                // Availability (Invariant I): a content-less chunk doc is
+                // Availability: a content-less chunk doc is
                 // unavailable, same as an absent one. Filter to usable chunks
                 // before the completeness check so config write skips cleanly
                 // (its existing non-throwing policy) instead of letting a
@@ -1004,7 +1004,7 @@ export class ConfigSync {
                     );
                     continue;
                 }
-                // Size ceiling (#4) before assembleChunks allocates the full
+                // Size ceiling before assembleChunks allocates the full
                 // buffer — symmetric to the push scan's MAX_CONFIG_SIZE gate.
                 const sizeBytes = chunks.reduce(
                     (n, c) => n + (c.content instanceof Uint8Array ? c.content.length : 0), 0,

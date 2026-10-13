@@ -1,5 +1,5 @@
 /**
- * clone-chunk-integrity.test.ts — regression for review finding #1/#10:
+ * clone-chunk-integrity.test.ts — regression for unverified chunk bodies on Clone:
  *
  *   The Clone / full-resync path (`pullAll` in remote-couch.ts) now fetches
  *   chunk attachments WITH the vault's ChunkHasher, so a chunk body that no
@@ -29,7 +29,7 @@ function authHeader(): string {
     return "Basic " + Buffer.from(`${cfg.user}:${cfg.password}`).toString("base64");
 }
 
-describe("Clone chunk integrity (review finding #1/#10: pullAll now verifies chunks)", () => {
+describe("Clone chunk integrity (pullAll verifies chunks)", () => {
     it("rejects a server-tampered chunk during Clone instead of landing it", async () => {
         const h = await createE2EHarness({ uniqueDb: true }); // plaintext vault (x64 ids)
         const base = h.config.couchUrl.replace(/\/+$/, "");

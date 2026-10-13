@@ -401,7 +401,7 @@ describe("HistoryCapture", () => {
             // A saveConflict throw is treated by the orchestrator as an
             // APPLY failure (clearDurable skipped → ghost re-presentation),
             // so diff-stage errors must be swallowed while the baseline
-            // advances (incident 2026-06-04 cascade shape).
+            // advances (otherwise one bad diff cascades into lost history).
             storage.saveDiff = async () => { throw new Error("URI malformed"); };
             await expect(
                 capture.saveConflict("a.md", "LOCAL", "REMOTE", "remote"),
@@ -412,7 +412,7 @@ describe("HistoryCapture", () => {
 
     // ── record-keeping advances on diff failure ─────────
 
-    describe("capture failure containment (incident 2026-06-04)", () => {
+    describe("capture failure containment", () => {
         it("saveDiff throw: snapshot and rate-limit still advance (no cascade)", async () => {
             capture.start();
             vault.addFile("a.md", "v1");

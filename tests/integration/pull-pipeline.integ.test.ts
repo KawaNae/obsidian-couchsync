@@ -1,5 +1,5 @@
 /**
- * PullPipeline integration tests — Phase 4 migration.
+ * PullPipeline integration tests.
  *
  * Drives PullPipeline against a real LocalDB + FakeCouchClient + real
  * PullWriter, and verifies observable side effects (docs in DB,
@@ -375,7 +375,7 @@ describe("PullPipeline integration", () => {
         });
     });
 
-    // ── EncryptionError classification (#enc-1) ──────────
+    // ── EncryptionError classification ──────────
     describe("EncryptionError classification", () => {
         it("longpoll: non-retriable EncryptionError halts immediately (no backoff)", async () => {
             // cipherVersion downgrade gate: must terminate the loop on the

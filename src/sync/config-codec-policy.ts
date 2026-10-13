@@ -2,7 +2,8 @@
  * Config-DB codec policy — the single source of truth for how the config
  * (settings) sync resolves its encryption / passphrase / compression.
  *
- * The config DB is an independent crypto principal (invariant 18): each of
+ * The config DB is an independent crypto principal (its own keys and
+ * chunk-id space, separate from the vault DB): each of
  * its three codec knobs can override the corresponding vault setting, or
  * inherit it. The inherit sentinel differs per field, which is exactly the
  * footgun this module exists to contain:

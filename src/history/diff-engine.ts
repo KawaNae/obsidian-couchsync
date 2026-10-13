@@ -34,8 +34,8 @@ function isLowSurrogate(code: number): boolean {
  * surrogate, producing EQUAL …D83C | DELETE DF45 | INSERT DF46). The lone
  * surrogates then blow up `patch_toText`, whose serializer calls
  * `encodeURI` (URIError "URI malformed" on V8, "String contained an
- * illegal UTF-16 sequence." on JSC) — the 2026-06-04 history-loss
- * incident (upstream: google/diff-match-patch#69).
+ * illegal UTF-16 sequence." on JSC), so the history entry was lost
+ * (upstream: google/diff-match-patch#69).
  *
  * Every split happens at an EQUAL↔non-EQUAL boundary (consecutive same-op
  * segments don't exist in dmp's canonical form, and DELETE|INSERT is not a

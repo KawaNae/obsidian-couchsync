@@ -86,9 +86,9 @@ describe("ChangeTracker", () => {
 
     // ── ignoreDelete ─────────────────────────────────────
     //
-    // ignoreWrite / clearIgnore was retired in v0.21.0; PR1 of the
-    // sync-classifier plan reintroduced an explicit `ignoreNextModify`
-    // because the new disk-write invariant means every pull-side write
+    // ignoreWrite / clearIgnore was retired in v0.21.0; an explicit
+    // `ignoreNextModify` was reintroduced later because writing pulled
+    // content to disk (even while the editor is open) means every pull-side write
     // produces a modify event we must drop before it hits the debounce.
 
     describe("ignoreDelete", () => {
@@ -144,7 +144,7 @@ describe("ChangeTracker", () => {
         });
     });
 
-    // ── hasPending (PR-A: pending-edit oracle, invariant 4) ─
+    // ── hasPending (pending-edit oracle) ─
 
     describe("hasPending", () => {
         it("returns true while a debounced fileToDb is scheduled", async () => {

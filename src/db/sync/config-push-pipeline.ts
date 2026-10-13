@@ -17,8 +17,8 @@
  *   5. bulkDocs the proceed[] set with attached _rev
  *   6. ALL-OR-NOTHING: any `error: "conflict"` row blocks the cursor
  *      advance, so the next run() re-enumerates the same delta and
- *      retries. Mirrors the safety the audit-2026-05-08 push-pipeline
- *      conflict-loss fix targets in vault sync.
+ *      retries. Mirrors how the vault push pipeline keeps a conflict
+ *      from silently dropping an id.
  *
  * `forcePush(divergent)` is the post-modal continuation: bumps each
  * divergent doc's local vclock to dominate remote (mergeVC + bump),
@@ -95,7 +95,7 @@ export class ConfigPushPipeline {
         const toPush: ConfigDoc[] = [];
         for (const r of localChanges.results) {
             if (!isConfigDocId(r.id)) continue;
-            if (r.deleted) continue; // tombstones not pushed in PR4 scope
+            if (r.deleted) continue; // config tombstones are not pushed
             if (!r.doc) continue;
             const doc = stripRev(r.doc) as ConfigDoc;
             if (!isConfigDoc(doc)) continue;

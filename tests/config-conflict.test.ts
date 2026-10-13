@@ -4,7 +4,7 @@
  * but the path passed to callbacks is the `.obsidian/...` path extracted
  * from the `config:` prefix.
  *
- * Phase 2: tests use resolveOnPull() instead of PouchDB conflict trees.
+ * Tests use resolveOnPull() instead of PouchDB conflict trees.
  */
 
 import { describe, it, expect, vi } from "vitest";
@@ -33,7 +33,7 @@ function makeConfig(
     };
 }
 
-describe("ConflictResolver — ConfigDoc support (Phase 2)", () => {
+describe("ConflictResolver — ConfigDoc support", () => {
     it("returns take-remote when remote VC dominates local (data differs)", async () => {
         const resolver = new ConflictResolver();
         const local = makeConfig(".obsidian/appearance.json", { A: 1, B: 1 }, "bG9jYWw=");
@@ -62,7 +62,7 @@ describe("ConflictResolver — ConfigDoc support (Phase 2)", () => {
         expect(verdict).toBe("concurrent");
     });
 
-    it("PR4: returns silent-merge for ConfigDoc when VCs incomparable but data identical", async () => {
+    it("returns silent-merge for ConfigDoc when VCs incomparable but data identical", async () => {
         const resolver = new ConflictResolver();
         // Same base64 data on both sides (= identical bytes), divergent vclocks.
         const local = makeConfig(".obsidian/hotkeys.json", { mobile: 1 }, "c2hhcmVk");

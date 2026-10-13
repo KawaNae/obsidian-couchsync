@@ -15,7 +15,7 @@
 
 /** Thrown by the encrypting decorator when a doc/attachment body cannot be
  *  decrypted (wrong key, missing IV, failed GCM tag) or when the vault's
- *  cipherVersion policy floor refuses an unsealed body (#1/#3). */
+ *  cipherVersion policy floor refuses an unsealed body. */
 export class EncryptionError extends Error {
     constructor(
         message: string,
@@ -24,7 +24,7 @@ export class EncryptionError extends Error {
          *  gate, encBody id/path HMAC mismatch) that retrying never fixes —
          *  they route to a terminal hard-error. `true` (default) for transient
          *  decrypt failures (key not yet distributed, partial write) that
-         *  survive backoff. Read by `classifyError` (#enc-1). */
+         *  survive backoff. Read by `classifyError`. */
         public readonly retriable: boolean = true,
     ) {
         super(message);

@@ -1,7 +1,7 @@
 /**
- * Regression: PR-D fake-tombstone vclock pollution.
+ * Regression: fake-tombstone vclock pollution.
  *
- * Pre-PR-D the `applyConflictChoice` take-remote branch always seeded
+ * The `applyConflictChoice` take-remote branch used to always seed
  * its `incrementVC` from `remoteDoc.vclock`. For the remote-deleted
  * vs local-edit shape the `remoteDoc` is a **fake tombstone** built by
  * `pull-writer.handlePulledDeletion` with `vclock: {}` — CouchDB's
@@ -12,7 +12,7 @@
  * (or out-of-order) and bulkDocs returned 409. Spurious retries, no
  * data loss but rev-tree inflation.
  *
- * Post-PR-D the deletion branch detects `remoteDoc.deleted === true`
+ * Now the deletion branch detects `remoteDoc.deleted === true`
  * and seeds from `mergeVC(localDoc.vclock, {}) = localDoc.vclock`.
  * The bumped tombstone strictly dominates `localDoc`, so the deletion
  * propagates cleanly.
@@ -47,8 +47,9 @@ function makeFakeTombstone(localDoc: FileDoc): FileDoc {
  * orchestrator + LocalDB stack into a unit-shaped test.
  *
  * Post-conflict-loop-fix: non-deletion take-remote adopts remoteDoc.vclock
- * verbatim (Invariant 3: chunks-equal → remote is vclock authority).
- * Deletion conflicts still use mergeVC + incrementVC (Invariant 6).
+ * verbatim (chunks-equal → remote is vclock authority).
+ * Deletion conflicts still use mergeVC + incrementVC (a fake tombstone's
+ * empty vclock is never adopted as authority).
  */
 function deriveTakeRemoteVclock(
     localDoc: FileDoc,
@@ -65,7 +66,7 @@ function deriveTakeRemoteVclock(
     return remoteDoc.vclock ?? {};
 }
 
-describe("regression: PR-D fake tombstone vclock derivation", () => {
+describe("regression: fake tombstone vclock derivation", () => {
     it("take-remote on a fake tombstone produces a vclock that dominates localDoc", async () => {
         // Local has been edited and pushed a few times; vclock reflects
         // multi-device history.
@@ -91,9 +92,9 @@ describe("regression: PR-D fake tombstone vclock derivation", () => {
     });
 
     it("non-deletion concurrent take-remote adopts remote vclock verbatim", async () => {
-        // Invariant 3: take-remote adopts remote content → chunks-equal
+        // Take-remote adopts remote content → chunks-equal
         // → remote.vclock is the sole authority. No self-component is
-        // added — doing so would poison the push churn guard (#sync-005)
+        // added — doing so would poison the push churn guard
         // into skipping the doc forever, causing a permanent conflict loop.
         const localDoc: FileDoc = {
             _id: makeFileId("notes/edit-conflict.md"),
@@ -128,7 +129,7 @@ describe("regression: PR-D fake tombstone vclock derivation", () => {
         expect(compareVC(resolvedVC, nextRemoteVC)).toBe("dominated");
     });
 
-    it("pre-PR-D shape would NOT dominate localDoc (regression evidence)", async () => {
+    it("legacy seeding would NOT dominate localDoc (regression evidence)", async () => {
         // Same inputs as the first case, but using the legacy seeding
         // (remoteDoc.vclock as-is, even if empty). This documents the
         // exact failure mode being fixed: dominated check fails.
@@ -142,7 +143,7 @@ describe("regression: PR-D fake tombstone vclock derivation", () => {
         const tombstone = makeFakeTombstone(localDoc);
         const legacyVclock = incrementVC(tombstone.vclock ?? {}, "dev-self");
         expect(legacyVclock).toEqual({ "dev-self": 1 });
-        // Pre-PR-D failure: legacy vclock is concurrent with localDoc,
+        // Legacy failure: the vclock is concurrent with localDoc,
         // not dominating — peers receiving this rev as a tombstone would
         // treat it as a concurrent change.
         expect(compareVC(legacyVclock, localDoc.vclock)).toBe("concurrent");
@@ -157,7 +158,7 @@ describe("regression: PR-D fake tombstone vclock derivation", () => {
             mtime: 1000, ctime: 1000, size: 5,
             vclock: { "dev-A": 5, "dev-B": 3 },
         };
-        // device-self resolves the conflict via take-remote (PR-D logic).
+        // device-self resolves the conflict via take-remote (current seeding).
         const tombstone = makeFakeTombstone(cView);
         const propagated = deriveTakeRemoteVclock(cView, tombstone, "dev-self");
         // device-C resolver compares its local rev to the propagated rev.

@@ -73,7 +73,7 @@ describe("SyncEvents", () => {
     // The boolean-aggregated query API (emitAsyncAny / onQuery) was removed in
     // v0.26.2: its sole subscriber was the `pull-delete` unpushed-edit probe,
     // whose catch swallowed I/O errors into a `false` (= apply the deletion),
-    // violating the safe-side principle (#err-10). It is now the
+    // violating the safe-side principle. It is now the
     // `probeUnpushed` function DI on the pull-writer, wrapped in a safe-side
     // try/catch — covered by tests/integration/pull-writer.integ.test.ts.
 

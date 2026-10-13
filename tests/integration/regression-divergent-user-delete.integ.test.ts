@@ -165,7 +165,7 @@ describe("regression: divergent user-delete", () => {
         await vs.markDeleted(path);
 
         // markDeleted committed the tombstone and established the deleted
-        // baseline (Invariant 7: deletion is an integration event — the
+        // baseline (deletion is an integration event — the
         // baseline is kept, not erased, so a later recreate keeps its
         // causal anchor).
         const doc = await db.get(makeFileId(path)) as FileDoc;

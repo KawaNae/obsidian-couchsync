@@ -12,7 +12,7 @@
  * then deletes every chunk not referenced by any live (non-deleted)
  * owner doc.
  *
- * Generic over the owner-doc kind (invariant 16): vault FileDocs live in
+ * Generic over the owner-doc kind: vault FileDocs live in
  * LocalDB, ConfigDocs live in ConfigLocalDB, and chunks are scoped per
  * DB. Two convenience wrappers (`gcOrphanChunks` for vault,
  * `gcOrphanConfigChunks` for config) wire the right doc enumerator into
@@ -90,7 +90,7 @@ export async function gcOrphanChunks(db: LocalDB): Promise<GcResult> {
 }
 
 /** Sweep orphan chunks in the config DB. References are derived from
- *  live ConfigDocs. Invariant 16 keeps the reference graph scoped to
+ *  live ConfigDocs. The reference graph is scoped to
  *  the config DB: config chunks are not visible from the vault DB and
  *  vice versa, so this sweep cannot accidentally delete a chunk that
  *  is still referenced from the other DB. */

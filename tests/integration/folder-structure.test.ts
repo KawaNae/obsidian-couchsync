@@ -1,11 +1,11 @@
 /**
- * Integration test: folder-structure operations (Phase 1).
+ * Integration test: folder-structure operations.
  *
  * Drives the real VaultSync + LocalDB + chunker with a faked, CASE-SENSITIVE
  * vault I/O (FakeVaultIO keys by exact path, like Android's ext4). Covers:
- *   - folder delete desugars to per-child tombstones (invariant S1)
+ *   - folder delete desugars to per-child tombstones (folders have no doc)
  *   - dbToFile refuses to create a case-colliding file rather than throwing
- *     "File already exists" / minting a duplicate (invariant S3/S5)
+ *     "File already exists" / minting a duplicate
  */
 import "fake-indexeddb/auto";
 import { describe, it, expect, afterEach } from "vitest";
@@ -60,7 +60,7 @@ class FolderAwareVaultIO extends FakeVaultIO {
     }
 }
 
-describe("Integration: folder structure (Phase 1)", () => {
+describe("Integration: folder structure", () => {
     const cleanups: Array<() => Promise<void>> = [];
 
     function createDevice(deviceId: string, vaultIO?: FakeVaultIO) {
@@ -131,7 +131,7 @@ describe("Integration: folder structure (Phase 1)", () => {
     it("dbToFile case-dedup tombstone does NOT delete the different-case canonical", async () => {
         // Models a case-insensitive FS where 'scripts/X.md' and 'Scripts/X.md'
         // are ONE physical file: a tombstone pulled for the non-canonical case
-        // must not nuke the surviving canonical (invariant S3/S5).
+        // must not nuke the surviving canonical.
         const dev = createDevice("dev-A");
         dev.vault.addFile("Scripts/X.md", "canonical");
         await dev.vs.fileToDb("Scripts/X.md");
@@ -152,7 +152,7 @@ describe("Integration: folder structure (Phase 1)", () => {
     it("prunes the parent folder that becomes empty after pull-applied deletions", async () => {
         // The Attachments2→Attachments3 scenario on the RECEIVING device: the
         // folder's files arrive as per-file tombstones; once the last file is
-        // deleted, the now-empty folder must be pruned (invariant S1 §C.3).
+        // deleted, the now-empty folder must be pruned.
         const vault = new FolderAwareVaultIO();
         const dev = createDevice("dev-recv", vault);
         await vault.createFolder("Box");
@@ -192,7 +192,7 @@ describe("Integration: folder structure (Phase 1)", () => {
         expect(await vault.exists("Keep")).toBe(true); // sibling keeps the folder alive
     });
 
-    it("reuses an existing folder's case instead of minting a duplicate-case folder (M-1)", async () => {
+    it("reuses an existing folder's case instead of minting a duplicate-case folder", async () => {
         // Case-sensitive FS: 'Notes/' already holds a file. A doc whose parent
         // dir differs ONLY in case ('notes/') is pulled. ensureParentDir must
         // place the child under the existing 'Notes/', not create a second
@@ -217,7 +217,7 @@ describe("Integration: folder structure (Phase 1)", () => {
         expect(notesFolders).toEqual(["Notes"]); // exactly one folder folds to this PathKey
     });
 
-    it("declines a file create whose path is occupied by a folder, instead of throwing (M-2)", async () => {
+    it("declines a file create whose path is occupied by a folder, instead of throwing", async () => {
         const vault = new FolderAwareVaultIO();
         const dev = createDevice("dev-A", vault);
         await vault.createFolder("archive");        // a FOLDER holds 'archive'
@@ -236,7 +236,7 @@ describe("Integration: folder structure (Phase 1)", () => {
         expect(await vault.abstractType("archive")).toBe("folder"); // folder untouched
     });
 
-    it("empty-folder prune does not delete a file occupying the parent's path (M-2 type guard)", async () => {
+    it("empty-folder prune does not delete a file occupying the parent's path (type guard)", async () => {
         const vault = new FolderAwareVaultIO();
         const dev = createDevice("dev-A", vault);
         vault.addFile("P/only.md", "child");

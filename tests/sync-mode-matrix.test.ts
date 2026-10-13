@@ -1,5 +1,5 @@
 /**
- * Phase 11 (data-layer-v2): 4-mode matrix coverage.
+ * 4-mode matrix coverage.
  *
  * Every combination of {encryption ∈ {off, on}, compression ∈ {off, on}}
  * must round-trip a chunk attachment through the decorator stack
@@ -21,8 +21,8 @@
  *  Every blob fed into the stack is envelope-formatted bytes
  *  (`[codec][IV?][body]`) and every blob returned by the stack is the
  *  same shape with the bits the decorators stripped now cleared.
- *  Tests wrap raw payloads via `asEnvelope` / `fromEnvelope` (see
- *  invariant 12).
+ *  Tests wrap raw payloads via `asEnvelope` / `fromEnvelope` because
+ *  every attachment byte sequence carries the envelope header.
  */
 
 import { describe, it, expect, beforeAll } from "vitest";
@@ -94,7 +94,7 @@ describe.each(modes)("sync mode matrix — $name", (mode) => {
 
         const innerBlob = await inner.getAttachment("chunk:iv-" + mode.name, "c");
         expect(innerBlob).not.toBeNull();
-        // Every byte on the wire is envelope-formatted (invariant 12).
+        // Every byte on the wire is envelope-formatted.
         // The header reflects which codecs were actually applied.
         const expectedHeader =
             (mode.encryption ? 0x01 : 0) | (mode.compression ? 0x02 : 0);

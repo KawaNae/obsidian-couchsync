@@ -86,7 +86,7 @@ export class ChunkAlgMismatchError extends ChunkIntegrityError {
  *  Both the live-sync fetch boundary (`SyncEngine.ensureChunks`) and the
  *  one-shot Clone/repair boundary (`remote-couch.resolveChunkAttachments`) MUST
  *  classify these identically; this single predicate is the shared rule so the
- *  two boundaries cannot drift (#4). Any other error (network, abort) is a
+ *  two boundaries cannot drift. Any other error (network, abort) is a
  *  genuine failure and must propagate. */
 export function isCorruptChunkError(e: unknown): boolean {
     return e instanceof ChunkIntegrityError || e instanceof EnvelopeError;
@@ -146,7 +146,7 @@ export function buildChunkAttachment(
  * the id — the inverse of the mint in `splitIntoChunks`. A content mismatch
  * throws `ChunkIntegrityError`; an algorithm mismatch (the hasher cannot
  * verify this id's tag) throws `ChunkAlgMismatchError` rather than skipping
- * (#10 — fail-closed). The check is only skipped when no hasher is given,
+ * (fail-closed). The check is only skipped when no hasher is given,
  * and the fetch boundaries that read untrusted remote bytes always pass one.
  *
  * NULL/absent attachments are not handled here — callers keep their own
@@ -161,7 +161,7 @@ export async function chunkFromAttachment(
     if (hasher) {
         const { alg, hash: expected } = parseChunkId(id);
         if (hasher.alg !== alg) {
-            // Fail-closed (#10): a hasher was supplied but its algorithm
+            // Fail-closed: a hasher was supplied but its algorithm
             // does not match the id's tag, so it cannot verify these bytes.
             // Silently skipping would let a server present an unverifiable id
             // and have its body trusted. Route to repair instead.
@@ -223,7 +223,7 @@ export interface FetchMissingChunksResult {
  * (availability check), persisting `fetched`, logging, and turning the
  * notFound/corrupt residual into their own result shape. This function only
  * guarantees that "corrupt" means exactly `isCorruptChunkError` everywhere
- * (the #4 shared rule), so the two boundaries cannot diverge again.
+ * (the shared rule), so the two boundaries cannot diverge again.
  */
 export async function fetchMissingChunks(
     missing: readonly string[],

@@ -263,7 +263,7 @@ export async function analyzeChunkConsistency(
  * FileDoc on the remote.
  *
  * Used as a re-validation guard immediately before a destructive repair
- * tombstones "orphan" chunks (#4). A consistency report is a snapshot taken
+ * tombstones "orphan" chunks. A consistency report is a snapshot taken
  * at scan time; between the scan and the (user-initiated, arbitrarily later)
  * repair, another device may have pushed a FileDoc that re-references a chunk
  * the report classified as orphan. Re-deriving the live reference set at the
@@ -286,7 +286,7 @@ export async function liveRemoteChunkRefs(
 /**
  * The set of chunk ids currently referenced by some local FileDoc — the LOCAL
  * mirror of `liveRemoteChunkRefs`, used as the re-validation guard immediately
- * before a destructive repair deletes "orphan-local" chunks (#9). Same TOCTOU
+ * before a destructive repair deletes "orphan-local" chunks. Same TOCTOU
  * shape: the report is a scan-time snapshot, and a concurrent pull may land a
  * FileDoc that re-references a chunk the report classified as orphan-local
  * between the scan and the delete. Re-deriving the live local reference set at

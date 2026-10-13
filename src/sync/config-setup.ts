@@ -11,7 +11,8 @@
  * and makes Create free of any filter/content semantics:
  *
  *   1. Derive the crypto root (`config:meta`) — pure, pre-destructive.
- *   2. Flag the binding as mid-setup (Invariant C, #err-9).
+ *   2. Flag the binding as mid-setup, so an interrupted Create blocks
+ *      live ops until a fresh Create completes.
  *   3. Wipe local: the binding's store is destroyed and re-opened (docs +
  *      meta + vclock baselines + cursors).
  *   4. Wipe remote: `DELETE /<configDb>` then `PUT /<configDb>`. Requires
@@ -64,7 +65,7 @@ export interface ConfigSetupHostHooks {
     /** Persist the mid-setup flag on this binding's record. Called
      *  immediately before the destructive local+remote wipe. A mid-flight
      *  failure leaves it set, so live ops against this DB refuse to run
-     *  until a fresh Create completes (#err-9). */
+     *  until a fresh Create completes. */
     beginSetup: () => Promise<void>;
     /** Empty and re-open this binding's local store. */
     resetLocal: () => Promise<void>;
@@ -73,8 +74,7 @@ export interface ConfigSetupHostHooks {
      *  `makeCouchClient(settings)`. */
     makeRawConfigClient?: () => ICouchClient;
     /** Create fully succeeded: record the new root (clearing the setup
-     *  flag, saving the passphrase) and keep its key — one commit
-     *  (Invariant C). */
+     *  flag, saving the passphrase) and keep its key — one commit. */
     commit: (meta: ConfigMetaDoc, crypto: CryptoProvider | null) => Promise<void>;
 }
 
@@ -91,15 +91,15 @@ export class ConfigSetupService {
         opts: ConfigSetupCreateOpts,
     ): Promise<ConfigSetupResult> {
         // 1. Derive the crypto root FIRST — a SELF-CONTAINED config:meta
-        //    (invariants 17 + 18): fresh salt + own keyCheck. PURE (no remote
-        //    I/O), so a key-derivation failure leaves both the local and
-        //    remote DBs untouched — nothing to recover (M-2).
+        //    (its own crypto root, independent of the vault DB): fresh salt +
+        //    own keyCheck. PURE (no remote I/O), so a key-derivation failure
+        //    leaves both the local and remote DBs untouched — nothing to recover.
         if (!this.getSettings().couchdbConfigDbName) {
             throw new Error("ConfigSetup: couchdbConfigDbName not configured");
         }
         const { meta, crypto } = await buildInitialConfigMeta(opts);
 
-        // 2. Flag BEFORE the destructive wipe (Invariant C, config side).
+        // 2. Flag BEFORE the destructive wipe.
         await this.host.beginSetup();
 
         // 3. Wipe local.
@@ -116,8 +116,8 @@ export class ConfigSetupService {
 
         // 5. Pin the crypto root: config:meta is the FIRST and ONLY write
         //    after ensureDb, so the window in which the remote config DB
-        //    exists WITHOUT an authoritative meta is as small as possible
-        //    (M-2). A failure here leaves the setup flag set (this device
+        //    exists WITHOUT an authoritative meta is as small as possible.
+        //    A failure here leaves the setup flag set (this device
         //    stays fail-closed), and a peer sees a meta-less DB it reports
         //    as uninitialized rather than corrupt.
         await this.pushConfigMetaRaw(meta);
@@ -125,7 +125,7 @@ export class ConfigSetupService {
         // 6. Commit. Create is structural only — seeding is the user's next,
         //    filter-governed Push, which encrypts under the root committed
         //    here (the fail-closed "no plaintext into an encrypted DB" guard
-        //    lives in ConfigBinding.wrapClient, #config-codec, L-1).
+        //    lives in ConfigBinding.wrapClient).
         await this.host.commit(meta, crypto);
 
         return { meta, crypto };

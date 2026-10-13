@@ -136,7 +136,7 @@ describe("SyncEngine retry supervisor", () => {
         a.engine.stop();
     });
 
-    it("verify: suspend-frozen abort is inconclusive — re-verifies silently, no hard error (#1b/#6/#7)", async () => {
+    it("verify: suspend-frozen abort is inconclusive — re-verifies silently, no hard error", async () => {
         h = createSyncHarness();
         const a = h.addDevice("dev-A");
         await a.engine.start();
@@ -169,7 +169,7 @@ describe("SyncEngine retry supervisor", () => {
         a.engine.stop();
     });
 
-    it("verify: every probe failing until budget exhaustion enters a network error (#1b contrast)", async () => {
+    it("verify: every probe failing until budget exhaustion enters a network error (contrast to the suspend-frozen case)", async () => {
         h = createSyncHarness();
         const a = h.addDevice("dev-A");
         await a.engine.start();
@@ -299,7 +299,7 @@ describe("SyncEngine retry supervisor", () => {
         a.engine.stop();
     });
 
-    it("enterError(encryption-paused) is terminal: stops retries, no auto-recovery (#1c)", async () => {
+    it("enterError(encryption-paused) is terminal: stops retries, no auto-recovery", async () => {
         h = createSyncHarness();
         const a = h.addDevice("dev-A");
 

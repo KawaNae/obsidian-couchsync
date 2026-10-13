@@ -1,7 +1,6 @@
 /**
  * Matrix tests for `classifySyncRelation` — the single sync-state
- * classifier that PR3/PR4 wire up to all four legacy classification
- * sites.
+ * classifier that replaced the four separate classification sites.
  */
 
 import { describe, it, expect } from "vitest";
@@ -76,7 +75,7 @@ describe("classifySyncRelation", () => {
         });
 
         it("Pixel7a-style initial-sync false-positive resolves to vclock-only-drift", () => {
-            // From project_false_positive_concurrent.md: device pushed under
+            // A re-imported device pushed under
             // its own deviceId but content identical to remote.
             expect(classifySyncRelation(input({
                 leftVC: VC({ "melchior-main": 72, "ipadpro11gen4-main": 11 }),
@@ -206,7 +205,8 @@ describe("classifySyncRelation", () => {
     // An equal vclock with differing content cannot come from a legit local
     // edit (that bumps the clock) — it is the config-Create stale-collision
     // anomaly (zombie {device:1} vs a freshly-reset {device:1}). It must be
-    // surfaced, not silently kept (the 2026-06-14 non-propagation bug).
+    // surfaced, not silently kept (silently keeping it left the config
+    // change unpropagated).
     describe("true-divergent (pull-site vclock tie)", () => {
         it("chunks differ + vclock equal + pull-site (not attributed) → true-divergent", () => {
             expect(classifySyncRelation(input({
@@ -329,21 +329,22 @@ describe("classifySyncRelation", () => {
     });
 
     // ── Today's Home.md repro shape ───────────────────────
-    describe("regression: 2026-05-10 Home.md silent loss shape", () => {
-        // After a successful PR1 dbToFile, lastSynced.vclock and FileDoc.vclock
-        // both equal `{melchior:12, fake-desktop:1}`. With PR1, disk is also
-        // the new content. classifier returns identical. With PR1 broken
-        // (= the bug), disk is OLD; classifier sees:
+    describe("regression: Home.md silent loss shape", () => {
+        // After a successful dbToFile, lastSynced.vclock and FileDoc.vclock
+        // both equal `{melchior:12, fake-desktop:1}`. When dbToFile writes to
+        // disk, disk is also the new content and the classifier returns
+        // identical. When the disk write is skipped (= the bug), disk is OLD; classifier sees:
         // - leftVC = lastSynced.vclock = {melchior:12, fake-desktop:1}
         // - rightVC = fileDoc.vclock = same
         // - leftChunks = OLD (disk), rightChunks = NEW (fileDoc)
         // - lastSynced.chunks = NEW (lying baseline)
         //
         // classifier returns "local-edit" because vclock equal + chunks differ.
-        // This means PR3 will route to push (which is what was happening) —
-        // but PR1 prevents the lie in the first place. PR5 adds defense in
-        // depth by detecting this shape and recovering.
-        it("PR1-broken state classifies as local-edit (push will happen but PR1 prevents the disk-stale state)", () => {
+        // This means reconcile routes to push (which is what was happening) —
+        // but always writing pulled content to disk prevents the lie in the
+        // first place. Stale-bookkeeping recovery adds defense in depth by
+        // detecting this shape and recovering.
+        it("skipped-disk-write state classifies as local-edit (push will happen but the disk write prevents the disk-stale state)", () => {
             const baseVC = VC({ "melchior-main": 12, "fake-desktop": 1 });
             const lastSynced: LastSynced = {
                 vclock: { ...baseVC },
@@ -365,14 +366,14 @@ describe("classifySyncRelation", () => {
             }))).toBe("local-edit");
         });
 
-        it("with PR1 working, post-pull state classifies as identical", () => {
+        it("with the disk write done, post-pull state classifies as identical", () => {
             const baseVC = VC({ "melchior-main": 12, "fake-desktop": 1 });
             const lastSynced: LastSynced = {
                 vclock: { ...baseVC },
                 chunks: ["NEW-chunk"],
                 size: 77,
             };
-            // PR1 invariant: disk == content, so leftChunks reflects NEW.
+            // Disk-write truth: disk == content, so leftChunks reflects NEW.
             expect(classifySyncRelation(input({
                 leftVC: { ...baseVC },
                 rightVC: { ...baseVC },
@@ -385,11 +386,11 @@ describe("classifySyncRelation", () => {
         });
     });
 
-    // ── Invariant 7: the deleted axis ───────────────────────
+    // ── Deletion is an integration event: the deleted axis ──
     // A tombstone's fingerprint is NOT normalized (markDeleted retains the
     // deleted content's chunks), so the deleted flag — not the chunks —
     // carries the deleted state.
-    describe("deleted axis (Invariant 7)", () => {
+    describe("deleted axis", () => {
         // The wild tombstone shape: retains the chunks it deleted.
         const tomb = { rightDeleted: true, rightChunks: C("a"), rightSize: 10 };
 
@@ -435,7 +436,7 @@ describe("classifySyncRelation", () => {
             }))).toBe("local-edit");
         });
 
-        it("W24 shape: file over tombstone, NO baseline → true-divergent (was remote-edit = wedged)", () => {
+        it("recreate shape: file over tombstone, NO baseline → true-divergent (was remote-edit = wedged)", () => {
             expect(classifySyncRelation(input({
                 ...tomb,
                 leftVCAttributed: true,

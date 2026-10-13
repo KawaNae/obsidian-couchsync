@@ -69,7 +69,7 @@ export interface SkippedFilesDoc {
 /**
  * Files whose FileDoc references chunks that are unavailable on BOTH local
  * and remote ("broken" / missingReferenced). Such a file cannot be restored
- * locally; reconcile quarantines it (Invariant II) to stop the restore
+ * locally; reconcile quarantines it to stop the restore
  * ping-pong, surfaces it, and clears the entry if the missing chunks later
  * arrive from another device. Distinct from `SkippedFilesDoc` (oversize =
  * deliberate exclusion): a quarantine clears on chunk arrival, a skip clears
@@ -153,7 +153,7 @@ export class LocalDB implements IDocStore<CouchSyncDoc> {
 
     /** Stamp the application-level schema version on both stores (docs
      *  + meta) on first open, or assert it matches the build's expected
-     *  version on subsequent opens. Invariant 15. */
+     *  version on subsequent opens, before any content read. */
     async ensureSchemaVersion(): Promise<void> {
         await this.runDocsOp((s) => s.ensureSchemaVersion(), "ensureSchemaVersion-docs");
         await this.runMetaOp((s) => s.ensureSchemaVersion(), "ensureSchemaVersion-meta");
@@ -301,8 +301,9 @@ export class LocalDB implements IDocStore<CouchSyncDoc> {
      * sibling folder `scriptsX/…`. Tombstones are excluded.
      *
      * Used to desugar a folder-level delete into per-file `markDeleted`
-     * calls (invariant S1): on a folder delete the children are already
-     * gone from the vault FS, so the DB is the only enumeration source.
+     * calls (a folder has no doc of its own): on a folder delete the
+     * children are already gone from the vault FS, so the DB is the only
+     * enumeration source.
      * Operates on the LOCAL (plaintext) id space, so it is transparent to
      * encryption — the encrypting client only rewrites ids on the wire.
      */

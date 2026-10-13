@@ -29,7 +29,7 @@ describe("toPathKey", () => {
     });
 });
 
-describe("unsafeVaultPathReason — remote path trust boundary (#3)", () => {
+describe("unsafeVaultPathReason — remote path trust boundary", () => {
     it("accepts ordinary vault-relative paths", () => {
         expect(unsafeVaultPathReason("Notes/agents.md")).toBeNull();
         expect(unsafeVaultPathReason("a/b/c.md")).toBeNull();

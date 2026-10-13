@@ -8,7 +8,8 @@
  *   - `pushSeq`: last LocalDB.changes cursor pushed by ConfigPushPipeline
  *
  * Persisted under `_sync/config-pull-seq` / `_sync/config-push-seq` in
- * the ConfigLocalDB meta store. No legacy migration: pre-PR2 users have
+ * the ConfigLocalDB meta store. No legacy migration: builds before these
+ * checkpoints existed have
  * no checkpoint stored, so `load()` leaves the in-memory cursors at 0
  * and the first ConfigPullWriter run does a full catchup from `since=0`
  * (== current `pullByPrefix` semantics — backwards compatible).

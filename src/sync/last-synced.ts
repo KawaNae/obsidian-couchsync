@@ -14,11 +14,11 @@ import type { VectorClock } from "./vector-clock.ts";
  * treat undefined chunks/size as "skip the divergent-edit guard for
  * this path until the next push/pull rewrites it in the full shape".
  *
- * `deleted` (Invariant 7 — deletion is an integration event): set when the
+ * `deleted` (deletion is an integration event): set when the
  * last integrated doc state for this path was a tombstone. The fingerprint
  * is normalized to `chunks: [], size: 0` on write. Without this flag a
  * deletion erased the baseline entirely, which destroyed the causal anchor
- * the recreate-after-delete path needs (the 2026-06-07 W24 stuck-push bug).
+ * the recreate-after-delete path needs (a recreated note stayed unpushable).
  * A deleted baseline shares the lifetime of the tombstone doc itself —
  * neither is pruned today; a future tombstone GC must issue the matching
  * `vclocks: [{path, op: "delete"}]` in the same sweep. `op: "delete"` is

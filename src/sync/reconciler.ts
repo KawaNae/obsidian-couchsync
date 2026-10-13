@@ -69,10 +69,10 @@ export interface ReconcileReport {
     restored: string[];
     /** Files quarantined because their chunks are unavailable on this device
      *  AND the server (broken / missingReferenced). Restore is suppressed
-     *  until the chunks arrive — no infinite retry (Invariant II). */
+     *  until the chunks arrive — no infinite retry. */
     quarantined: string[];
-    /** Canonical paths kept after resolving a PathKey collision (invariant
-     *  S4/S5 — two case/NFC variants of one logical file de-duplicated to a
+    /** Canonical paths kept after resolving a PathKey collision (two
+     *  case/NFC variants of one logical file de-duplicated to a
      *  single canonical case). */
     collisionsResolved: string[];
     /** Whether the run took the fast-path short-circuit (no full scan). */
@@ -240,9 +240,9 @@ export class Reconciler {
                 manifestPaths !== null && setEquals(manifestPaths, vaultPathSet);
             const currentSig = await this.localDb.docsChangeSignature();
             const dbUnchanged = docsSigEquals(cursor?.lastSeenDocsSig, currentSig);
-            // Invariant S7: never let the short-circuit hide a collision. Two
-            // vault files folding to one PathKey (a case-sensitive FS holding
-            // both `scripts/X` and `Scripts/X` — the incident source) must take
+            // Never let the short-circuit hide a collision. Two vault files
+            // folding to one PathKey (a case-sensitive FS holding both
+            // `scripts/X` and `Scripts/X`) must take
             // the slow path so Case F runs. DB-side-only duplicates always
             // arrive via a pull, which writes docs rows and moves the
             // signature → `dbUnchanged` is false, so they already force the
@@ -268,7 +268,7 @@ export class Reconciler {
         // "push" (vault side) and "delete" (DB side).
         // The original-case path lives inside each value (TFile.path or
         // FileDoc._id) and is what we use for FS I/O and reporting.
-        // Group by PathKey into ARRAYS, not last-wins scalars (invariant S4):
+        // Group by PathKey into ARRAYS, not last-wins scalars:
         // the DB id space is case-sensitive, so `scripts/X` and `Scripts/X`
         // are distinct docs that fold to one PathKey. A scalar Map would drop
         // the shadow and hide the collision; the array form makes a >1-occupant
@@ -295,9 +295,9 @@ export class Reconciler {
             const docs = dbByPath.get(pathKey) ?? [];
             const aliveDocs = docs.filter((d) => !d.deleted);
 
-            // Case F (invariant S4/S5): a PathKey with genuine MULTIPLICITY —
-            // two case-variant files on disk (case-sensitive FS) or two alive
-            // DB docs of different case (the scripts/Scripts incident). This is
+            // Case F: a PathKey with genuine MULTIPLICITY — two case-variant
+            // files on disk (case-sensitive FS) or two alive DB docs of
+            // different case (`scripts/X` vs `Scripts/X`). This is
             // distinct from benign single-occupant case drift (one vault file
             // whose case differs from its one DB doc), which the normal Case
             // A–E logic already handles via the vault-case `displayPath`. Two
@@ -316,7 +316,7 @@ export class Reconciler {
 
             // Case E: vault and DB both empty (or DB tombstone) → no-op,
             // plus baseline hygiene: a tombstone whose baseline is still the
-            // old alive entry (pre-Invariant-7 pull-applied deletions) is
+            // old alive entry (deletions applied by builds that erased the baseline) is
             // upgraded to the deleted baseline so a later remote recreate
             // classifies as a restore instead of a false conflict.
             if (!file && (!doc || doc.deleted)) {
@@ -346,9 +346,9 @@ export class Reconciler {
                     }
                     continue;
                 }
-                // DB tombstone under a vault file (Invariant 7). The old code
-                // blind-forwarded to fileToDb, whose divergent guard skipped
-                // every relation except local-edit — the W24 wedged-path shape.
+                // DB tombstone under a vault file. The old code blind-forwarded
+                // to fileToDb, whose divergent guard skipped every relation
+                // except local-edit, wedging a recreated path unpushable.
                 // Route through the classifier and dispatch each verdict to
                 // its real action instead.
                 let relation: SyncRelation;
@@ -381,10 +381,10 @@ export class Reconciler {
                         break;
                     case "true-divergent":
                         // No baseline explains the file over the tombstone
-                        // (the wedged W24 state itself, or a recreate raced by
-                        // another device's re-delete). Neither silent restore
-                        // (H-1 data-loss shape) nor silent skip (W24 shape) —
-                        // the user arbitrates.
+                        // (a recreate after an erased baseline, or a recreate
+                        // raced by another device's re-delete). Silent restore
+                        // would resurrect a deletion and silent skip would wedge
+                        // the path — the user arbitrates.
                         if (this.conflictOrchestrator) {
                             if (await this.tryStep(displayPath, "conflict-recreate",
                                 () => this.conflictOrchestrator!.handleDivergentRecreate(file.path, doc),
@@ -400,8 +400,8 @@ export class Reconciler {
                         break;
                     default:
                         // identical / vclock-only-drift / legacy-skip cannot be
-                        // produced for alive-file × tombstone input (Invariant 7
-                        // makes contentEqual false and legacy baselines refine
+                        // produced for alive-file × tombstone input (the deleted
+                        // flag makes contentEqual false and legacy baselines refine
                         // to true-divergent). Guard for visibility.
                         logError(
                             `unexpected relation '${relation}' for tombstone reconcile of ${displayPath}`,
@@ -422,12 +422,12 @@ export class Reconciler {
             //   2. The vault manifest is a coarse fallback: it is written ONLY
             //      by reconcile (line ~447), so a freshly pulled-but-not-yet-
             //      reconciled path is invisible to it. Using it as the primary
-            //      oracle resurrected user deletions in that window (the H-1
-            //      bug). Demoted to legacy / first-run / no-lastSynced fallback.
+            //      oracle resurrected user deletions in that window.
+            //      Demoted to legacy / first-run / no-lastSynced fallback.
             if (!file && doc && !doc.deleted) {
                 const lastSynced = this.vaultSync.getLastSynced(displayPath);
                 if (lastSynced?.deleted) {
-                    // Deleted baseline (Invariant 7): we integrated a deletion
+                    // Deleted baseline: we integrated a deletion
                     // of this path, and the alive doc tells us what happened
                     // next on the causal axis.
                     const rel = compareVC(doc.vclock ?? {}, lastSynced.vclock);
@@ -487,8 +487,8 @@ export class Reconciler {
                         // equal/dominated: we integrated this content and the
                         // doc has NOT advanced past our baseline → the missing
                         // file is a genuine local delete. Propagate the
-                        // tombstone (H-1 fix: previously the manifest-blind
-                        // classifier restored it on a dropped delete event).
+                        // tombstone (a manifest-only classifier restored it on
+                        // a dropped delete event, resurrecting the deletion).
                         if (await this.tryStep(displayPath, "delete",
                             () => this.vaultSync.markDeleted(displayPath), mode)) {
                             report.deleted.push(displayPath);
@@ -525,10 +525,10 @@ export class Reconciler {
                 switch (relation) {
                     case "identical":
                         report.inSync++;
-                        // PR5: align lastSynced to the FileDoc's content
+                        // Align lastSynced to the FileDoc's content
                         // fingerprint. No-op when already aligned; upgrades
                         // legacy entries and recovers from stale-bookkeeping
-                        // when invariant 1 has been violated.
+                        // when disk-write truth has been violated.
                         await this.tryStep(displayPath, "align",
                             async (): Promise<void> => {
                                 await this.vaultSync.alignLastSyncedToDoc(file.path, doc, file.stat);
@@ -537,18 +537,17 @@ export class Reconciler {
                         break;
                     case "vclock-only-drift":
                         // Same content, different causality. Adopt fileDoc.vclock
-                        // as the lastSynced baseline (Invariant 3, chunks-equal
-                        // vclock authority). Closes audit-2026-05-08 MEDIUM
-                        // (false-positive concurrent on initial-sync devices)
-                        // and the 2026-05-10 phantom-loop shape
-                        // (project_phantom_lastsynced_stamp.md).
+                        // as the lastSynced baseline (chunks-equal vclock
+                        // authority). Avoids false-positive concurrent
+                        // conflicts on initial-sync devices and the phantom
+                        // stamp loop that a merged baseline causes.
                         if (await this.tryStep(displayPath, "vclock-adopt",
                             () => this.vaultSync.adoptDocVclock(file.path, doc, file.stat), mode)) {
                             report.inSync++;
                         }
                         break;
                     case "local-edit":
-                        // CLASSIFIER FIX (PR3): the previous "local-unpushed"
+                        // The previous "local-unpushed"
                         // branch had no divergent guard. The classifier now
                         // returns true-divergent when local has drifted from
                         // baseline AND remote dominates, so the local-edit
@@ -561,7 +560,8 @@ export class Reconciler {
                     case "legacy-skip": {
                         // legacy-skip: pre-extension lastSynced — fall back to
                         // pull (= old behavior when divergent guard couldn't
-                        // run). PR5 startup sweep will upgrade the entries.
+                        // run). The startup legacy-lastSynced sweep upgrades
+                        // the entries.
                         const r = await this.applyRemoteToVault(displayPath, doc, "pull", mode);
                         if (r === "applied") report.remoteWins.push(displayPath);
                         else if (r === "quarantined") report.quarantined.push(displayPath);
@@ -593,7 +593,7 @@ export class Reconciler {
         // settle(), so an unguarded write here races teardown
         // (DatabaseClosedError). The per-file writes above already gate on
         // `disposed` (tryStep / applyRemoteToVault); this trailing persist was
-        // the lone gap (#err-7). A skipped persist just means a full rescan
+        // the lone gap. A skipped persist just means a full rescan
         // next session — safe.
         if (mode === "apply" && !this.disposed) {
             const newManifest: VaultManifest = {
@@ -701,7 +701,7 @@ export class Reconciler {
 
     /**
      * Apply a remote FileDoc to the vault (restore/pull) with broken-chunk
-     * quarantine (Invariant II). Returns the outcome so the caller records it
+     * quarantine. Returns the outcome so the caller records it
      * in the right report bucket.
      *
      *  - "applied": chunks available, file written.
@@ -755,10 +755,10 @@ export class Reconciler {
     }
 
     /**
-     * Case F — resolve a PathKey collision (invariant S4/S5): two case/NFC
-     * variants of one logical file. Converge using the SAME lens as content
-     * conflicts — chunks decide reality, vclock decides causality (symmetric
-     * with Invariant 3) — never an ad-hoc disk-preference rule.
+     * Case F — resolve a PathKey collision: two case/NFC variants of one
+     * logical file. Converge using the SAME lens as content conflicts —
+     * chunks decide reality, vclock decides causality (symmetric with the
+     * chunks-equal vclock authority) — never an ad-hoc disk-preference rule.
      *
      *  - Auto-converge ONLY when every variant is content-equal (same chunk
      *    list) AND no colliding on-disk file has unpushed edits. The canonical
@@ -767,7 +767,7 @@ export class Reconciler {
      *    docs are tombstoned and non-canonical on-disk files removed; the
      *    canonical is restored if absent locally.
      *  - Otherwise the variants are genuinely different files sharing a name:
-     *    Phase 1 leaves them untouched and logs (Phase 2 routes to the conflict
+     *    they are left untouched and logged (not yet routed to the conflict
      *    orchestrator). No destructive action without proven content equality.
      *
      * The disk-delete is FS-correct without special-casing: `files` carries
@@ -798,7 +798,7 @@ export class Reconciler {
 
         // Refuse to auto-resolve if any colliding file has unpushed edits — the
         // doc chunks would not reflect that edit, so a disk delete could lose
-        // it (Invariant 4 oracle).
+        // it (pending-edit oracle).
         let anyPending = false;
         if (contentEqual) {
             for (const f of files) {
@@ -904,7 +904,7 @@ function setEquals<T>(a: Set<T>, b: Set<T>): boolean {
 /**
  * Group items by their PathKey (NFC + lowercase) into arrays. Unlike a
  * last-wins scalar Map, this preserves every original-case occupant of a
- * folded key so a collision (invariant S4) is detectable rather than
+ * folded key so a collision is detectable rather than
  * silently dropped.
  */
 function groupByPathKey<T>(

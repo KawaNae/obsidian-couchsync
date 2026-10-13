@@ -71,13 +71,12 @@ interface QueuedConflict {
  *     (CRDT-level conflict, neither side dominates)
  *   - `handleDivergentLocalEdit` from Reconciler — vault-content drifted
  *     from last integration baseline while LocalDB doc was advanced by a
- *     pull (Regression A path)
+ *     pull
  *   - `handleDivergentLocalDelete` from Reconciler — vault file removed
- *     by user while LocalDB doc was advanced by a pull (Regression B
- *     path)
+ *     by user while LocalDB doc was advanced by a pull
  *   - `handleDivergentRecreate` from Reconciler — vault file present over
- *     a LocalDB tombstone with no explaining baseline (Invariant 7,
- *     recreate-after-delete with lost causal anchor)
+ *     a LocalDB tombstone with no explaining baseline (recreate-after-
+ *     delete with lost causal anchor)
  *
  * All entries funnel through the same modal pipeline; only the apply
  * callbacks differ.
@@ -96,7 +95,7 @@ export class ConflictOrchestrator {
 
     /** Conflicts awaiting presentation, keyed by path (dedup). Drained as a
      *  group so a burst presents as ONE batch modal instead of N stacked ones
-     *  (the 2026-06-02 black-screen). */
+     *  (stacked modal overlays turned the screen black). */
     private queue = new Map<string, QueuedConflict>();
     private draining = false;
     private debounceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -139,7 +138,7 @@ export class ConflictOrchestrator {
                 for (const w of queued.waiters) w();
             }
             // Drop any durable conflict record so the pull drain won't
-            // re-present it (#3 / edit-vs-edit).
+            // re-present it (edit-vs-edit included).
             void clearPendingConflict(this.deps.localDb, makeFileId(filePath)).catch(() => {});
         });
     }
@@ -303,7 +302,8 @@ export class ConflictOrchestrator {
             outcome = "resolved";
         }
         // A defer keeps the durable record so it re-presents next session
-        // (Invariant B). Anything else (resolved / error keep-local) clears it.
+        // (it is not re-derived from the pull feed). Anything else (resolved /
+        // error keep-local) clears it.
         if (outcome !== "deferred") {
             await item.clearDurable();
             this.deps.replicator.events.emit("conflict-resolved", { filePath: item.filePath });
@@ -473,14 +473,14 @@ export class ConflictOrchestrator {
     /**
      * Reconciler entry — a vault file exists over a LocalDB tombstone with
      * no baseline explaining it (classifier `true-divergent` with
-     * `rightDeleted`, Invariant 7). Mirror image of
+     * `rightDeleted`). Mirror image of
      * `handleDivergentLocalDelete`: there the file is gone and the doc is
      * alive; here the file is present and the doc is deleted. Neither
-     * silent outcome is safe — restoring would resurrect a deletion (the
-     * H-1 data-loss shape), skipping would wedge the path unpushable (the
-     * W24 bug shape) — so the user arbitrates.
+     * silent outcome is safe — restoring would resurrect a deletion (silent
+     * un-delete), skipping would wedge the path unpushable forever — so the
+     * user arbitrates.
      *
-     * Invariant 6 note: `tombstoneDoc` is the committed LocalDB tombstone
+     * vclock provenance: `tombstoneDoc` is the committed LocalDB tombstone
      * (markDeleted- or buildAcceptedTombstone-origin, real vclock). The
      * fake `vclock: {}` carrier built by `handlePulledDeletion` is never
      * committed, so it cannot reach this path; and `forceLocalEdit` merges
@@ -649,7 +649,7 @@ export class ConflictOrchestrator {
      * CouchDB's `_changes` doesn't expose deleted-doc bodies, so the
      * pull side cannot reconstruct the deleting device's vclock.
      *
-     * **Invariant 6 (vclock 派生の出所制限).** A fake tombstone is a
+     * **vclock 派生の出所制限.** A fake tombstone is a
      * flag carrier — never a causality source. When we promote one to
      * a real LocalDB tombstone via take-remote, the seed vclock comes
      * from `localDoc.vclock` (the only place this device has observed
@@ -674,7 +674,7 @@ export class ConflictOrchestrator {
             const isDeletionConflict = remoteDoc.deleted === true;
             let updatedVC: Record<string, number>;
             if (isDeletionConflict) {
-                // Invariant 6: the fake tombstone's vclock is {} by
+                // The fake tombstone's vclock is {} by
                 // construction — seed from localDoc so the result
                 // strictly dominates both sides and propagates cleanly.
                 updatedVC = incrementVC(
@@ -682,13 +682,13 @@ export class ConflictOrchestrator {
                     deviceId,
                 );
             } else {
-                // Invariant 3 (chunks-equal → doc is vclock authority):
+                // Chunks-equal → doc is vclock authority:
                 // take-remote adopts remote content verbatim, so chunks
                 // will equal the remote head. The remote vclock is the
                 // sole authority — adding a self-component would create
-                // a clock that the push churn guard (#sync-005) skips
-                // forever, poisoning future comparisons into false
-                // concurrent (the pixel conflict-loop root cause).
+                // a clock that the push churn guard skips forever,
+                // poisoning future comparisons into false concurrent (a
+                // conflict that re-appears every cycle).
                 updatedVC = remoteDoc.vclock ?? {};
             }
             const updated = {

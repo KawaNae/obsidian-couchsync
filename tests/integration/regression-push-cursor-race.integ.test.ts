@@ -1,6 +1,6 @@
 /**
- * Regression: push cursor lost-update race (2026-06-03 search1.jpeg
- * incident, HIGH).
+ * Regression: push cursor lost-update race (a deleted search1.jpeg was
+ * resurrected on another device).
  *
  * `DexieStore.changes()` used to read `_update_seq` in a separate IDB
  * transaction from the row query; a write committing in the gap was

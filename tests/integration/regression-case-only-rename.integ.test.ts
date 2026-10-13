@@ -1,6 +1,5 @@
 /**
- * Regression: case-only / NFC-variant renames permanently reverted
- * (2026-06-07 bug hunt, MEDIUM).
+ * Regression: case-only / NFC-variant renames permanently reverted.
  *
  * Old handleRename desugared into fileToDb(new) + markDeleted(old):
  *   1. fileToDb minted the new doc at {self:1} (old vclock discarded) and

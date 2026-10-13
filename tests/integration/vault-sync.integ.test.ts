@@ -179,7 +179,7 @@ describe("VaultSync", () => {
             expect(vault.files.has("a.md")).toBe(false);
         });
 
-        it("rejects a remote path that escapes the vault (#3 traversal)", async () => {
+        it("rejects a remote path that escapes the vault (traversal)", async () => {
             vault.addFile("seed.md", "payload");
             await vs.fileToDb("seed.md");
             const seed = await db.get(makeFileId("seed.md")) as FileDoc;
@@ -194,7 +194,7 @@ describe("VaultSync", () => {
             expect(vault.files.has("../evil.md")).toBe(false);
         });
 
-        it("rejects a tombstone whose path escapes the vault (#3 delete-via-traversal)", async () => {
+        it("rejects a tombstone whose path escapes the vault (delete-via-traversal)", async () => {
             vault.addFile("seed.md", "payload");
             await vs.fileToDb("seed.md");
             const seed = await db.get(makeFileId("seed.md")) as FileDoc;
@@ -207,7 +207,7 @@ describe("VaultSync", () => {
             expect(res).toEqual({ applied: false, reason: "unsafe-path" });
         });
 
-        it("skips pull when total chunk size exceeds maxFileSizeMB (#4, symmetric to push)", async () => {
+        it("skips pull when total chunk size exceeds maxFileSizeMB (symmetric to push)", async () => {
             vault.addFile("big.md", "y".repeat(4000));
             await vs.fileToDb("big.md");
             vault.files.delete("big.md");
@@ -235,7 +235,7 @@ describe("VaultSync", () => {
         });
     });
 
-    // ── classifyFileVsDoc (PR3 — replaces legacy compareFileToDoc) ─
+    // ── classifyFileVsDoc (replaces legacy compareFileToDoc) ─
 
     describe("classifyFileVsDoc", () => {
         it("returns identical when content matches", async () => {
@@ -274,7 +274,7 @@ describe("VaultSync", () => {
             // Vault has different content from both lastSynced and remote.
             vault.addFile("a.md", "v1-but-different", { size: 777 });
             const result = await vs.classifyFileVsDoc(updated as FileDoc, "a.md", (await vault.stat("a.md"))!);
-            // PR3 classifier detects "right dominates AND left drifted from
+            // The classifier detects "right dominates AND left drifted from
             // baseline" → true-divergent (instead of legacy remote-pending
             // which had a separate divergent-edit guard).
             expect(result).toBe("true-divergent");
@@ -472,7 +472,7 @@ describe("VaultSync", () => {
         });
     });
 
-    // ── hasUnpushedChanges (PR-B: chunks-aware, invariant 4) ─
+    // ── hasUnpushedChanges (chunks-aware pending-edit oracle) ─
 
     describe("hasUnpushedChanges", () => {
         it("returns false when no integration baseline exists", async () => {

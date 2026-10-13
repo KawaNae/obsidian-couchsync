@@ -393,7 +393,7 @@ async function resolveChunkAttachments(
                     notFound.add(id);
                     continue;
                 }
-                // Authenticate at the fetch boundary (Invariant I). The
+                // Authenticate at the fetch boundary. The
                 // decoder stack already decrypted + decompressed; verify the
                 // bytes still hash to the content-addressed id. A hash/alg
                 // mismatch or malformed envelope means the chunk is corrupt
@@ -401,7 +401,7 @@ async function resolveChunkAttachments(
                 // route to repair) instead of writing untrusted bytes.
                 // `isCorruptChunkError` is the SAME rule the live-sync path in
                 // SyncEngine.ensureChunks uses — the two boundaries share it so
-                // they classify a corrupt chunk identically (#4).
+                // they classify a corrupt chunk identically.
                 try {
                     docs[i] = await chunkFromAttachment(id, blob, hasher);
                 } catch (e) {

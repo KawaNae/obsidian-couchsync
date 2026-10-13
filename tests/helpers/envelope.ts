@@ -1,7 +1,7 @@
 /** Test helpers for envelope-aware decorator tests.
  *
  *  The decorator stack (`CompressingCouchClient`, `EncryptingCouchClient`)
- *  contracts on envelope-formatted bytes at every layer (invariant 12).
+ *  contracts on envelope-formatted bytes at every layer.
  *  Production callers wrap their raw bytes via
  *  `encodeEnvelope(plainEnvelope(...))` before pushing into the stack
  *  and decode the envelope after pulling. These helpers do the same

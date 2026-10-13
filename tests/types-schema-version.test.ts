@@ -7,7 +7,7 @@ import {
     type ConfigDoc,
 } from "../src/types.ts";
 
-describe("schema version (v2) — invariant 11 (writer-required schemaVersion)", () => {
+describe("schema version (v2) — writer-required schemaVersion", () => {
     it("exposes CURRENT_SCHEMA_VERSION = 2", () => {
         expect(CURRENT_SCHEMA_VERSION).toBe(2);
     });

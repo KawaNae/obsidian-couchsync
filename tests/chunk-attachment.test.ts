@@ -73,7 +73,7 @@ describe("chunk-attachment round-trip", () => {
         ).rejects.toBeInstanceOf(ChunkIntegrityError);
     });
 
-    it("fail-closed: throws ChunkAlgMismatchError when the hasher's alg differs from the id's tag (#10)", async () => {
+    it("fail-closed: throws ChunkAlgMismatchError when the hasher's alg differs from the id's tag", async () => {
         // hmac-tagged id but only an x64 hasher available → the hasher cannot
         // verify these bytes. Previously this silently skipped verification,
         // letting a server present an unverifiable id and have its body
@@ -111,7 +111,7 @@ describe("chunk-attachment round-trip", () => {
     });
 });
 
-describe("isCorruptChunkError — shared classifier for both fetch boundaries (#4)", () => {
+describe("isCorruptChunkError — shared classifier for both fetch boundaries", () => {
     it("treats integrity, alg-mismatch and envelope errors as corrupt", () => {
         expect(isCorruptChunkError(new ChunkIntegrityError("id", "a", "b"))).toBe(true);
         expect(isCorruptChunkError(new ChunkAlgMismatchError("id", "hmac", "x64"))).toBe(true);

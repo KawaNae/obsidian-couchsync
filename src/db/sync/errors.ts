@@ -45,7 +45,7 @@ export function classifyError(err: unknown): SyncErrorDetail {
         };
     }
 
-    // Encryption-agreement pause (#1c): the supervised preCatchupCheck found
+    // Encryption-agreement pause: the supervised preCatchupCheck found
     // a user-actionable encryption state (server downgrade, cross-device
     // mismatch, pre-v2 legacy meta, or wrong passphrase) and set
     // connectionState back to "tested". Terminal — retrying loops against
@@ -60,7 +60,7 @@ export function classifyError(err: unknown): SyncErrorDetail {
     // Like a schema mismatch, retrying never succeeds, so it maps to the same
     // terminal kind the engine halts on rather than the backoff loop. A
     // retriable EncryptionError (decrypt failure) falls through to "unknown"
-    // and stays transient. (#enc-1)
+    // and stays transient.
     if (err instanceof EncryptionError && err.retriable === false) {
         return { kind: "schema-mismatch", message: rawMessage };
     }
@@ -72,7 +72,7 @@ export function classifyError(err: unknown): SyncErrorDetail {
     // this stays a neutral "aborted" kind; verifyReachable disambiguates via
     // elapsed wall-clock (suspend ⇒ elapsed ≫ timeout) before deciding
     // whether to enter a hard error. Mislabeling it "Server unreachable"
-    // was the source of the spurious resume notifications. (#6)
+    // was the source of the spurious resume notifications.
     if (e?.name === "AbortError" || /operation was aborted|\baborted\b/i.test(rawMessage)) {
         return { kind: "aborted", code, message: rawMessage };
     }

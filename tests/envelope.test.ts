@@ -83,7 +83,7 @@ describe.each([
     });
 });
 
-// ── decoder validation (invariant 12 reject paths) ──────────────
+// ── decoder validation (reject paths) ──────────────
 
 describe("envelope decoder validation", () => {
     it("rejects empty blob", () => {

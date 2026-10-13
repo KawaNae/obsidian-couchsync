@@ -105,7 +105,7 @@ export function createSyncHarness(opts: SyncHarnessOptions = {}): SyncHarness {
             deviceId: id,
             // URL 系は clientFactory が無視するので任意値でOK。
             // connectionState は "syncing" にする: openSession が
-            // connectionState === "syncing" でゲートされる (Invariant III) ため、
+            // connectionState === "syncing" でゲートされる (準備が済んだセッションだけを開く) ため、
             // engine.start() で実際にセッションが開くにはこの状態が必要。
             // provisioning 前の挙動を見るテストは override する。
             connectionState: "syncing",

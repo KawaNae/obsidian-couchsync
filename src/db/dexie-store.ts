@@ -146,8 +146,7 @@ export class SyncDB extends Dexie {
         // v3: add a dedicated `_meta` table for application-level schema
         // versioning (and any future cross-cutting bookkeeping). Kept
         // separate from `meta` so the `_local/*`-style domain keys in
-        // `meta` are not confused with format-versioning rows — see
-        // invariant 15.
+        // `meta` are not confused with format-versioning rows.
         this.version(3).stores({
             docs: "_id, type, _localSeq",
             meta: "key",
@@ -208,7 +207,7 @@ export class DexieStore<T extends { _id: string; _rev?: string } = any>
      *
      * Idempotent: safe to call on every open. Implementations should
      * call this from their `open()` / `ensureHealthy()` path so the
-     * invariant 15 check fires before any content read.
+     * schema-version check fires before any content read.
      */
     async ensureSchemaVersion(
         expected: number = DEXIE_STORE_SCHEMA_VERSION,
@@ -473,9 +472,9 @@ export class DexieStore<T extends { _id: string; _rev?: string } = any>
         // `_update_seq` in a separate IDB transaction; a write committing
         // between the row query and that read produced a last_seq covering a
         // row that was never enumerated. The push pipeline commits last_seq
-        // as its cursor, so the skipped row (a tombstone, in the 2026-06-03
-        // search1.jpeg incident) became permanently unpushable — no changes
-        // row, no unpushed-set entry, no log. Deriving last_seq from
+        // as its cursor, so the skipped row (a tombstone, whose file then
+        // stayed alive on every other device) became permanently
+        // unpushable — no changes row, no unpushed-set entry, no log. Deriving last_seq from
         // max(rows._localSeq) makes the race structurally impossible: all
         // rows of one tx share one _localSeq and `toArray()` is a single
         // snapshot read, so a tx is visible all-or-nothing.

@@ -110,7 +110,7 @@ describe("ConfigPushPipeline — incremental push", () => {
     });
 
     it("equal vclock but DIFFERENT content (Init stale-collision) → divergent, NOT silent skip", async () => {
-        // Source-side half of the 2026-06-14 bug: local has new content at the
+        // Source-side half of the Init stale-collision bug: local has new content at the
         // same {dev-A:1} as a stale remote. The old equal-skip trusted the
         // vclock proxy and silently dropped the local content. It must now
         // surface as divergent so nothing is lost.

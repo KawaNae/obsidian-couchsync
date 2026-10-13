@@ -453,7 +453,7 @@ describe("config binding lifecycle", () => {
     });
 
     describe("Join", () => {
-        it("syncs with the codec of config:meta and leaves Step 1 alone (invariant 17)", async () => {
+        it("syncs with the codec of config:meta and leaves Step 1 alone (config:meta is the authority for the DB's codec)", async () => {
             await seed("cfg-enc", { ".obsidian/app.json": `{"x":1}` }, ENC);
             // B's Step 1 says plaintext + compressed; the meta says encrypted, uncompressed.
             const b = makeDevice("dev-B", {
@@ -583,7 +583,7 @@ describe("config binding lifecycle", () => {
             expect(err.message).not.toMatch(/Create|Init/);
             expect(await attachmentOf(b)).toBeNull();
             expect(getEntry(b.settings)).toBeUndefined();
-            // Invariant C: the store is emptied only after the unlock succeeded.
+            // Setup atomicity: the store is emptied only after the unlock succeeded.
             expect(await store.get(makeConfigId(".obsidian/local.json"))).not.toBeNull();
         });
     });
@@ -701,7 +701,7 @@ describe("config binding lifecycle", () => {
         });
     });
 
-    describe("Step 1 / vault codec changes never stop sync — after Create AND after Join (#config-codec)", () => {
+    describe("Step 1 / vault codec changes never stop sync — after Create AND after Join", () => {
         it("after Create: Step 1 flipped, Push still succeeds with the created codec", async () => {
             const a = await creator("cfg-A", { ".obsidian/app.json": "{}" });
             a.settings.configCompressionEnabled = true;
@@ -764,7 +764,7 @@ describe("config binding lifecycle", () => {
         });
     });
 
-    describe("the setup flag is per binding (#err-9)", () => {
+    describe("the setup flag is per binding", () => {
         it("an interrupted Create on A blocks A only; B syncs", async () => {
             await seed("cfg-A", { ".obsidian/app.json": `{"a":1}` });
             await seed("cfg-B", { ".obsidian/app.json": `{"b":1}` });

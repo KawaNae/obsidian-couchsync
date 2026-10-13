@@ -3,8 +3,8 @@
  * compression) with a remote DB's self-describing meta doc.
  *
  * Generic over the meta kind: `vault:meta` for the vault DB,
- * `config:meta` for the config DB. Phase 2 (invariant 17/18) treats
- * each meta as an independent crypto root, so this check runs once
+ * `config:meta` for the config DB. Since v0.26 each meta is an
+ * independent crypto root, so this check runs once
  * per DB — once at vault startup against vault:meta, once at config
  * startup against config:meta. Both call paths share this function via
  * the `metaDocId` parameter.
@@ -43,7 +43,7 @@ export type EncryptionAgreement =
      *  recorded floor (`settings.vaultCipherVersion` / `configCipherVersion`).
      *  Because the meta doc is server-writable, a curious server can rewrite
      *  cipherVersion 3 → 2 to re-enable the unauthenticated legacy/plaintext
-     *  decode path (#1/#3). Refusing it here, before any data flows, keeps the
+     *  decode path. Refusing it here, before any data flows, keeps the
      *  TOFU floor monotonic. Surfaced like a wrong-passphrase / tamper error. */
     | { status: "cipher-downgrade-detected"; meta: DbMetaDoc; localFloor: number };
 

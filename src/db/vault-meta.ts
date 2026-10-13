@@ -18,7 +18,7 @@
  * - Replicated doc bodies carry `schemaVersion` for shape.
  * - Chunk ids carry the hash-algorithm tag (`chunk:<alg>:<hash>`).
  *
- * That separation (invariants 11-15) means a reader handed any single
+ * That separation means a reader handed any single
  * byte sequence can decode it without first fetching `vault:meta`.
  * The doc is for Clone-time stack assembly and human-facing settings
  * — not the per-blob decode path.
@@ -95,7 +95,7 @@ export interface VaultMetaDoc {
              *        (`encryptedPath`).
              *  - v3: file/config doc bodies are compressed-then-encrypted into a
              *        single `encBody`, GCM-bound to the `_id` (AAD). Attachment
-             *        framing is unchanged. (#2 — authenticated, confidential body.) */
+             *        framing is unchanged. (Authenticated, confidential body.) */
             cipherVersion: 2 | 3;
             salt: string; // base64
             keyCheck: string; // encrypted token
@@ -139,19 +139,19 @@ export async function fetchVaultMeta(
  * Schema for the `config:meta` doc — self-describing meta for the
  * separate config DB.
  *
- * **Phase 2 (v0.26) — independent crypto principal.** Each `<db>:meta`
+ * **Independent crypto principal (v0.26).** Each `<db>:meta`
  * is its own crypto root: own salt, own keyCheck. The
  * structural shape mirrors VaultMetaDoc so a single generic helper
  * (`buildInitialMeta` / `unlockMeta`) can build and unlock both, but
  * the crypto material is not shared — same passphrase + different salts
  * → different keys → vault HMAC and config HMAC live in disjoint id
- * spaces. Invariant 17 (this doc is authority for config DB codec
- * state) and invariant 18 (cryptoProvider is per-DB) hold simultaneously.
+ * spaces. This doc is the authority for the config DB's codec state, and
+ * the cryptoProvider is per-DB, at the same time.
  *
- * `schemaVersion: 2` — bumped from the Phase 1 in-progress shape (which
+ * `schemaVersion: 2` — bumped from the earlier in-progress shape (which
  * was a clone of vault:meta and therefore not a real crypto root).
  * Readers that see schemaVersion 1 surface `legacy-meta` (Create required) so the
- * Phase 1 → Phase 2 transition lands cleanly on a fresh own-salt write.
+ * move to the independent root lands cleanly on a fresh own-salt write.
  */
 export interface ConfigMetaDoc {
     _id: typeof CONFIG_META_DOC_ID;
@@ -193,9 +193,9 @@ export async function fetchConfigMeta(
  * `ConfigBinding.wrapClient` and its chunk hasher. Every call also mints a
  * fresh `generationId`, encrypted or not.
  *
- * Phase 2 signature change: previously this cloned from `vault:meta`
+ * Signature change in v0.26: previously this cloned from `vault:meta`
  * (`buildInitialConfigMeta(vaultMeta)`). That coupling broke
- * cross-vault config sharing (Android decrypt failure, 2026-05-29).
+ * cross-vault config sharing (an Android device failed to decrypt).
  * The new shape takes the same `{encryption, passphrase, compression}`
  * triple as the vault builder and produces a fully independent root.
  */
@@ -287,7 +287,7 @@ export async function unlockVaultMeta(
     return unlockMeta(meta, passphrase);
 }
 
-// ── Generic meta helpers (Phase 2) ─────────────────────────
+// ── Generic meta helpers ───────────────────────────────────────
 
 /** Schema version stamped on freshly-built meta docs of each kind. */
 const META_SCHEMA_VERSION = {
@@ -318,7 +318,7 @@ interface BuildMetaResult<T extends DbMetaDoc> {
  *
  * Two metas built from the same passphrase but different `docId` produce
  * **different** salts (and therefore different keys) — that is the
- * structural mechanism of Phase 2's invariant 18.
+ * structural mechanism that keeps the cryptoProvider per-DB.
  */
 export async function buildInitialMeta(opts: BuildMetaOpts): Promise<BuildMetaResult<DbMetaDoc>> {
     if (opts.encryption) {
@@ -365,8 +365,8 @@ export async function buildInitialMeta(opts: BuildMetaOpts): Promise<BuildMetaRe
  *  passphrase, since the AES-GCM auth tag fails). keyCheck is the sole
  *  passphrase verifier: it is authenticated and costs a full PBKDF2
  *  derivation per guess, so there is no faster offline oracle. Symmetric
- *  for both vault and config DBs — invariant 17 means each meta carries
- *  everything needed to verify itself. */
+ *  for both vault and config DBs — each meta is a self-contained crypto
+ *  root and carries everything needed to verify itself. */
 export async function unlockMeta(
     meta: DbMetaDoc,
     passphrase: string,

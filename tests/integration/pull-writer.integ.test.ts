@@ -1,5 +1,5 @@
 /**
- * PullWriter integration tests — Phase 4 migration.
+ * PullWriter integration tests.
  *
  * Drives PullWriter against a real LocalDB + real ConflictResolver and
  * verifies side effects (docs landed, vclocks driving verdict, pull
@@ -49,9 +49,9 @@ function attachPullWriter(opts: {
      *  decline (IME divergence etc.). */
     applyPullWrite?: (doc: FileDoc) => Promise<WriteResult> | Promise<void>;
     /** Re-fetch a remote FileDoc for the local-delete-vs-remote-edit
-     *  re-presentation (#7). Defaults to "absent". */
+     *  re-presentation. Defaults to "absent". */
     getRemoteDoc?: (id: string) => Promise<FileDoc | null>;
-    /** Probe for an unpushed local edit (hard-delete path, #del-1). Defaults
+    /** Probe for an unpushed local edit (hard-delete path). Defaults
      *  to "no unpushed" so a tombstone applies durably. */
     probeUnpushed?: (path: string) => Promise<boolean>;
     /** Override the chunk-fetch callback (defaults to no-op). Tests that
@@ -202,9 +202,9 @@ describe("PullWriter integration", () => {
             const rig = attachPullWriter({ device: b, withResolver: true });
 
             // Seed with a non-empty local chunk so the remote (different
-            // chunk) is genuinely concurrent. Pre-PR4 this test passed with
+            // chunk) is genuinely concurrent. This test once passed with
             // empty chunks on both sides because the resolver ignored
-            // content; post-PR4 the classifier silent-merges chunk-equal
+            // content; the classifier now silent-merges chunk-equal
             // pairs, so the chunks must differ to exercise concurrent.
             await seedLocalFileDoc(b, "test.md", { A: 2 }, ["chunk:local"]);
             const remote = makeRemoteFileDoc("test.md", { B: 1 }, {
@@ -223,7 +223,7 @@ describe("PullWriter integration", () => {
         });
 
         it("equal vclock + chunks differ (pull tie) → concurrent, NOT silent converged-skip", async () => {
-            // 2026-06-14 on-device bug: after a Config Init resets vclocks, a
+            // Seen on device: after a Config Init resets vclocks, a
             // stale local doc collides with a freshly-pushed remote at the SAME
             // {A:1}. The old convergedSkip trusted the vclock proxy and silently
             // kept the stale local (the new content never propagated). It must
@@ -250,11 +250,11 @@ describe("PullWriter integration", () => {
             await expectDb(b.db).toHaveFileDoc("edge.md").withVclock({ A: 1 });
         });
 
-        it("PR4: silent-merge when vclocks divergent but chunks identical (audit MEDIUM)", async () => {
-            // audit-2026-05-08 MEDIUM: a re-imported device pushed under its
+        it("silent-merge when vclocks divergent but chunks identical", async () => {
+            // A re-imported device pushed under its
             // own deviceId, then catchup brings remote with same content but
-            // a foreign device's vclock. Pre-PR4 fired a `concurrent` event
-            // (false positive); post-PR4 silently merges.
+            // a foreign device's vclock. A vclock-only comparison fired a
+            // `concurrent` event (false positive); the writer silently merges.
             h = createSyncHarness();
             const b = h.addDevice("dev-B");
             const rig = attachPullWriter({ device: b, withResolver: true });
@@ -561,7 +561,7 @@ describe("PullWriter integration", () => {
     // ── deletion handling ────────────────────────────────
 
     describe("deletion handling", () => {
-        it("probes unpushed for file tombstones and applies the deletion durably (#del-1)", async () => {
+        it("probes unpushed for file tombstones and applies the deletion durably", async () => {
             h = createSyncHarness();
             const b = h.addDevice("dev-B");
             const probed: string[] = [];
@@ -663,7 +663,7 @@ describe("PullWriter integration", () => {
             expect(concurrent[0].remoteDeleted).toBe(true);
         });
 
-        it("durable deletion survives an apply crash and recovers on drain (#del-1)", async () => {
+        it("durable deletion survives an apply crash and recovers on drain", async () => {
             h = createSyncHarness();
             const b = h.addDevice("dev-B");
             await seedLocalFileDoc(b, "doomed.md", { A: 1 });
@@ -691,7 +691,7 @@ describe("PullWriter integration", () => {
             expect(stored?.deleted).toBe(true); // no permanent loss
         });
 
-        it("treats a probe I/O error as a conflict, not a silent deletion (#err-10)", async () => {
+        it("treats a probe I/O error as a conflict, not a silent deletion (fail safe-side)", async () => {
             h = createSyncHarness();
             const b = h.addDevice("dev-B");
             await seedLocalFileDoc(b, "risky.md", { A: 1 });
@@ -715,14 +715,14 @@ describe("PullWriter integration", () => {
         });
     });
 
-    // ── Invariant B: pending-apply recovery ──────────────
+    // ── Pull durability: pending-apply recovery ──────────────
     //
     // A file pulled while its chunk is not yet durable must NOT be
     // checkpointed-past silently: it is recorded in the pending-apply set
     // (in the same tx as the remoteSeq advance) and recovered by
     // drainPendingApply once the chunk becomes available.
 
-    describe("Invariant B — pending-apply recovery", () => {
+    describe("pull durability — pending-apply recovery", () => {
         const PENDING_PREFIX = "_sync/pending-apply/";
 
         /** Build a PullWriter whose chunk availability is flag-controlled. */
@@ -823,7 +823,7 @@ describe("PullWriter integration", () => {
         });
     });
 
-    // ── #3: deletion-conflict durability ─────────────────
+    // ── deletion-conflict durability ─────────────────────
     describe("pending-conflict (remote-delete vs local-edit durability)", () => {
         it("persists a soft-delete-vs-edit conflict in the cursor-advance tx and re-presents it after a restart", async () => {
             h = createSyncHarness();
@@ -915,7 +915,7 @@ describe("PullWriter integration", () => {
     // Both sides are concurrent ALIVE edits. Pre-defer this was NOT persisted
     // (keep-local kept the remote rev retrievable). With defer the cursor
     // advances past the remote rev without accepting it, so the conflict must
-    // be durable and re-fetch the remote doc on drain (2026-06-02 incident).
+    // be durable and re-fetch the remote doc on drain.
     describe("pending-conflict edit-vs-edit (defer durability)", () => {
         it("persists an edit-vs-edit conflict and re-presents the remote edit after a restart", async () => {
             h = createSyncHarness();
@@ -1017,12 +1017,12 @@ describe("PullWriter integration", () => {
         });
     });
 
-    // ── #5: clean-deletion apply durability ──────────────
+    // ── clean-deletion apply durability ──────────────────
     // A clean remote soft-deletion (take-remote, no local edit) applies the
     // vault delete post-commit; if it throws / the process dies, the old code
     // never retried (it was excluded from pending-apply). Now it is recorded
     // as `pending-deletion` and re-applied by the drain.
-    describe("pending-deletion (clean soft-delete apply durability, #5)", () => {
+    describe("pending-deletion (clean soft-delete apply durability)", () => {
         it("records a failed take-remote deletion and re-applies it on the next drain", async () => {
             h = createSyncHarness();
             const b = h.addDevice("dev-B");
@@ -1064,12 +1064,12 @@ describe("PullWriter integration", () => {
         });
     });
 
-    // ── #7: reverse deletion-conflict durability ─────────
-    // Mirror of #3: the local copy is a tombstone and the pulled remote is a
+    // ── reverse deletion-conflict durability ─────────────
+    // Mirror of the deletion-conflict block: the local copy is a tombstone and the pulled remote is a
     // concurrent ALIVE edit. Must persist + re-present (the remote edit), not
     // drop it silently. The dominated case (remote strictly newer) must NOT
     // record a conflict — that is a legitimate resurrection.
-    describe("pending-conflict reverse (local-delete vs remote-edit, #7)", () => {
+    describe("pending-conflict reverse (local-delete vs remote-edit)", () => {
         function seedLocalTombstone(b: DeviceHarness, path: string, vclock: Record<string, number>): FileDoc {
             const doc: FileDoc = {
                 _id: makeFileId(path), type: "file", schemaVersion: FILE_SCHEMA_VERSION,
@@ -1141,7 +1141,7 @@ describe("PullWriter integration", () => {
 
     // ── tombstone chunk-fetch skip ────────────────────────
     // Tombstone fingerprints are NOT normalized (markDeleted retains the
-    // deleted content's chunks — Invariant 7), but applying a deletion never
+    // deleted content's chunks), but applying a deletion never
     // reads chunk bodies. Fetching them wasted bandwidth on dead content
     // that the next chunk GC dropped again (GC pins via live docs only).
     describe("tombstone chunk-fetch skip", () => {

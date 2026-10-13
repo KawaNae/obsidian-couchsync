@@ -87,7 +87,7 @@ export class Checkpoints {
      * `pendingApplyAdd` carries the file-doc ids whose chunks are not yet
      * local (so their vault apply, attempted in `onCommit` AFTER this tx
      * durably commits, may fail). Recording them in the SAME tx as the
-     * `remoteSeq` advance is the load-bearing half of Invariant B: the
+     * `remoteSeq` advance is the load-bearing half of pull durability: the
      * cursor can never move past a file that isn't either applied or
      * remembered for retry. The caller removes the ids that apply cleanly
      * (post-commit), leaving only genuine misses in the set.
@@ -100,8 +100,8 @@ export class Checkpoints {
          *  pending-deletion → re-apply the deletion). */
         pendingApplyAdd?: Array<{ id: string; reason: PendingApplyReason }>;
         /** File-doc ids whose deletion-vs-edit conflict (either direction) must
-         *  be persisted in the SAME tx as the cursor advance (Invariant B for
-         *  the deletion-conflict class — see pending-conflict.ts). */
+         *  be persisted in the SAME tx as the cursor advance, so the cursor
+         *  never moves past an unresolved conflict — see pending-conflict.ts. */
         pendingConflictAdd?: Array<{ id: string; kind: PendingConflictKind }>;
         onCommit: () => Promise<void>;
     }): Promise<void> {
@@ -128,7 +128,7 @@ export class Checkpoints {
     }
 
     /**
-     * Add and/or remove pending-apply entries (Invariant B). Used by the
+     * Add and/or remove pending-apply entries. Used by the
      * post-commit cleanup (remove the ids that applied cleanly) and by the
      * drain (remove resolved ids, re-add still-missing ones with a bumped
      * attempt count). A standalone tx — not paired with a cursor advance,
@@ -176,7 +176,7 @@ export class Checkpoints {
         // A delete-only batch produces no accepted docs but may still carry a
         // deletion-vs-edit conflict (either direction). Persist it in the SAME
         // tx as the cursor advance so the conflict survives a missed modal /
-        // restart (Invariant B for the deletion-conflict class).
+        // restart.
         const now = Date.now();
         for (const { id, kind } of pendingConflictAdd ?? []) {
             const entry: PendingConflictEntry = { addedAt: now, kind };

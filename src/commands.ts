@@ -179,7 +179,7 @@ export async function runChunkConsistencyReport(
             async (currentReport) => {
                 void currentReport; // the displayed snapshot is a preview only
                 const repairProgress = new ProgressNotice("Chunk repair");
-                // #4: re-analyze immediately before acting. The report shown in
+                // Re-analyze immediately before acting. The report shown in
                 // the modal may be stale (arbitrary user think-time), and acting
                 // on a stale snapshot can tombstone a chunk another device just
                 // re-referenced. A fresh analyze also re-checks the convergence

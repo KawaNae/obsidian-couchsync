@@ -412,7 +412,7 @@ describe("remote-couch (IDocStore + ICouchClient)", () => {
             expect(written).toBe(1);
         });
 
-        it("rejects a chunk whose body does not hash to its id (verified fetch boundary, #1)", async () => {
+        it("rejects a chunk whose body does not hash to its id (verified fetch boundary)", async () => {
             // Content-addressed id for "REAL", but the attachment decodes to
             // "EVIL" — a server-substituted body. pullAll must verify against
             // the hasher and skip it (route to repair), not write untrusted bytes.

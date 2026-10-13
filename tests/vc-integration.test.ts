@@ -129,7 +129,7 @@ describe("VC integration — two peers", () => {
     });
 
     it("equal vclocks with different chunks (pull) → concurrent (truthful)", async () => {
-        // Unit-level repro of the 2026-06-14 non-propagation bug. A pull
+        // Unit-level repro of the config non-propagation bug. A pull
         // compares two REAL doc vclocks; an equal clock with differing content
         // cannot come from a legit local edit (that bumps the clock). It is the
         // config-Create stale-collision anomaly and MUST surface as concurrent —

@@ -13,10 +13,10 @@
  *      declines, so PullWriter can account skips and emit `pull-skipped`
  *      for the supervisor to schedule a reconcile retry.
  *
- * Production trigger: 2026-05-05 23:38 desktop edit of
+ * Production trigger: a desktop edit of
  * `Obsidian-task-viewer.md` (rev 196) was overwritten 12h later by iPad's
  * rev 197 (chunks matching rev 193, vclock dominating rev 196). Manual
- * reproduction on Android emulator + dev vault on 2026-05-06 confirmed
+ * reproduction on Android emulator + dev vault confirmed
  * the structural fingerprint:
  *
  *   - LocalDB.doc: { chunks: [h_new], vclock: V_new }     ← committed by pull
@@ -232,7 +232,7 @@ describe("regression: pull-skipped event triggers reconcile schedule", () => {
      * the count, so the supervisor (main.ts) can fire reconcile.
      *
      * Without this trigger, idle longpoll persists divergent state
-     * indefinitely (verified 2026-05-06: 90s of idle yielded no
+     * indefinitely (verified on device: 90s of idle yielded no
      * spontaneous reconciler activity).
      */
     it("emits pull-skipped event when applyPullWrite returns applied:false", async () => {

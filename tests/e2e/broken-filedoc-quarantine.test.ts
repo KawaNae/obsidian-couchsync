@@ -1,7 +1,7 @@
 /**
- * E2E (G2): a FileDoc whose chunks are unavailable on this device AND the
+ * E2E: a FileDoc whose chunks are unavailable on this device AND the
  * server (broken / missingReferenced) must be QUARANTINED by the reconciler —
- * not restore-looped (the field ping-pong), not opaque-crashed (G1). Recovers
+ * not restore-looped (the field ping-pong), not opaque-crashed (content-less chunk TypeError). Recovers
  * automatically once the chunk reappears.
  *
  * Drives the real Reconciler + real engine.ensureFileChunks against real

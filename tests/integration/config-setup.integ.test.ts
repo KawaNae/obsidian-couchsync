@@ -2,7 +2,7 @@
  * ConfigSetupService integration tests — true clean-slate init.
  *
  * Drives ConfigSync.create() (formerly init) against a real ConfigLocalDB + FakeCouchClient
- * and verifies the new (PR5) semantics:
+ * and verifies the clean-slate semantics:
  *
  *   - The local DB is destroyed (not just deleteByPrefix-d) — cache,
  *     checkpoints, and lastSynced all start fresh.
@@ -44,7 +44,7 @@ function asCouchClient(fake: FakeCouchClient): CouchClient {
     return fake as unknown as CouchClient;
 }
 
-describe("ConfigSetupService — clean-slate init (PR5)", () => {
+describe("ConfigSetupService — clean-slate init", () => {
     let vault: FakeVaultIO;
     let modal: FakeModalPresenter;
     let db: ConfigLocalDB;
@@ -76,7 +76,7 @@ describe("ConfigSetupService — clean-slate init (PR5)", () => {
             {
                 storeFactory: () => db,
                 clientFactory: () => asCouchClient(remote),
-                // Phase 2: raw client factory reuses the in-memory fake
+                // The raw client factory reuses the in-memory fake
                 // because the test has no real codec layer to bypass.
                 rawClientFactory: () => asCouchClient(remote),
             },
@@ -164,8 +164,8 @@ describe("ConfigSetupService — clean-slate init (PR5)", () => {
     });
 
     it("init produces fresh rev=1- on remote (no carry-over from previous tenant)", async () => {
-        // Simulate the audit-2026-05-08 phantom: previous tenant
-        // accumulated rev=N for `app.json`. After our PR5 init, the doc
+        // Simulate a previous tenant that accumulated rev=N for
+        // `app.json`. After a clean-slate init, the doc
         // must come back at a new rev tree (rev=1-).
         const id = makeConfigId(".obsidian/app.json");
         await remote.bulkDocs([{
@@ -199,7 +199,7 @@ describe("ConfigSetupService — clean-slate init (PR5)", () => {
     });
 });
 
-describe("ConfigSetupService — setup atomicity (#err-9)", () => {
+describe("ConfigSetupService — setup atomicity", () => {
     let vault: FakeVaultIO;
     let db: ConfigLocalDB;
     let auth: AuthGate;
@@ -259,9 +259,9 @@ describe("ConfigSetupService — setup atomicity (#err-9)", () => {
         expect(getEntry(settings)?.settingUp).toBe(true);
     });
 
-    // ── M-2: init ordering & blast-radius minimisation ──
+    // ── init ordering & blast-radius minimisation ──
 
-    it("pushes config:meta as the first remote write after ensureDb, before any config doc (M-2)", async () => {
+    it("pushes config:meta as the first remote write after ensureDb, before any config doc", async () => {
         vault.addFile(".obsidian/app.json", `{}`);
         const ensureSpy = vi.spyOn(remote, "ensureDb");
         const bulkSpy = vi.spyOn(remote, "bulkDocs");
@@ -288,7 +288,7 @@ describe("ConfigSetupService — setup atomicity (#err-9)", () => {
         expect(appIdx).toBeGreaterThan(metaIdx);
     });
 
-    it("does not destroy the remote when the pre-destroy config check fails (pre-destructive, M-2)", async () => {
+    it("does not destroy the remote when the pre-destroy config check fails (pre-destructive)", async () => {
         // No config DB applied (unbound) trips the pre-check, which runs
         // BEFORE the crypto derivation and the destructive wipe. Nothing must
         // be destroyed and the setup latch must never be set.
@@ -355,7 +355,7 @@ describe("ConfigSetupService — setup atomicity (#err-9)", () => {
     });
 });
 
-// NOTE: The "fail-closed encrypting client (L-1)" describe block was removed
+// NOTE: The "fail-closed encrypting client" describe block was removed
 // when Init was split from Push. Init no longer pushes content, so it never
 // builds an encrypting client — there is no init-time plaintext-into-encrypted
 // branch left to guard. The equivalent protection now lives where the content

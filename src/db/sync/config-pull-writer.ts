@@ -74,10 +74,9 @@ export interface ConfigPullStats {
     keepLocal: number;
     deleted: number;
     concurrent: number;
-    /** PR-C: chunks-equal but vclocks drifted — committed with mergeVC,
-     *  no concurrent modal. Closes audit-2026-05-08 MEDIUM on the
-     *  ConfigSync side (vault PullWriter has the same counter under the
-     *  name `vclockOnlyDriftCount`). */
+    /** Chunks-equal but vclocks drifted — committed with mergeVC,
+     *  no false-positive concurrent modal (vault PullWriter has the same
+     *  counter under the name `vclockOnlyDriftCount`). */
     vclockOnlyDrift: number;
 }
 
@@ -117,7 +116,7 @@ export class ConfigPullWriter {
         const concurrent: ConfigConcurrentEntry[] = [];
 
         let totalReceived = 0;
-        // One-shot guard for the seq-regression self-heal (L-2/L-3). A healthy
+        // One-shot guard for the seq-regression self-heal. A healthy
         // recreate-elsewhere event resets the cursor exactly once; a SECOND
         // regression in the same run means the server keeps reporting a
         // last_seq below our cursor — a pathological / hostile server we must
@@ -141,11 +140,11 @@ export class ConfigPullWriter {
             // nothing forever. Reset to 0 and re-pull the whole DB. The vault
             // pull guard (pull-pipeline.ts) throws into an error state, but a
             // config Create is an admin op the other devices should simply follow,
-            // so we self-heal instead. (#config-codec)
+            // so we self-heal instead.
             if (seqNumeric(batch.last_seq) < seqNumeric(since)) {
                 // A second regression in one run is not a legitimate recreate —
                 // the server is unstable or lying about last_seq. Fail terminally
-                // rather than spin to MAX_PULL_BATCHES (L-3). The re-pulled docs
+                // rather than spin to MAX_PULL_BATCHES. The re-pulled docs
                 // are still integrity-checked (cipherVersion floor + HMAC), so
                 // this is an availability guard, not a confidentiality one.
                 if (didSeqReset) {
@@ -161,7 +160,7 @@ export class ConfigPullWriter {
                     `< cursor=${since}) — config DB recreated elsewhere; ` +
                     `resetting cursor and re-pulling from scratch.`,
                 );
-                // Durable reset (L-2): persist pullSeq=0 to disk, not just the
+                // Durable reset: persist pullSeq=0 to disk, not just the
                 // in-memory cursor. A crash after a memory-only reset would leave
                 // the high cursor on disk and re-trigger this regression (and a
                 // full re-pull) every session. saveEmptyPullBatch writes
@@ -261,7 +260,7 @@ export class ConfigPullWriter {
             const remoteDoc = stripRev(row.doc) as ConfigDoc;
             if (!isConfigDoc(remoteDoc)) continue;
 
-            // Schema-version gate (Plan agent C1, invariant 17). v0.25
+            // Schema-version gate. v0.25
             // shipped ConfigDoc with `data: string` and `schemaVersion: 2`;
             // v0.26 expects `chunks: string[]` + `schemaVersion: 3`. Mixing
             // shapes silently corrupts disk writes, so we abort loudly
@@ -278,10 +277,9 @@ export class ConfigPullWriter {
                 // chunks equal AND deleted matches. A vclock TIE with differing
                 // content is the config-Create stale-collision anomaly and MUST
                 // fall through to the resolver (→ true-divergent → concurrent),
-                // not be silently kept — that was the 2026-06-14 on-device
-                // non-propagation bug (first push at vclock {1} never reached
-                // peers). The predicate is a strict subset of `identical`, so
-                // it can never disagree with classifySyncRelation (Invariant 2).
+                // not be silently kept — otherwise a first push at vclock {1}
+                // never reaches peers. The predicate is a strict subset of
+                // `identical`, so it can never disagree with classifySyncRelation.
                 if (Object.keys(localVC).length > 0
                     && compareVC(localVC, remoteVC) === "equal"
                     && chunkListsEqual(localDoc.chunks, remoteDoc.chunks)
@@ -294,10 +292,9 @@ export class ConfigPullWriter {
                         localDoc, remoteDoc, { recreateAuthority },
                     );
                     const path = configPathFromId(remoteDoc._id);
-                    // **Invariant 5 (PullVerdict 完全網羅).** Every verdict
-                    // must be handled explicitly — fall-through silently
-                    // dropping `silent-merge` was the audit-2026-05-08
-                    // MEDIUM bug shape on the ConfigSync side. The final
+                    // **PullVerdict exhaustive.** Every verdict
+                    // must be handled explicitly — a fall-through once
+                    // silently dropped `silent-merge` here. The final
                     // `_exhaustive: never` makes future verdict additions
                     // a compile error rather than a silent regression.
                     switch (verdict) {
@@ -448,7 +445,7 @@ export class ConfigPullWriter {
      */
     private async ensureChunks(configDoc: ConfigDoc): Promise<void> {
         const existing = await this.deps.db.getChunks(configDoc.chunks);
-        // Availability (Invariant I): content-less doc counts as missing so it
+        // Availability: content-less doc counts as missing so it
         // is re-fetched rather than trusted by id. Symmetric with the vault
         // side (SyncEngine.ensureChunksInternal).
         const usableIds = new Set(
@@ -461,7 +458,7 @@ export class ConfigPullWriter {
         // the same implementation the vault boundary uses, so a corrupt config
         // chunk is classified identically — `isCorruptChunkError` (incl. a
         // structurally-malformed EnvelopeError), not just ChunkIntegrityError
-        // (L-8: the config copy previously rethrew EnvelopeError, aborting the
+        // (the config copy previously rethrew EnvelopeError, aborting the
         // whole doc's ensureChunks instead of skipping + warning like vault).
         const { fetched, notFound, corrupt } = await fetchMissingChunks(missing, {
             getAttachment: (id, name, sig) =>

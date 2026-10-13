@@ -10,8 +10,8 @@ export const MAX_PREVIOUS_DEVICE_IDS = 10;
  *   editing → tested → setupDone → syncing
  *
  * `settingUp` is a non-syncable transient entered at the START of Init/
- * Clone, before the destructive `localDb.destroy()` (Invariant C — setup
- * atomicity). It is persisted pessimistically so that a setup which fails
+ * Clone, before the destructive `localDb.destroy()`, so that setup is
+ * atomic. It is persisted pessimistically so that a setup which fails
  * (or whose process dies) mid-flight can never leave the prior
  * `setupDone`/`syncing` state behind — which would let the user start
  * sync against a half-built local DB. Only a confirmed-successful setup
@@ -43,7 +43,7 @@ export interface ConfigBindingRecord {
      *  sync op. `undefined` for a plaintext DB. */
     cipherFloor?: number;
     /** This device's Create is in progress; true between the destructive
-     *  wipe and the commit (Invariant C, #err-9). */
+     *  wipe and the commit, so an interrupted Create is detectable. */
     settingUp: boolean;
     /** The passphrase that unlocks this DB's encrypted root: the one Create
      *  encrypted with, or the one Join unlocked with. Written only by those
@@ -121,14 +121,13 @@ export interface CouchSyncSettings {
      *  chunks keep whatever encoding they were stored with). */
     compressionEnabled: boolean;
 
-    /** Phase 2 (v0.26): config-side codec overrides. Each field is
+    /** v0.26: config-side codec overrides. Each field is
      *  optional — `undefined` means "inherit from the vault setting
      *  above". Concrete values let advanced users decouple config
      *  crypto/compression from vault, e.g. share a plaintext config
-     *  DB across pools while keeping notes encrypted. The settings UI
-     *  surfaces these in a Phase 3 follow-up; the internal code paths
-     *  already honour them today (invariant 18: cryptoProvider is
-     *  per-DB). */
+     *  DB across pools while keeping notes encrypted. Set from Step 1
+     *  of the Config Sync tab; the codec paths honour them because the
+     *  config DB has its own cryptoProvider, independent of the vault's. */
     configEncryptionEnabled?: boolean;
     /** The passphrase the NEXT Create encrypts the config DB with; empty
      *  inherits the vault passphrase. Also one of the values Join tries.
@@ -145,7 +144,7 @@ export interface CouchSyncSettings {
      *  check refuses a remote `vault:meta` whose cipherVersion is below it.
      *  Sourced from client-local state, never re-read live from the
      *  server-writable meta, so a curious server cannot lower the floor by
-     *  rewriting meta (closes the v3 downgrade hole, #1/#3). `undefined` on a
+     *  rewriting meta (closes the cipherVersion-3 downgrade hole). `undefined` on a
      *  not-yet-observed or plaintext vault — permissive (legacy dual-read). */
     vaultCipherVersion?: number;
     /** Per-config-DB cipher floor and Create-interrupted flag, keyed by

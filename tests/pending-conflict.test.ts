@@ -1,7 +1,7 @@
 /**
  * pending-conflict persistence — kind round-trip + backward-compat.
  *
- * Covers the Phase 3 addition of the `edit-vs-edit` kind: it must persist and
+ * Covers the `edit-vs-edit` kind: it must persist and
  * load cleanly, while an unknown/legacy kind from a future or corrupt build is
  * defensively dropped (never crashes the load path, never re-presents garbage).
  */

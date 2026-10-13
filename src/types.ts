@@ -27,10 +27,11 @@ export type { DocKind, ParsedDocId, ChunkHashAlg } from "./types/doc-id.ts";
  *  own version literal so the kinds can evolve independently: e.g.
  *  ConfigDoc moves from v2 to v3 (chunks-based) without forcing FileDoc
  *  to re-stamp. Writers stamp the constant matching the kind; readers
- *  rely on the type guarantee (invariant 11) and don't tolerate
+ *  rely on the type guarantee (the field is required, so a missing
+ *  stamp is a compile error) and don't tolerate
  *  undefined.
  *
- *  - `FILE_SCHEMA_VERSION = 2` — attachment-based v2 (data-layer-v2)
+ *  - `FILE_SCHEMA_VERSION = 2` — attachment-based v2 (v0.25)
  *  - `CHUNK_SCHEMA_VERSION = 2` — attachment-based v2
  *  - `CONFIG_SCHEMA_VERSION = 3` — chunks-based, attachment payload
  *    (ConfigSync chunking, supersedes the `data: string` inline form)
@@ -122,8 +123,8 @@ export interface ChunkDoc extends CouchSyncDocBase {
  *  v3 (ConfigSync chunking) replaces the legacy `data: string` (base64
  *  inline) field with `chunks: string[]`, mirroring FileDoc. Each chunk
  *  rides as a `ChunkDoc` in the SAME config DB with an envelope-formatted
- *  attachment "c" — invariant 12 universality now applies to config DB
- *  too. Cross-device dedup (identical plugin/theme across N devices →
+ *  attachment "c" — every attachment carries the codec envelope
+ *  header, in the config DB too. Cross-device dedup (identical plugin/theme across N devices →
  *  one chunk on remote) and wire-level gzip (via CompressingCouchClient)
  *  are the load-bearing wins.
  */

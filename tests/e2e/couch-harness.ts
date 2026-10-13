@@ -1,5 +1,5 @@
 /**
- * E2E harness — Phase 1 の SyncHarness と同じ shape を持つが、内部で実 CouchClient
+ * E2E harness — tests/harness/sync-harness.ts の SyncHarness と同じ shape を持つが、内部で実 CouchClient
  * を使う。fake-indexeddb は再利用 (LocalDB 側はテストごとに fresh)。
  *
  * 前提: docker-compose up で CouchDB 3.3 が :5984 で起動済み。
@@ -204,7 +204,7 @@ export interface CreateE2EHarnessOpts {
     /** Enable the real codec stack on every device (Compressing(Encrypting(raw))),
      *  using one shared crypto provider so chunk hmac ids dedupe across devices —
      *  exactly how an encrypted vault syncs in production. Exercises the path
-     *  that G4 (still-encrypted decompress) lived on. */
+     *  where still-encrypted bytes once reached decompress. */
     codec?: { passphrase: string; compression?: boolean };
 }
 
@@ -245,7 +245,7 @@ export async function createE2EHarness(opts: CreateE2EHarnessOpts = {}): Promise
         const settings = makeSettings({
             deviceId: id,
             // Provisioned, live-syncing vault: openSession gates on
-            // connectionState === "syncing" (Invariant III). The harness
+            // connectionState === "syncing" (only provisioned sessions open). The harness
             // simulates a device past Init/Clone; tests that exercise the
             // not-yet-provisioned path override this.
             connectionState: "syncing",
@@ -281,11 +281,12 @@ export async function createE2EHarness(opts: CreateE2EHarnessOpts = {}): Promise
         let deviceCrypto: CryptoProvider | undefined = sharedCrypto;
         // Local cipherVersion floor (mirrors main.ts `activeCipherVersion`):
         // installed by runInit/runClone so the decode layer enforces the
-        // downgrade floor end-to-end (#1/#3).
+        // downgrade floor end-to-end.
         let deviceCipherVersion: number | undefined = sharedCrypto ? 3 : undefined;
         // Codec stack mirrors main.ts wrapVaultClient: Compressing(Encrypting(raw)).
         // Encrypt iff a crypto provider is installed; compress per the persisted
-        // flag — the exact two-source composition that G4 exercised.
+        // flag — the exact two-source composition under which still-encrypted
+        // bytes once reached decompress.
         const wrapVaultClient = (raw: ICouchClient): ICouchClient => {
             let c: ICouchClient = raw;
             if (deviceCrypto) c = new EncryptingCouchClient(c, deviceCrypto, deviceCipherVersion);

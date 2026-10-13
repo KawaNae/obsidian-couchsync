@@ -4,7 +4,7 @@
  *
  * Extracted from the tab's render() so the state→affordance mapping is a
  * pure, unit-testable function rather than inline ternaries tangled with
- * Obsidian DOM. The load-bearing rule (Invariant C / Bug 1): the Live
+ * Obsidian DOM. The load-bearing rule (setup atomicity): the Live
  * Sync toggle is enabled ONLY in `setupDone`/`syncing`. A `settingUp`
  * state — a setup that failed or is mid-flight — keeps Init/Clone enabled
  * for retry but MUST keep Live Sync disabled, so the user can never start

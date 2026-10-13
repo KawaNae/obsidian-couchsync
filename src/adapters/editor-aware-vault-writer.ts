@@ -2,7 +2,7 @@
  * Production VaultWriter — applies remote content while preserving
  * open-editor session state.
  *
- * **Postcondition (PR1 invariant — disk-write truth):** when
+ * **Postcondition (disk-write truth):** when
  * `applyRemoteContent` returns `applied: true`, the bytes on disk equal
  * `content`. The CM dispatch is a UX overlay (cursor / scroll preservation),
  * never the system's persistence. This invariant lets `lastSynced.chunks`
