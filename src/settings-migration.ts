@@ -147,8 +147,9 @@ export function migrateSettings(data: Record<string, any>): void {
  * over the device's IndexedDB names: a pattern cannot tell a legacy config
  * store from another vault's own store (a vault named `<vault>-config-<x>`
  * has its vault store at `couchsync-<vault>-config-<x>`). Stores of config
- * DB names used earlier are left alone — cleaning unused stores is out of
- * scope (design: 扱わないこと).
+ * DB names used earlier are left alone: a store of another DB name may
+ * still be the one a later Apply switches back to, and nothing here can tell
+ * an abandoned store from one that is merely not applied now.
  */
 export function legacyConfigStoreName(vaultName: string, configDbName: string): string | null {
     if (!configDbName) return null;

@@ -732,7 +732,7 @@ describe("config binding lifecycle", () => {
             await a.cs.close();
         });
 
-        it("a Vault Clone that changes the inherited codec does not stop config Pull (review scenario)", async () => {
+        it("a Vault Clone that changes the inherited codec does not stop config Pull", async () => {
             // Config inherits the vault codec (no config overrides): plaintext,
             // uncompressed at Join time.
             const a = await creator("cfg-A", { ".obsidian/app.json": `{"v":1}` });
@@ -953,7 +953,7 @@ describe("config binding lifecycle", () => {
             await dev.cs.join();
         });
     });
-    describe("switching servers X → Y → X (review scenario)", () => {
+    describe("switching servers X → Y → X", () => {
         const X = "http://x.example:5984";
         const Y = "http://y.example:5984";
 
@@ -1163,9 +1163,8 @@ describe("config binding lifecycle", () => {
         });
     });
 
-    // Re-review 2026-09-25 (R1–R3): the scenarios that broke before the
-    // passphrase was resolved once and the server Apply was ordered after
-    // the rebind.
+    // The scenarios that broke while the passphrase was re-resolved on every
+    // op and the server Apply was saved outside the rebind.
     describe("the passphrase belongs to the binding, and is resolved once at Create / Join", () => {
         /** Config inherits the vault codec and passphrase (no overrides). */
         const VAULT_ENC = { encryptionEnabled: true, encryptionPassphrase: "P" } as const;
@@ -1281,11 +1280,11 @@ describe("config binding lifecycle", () => {
         });
     });
 
-    describe("a server Apply while a config op runs (R2, R3)", () => {
+    describe("a server Apply while a config op runs", () => {
         const X = "http://x.example:5984";
         const Y = "http://y.example:5984";
 
-        it("R2: refused and nothing saved; Create's preview and Create both hit the server the settings name", async () => {
+        it("refused and nothing saved; Create's preview and Create both hit the server the settings name", async () => {
             // Y holds a shared config DB.
             const y = await creator("cfg", {
                 ".obsidian/app.json": "{}", ".obsidian/hotkeys.json": "{}",
@@ -1329,7 +1328,7 @@ describe("config binding lifecycle", () => {
             await y.cs.close();
         });
 
-        it("R3: the filter tree lists the server the settings name, and a listing read for a replaced binding is marked", async () => {
+        it("the filter tree lists the server the settings name, and a listing read for a replaced binding is marked", async () => {
             await seed("cfg", { ".obsidian/app.json": "{}" }, { couchdbUri: X });
             await seed("cfg", { ".obsidian/hotkeys.json": "{}" }, { couchdbUri: Y });
             const d = makeDevice("dev", { couchdbUri: X });

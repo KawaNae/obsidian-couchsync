@@ -9,9 +9,9 @@
  * precondition failure (fix a setting, wait, reload) apart from a transport
  * failure without sniffing message text.
  *
- * The `kind` vocabulary mirrors the design's failure table
- * (docs/superpowers/specs/2026-09-25-config-binding-design.md, 失敗の分類).
- * Transport failures (network / timeout / auth) are NOT not-ready kinds —
+ * Each `kind` is one cause the user can act on — a setting to fix, a step
+ * to run (Join, Create, Check), or a server to verify — so a kind maps to
+ * exactly one piece of advice. Transport failures (network / timeout / auth) are NOT not-ready kinds —
  * they stay the transport's own errors and are classified by `classifyError`.
  *
  * The user-facing wording of every kind lives in `configNotReady` below, so
@@ -86,14 +86,15 @@ export interface ConfigNotReadyContext {
 
 /**
  * Build the `ConfigNotReadyError` for `kind` with its canonical user-facing
- * message (design: 失敗の分類). The message is the only place a kind's
- * advice lives. Guidance rules:
+ * message. The message is the only place a kind's advice lives. Guidance
+ * rules:
  *   - key / passphrase / reset problems never suggest Create — it wipes the
  *     config every device shares and cannot fix a key. Their messages never
  *     contain the word "Create" (tests pin this per kind);
  *   - Create is named only where re-creating is the actual fix
  *     (db-missing, uninitialized, meta-missing, legacy-meta,
- *     setup-interrupted), and then with its blast radius.
+ *     setup-interrupted), and then with its blast radius — or where Create
+ *     itself is what failed (create-passphrase-missing).
  */
 export function configNotReady(
     kind: ConfigNotReadyKind,

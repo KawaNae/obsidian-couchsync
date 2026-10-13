@@ -1,8 +1,7 @@
 /**
  * Settings migration: the former GLOBAL config-sync state
  * (`configCodecApplied`, `configCipherVersion`, `configSettingUp`) and the
- * per-DB records of a pre-release binding build (config-binding design,
- * settings と移行).
+ * per-DB records of a pre-release binding build.
  *
  * The attachment (codec, joined root) now lives in the binding's local
  * store, which the migration cannot reach: a recorded codec or root is

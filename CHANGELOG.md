@@ -35,13 +35,35 @@ All notable changes to obsidian-couchsync.
   switching servers back and forth no longer skips changes or writes the
   other server's config. The config key no longer depends on Vault Sync
   being connected.
-- **Config sync failures are always reported.** Every config Push, Pull,
-  Join and Create failure now shows a notice and a log line naming the cause
-  (not joined, missing or wrong passphrase, the database re-created on
-  another device, server unreachable, …) with its fix. Key and passphrase
-  problems never suggest Create. The filter tree says why it cannot list the
-  server instead of always "Server not reachable", and no longer contacts the
-  server while a config operation runs.
+- **Config sync failures are always reported, with the cause and the fix.**
+  Every config Push, Pull, Join and Create failure now shows a notice and a
+  log line naming the cause (not joined, missing or wrong passphrase, the
+  database re-created on another device, …) with its fix. A server that
+  cannot be reached, a timeout, rejected credentials or a server error is
+  worded the same way ("The server could not be reached — check the network
+  connection and the server URI in the CouchDB tab.") instead of the bare
+  `Failed to fetch`; the raw error follows in parentheses. Key and
+  passphrase problems never suggest Create. Rejected credentials now point
+  to the CouchDB tab (and its Test button), not Vault Sync.
+- **Config Sync's Step 3 shows what last went wrong.** The status line
+  follows this device's relation to the config database: rejected
+  credentials, an unfinished Create, then the last Push, Pull, Join, Create
+  or check that failed (e.g. "Last Join: The passphrase this device has does
+  not unlock …"), then "Not joined yet", then ready — so a failed Join says
+  why even before this device has joined. A result about a database root
+  this device no longer uses is not shown. The filter tree's
+  listing of the server counts as a check; when it cannot list the server it
+  says "Showing this device's config only — see Step 3." It does not contact
+  the server while a config operation runs, before this device has joined,
+  or while a Create is unfinished.
+- **Notices of one-shot operations read once.** Init, Clone, Verify, the
+  chunk report and every config operation now end with
+  `CouchSync: <operation> failed — <cause and fix>` or
+  `<operation> cancelled`, instead of
+  `CouchSync: CouchSync: Config Pull — Config Pull failed: …`. Vault Init,
+  Clone and Verify failures use the same wording as config sync, and a
+  failed Verify is reported as a failure. A cancelled operation is logged as
+  a warning, not an error.
 - **Changing a codec setting no longer stops config sync.** Push and Pull
   now use the encryption and compression of the config database this device
   created or joined. Step 1 in Config Sync is what the next Create builds a
@@ -70,21 +92,33 @@ All notable changes to obsidian-couchsync.
   now has Create (first device: reset the config database with a new root,
   then Push) and Join (every other device: sync with the existing
   database's encryption and compression and unlock it with its passphrase;
-  the server is not changed, then Pull). Push and Pull on a device that has not joined
-  stop and ask it to Join. Join does not change the Step 1 settings.
+  the server is not changed, then Pull). Push and Pull on a device that has
+  not joined stop and ask it to Join. Join does not change the Step 1
+  settings.
   Create's confirmation shows how many documents
   the server holds and whether `config:meta` exists — or that the server
   could not be read —, the encryption, compression and cipher version it
   will build (highlighted when that is weaker than the database's current
   one, e.g. encrypted → unencrypted), and that every other device must Join
   again.
-- **The config passphrase is fixed when you Create or Join.** An empty Step 1
-  passphrase still means "use the Vault Sync passphrase", but only for the
-  next Create or Join; when it succeeds on an encrypted database, the
-  passphrase it used is saved in Step 1. Push and Pull use only that saved
-  passphrase, so turning Vault Sync encryption off or changing the vault
-  passphrase no longer stops config sync. A plaintext database saves no
-  passphrase.
+- **The config passphrase belongs to the database you Create or Join.**
+  Create and Join keep the passphrase of an encrypted config database with
+  that database (per server and database name, in settings). Push and Pull
+  unlock it with that value alone, so neither Step 1, turning Vault Sync
+  encryption off nor a new vault passphrase stops config sync, and two config
+  databases with different passphrases each keep their own. A plaintext
+  database keeps none.
+- **Step 1's passphrase is only what the next Create encrypts with.** Left
+  empty, it inherits the Vault Sync passphrase. It is shown only while Step 1
+  encryption is on, and Create and Join do not write to it. An encrypting
+  Create with no passphrase at all stops before anything is deleted and
+  points to Step 1.
+- **Join asks for the passphrase only when it has none that works.** It
+  tries the passphrase it kept for the database, then Step 1's, then the
+  Vault Sync passphrase, and asks only when none unlocks the database. The
+  prompt says whether no passphrase was set or none matched, checks the
+  answer, and stays open on a wrong one. Cancelling it ends the Join with
+  "Join cancelled — nothing was changed."
 
 ### Migration
 
@@ -95,7 +129,9 @@ All notable changes to obsidian-couchsync.
   config Push or Pull asks it to Join. Join does not change the server, any
   config file or the Step 1 settings, and the next Pull downloads the config
   again. The cipher-version floor and an interrupted Create are kept in
-  settings, per server and database. The previous local config store of the
+  settings, per server and database. Join tries the Step 1 and Vault Sync
+  passphrases first, so a device whose config passphrase is already in
+  Step 1 is not asked for it. The previous local config store of the
   config database applied now (`couchsync-<vault>-config-<db>`) is deleted on
   start; stores of config database names used earlier stay on disk.
 

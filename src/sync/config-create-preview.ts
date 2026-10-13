@@ -1,7 +1,6 @@
 /**
  * config-create-preview.ts — what the Create confirm dialog tells the user
- * about the server before they wipe it, and what Create will build
- * (config-binding design, Create).
+ * about the server before they wipe it, and what Create will build.
  *
  * `ConfigSync.previewCreate` reads the remote config DB (raw client, no key
  * needed) and returns a `ConfigCreatePreview`; `describeCreateConfirm` turns
