@@ -369,16 +369,56 @@ describe("ConfigSync", () => {
             expect(vault.readText(".obsidian/plugins/dv/data.json")).toBe(`{"k":2}`);
         });
 
-        it("overwrites existing file", async () => {
+        it("overwrites an existing file whose content differs", async () => {
             vault.addFile(".obsidian/app.json", "old");
             await seedConfigDoc(".obsidian/app.json", "new");
 
-            await cs.write();
+            expect(await cs.write()).toBe(1);
 
             expect(vault.readText(".obsidian/app.json")).toBe("new");
         });
 
-        it("invokes onProgress for each written entry", async () => {
+        it("overwrites a same-size file whose bytes differ", async () => {
+            vault.addFile(".obsidian/app.json", `{"a":1}`);
+            await seedConfigDoc(".obsidian/app.json", `{"a":2}`);
+
+            expect(await cs.write()).toBe(1);
+
+            expect(vault.readText(".obsidian/app.json")).toBe(`{"a":2}`);
+        });
+
+        it("leaves a file whose content already matches untouched", async () => {
+            vault.addFile(".obsidian/app.json", `{"theme":"dark"}`, { mtime: 1000 });
+            await seedConfigDoc(".obsidian/app.json", `{"theme":"dark"}`);
+            const writes: string[] = [];
+            const writeBinary = vault.writeBinary.bind(vault);
+            const createBinary = vault.createBinary.bind(vault);
+            vault.writeBinary = async (p, d) => { writes.push(p); return writeBinary(p, d); };
+            vault.createBinary = async (p, d) => { writes.push(p); return createBinary(p, d); };
+
+            expect(await cs.write()).toBe(0);
+
+            expect(writes).toEqual([]);
+            // An unchanged mtime is what keeps Obsidian from re-reading it.
+            expect((await vault.stat(".obsidian/app.json"))!.mtime).toBe(1000);
+        });
+
+        it("writes only the files that differ and counts them", async () => {
+            vault.addFile(".obsidian/app.json", "{}");
+            vault.addFile(".obsidian/hotkeys.json", "old");
+            await seedConfigDoc(".obsidian/app.json", "{}");
+            await seedConfigDoc(".obsidian/hotkeys.json", "new");
+            await seedConfigDoc(".obsidian/appearance.json", `{"x":1}`);
+
+            expect(await cs.write()).toBe(2);
+            expect(vault.readText(".obsidian/hotkeys.json")).toBe("new");
+            expect(vault.readText(".obsidian/appearance.json")).toBe(`{"x":1}`);
+
+            // A second write finds the disk in step with the DB.
+            expect(await cs.write()).toBe(0);
+        });
+
+        it("invokes onProgress for each entry it considers", async () => {
             await seedConfigDoc(".obsidian/app.json", "{}");
             await seedConfigDoc(".obsidian/hotkeys.json", "{}");
 

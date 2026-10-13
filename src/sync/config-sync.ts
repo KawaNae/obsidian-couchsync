@@ -708,7 +708,9 @@ export class ConfigSync {
      *  Concurrent edits are surfaced AFTER the batch commit (informational),
      *  not pre-flight — the resolver classifies them as keep-local equivalents
      *  and the cursor advances past them, so re-running pull() will surface
-     *  them again until manually resolved (matches vault-sync semantics). */
+     *  them again until manually resolved (matches vault-sync semantics).
+     *  Returns the number of files written; 0 means the disk already
+     *  matched and there is nothing to reload. */
     async pull(): Promise<number> {
         return this.runOperation("pull", async (ctx, progress, binding, keys) => {
             await binding.ensureCheckpointsLoaded();
@@ -743,7 +745,9 @@ export class ConfigSync {
             if (result.stats.convergedSkip) summaryParts.push(`${result.stats.convergedSkip} converged`);
             if (result.stats.concurrent) summaryParts.push(`${result.stats.concurrent} concurrent`);
             const summary = summaryParts.length > 0 ? summaryParts.join(", ") : "no changes";
-            progress.done(`${summary}. Wrote ${written} file(s). Reload Obsidian to apply.`);
+            progress.done(written > 0
+                ? `${summary}. Wrote ${written} file(s). Reload Obsidian to apply.`
+                : `${summary}. Files up to date.`);
             return written;
         });
     }
@@ -938,7 +942,12 @@ export class ConfigSync {
      *  VaultSync.dbToFile); the missing chunk is expected to arrive on
      *  the next pull. Tombstones (`deleted: true`) are silently skipped
      *  \u2014 config-sync currently has no continuous tombstone-driven flow,
-     *  but the field is honoured for safety. */
+     *  but the field is honoured for safety.
+     *
+     *  Idempotent: only files whose disk content differs from the DB are
+     *  written (symmetric to `scanWith`'s unchanged short-circuit on the
+     *  push side). Returns the number of files actually written, so 0
+     *  means the disk already matched. */
     async write(onProgress?: (path: string, index: number, total: number) => void): Promise<number> {
         const binding = this.requireBinding();
         // Local-only: refuse a half-built DB, but don't demand a Join (the
@@ -1018,6 +1027,11 @@ export class ConfigSync {
                     continue;
                 }
                 const buf = ConfigSync.assembleChunks(doc.chunks, chunks);
+                // A file whose bytes already match is left alone: rewriting
+                // it bumps its mtime, and Obsidian re-reads app.json,
+                // appearance.json or a plugin's data.json on that, replacing
+                // settings held in memory.
+                if (await this.diskMatches(path, buf)) continue;
                 await this.ensureDir(path);
                 if (await this.vault.exists(path)) {
                     await this.vault.writeBinary(path, buf);
@@ -1030,6 +1044,21 @@ export class ConfigSync {
             }
         }
         return count;
+    }
+
+    /** True when `path` is a file on disk whose bytes equal `buf`. The size
+     *  is compared first, so most changed files are told apart without a
+     *  read. */
+    private async diskMatches(path: string, buf: ArrayBuffer): Promise<boolean> {
+        const stat = await this.vault.stat(path);
+        if (!stat || stat.size !== buf.byteLength) return false;
+        const disk = new Uint8Array(await this.vault.readBinary(path));
+        const want = new Uint8Array(buf);
+        if (disk.length !== want.length) return false;
+        for (let i = 0; i < want.length; i++) {
+            if (disk[i] !== want[i]) return false;
+        }
+        return true;
     }
 
     /** Build the per-write receive context: this device's platform + the set
