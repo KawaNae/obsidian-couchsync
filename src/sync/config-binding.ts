@@ -35,8 +35,9 @@
  * SettingUp (the setup flag), Blocked (the op throws a
  * `ConfigNotReadyError`) or Ready. A persisted state could disagree with
  * the store and the server it summarises; re-evaluating cannot. What the
- * settings tab shows is `relation()`: the attachment, the setup flag and
- * the outcome of the last op (in memory only). The key never depends on the
+ * settings tab shows is `relation()`: the attachment, the setup flag, the
+ * outcome of the last user operation and that of the last check (in memory
+ * only). The key never depends on the
  * vault's connectionState (invariant 18).
  */
 import { ConfigLocalDB } from "../db/config-local-db.ts";
@@ -96,7 +97,8 @@ export type ConfigOpName = "push" | "pull" | "join" | "create" | "check";
 export interface ConfigOutcome {
     op: ConfigOpName;
     /** When the operation started (ms since epoch). A result that started
-     *  earlier than the recorded one is older news and is dropped. */
+     *  earlier than the one recorded in its slot is older news and is
+     *  dropped. */
     at: number;
     /** `metaFingerprint` of the attachment the operation evaluated — for a
      *  locked op, the one in place when it ended (Join / Create replace
@@ -107,18 +109,22 @@ export interface ConfigOutcome {
 }
 
 /** Snapshot of this device's relation to the config DB, for the status
- *  line. Not persisted: after a reload the last outcome is unknown until
- *  the next operation or check. */
+ *  line. Not persisted: after a reload the last outcomes are unknown until
+ *  the next operation or check. An outcome is given only when it was
+ *  evaluated against the attachment in place now — a result about another
+ *  root (or about not being joined) no longer describes the relation. */
 export interface ConfigRelation {
     dbName: string;
     /** The participation record, or null when not joined. */
     attachment: ConfigAttachment | null;
     /** A Create of this device did not finish. */
     settingUp: boolean;
-    /** The last outcome, only when it was evaluated against the attachment
-     *  in place now — a result about another root (or about not being
-     *  joined) no longer describes the relation. */
-    last: ConfigOutcome | null;
+    /** The last Push, Pull, Join or Create. A check never replaces it: a
+     *  check only reads, so its success says nothing about whether the
+     *  write that failed would now succeed. */
+    lastOp: ConfigOutcome | null;
+    /** The last check (the filter tree's read-only inspect + listing). */
+    lastCheck: ConfigOutcome | null;
 }
 
 /**
@@ -199,7 +205,8 @@ export class ConfigBinding {
 
     private checkpointsLoaded = false;
     private closed = false;
-    private lastOutcome: ConfigOutcome | null = null;
+    private lastOp: ConfigOutcome | null = null;
+    private lastCheck: ConfigOutcome | null = null;
 
     /** Result of the last passphrase check against one `config:meta` root.
      *  A memo of PBKDF2 results, not binding state: negative results are
@@ -299,24 +306,41 @@ export class ConfigBinding {
 
     /** Record how an operation ended. Called by the op runner (Push, Pull,
      *  Join, Create — not for a busy refusal or a cancellation) and by the
-     *  filter tree's check. Only an outcome that started no earlier than the
-     *  recorded one replaces it, so a check that was overtaken by an op
-     *  cannot overwrite that op's result. */
+     *  filter tree's check. User operations and checks have a slot each;
+     *  in its slot, only an outcome that started no earlier than the
+     *  recorded one replaces it, so an overtaken result cannot overwrite a
+     *  newer one.
+     *
+     *  - A failed operation is cleared only by a later operation that
+     *    succeeds. A check reads and never writes, so its success does not
+     *    show that a failed Push or Create would now go through.
+     *  - A failed check is cleared by a later check that succeeds, or by a
+     *    later operation that succeeds: every operation reached the server
+     *    and read its `config:meta` with this device's key. */
     record(o: ConfigOutcome): void {
         if (this.closed) return;
-        if (this.lastOutcome && o.at < this.lastOutcome.at) return;
-        this.lastOutcome = o;
+        if (o.op === "check") {
+            if (this.lastCheck && o.at < this.lastCheck.at) return;
+            this.lastCheck = o;
+            return;
+        }
+        if (this.lastOp && o.at < this.lastOp.at) return;
+        this.lastOp = o;
+        if (o.error === null && this.lastCheck?.error && this.lastCheck.at <= o.at) {
+            this.lastCheck = null;
+        }
     }
 
     /** This device's relation to the config DB now. */
     relation(): ConfigRelation {
         const fp = this.att?.metaFingerprint ?? null;
-        const last = this.lastOutcome;
+        const current = (o: ConfigOutcome | null) => (o && o.against === fp ? o : null);
         return {
             dbName: this.dbName,
             attachment: this.att,
             settingUp: this.entry()?.settingUp === true,
-            last: last && last.against === fp ? last : null,
+            lastOp: current(this.lastOp),
+            lastCheck: current(this.lastCheck),
         };
     }
 

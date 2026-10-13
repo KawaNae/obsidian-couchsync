@@ -430,7 +430,10 @@ export class ConfigSyncTab {
                         } catch {
                             // Reported by ConfigSync (ProgressNotice + log).
                         }
-                        // The status line shows this op's outcome.
+                        // Re-list the server so the tree shows what was
+                        // pushed. The check this starts does not hide a
+                        // failed Push: the status line keeps the last
+                        // operation and the last check apart.
                         this.remoteCache = null;
                         this.deps.refresh();
                     })

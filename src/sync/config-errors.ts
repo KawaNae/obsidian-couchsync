@@ -136,12 +136,14 @@ export function configNotReady(
                     "Step 3 (it does not change the server), then sync.";
             case "passphrase-missing":
                 return `Config database ${db} is encrypted, and this device has no ` +
-                    "passphrase for it. Press Join in Step 3 — it asks for the " +
-                    "passphrase the database was set up with.";
+                    "passphrase for it. Press Join in Step 3 — it tries the passphrases " +
+                    "this device has and, if none unlocks the database, asks for the " +
+                    "one it was set up with.";
             case "passphrase-mismatch":
                 return `The passphrase this device has does not unlock config database ` +
-                    `${db}. Press Join in Step 3 — it asks for the passphrase the ` +
-                    "database was set up with.";
+                    `${db}. Press Join in Step 3 — it tries the passphrases this device ` +
+                    "has and, if none unlocks the database, asks for the one it was set " +
+                    "up with.";
             case "create-passphrase-missing":
                 return `Encryption is on for ${db}, but there is no passphrase to ` +
                     "encrypt with. Enter one in Step 1 (Encryption & compression), " +

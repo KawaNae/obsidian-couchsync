@@ -313,7 +313,7 @@ describe("filter tree remote listing — the tab's check of the relation", () =>
         const cs = await quietSync(() => new FailingListClient(err));
         const res = await cs.listRemoteConfigPathsQuiet();
         expect(res).toEqual({ paths: [], ok: false, bindingKey: cs.currentBinding()!.key });
-        const last = cs.currentBinding()!.relation().last;
+        const last = cs.currentBinding()!.relation().lastCheck;
         expect(last).toMatchObject({ op: "check", error: err });
         // Logged with the worded cause, not silently dropped.
         expect(getLogEntries().some(
@@ -327,7 +327,7 @@ describe("filter tree remote listing — the tab's check of the relation", () =>
         const cs = await quietSync(() => { throw keyMissing; });
         const res = await cs.listRemoteConfigPathsQuiet();
         expect(res.ok).toBe(false);
-        expect(cs.currentBinding()!.relation().last?.error).toBe(keyMissing);
+        expect(cs.currentBinding()!.relation().lastCheck?.error).toBe(keyMissing);
     });
 
     it("reads encrypted `config:<hmac>` ids through the wrapped client as plaintext paths", async () => {
@@ -347,7 +347,7 @@ describe("filter tree remote listing — the tab's check of the relation", () =>
         expect(res).toEqual({
             paths: [".obsidian/app.json"], ok: true, bindingKey: cs.currentBinding()!.key,
         });
-        expect(cs.currentBinding()!.relation().last).toMatchObject({ op: "check", error: null });
+        expect(cs.currentBinding()!.relation().lastCheck).toMatchObject({ op: "check", error: null });
     });
 
     it("an unconfigured DB name is not a failure (empty listing)", async () => {
@@ -365,7 +365,7 @@ describe("filter tree remote listing — the tab's check of the relation", () =>
         expect(info).not.toHaveBeenCalled();
         expect(getDoc).not.toHaveBeenCalled();
         expect(getLogEntries().filter((e) => e.level === "warn")).toEqual([]);
-        expect(cs.currentBinding()!.relation().last).toBeNull();
+        expect(cs.currentBinding()!.relation()).toMatchObject({ lastOp: null, lastCheck: null });
     });
 
     it("an unfinished Create is not checked either", async () => {
@@ -417,7 +417,7 @@ describe("the op runner records outcomes on the binding", () => {
         remote.info = async () => { throw new TypeError("Failed to fetch"); };
         const before = Date.now();
         await expect(cs.pull()).rejects.toThrow(/Failed to fetch/);
-        const last = cs.currentBinding()!.relation().last!;
+        const last = cs.currentBinding()!.relation().lastOp!;
         expect(last.op).toBe("pull");
         expect(last.at).toBeGreaterThanOrEqual(before);
         expect(last.against).toBe(await configMetaFingerprint(meta));
@@ -431,7 +431,7 @@ describe("the op runner records outcomes on the binding", () => {
         const cs = makeCs(remote);
         await cs.rebind("config-test");
         await cs.push();
-        expect(cs.currentBinding()!.relation().last).toMatchObject({ op: "push", error: null });
+        expect(cs.currentBinding()!.relation().lastOp).toMatchObject({ op: "push", error: null });
     });
 
     it("a busy refusal is not recorded", async () => {
@@ -443,10 +443,10 @@ describe("the op runner records outcomes on the binding", () => {
         const first = cs.pull();
         await vi.waitFor(() => expect(remote.parked).toBe(true));
         await expect(cs.push()).rejects.toMatchObject({ kind: "busy" });
-        expect(cs.currentBinding()!.relation().last).toBeNull();
+        expect(cs.currentBinding()!.relation()).toMatchObject({ lastOp: null, lastCheck: null });
         remote.unpark();
         await first;
-        expect(cs.currentBinding()!.relation().last).toMatchObject({ op: "pull", error: null });
+        expect(cs.currentBinding()!.relation().lastOp).toMatchObject({ op: "pull", error: null });
     });
 
     it("a cancelled op is not recorded and logs no error", async () => {
@@ -458,7 +458,7 @@ describe("the op runner records outcomes on the binding", () => {
         const p = cs.pull();
         cs.cancelCurrent();
         await expect(p).rejects.toMatchObject({ name: "AbortError" });
-        expect(cs.currentBinding()!.relation().last).toBeNull();
+        expect(cs.currentBinding()!.relation()).toMatchObject({ lastOp: null, lastCheck: null });
         expect(getLogEntries().filter((e) => e.level === "error")).toEqual([]);
     });
 });

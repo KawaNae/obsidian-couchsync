@@ -50,8 +50,10 @@ All notable changes to obsidian-couchsync.
   credentials, an unfinished Create, then the last Push, Pull, Join, Create
   or check that failed (e.g. "Last Join: The passphrase this device has does
   not unlock …"), then "Not joined yet", then ready — so a failed Join says
-  why even before this device has joined. A result about a database root
-  this device no longer uses is not shown. The filter tree's
+  why even before this device has joined. A failed Push, Pull, Join or
+  Create stays until one of them succeeds — the filter tree's read-only
+  check succeeding does not clear it. A result about a database root this
+  device no longer uses is not shown. The filter tree's
   listing of the server counts as a check; when it cannot list the server it
   says "Showing this device's config only — see Step 3." It does not contact
   the server while a config operation runs, before this device has joined,

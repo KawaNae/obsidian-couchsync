@@ -285,7 +285,7 @@ describe("config binding lifecycle", () => {
             expect(binding.keyDerivations).toBe(1);
             expect(await dev.cs.pull()).toBe(1);
             expect(binding.keyDerivations).toBe(1);
-            expect(binding.relation().last).toMatchObject({ op: "pull", error: null });
+            expect(binding.relation().lastOp).toMatchObject({ op: "pull", error: null });
         });
     });
 
@@ -550,7 +550,7 @@ describe("config binding lifecycle", () => {
             expect(b.settings.configEncryptionPassphrase).toBe("wrong");
             expect(await store.get(makeConfigId(".obsidian/local.json"))).not.toBeNull();
             // Not an outcome of the relation, and not an error.
-            expect(b.cs.currentBinding()!.relation().last).toBeNull();
+            expect(b.cs.currentBinding()!.relation()).toMatchObject({ lastOp: null, lastCheck: null });
             const logs = getLogEntries();
             expect(logs.filter((e) => e.level === "error")).toEqual([]);
             expect(logs.some((e) => e.level === "warn"
@@ -695,7 +695,7 @@ describe("config binding lifecycle", () => {
             const err = await b.cs.pull().catch((e) => e);
             expect(err).toMatchObject({ kind: "cipher-downgrade" });
             expect(err.message).not.toMatch(/Create/);
-            expect(b.cs.currentBinding()!.relation().last).toMatchObject({
+            expect(b.cs.currentBinding()!.relation().lastOp).toMatchObject({
                 op: "pull", error: { kind: "cipher-downgrade" },
             });
         });
@@ -795,7 +795,7 @@ describe("config binding lifecycle", () => {
             // Create first (the setup flag), which is what the user must fix.
             expect(dev.cs.currentBinding()!.relation()).toMatchObject({
                 settingUp: true, attachment: null,
-                last: { op: "create", error: { message: "network down" } },
+                lastOp: { op: "create", error: { message: "network down" } },
             });
         });
     });
@@ -815,7 +815,7 @@ describe("config binding lifecycle", () => {
             const after = await b.cs.listRemoteConfigPathsQuiet();
             expect(after.ok).toBe(true);
             expect(after.paths.sort()).toEqual([".obsidian/app.json", ".obsidian/hotkeys.json"]);
-            expect(b.cs.currentBinding()!.relation().last).toMatchObject({ op: "check", error: null });
+            expect(b.cs.currentBinding()!.relation().lastCheck).toMatchObject({ op: "check", error: null });
         });
     });
 
@@ -1051,7 +1051,7 @@ describe("config binding lifecycle", () => {
             // the op lock and drop the key on failure — mid-scan.
             putEntry(b.settings, { ...getEntry(b.settings)!, passphrase: "wrong" });
             const getDoc = vi.spyOn(remote("cfg-enc"), "getDoc");
-            const lastBefore = binding.relation().last;
+            const before = binding.relation();
             const listing = await b.cs.listRemoteConfigPathsQuiet();
             expect(listing).toMatchObject({ paths: [], ok: false });
             expect(getDoc).not.toHaveBeenCalled();
@@ -1059,7 +1059,8 @@ describe("config binding lifecycle", () => {
             await expect(binding.inspect(remote("cfg-enc"))).rejects.toMatchObject({
                 kind: "passphrase-mismatch",
             });
-            expect(binding.relation().last).toBe(lastBefore);
+            expect(binding.relation().lastOp).toBe(before.lastOp);
+            expect(binding.relation().lastCheck).toBe(before.lastCheck);
 
             release();
             expect(await running).toBe(2);
@@ -1419,7 +1420,7 @@ describe("config binding lifecycle", () => {
 
             await expect(b.cs.join()).rejects.toMatchObject({ kind: "passphrase-mismatch" });
             expect(b.cs.currentBinding()!.relation()).toMatchObject({
-                attachment: null, last: { op: "join", against: null },
+                attachment: null, lastOp: { op: "join", against: null },
             });
             const v = view(b);
             expect(v.tone).toBe("error");
