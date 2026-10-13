@@ -7,7 +7,10 @@
  * refusal or a cancellation) and the notice words the error.
  */
 import { describe, it, expect, beforeEach } from "vitest";
-import { VaultBinding, type VaultBindingHost, type AskVaultPassphrase } from "../src/sync/vault-binding.ts";
+import {
+    VaultBinding, VaultEncryptionPausedError, type VaultBindingHost, type AskVaultPassphrase,
+} from "../src/sync/vault-binding.ts";
+import { classifyError } from "../src/db/sync/errors.ts";
 import { AuthGate } from "../src/db/sync/auth-gate.ts";
 import { buildInitialVaultMeta, fetchVaultMeta, pushVaultMeta } from "../src/db/vault-meta.ts";
 import { FakeCouchClient } from "./helpers/fake-couch-client.ts";
@@ -21,6 +24,7 @@ interface Rig {
     remote: FakeCouchClient;
     auth: AuthGate;
     stops: number;
+    starts: number;
     saves: CouchSyncSettings["connectionState"][];
     /** connectionState seen when the destructive setup step started. */
     stateAtSetup: CouchSyncSettings["connectionState"] | null;
@@ -46,7 +50,7 @@ function rig(opts: {
     const r: Rig = {
         binding: null as unknown as VaultBinding,
         settings, remote, auth: new AuthGate(),
-        stops: 0, saves: [], stateAtSetup: null, failures: [], dones: [], setupError: null, setupGate: null,
+        stops: 0, starts: 0, saves: [], stateAtSetup: null, failures: [], dones: [], setupError: null, setupGate: null,
     };
     const result = { vaultFiles: 3, totalDocs: 7 };
     const host: VaultBindingHost = {
@@ -68,6 +72,7 @@ function rig(opts: {
             },
         }),
         stopLive: () => { r.stops++; },
+        startLive: async () => { r.starts++; },
         openProgress: () => ({
             update: () => {},
             done: (s) => { r.dones.push(s); },
@@ -236,5 +241,119 @@ describe("VaultBinding.clone", () => {
         expect(r.binding.outcomesNow().lastOp).not.toBeNull();
         r.settings.couchdbDbName = "other";
         expect(r.binding.outcomesNow().lastOp).toBeNull();
+    });
+});
+
+describe("VaultBinding.checkAgreement", () => {
+    const signal = new AbortController().signal;
+
+    it("encryption changed by another device: pauses to tested and records why", async () => {
+        const r = rig({ settings: { connectionState: "syncing", encryptionEnabled: false } });
+        await encryptedRemote(r.remote, "pw");
+        const err = await r.binding.checkAgreement(signal).catch((e) => e);
+        expect(err).toBeInstanceOf(VaultEncryptionPausedError);
+        expect(err).toMatchObject({ reason: "encryption-changed", encryptionPaused: true });
+        expect(err.userMessage).toMatch(/^Sync paused — another device turned vault encryption on\./);
+        expect(r.settings.connectionState).toBe("tested");
+        expect(r.binding.outcomesNow().lastCheck).toMatchObject({ op: "agreement", error: err });
+        // The engine halts on it and shows its own sentence.
+        expect(classifyError(err)).toEqual({ kind: "encryption-paused", message: err.userMessage });
+    });
+
+    it("a wrong stored passphrase pauses and clears it", async () => {
+        const r = rig({
+            settings: { connectionState: "syncing", encryptionEnabled: true, encryptionPassphrase: "old" },
+        });
+        await encryptedRemote(r.remote, "pw");
+        await expect(r.binding.checkAgreement(signal)).rejects.toMatchObject({ reason: "passphrase-mismatch" });
+        expect(r.settings).toMatchObject({ connectionState: "tested", encryptionPassphrase: "" });
+    });
+
+    it("an agreed vault unlocks, takes the server's compression flag and records a passed check", async () => {
+        const r = rig({
+            settings: {
+                connectionState: "syncing", encryptionEnabled: true, encryptionPassphrase: "pw",
+                compressionEnabled: false,
+            },
+        });
+        await encryptedRemote(r.remote, "pw");
+        await r.binding.checkAgreement(signal);
+        expect(r.settings).toMatchObject({ connectionState: "syncing", compressionEnabled: true, vaultCipherVersion: 3 });
+        expect(r.binding.chunkHasher.alg).toBe("hmac");
+        expect(r.binding.outcomesNow().lastCheck).toMatchObject({ op: "agreement", error: null });
+    });
+
+    it("a transient failure is thrown as is and not recorded", async () => {
+        const failing = (remote: FakeCouchClient): ICouchClient => new Proxy(remote, {
+            get(target, prop, recv) {
+                if (prop === "getDoc") return async () => { throw new TypeError("Failed to fetch"); };
+                return Reflect.get(target, prop, recv);
+            },
+        });
+        const r = rig({ settings: { connectionState: "syncing" }, client: failing });
+        await expect(r.binding.checkAgreement(signal)).rejects.toThrow("Failed to fetch");
+        expect(r.settings.connectionState).toBe("syncing");
+        expect(r.binding.outcomesNow().lastCheck).toBeNull();
+    });
+
+    it("a successful Init clears the recorded pause", async () => {
+        const r = rig({ settings: { connectionState: "syncing", encryptionEnabled: false } });
+        await encryptedRemote(r.remote, "pw");
+        await r.binding.checkAgreement(signal).catch(() => {});
+        await r.binding.init();
+        expect(r.binding.outcomesNow()).toMatchObject({ lastOp: { op: "init", error: null }, lastCheck: null });
+    });
+});
+
+describe("VaultBinding: the one writer of the setup state", () => {
+    it("Live Sync turns on only from setupDone, and off back to setupDone", async () => {
+        const r = rig({ settings: { connectionState: "tested" } });
+        await expect(r.binding.setLiveSync(true)).rejects.toThrow(/Run Init or Clone/);
+        expect(r.starts).toBe(0);
+        r.settings.connectionState = "setupDone";
+        await r.binding.setLiveSync(true);
+        expect(r.settings.connectionState).toBe("syncing");
+        expect(r.starts).toBe(1);
+        await r.binding.setLiveSync(false);
+        expect(r.settings.connectionState).toBe("setupDone");
+        expect(r.stops).toBe(1);
+    });
+
+    it("Step 2 Apply selects the DB and asks for a setup", async () => {
+        const r = rig();
+        await r.binding.applyDatabase("other");
+        expect(r.settings).toMatchObject({ couchdbDbName: "other", connectionState: "tested" });
+    });
+
+    it("a Step 1 codec change drops a finished setup to tested, not a broken one", async () => {
+        const r = rig();
+        await r.binding.changeCodecSetting({ compressionEnabled: false });
+        expect(r.settings).toMatchObject({ compressionEnabled: false, connectionState: "tested" });
+        r.settings.connectionState = "settingUp";
+        await r.binding.changeCodecSetting({ compressionEnabled: true });
+        expect(r.settings.connectionState).toBe("settingUp");
+    });
+
+    it("new server credentials send the setup back to editing", async () => {
+        const r = rig();
+        await r.binding.applyServer({ couchdbUser: "u2", serverTested: true }, true);
+        expect(r.settings).toMatchObject({ couchdbUser: "u2", connectionState: "editing" });
+    });
+
+    it("every writer is refused while Init or Clone runs", async () => {
+        const r = rig();
+        let release!: () => void;
+        r.setupGate = new Promise<void>((res) => { release = res; });
+        const running = r.binding.init();
+        await new Promise((res) => setTimeout(res, 0));
+        expect(r.binding.changeBlocker()).toMatch(/Init is running/);
+        await expect(r.binding.setLiveSync(true)).rejects.toThrow(/Init is running/);
+        await expect(r.binding.applyDatabase("x")).rejects.toThrow(/Init is running/);
+        await expect(r.binding.changeCodecSetting({ compressionEnabled: false })).rejects.toThrow(/Init is running/);
+        await expect(r.binding.applyServer({ couchdbUser: "x" }, true)).rejects.toThrow(/Init is running/);
+        expect(r.settings.couchdbDbName).toBe("vault");
+        release();
+        await running;
+        expect(r.binding.changeBlocker()).toBeNull();
     });
 });

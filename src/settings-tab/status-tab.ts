@@ -20,6 +20,7 @@ import {
 } from "./couch-fetch.ts";
 import { addPasswordToggle } from "./vault-sync-tab.ts";
 import { applyServerSettings, type ConfigServerSwitch } from "./server-apply.ts";
+import type { VaultBinding } from "../sync/vault-binding.ts";
 import { logWarn } from "../ui/log.ts";
 import { showNotice } from "../ui/notices.ts";
 
@@ -90,6 +91,9 @@ export interface CouchDbTabDeps {
     updateSettings: (patch: Partial<CouchSyncSettings>) => Promise<void>;
     replicator: SyncEngine;
     auth: AuthGate;
+    /** The vault setup: a server change sends it back to Step 2, through
+     *  the binding (refused while Init or Clone runs). */
+    vault: Pick<VaultBinding, "changeBlocker" | "applyServer">;
     /** The config binding is keyed by (server, config DB), so a server
      *  change must switch it. Omitted → the server is saved directly (no
      *  config sync wired, e.g. tests). */
@@ -145,14 +149,18 @@ export class CouchDbTab {
         }
     }
 
-    /** Apply needs a passed Test, and no running config op: the config
-     *  binding follows the server and cannot switch under an op. */
+    /** Apply needs a passed Test, and no running config op or vault
+     *  Init / Clone: both follow the server and cannot switch under a run. */
     private canApply(): boolean {
-        return this.testPassed && !this.deps.configBinding?.changeBlocker();
+        return this.testPassed && !this.applyBlocker();
+    }
+
+    private applyBlocker(): string | null {
+        return this.deps.vault.changeBlocker() ?? this.deps.configBinding?.changeBlocker() ?? null;
     }
 
     private applyDescText(): string {
-        const blocked = this.deps.configBinding?.changeBlocker();
+        const blocked = this.applyBlocker();
         if (blocked) return blocked;
         return this.testPassed ? "Save server connection." : "Test connection first.";
     }
@@ -276,15 +284,18 @@ export class CouchDbTab {
             || this.draft.user !== saved.user
             || this.draft.pass !== saved.pass;
 
-        const patch: Partial<CouchSyncSettings> = {
+        const patch = {
             couchdbUri: this.draft.uri,
             couchdbUser: this.draft.user,
             couchdbPassword: this.draft.pass,
             serverTested: true,
         };
 
-        if (credentialsChanged) {
-            patch.connectionState = "editing";
+        const vaultBlocked = this.deps.vault.changeBlocker();
+        if (vaultBlocked) {
+            showNotice(`${vaultBlocked} The server was not changed.`, 10000);
+            this.updateDirtyState();
+            return;
         }
 
         // Settings are saved inside the config binding switch, never before
@@ -295,7 +306,7 @@ export class CouchDbTab {
             configBinding: this.deps.configBinding,
             oldUri: saved.uri,
             newUri: this.draft.uri,
-            save: () => this.deps.updateSettings(patch),
+            save: () => this.deps.vault.applyServer(patch, credentialsChanged),
         });
         if (result.kind === "refused-busy") {
             showNotice(

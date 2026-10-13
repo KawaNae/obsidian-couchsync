@@ -88,6 +88,7 @@ export class CouchSyncSettingTab extends PluginSettingTab {
             app: this.app,
             replicator: this.plugin.replicator,
             auth: this.plugin.auth,
+            vault: this.plugin.vaultBinding,
             // The config binding is (server, config DB): a server change
             // switches it, with the settings saved inside the switch
             // (invariant on ConfigSync.rebind). Refused — nothing saved —
@@ -119,12 +120,8 @@ export class CouchSyncSettingTab extends PluginSettingTab {
             auth: this.plugin.auth,
             remoteOps: this.plugin.remoteOps,
             localDb: this.plugin.localDb,
-            initVault: () => this.plugin.initVault(),
-            cloneFromRemote: () => this.plugin.cloneFromRemote(),
-            startSync: () => this.plugin.startSync(),
-            stopSync: () => this.plugin.stopSync(),
+            vault: this.plugin.vaultBinding,
             refresh: () => this.display(),
-            encryptionMismatch: this.plugin.encryptionMismatch,
         };
         if (!this.vaultSyncTab) {
             this.vaultSyncTab = new VaultSyncTab(vaultSyncDeps);

@@ -283,6 +283,7 @@ export async function createE2EHarness(opts: CreateE2EHarnessOpts = {}): Promise
             makeRawClient: () => client,
             setup: () => setupService,
             stopLive: () => { engine.stop(); ct.stop(); },
+            startLive: async () => {},
             openProgress: () => ({ update: () => {}, done: () => {}, fail: () => {} }),
             askPassphrase: async (reason) => {
                 throw new Error(`the harness answers no passphrase prompt (${reason} passphrase)`);

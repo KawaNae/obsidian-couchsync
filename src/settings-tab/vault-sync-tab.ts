@@ -15,6 +15,8 @@ import type { LocalDB } from "../db/local-db.ts";
 import { validateDeviceName } from "../utils/device-name.ts";
 import { setupGating } from "./setup-gating.ts";
 import { showNotice } from "../ui/notices.ts";
+import { describeError } from "../ui/describe-error.ts";
+import { VaultEncryptionPausedError, type VaultBinding } from "../sync/vault-binding.ts";
 
 export interface VaultSyncTabDeps {
     app: App;
@@ -24,12 +26,10 @@ export interface VaultSyncTabDeps {
     auth: AuthGate;
     remoteOps: VaultRemoteOps;
     localDb: LocalDB;
-    initVault: () => Promise<void>;
-    cloneFromRemote: () => Promise<void>;
-    startSync: () => Promise<void>;
-    stopSync: () => void;
+    /** Owner of the vault setup: Init, Clone and every change of the setup
+     *  state go through it. */
+    vault: VaultBinding;
     refresh: () => void;
-    encryptionMismatch?: { status: string };
 }
 
 interface Draft {
@@ -177,12 +177,9 @@ export class VaultSyncTab {
                     .onClick(async () => {
                         btn.setButtonText("Pushing...");
                         btn.setDisabled(true);
-                        try {
-                            await this.deps.initVault();
-                            this.deps.refresh();
-                        } catch {
-                            this.deps.refresh();
-                        }
+                        // The binding reports and records a failure.
+                        await this.deps.vault.init().catch(() => {});
+                        this.deps.refresh();
                     })
             );
 
@@ -205,12 +202,9 @@ export class VaultSyncTab {
                     .onClick(async () => {
                         btn.setButtonText("Pulling...");
                         btn.setDisabled(true);
-                        try {
-                            await this.deps.cloneFromRemote();
-                            this.deps.refresh();
-                        } catch {
-                            this.deps.refresh();
-                        }
+                        // The binding reports and records a failure.
+                        await this.deps.vault.clone().catch(() => {});
+                        this.deps.refresh();
                     })
             );
 
@@ -231,14 +225,7 @@ export class VaultSyncTab {
                     .setValue(state === "syncing")
                     .setDisabled(!syncToggleEnabled)
                     .onChange(async (value) => {
-                        if (value) {
-                            await this.deps.updateSettings({ connectionState: "syncing" });
-                            await this.deps.startSync();
-                        } else {
-                            this.deps.stopSync();
-                            await this.deps.updateSettings({ connectionState: "setupDone" });
-                        }
-                        this.deps.refresh();
+                        await this.changeSetup(() => this.deps.vault.setLiveSync(value));
                     })
             );
 
@@ -337,11 +324,20 @@ export class VaultSyncTab {
     }
 
     private async handleApply(): Promise<void> {
-        await this.deps.updateSettings({
-            couchdbDbName: this.draft.db,
-            connectionState: "tested",
+        await this.changeSetup(async () => {
+            await this.deps.vault.applyDatabase(this.draft.db);
+            this.testPassed = false;
         });
-        this.testPassed = false;
+    }
+
+    /** Run a change of the vault setup; a refusal (Init or Clone runs) is
+     *  shown as a notice. The tab is redrawn either way. */
+    private async changeSetup(change: () => Promise<void>): Promise<void> {
+        try {
+            await change();
+        } catch (e) {
+            showNotice(describeError(e).text, 8000);
+        }
         this.deps.refresh();
     }
 
@@ -449,7 +445,8 @@ export class VaultSyncTab {
             cls: "setting-item-description",
         });
 
-        if (this.deps.encryptionMismatch) {
+        const lastCheck = this.deps.vault.outcomesNow().lastCheck?.error;
+        if (lastCheck instanceof VaultEncryptionPausedError && lastCheck.reason === "encryption-changed") {
             const warn = el.createEl("p", {
                 text: "Encryption state was changed by another device. " +
                     "Adjust settings here, then re-run Init or Clone in Step 3.",
@@ -472,11 +469,9 @@ export class VaultSyncTab {
                     .setValue(settings.encryptionEnabled)
                     .setDisabled(!editable)
                     .onChange(async (value) => {
-                        const patch: Partial<CouchSyncSettings> = { encryptionEnabled: value };
-                        if (!value) patch.encryptionPassphrase = "";
-                        if (state === "setupDone") patch.connectionState = "tested";
-                        await this.deps.updateSettings(patch);
-                        this.deps.refresh();
+                        await this.changeSetup(() => this.deps.vault.changeCodecSetting(
+                            value ? { encryptionEnabled: true } : { encryptionEnabled: false, encryptionPassphrase: "" },
+                        ));
                     })
             );
 
@@ -517,10 +512,7 @@ export class VaultSyncTab {
                     .setValue(settings.compressionEnabled)
                     .setDisabled(!editable)
                     .onChange(async (value) => {
-                        const patch: Partial<CouchSyncSettings> = { compressionEnabled: value };
-                        if (state === "setupDone") patch.connectionState = "tested";
-                        await this.deps.updateSettings(patch);
-                        this.deps.refresh();
+                        await this.changeSetup(() => this.deps.vault.changeCodecSetting({ compressionEnabled: value }));
                     })
             );
     }

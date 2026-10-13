@@ -36,7 +36,6 @@ import { ObsidianCompositionTracker } from "./adapters/obsidian-composition-trac
 import { EditorAwareVaultWriter } from "./adapters/editor-aware-vault-writer.ts";
 import { CompositionGate } from "./sync/composition-gate.ts";
 import { makeCouchClient } from "./db/couch-client.ts";
-import type { EncryptionAgreement } from "./db/encryption-agreement.ts";
 import { VaultBinding } from "./sync/vault-binding.ts";
 import { PassphraseModal } from "./ui/passphrase-modal.ts";
 import type { ICouchClient } from "./db/interfaces.ts";
@@ -72,9 +71,6 @@ export default class CouchSyncPlugin extends Plugin {
     /** Owner of the vault DB's setup: the codec state, Init / Clone, the
      *  encryption-agreement check and their outcomes. */
     vaultBinding!: VaultBinding;
-    get encryptionMismatch(): EncryptionAgreement | undefined {
-        return this.vaultBinding?.encryptionMismatch;
-    }
 
     /** Cross-platform OS label for the log frontmatter. Desktop uses Node
      *  `process.platform` (win32/darwin/linux); mobile has no Node, so derive
@@ -198,6 +194,7 @@ export default class CouchSyncPlugin extends Plugin {
             ),
             setup: () => this.setupService,
             stopLive: () => this.stopSync(),
+            startLive: () => this.startSync(),
             openProgress: (label) => new ProgressNotice(label),
             askPassphrase: (reason, tryUnlock) => new PassphraseModal(
                 this.app, false,
@@ -665,14 +662,8 @@ export default class CouchSyncPlugin extends Plugin {
         return /^[0-9a-f]{8}-/.test(id);
     }
 
-    initVault(): Promise<void> {
-        return this.vaultBinding.init();
-    }
-
-    cloneFromRemote(): Promise<void> {
-        return this.vaultBinding.clone();
-    }
-
+    /** Start the live session when the vault is set up for it. The setup
+     *  state itself is changed by `vaultBinding` only. */
     async startSync(): Promise<void> {
         if (this.settings.connectionState !== "syncing") return;
         if (!this.settings.deviceId) {

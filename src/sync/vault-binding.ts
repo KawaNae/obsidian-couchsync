@@ -5,6 +5,10 @@
  * is left is the setup of the vault DB itself, and this class owns all of
  * it:
  *
+ *   - the setup state (`settings.connectionState`): every change of it
+ *     goes through a method here (Init, Clone, the Live Sync switch, Step 2
+ *     Apply, a Step 1 codec change, a server change, an encryption pause);
+ *     only the settings migration on load rewrites it elsewhere;
  *   - the codec state the vault decorator stack is built from: the unlocked
  *     key, and the compression flag and cipher floor a Clone applies in
  *     memory before it commits them (`wrapClient`, `chunkHasher`);
@@ -35,7 +39,7 @@ import {
     VAULT_META_DOC_ID,
     type VaultMetaDoc,
 } from "../db/vault-meta.ts";
-import { checkEncryptionAgreement, type EncryptionAgreement } from "../db/encryption-agreement.ts";
+import { checkEncryptionAgreement } from "../db/encryption-agreement.ts";
 import { classifyError } from "../db/sync/errors.ts";
 import { describeError, rawErrorMessage, UserFacingError } from "../ui/describe-error.ts";
 import { logWarn } from "../ui/log.ts";
@@ -81,6 +85,8 @@ export interface VaultBindingHost {
     setup(): VaultSetupRunner;
     /** Stop the live session and the change tracker. */
     stopLive(): void;
+    /** Start the live session (the state is `syncing` when called). */
+    startLive(): Promise<void>;
     openProgress(label: string): VaultProgress;
     askPassphrase: AskVaultPassphrase;
 }
@@ -120,9 +126,6 @@ export class VaultBinding {
     private cipherVersionOverride?: number;
     private inflight: Exclude<VaultOpName, "agreement"> | null = null;
     private readonly outcomes = new OutcomeLedger<VaultOpName>((op) => op === "agreement");
-    /** The agreement the last check disagreed with (encryption changed by
-     *  another device, or a cipher downgrade), for the Step 1 warning. */
-    encryptionMismatch?: EncryptionAgreement;
 
     /** The vault chunk hasher: HMAC under the key when the vault is
      *  encrypted and unlocked, xxhash64 otherwise. Reads the key on every
@@ -217,6 +220,77 @@ export class VaultBinding {
     /** The Init or Clone running now, or null. */
     busy(): "init" | "clone" | null {
         return this.inflight;
+    }
+
+    /** Why the vault setup cannot be changed now (Init or Clone runs), or
+     *  null. */
+    changeBlocker(): string | null {
+        return this.inflight
+            ? `${OP_LABELS[this.inflight]} is running — wait for it to finish.`
+            : null;
+    }
+
+    private assertIdle(): void {
+        const blocked = this.changeBlocker();
+        if (blocked) throw new UserFacingError(blocked);
+    }
+
+    /**
+     * Step 4's Live Sync switch. On: only from `setupDone` — a setup that
+     * did not finish never syncs; persists `syncing`, then starts the
+     * session. Off: stops the session, then persists `setupDone`.
+     */
+    async setLiveSync(on: boolean): Promise<void> {
+        this.assertIdle();
+        const state = this.settings().connectionState;
+        if (on) {
+            if (state === "syncing") return;
+            if (state !== "setupDone") {
+                throw new UserFacingError("Run Init or Clone (Step 3) before turning on Live Sync.");
+            }
+            await this.writeState("syncing");
+            await this.host.startLive();
+        } else {
+            if (state !== "syncing") return;
+            this.host.stopLive();
+            await this.writeState("setupDone");
+        }
+    }
+
+    /** Step 2 Apply: select the vault DB. The device must set it up (Init or
+     *  Clone) before it syncs with it. */
+    async applyDatabase(dbName: string): Promise<void> {
+        this.assertIdle();
+        const s = this.settings();
+        s.couchdbDbName = dbName;
+        s.connectionState = "tested";
+        await this.host.saveSettings();
+    }
+
+    /** A Step 1 codec setting changed (encryption, compression). The vault
+     *  on the server was set up with the old one, so a finished setup no
+     *  longer holds: `setupDone` drops to `tested` (Init or Clone again). */
+    async changeCodecSetting(
+        patch: Partial<Pick<CouchSyncSettings, "encryptionEnabled" | "encryptionPassphrase" | "compressionEnabled">>,
+    ): Promise<void> {
+        this.assertIdle();
+        const s = this.settings();
+        Object.assign(s, patch);
+        if (s.connectionState === "setupDone") s.connectionState = "tested";
+        await this.host.saveSettings();
+    }
+
+    /** The CouchDB tab's Apply. New credentials (or server) send the vault
+     *  setup back to `editing`: Step 2 has to be checked again. */
+    async applyServer(
+        patch: Partial<Pick<CouchSyncSettings, "couchdbUri" | "couchdbUser" | "couchdbPassword" | "serverTested">>,
+        credentialsChanged: boolean,
+    ): Promise<void> {
+        this.assertIdle();
+        const s = this.settings();
+        Object.assign(s, patch);
+        if (credentialsChanged) s.connectionState = "editing";
+        await this.host.saveSettings();
     }
 
     /** How the last Init / Clone and the last agreement check ended, for the
@@ -348,7 +422,6 @@ export class VaultBinding {
                 await pushVaultMeta(raw, meta);
                 if (!enc) s.encryptionPassphrase = "";
                 s.connectionState = "setupDone";
-                this.encryptionMismatch = undefined;
                 if (meta.encryption.enabled) {
                     this.ratchetCipherFloor(meta.encryption.cipherVersion);
                 }
@@ -414,7 +487,6 @@ export class VaultBinding {
                 s.connectionState = "setupDone";
                 this.compressionOverride = undefined;
                 this.cipherVersionOverride = undefined;
-                this.encryptionMismatch = undefined;
                 await this.host.saveSettings();
                 return `${result.vaultFiles} files written.`;
             } catch (e) {
@@ -468,7 +540,6 @@ export class VaultBinding {
                     `vault:meta cipherVersion downgrade detected ` +
                     `(below floor ${agreement.localFloor}) — refusing early unlock.`,
                 );
-                this.encryptionMismatch = agreement;
                 return;
             }
             if (agreement.status !== "agreed-encrypted"
@@ -492,92 +563,140 @@ export class VaultBinding {
      *
      *   - agreed: unlock the key once (asking for the passphrase when none
      *     is stored), ratchet the cipher floor, and take the server's
-     *     compression flag. Returns normally.
-     *   - a transient failure while reading `vault:meta` is thrown as is;
-     *     the engine retries.
-     *   - a state the user has to act on (cipher downgrade, encryption
-     *     changed by another device, pre-v2 meta, no or a wrong passphrase)
-     *     pauses: see `pause`.
+     *     compression flag. Recorded as a passed check.
+     *   - a transient failure while reading `vault:meta` is thrown as is and
+     *     not recorded: the check did not conclude, and the engine retries
+     *     (the status bar shows the live session's errors).
+     *   - a state the user has to act on pauses (`pause`), recorded as a
+     *     failed check so Step 3 says why.
      */
     async checkAgreement(_signal: AbortSignal): Promise<void> {
+        const at = Date.now();
         const s = this.settings();
+        const against = vaultTarget(s);
         const agreement = await checkEncryptionAgreement(
             this.host.makeRawClient(), s.encryptionEnabled,
             VAULT_META_DOC_ID, s.vaultCipherVersion,
         );
 
         if (agreement.status === "cipher-downgrade-detected") {
-            this.encryptionMismatch = agreement;
-            throw await this.pause(
-                "vault encryption was downgraded on the server " +
-                `(cipherVersion below this device's floor ${agreement.localFloor}). ` +
-                "Sync paused — verify the server has not been tampered with.",
-            );
+            throw await this.pause(at, against, "cipher-downgrade", { localFloor: agreement.localFloor });
+        }
+        if (agreement.status === "remote-encrypted" || agreement.status === "remote-plaintext") {
+            throw await this.pause(at, against, "encryption-changed", {
+                remoteEncrypted: agreement.status === "remote-encrypted",
+            });
+        }
+        if (agreement.status === "legacy-meta-only") {
+            throw await this.pause(at, against, "legacy-meta");
         }
 
-        if (agreement.status === "agreed-encrypted") {
-            if (!this.crypto) {
-                const meta = agreement.meta as VaultMetaDoc;
-                let passphrase = s.encryptionPassphrase;
-                let crypto: CryptoProvider | null = null;
-                if (!passphrase) {
-                    const answer = await this.host.askPassphrase("missing", async (p) => {
-                        crypto = p ? (await unlockVaultMeta(meta, p))?.crypto ?? null : null;
-                        return crypto !== null;
-                    });
-                    if (answer === null || crypto === null) {
-                        throw await this.pause("passphrase required. Sync paused.");
-                    }
-                    passphrase = answer;
-                } else {
-                    crypto = (await unlockVaultMeta(meta, passphrase))?.crypto ?? null;
-                    if (!crypto) {
-                        s.encryptionPassphrase = "";
-                        await this.host.saveSettings();
-                        throw await this.pause("wrong passphrase. Sync paused.");
-                    }
+        if (agreement.status === "agreed-encrypted" && !this.crypto) {
+            const meta = agreement.meta as VaultMetaDoc;
+            const unlocked: { crypto: CryptoProvider | null } = { crypto: null };
+            let passphrase = s.encryptionPassphrase;
+            if (!passphrase) {
+                const answer = await this.host.askPassphrase("missing", async (p) => {
+                    unlocked.crypto = p ? (await unlockVaultMeta(meta, p))?.crypto ?? null : null;
+                    return unlocked.crypto !== null;
+                });
+                if (answer === null || unlocked.crypto === null) {
+                    throw await this.pause(at, against, "passphrase-missing");
                 }
-                if (!s.encryptionPassphrase) {
-                    s.encryptionPassphrase = passphrase;
+                passphrase = answer;
+                s.encryptionPassphrase = passphrase;
+                await this.host.saveSettings();
+            } else {
+                unlocked.crypto = (await unlockVaultMeta(meta, passphrase))?.crypto ?? null;
+                if (!unlocked.crypto) {
+                    s.encryptionPassphrase = "";
                     await this.host.saveSettings();
+                    throw await this.pause(at, against, "passphrase-mismatch");
                 }
-                this.crypto = crypto!;
-                const cv = meta.encryption.enabled ? meta.encryption.cipherVersion : 0;
-                if (this.ratchetCipherFloor(cv)) await this.host.saveSettings();
             }
-        } else if (agreement.status === "remote-encrypted"
-            || agreement.status === "remote-plaintext") {
-            this.encryptionMismatch = agreement;
-            throw await this.pause(
-                "encryption state changed by another device. " +
-                "Open Settings → Vault Sync to re-run Init or Clone.",
-            );
-        } else if (agreement.status === "legacy-meta-only") {
-            throw await this.pause(
-                "this vault was set up with a pre-v2 build. " +
-                "Open Settings → Vault Sync and re-run Init or Clone to migrate.",
-            );
+            this.crypto = unlocked.crypto;
+            const cv = meta.encryption.enabled ? meta.encryption.cipherVersion : 0;
+            if (this.ratchetCipherFloor(cv)) await this.host.saveSettings();
         }
 
         // The compression flag is the server's: take it so every device
         // builds the same decorator stack.
-        const remoteMeta = (agreement.status === "agreed-encrypted"
-            || agreement.status === "agreed-plaintext") ? agreement.meta : null;
-        if (remoteMeta && s.compressionEnabled !== remoteMeta.compression.enabled) {
-            s.compressionEnabled = remoteMeta.compression.enabled;
+        if (agreement.meta && s.compressionEnabled !== agreement.meta.compression.enabled) {
+            s.compressionEnabled = agreement.meta.compression.enabled;
             await this.host.saveSettings();
         }
-        if (agreement.status === "agreed-encrypted" || agreement.status === "agreed-plaintext") {
-            this.encryptionMismatch = undefined;
-        }
+        this.outcomes.record({ op: "agreement", at, against, error: null });
     }
 
     /** Pause live sync for a state the user has to act on: persist
      *  `tested` (the next load does not start sync; Step 3 offers Init and
-     *  Clone) and return the terminal error for the caller to throw. */
-    private async pause(message: string): Promise<Error> {
+     *  Clone), record the failed check, and return the terminal error for
+     *  the caller to throw. The live session surfaces it once. */
+    private async pause(
+        at: number,
+        against: string,
+        reason: VaultPauseReason,
+        detail: VaultPauseDetail = {},
+    ): Promise<VaultEncryptionPausedError> {
+        const e = new VaultEncryptionPausedError(reason, detail);
         await this.writeState("tested");
-        return Object.assign(new Error(message), { encryptionPaused: true });
+        this.outcomes.record({ op: "agreement", at, against, error: e });
+        return e;
+    }
+}
+
+/** Why the live session paused on the encryption agreement. */
+export type VaultPauseReason =
+    /** `vault:meta` declares a cipher version below this device's floor. */
+    | "cipher-downgrade"
+    /** Another device turned encryption on or off. */
+    | "encryption-changed"
+    /** Only a pre-v2 `encryption:meta` is on the server. */
+    | "legacy-meta"
+    /** Encrypted, and the passphrase prompt was cancelled. */
+    | "passphrase-missing"
+    /** Encrypted, and the stored passphrase does not unlock it. */
+    | "passphrase-mismatch";
+
+export interface VaultPauseDetail {
+    localFloor?: number;
+    remoteEncrypted?: boolean;
+}
+
+function pauseMessage(reason: VaultPauseReason, d: VaultPauseDetail): string {
+    const redo = "re-run Init or Clone in Vault Sync (Step 3)";
+    switch (reason) {
+        case "cipher-downgrade":
+            return "Sync paused — the server's vault:meta declares an older cipher version " +
+                `than this device trusts (below ${d.localFloor}), which can mean the server ` +
+                `was tampered with. Verify the server, then ${redo}.`;
+        case "encryption-changed":
+            return `Sync paused — another device turned vault encryption ` +
+                `${d.remoteEncrypted ? "on" : "off"}. Match Step 1 in Vault Sync, then ${redo}.`;
+        case "legacy-meta":
+            return `Sync paused — this vault was set up with a pre-v2 build. To migrate, ${redo}.`;
+        case "passphrase-missing":
+            return "Sync paused — the vault is encrypted and no passphrase was entered. " +
+                "Run Clone in Vault Sync (Step 3); it asks for the passphrase.";
+        case "passphrase-mismatch":
+            return "Sync paused — the stored passphrase does not unlock this vault. " +
+                "Run Clone in Vault Sync (Step 3); it asks for the passphrase.";
+    }
+}
+
+/**
+ * The live session paused on the encryption agreement. Terminal for the
+ * engine (`encryptionPaused`, see `classifyError`): retrying meets the same
+ * server state. Carries its own sentence (`userMessage`).
+ */
+export class VaultEncryptionPausedError extends Error {
+    readonly encryptionPaused = true;
+    readonly userMessage: string;
+    constructor(readonly reason: VaultPauseReason, readonly detail: VaultPauseDetail = {}) {
+        const msg = pauseMessage(reason, detail);
+        super(msg);
+        this.name = "VaultEncryptionPausedError";
+        this.userMessage = msg;
     }
 }
 
