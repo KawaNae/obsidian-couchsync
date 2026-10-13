@@ -6,6 +6,43 @@ All notable changes to obsidian-couchsync.
 
 ### Fixed
 
+- **Vault Init and Clone failures are always reported, and a failure before
+  anything is changed leaves the setup as it was.** A Clone that failed while
+  reading `vault:meta` or unlocking the vault (an unreachable server, a
+  wrong passphrase) showed nothing — no notice, no log line. Init and Clone
+  now show their notice from the first step and word every failure with its
+  cause and fix. Both first check that the server answers and prepare
+  everything that needs no change (the metadata, the key); only then do they
+  stop live sync and mark the setup unfinished. Before, Init did that before
+  checking the passphrase, so a missing passphrase disabled Live Sync
+  although nothing had been touched. A second Init or Clone while one runs,
+  and a run while the server rejects the credentials, are refused.
+- **Clone asks for the passphrase the way Config Join does.** When the Step 1
+  passphrase is missing or does not unlock the vault, Clone asks for it,
+  saying which of the two it is; a wrong answer keeps the prompt open with an
+  error. Cancelling ends with "Clone cancelled — nothing was changed." The
+  prompt that live sync shows when an encrypted vault has no stored
+  passphrase also stays open on a wrong answer.
+- **Vault Sync's Step 3 shows what last went wrong.** The status line now
+  says why sync paused on encryption (e.g. "Last encryption check: Sync
+  paused — another device turned vault encryption on. …") instead of "Choose
+  how to initialize this vault.", and shows the last failed Init or Clone.
+  While Init or Clone runs, Init, Clone and Live Sync are disabled, and
+  Step 2 Apply, the Step 1 switches and the CouchDB tab's Apply are refused.
+- **Clone no longer claims an unchecked database is empty.** After reopening
+  the settings, Clone said "Database is empty — use Init" until Step 2's
+  Check was pressed again. It now asks for the Check instead; the result of
+  the last Check is kept until Obsidian restarts.
+- **More failures are worded with their cause and fix.** Step 2's Check (in
+  Vault Sync and Config Sync), the CouchDB tab's Test and database delete,
+  Verify's Repair, the chunk repair and its retry, and the Maintenance
+  actions (legacy config cleanup, deleting the local vault, config and log
+  databases, log export and clear) now report through the same notice as
+  Init and Clone. A chunk repair or retry that fails no longer leaves its
+  progress notice on screen, and deleting the local vault database is
+  refused while Init or Clone runs. Deleting a server database without
+  admin rights says so instead of pausing sync for rejected credentials.
+
 - **Clone no longer aborts on a single transient network failure.** A Clone
   issues thousands of read requests (paginated `_all_docs` plus one GET per
   chunk attachment); one dropped request (`Failed to fetch`, a request
