@@ -502,12 +502,22 @@ export default class CouchSyncPlugin extends Plugin {
                 // plugins on a mobile device. Mirrors the getPlatform wiring.
                 getIsMobile: () => Platform.isMobile,
                 // Bindings persist their settings entry (cipher floor, setup
-                // flag) and the passphrase a Create / Join used.
+                // flag, the DB's passphrase).
                 saveSettings: () => this.saveSettings(),
-                // Join asks for the config passphrase when none is set.
-                promptPassphrase: () => new PassphraseModal(
+                // Join asks when none of the passphrases at hand unlocks the
+                // DB; the modal checks each answer and stays open on a wrong
+                // one.
+                askPassphrase: (reason, tryUnlock) => new PassphraseModal(
                     this.app, false,
-                    "Enter the passphrase the config database was set up with.",
+                    (reason === "missing"
+                        ? "This config database is encrypted, and no passphrase is set on this device. "
+                        : "The passphrases set on this device do not unlock this config database. ") +
+                        "Enter the passphrase it was set up with.",
+                    {
+                        validate: async (p) => (await tryUnlock(p))
+                            ? null
+                            : "This passphrase does not unlock the config database.",
+                    },
                 ).waitForResult(),
             },
         );

@@ -340,11 +340,14 @@ describe("ConfigSetupService — setup atomicity (#err-9)", () => {
         expect(wrapped).not.toHaveBeenCalled();
         // The freshly derived key is usable on the binding Create ran
         // against (HMAC chunk ids for local work), the passphrase it used is
-        // saved, and the device is joined with the new root and a floor.
+        // kept on the binding (Step 1 unchanged), and the device is joined
+        // with the new root and a floor.
         expect(cs2.currentBinding()!.currentKeys().hasher.alg).toBe("hmac");
         expect(settings.configEncryptionPassphrase).toBe("test-pass-123");
         expect(cs2.currentBinding()!.attachment).not.toBeNull();
-        expect(getEntry(settings)).toEqual({ cipherFloor: 3, settingUp: false });
+        expect(getEntry(settings)).toEqual({
+            cipherFloor: 3, settingUp: false, passphrase: "test-pass-123",
+        });
         // The attachment (the new root's codec) is in the store.
         expect(await getAttachment(db)).toMatchObject({
             codec: { encryption: true, compression: false },

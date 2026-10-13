@@ -1,5 +1,5 @@
 /**
- * Config binding lifecycle (config-binding design, stages 2–3).
+ * Config binding lifecycle.
  *
  * The config DB name, its local store, cursors, lastSynced cache, key and
  * this device's participation record are one binding owned by ConfigSync.
@@ -19,9 +19,10 @@
  *   - settings and binding change together: a server or DB change refused
  *     while an op runs saves nothing, so Create's preview, Create itself
  *     and the filter tree all use the server the settings name;
- *   - the passphrase is resolved once, at Create / Join, and saved as the
- *     explicit config passphrase: later vault-side changes do not stop
- *     config sync;
+ *   - the passphrase is resolved once, at Create / Join, and kept on the
+ *     binding: later Step 1 or vault-side changes do not stop config sync,
+ *     and DBs with different passphrases keep their own; Join tries the
+ *     values at hand and asks only when none unlocks;
  *   - Push / Pull use the joined DB's codec: a Step 1 or vault codec change
  *     (e.g. a Vault Clone) never stops config sync;
  *   - an op's key and chunk hasher are fixed for its run — the filter tree
@@ -38,7 +39,7 @@
 import "fake-indexeddb/auto";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { ConfigSync } from "../../src/sync/config-sync.ts";
-import type { ConfigStoreFactory } from "../../src/sync/config-binding.ts";
+import type { AskConfigPassphrase, ConfigStoreFactory } from "../../src/sync/config-binding.ts";
 import { ConfigLocalDB } from "../../src/db/config-local-db.ts";
 import { AuthGate } from "../../src/db/sync/auth-gate.ts";
 import { ALWAYS_VISIBLE } from "../../src/db/visibility-gate.ts";
@@ -54,6 +55,7 @@ import { FakeCouchClient } from "../helpers/fake-couch-client.ts";
 import { FakeVaultIO } from "../helpers/fake-vault-io.ts";
 import { FakeModalPresenter } from "../helpers/fake-modal-presenter.ts";
 import { makeSettings } from "../helpers/settings-factory.ts";
+import { clearLog, getLogEntries } from "../../src/ui/log.ts";
 import {
     getAttachment,
     getEntry,
@@ -128,7 +130,7 @@ describe("config binding lifecycle", () => {
     function makeDevice(
         deviceId: string,
         overrides: Partial<CouchSyncSettings> = {},
-        promptPassphrase?: () => Promise<string | null>,
+        askPassphrase?: AskConfigPassphrase,
         reuse?: { vault: FakeVaultIO; vaultName: string; settings: CouchSyncSettings },
     ): Device {
         const vault = reuse?.vault ?? new FakeVaultIO();
@@ -152,7 +154,7 @@ describe("config binding lifecycle", () => {
                 storeFactory,
                 rawClientFactory: (s) => remote(s.couchdbConfigDbName, s.couchdbUri),
                 saveSettings: async () => { dev.saves++; },
-                promptPassphrase,
+                askPassphrase,
             },
         );
         return dev;
@@ -273,7 +275,7 @@ describe("config binding lifecycle", () => {
             expect(att.metaFingerprint).toMatch(/^sha256:/);
             expect(binding.attachment).toEqual(att);
             // The settings entry: cipher floor SET from the meta.
-            expect(getEntry(dev.settings)).toEqual({ cipherFloor: 3, settingUp: false });
+            expect(getEntry(dev.settings)).toEqual({ cipherFloor: 3, settingUp: false, passphrase: PASS });
             expect(dev.saves).toBeGreaterThan(0);
 
             expect(await dev.cs.pull()).toBe(1);
@@ -473,17 +475,86 @@ describe("config binding lifecycle", () => {
             expect(b.vault.readText(".obsidian/app.json")).toBe(`{"x":1}`);
         });
 
-        it("asks for the passphrase when none is set, and keeps it", async () => {
+        it("asks for the passphrase when none is at hand, keeps it on the binding, and leaves Step 1 alone", async () => {
             await seed("cfg-enc", { ".obsidian/app.json": "{}" }, ENC);
-            const prompt = vi.fn(async () => PASS);
+            const answers: boolean[] = [];
+            const ask = vi.fn<AskConfigPassphrase>(async (_reason, tryUnlock) => {
+                // The modal re-asks on a wrong answer: first a typo, then the
+                // right one.
+                answers.push(await tryUnlock("typo"));
+                answers.push(await tryUnlock(PASS));
+                return PASS;
+            });
             const b = makeDevice("dev-B", {
                 configEncryptionEnabled: true, configEncryptionPassphrase: "", encryptionPassphrase: "",
-            }, prompt);
+            }, ask);
             await apply(b, "cfg-enc");
             await b.cs.join();
-            expect(prompt).toHaveBeenCalledTimes(1);
-            expect(b.settings.configEncryptionPassphrase).toBe(PASS);
+            expect(ask).toHaveBeenCalledTimes(1);
+            expect(ask.mock.calls[0][0]).toBe("missing");
+            expect(answers).toEqual([false, true]);
+            expect(getEntry(b.settings)).toMatchObject({ passphrase: PASS });
+            expect(b.settings.configEncryptionPassphrase).toBe("");
             expect(await b.cs.pull()).toBe(1);
+        });
+
+        it("tries the binding's passphrase, then Step 1, then the vault's — each once — before asking", async () => {
+            await seed("cfg-enc", { ".obsidian/app.json": "{}" }, ENC);
+            const ask = vi.fn<AskConfigPassphrase>(async () => null);
+            const b = makeDevice("dev-B", {
+                configEncryptionEnabled: true, configEncryptionPassphrase: "step1", encryptionPassphrase: PASS,
+            }, ask);
+            await apply(b, "cfg-enc");
+            putEntry(b.settings, { settingUp: false, passphrase: "stale" });
+            await b.cs.join();
+            const binding = b.cs.currentBinding()!;
+            // "stale", "step1", then the vault's: three derivations, no prompt.
+            expect(binding.keyDerivations).toBe(3);
+            expect(ask).not.toHaveBeenCalled();
+            expect(getEntry(b.settings)).toMatchObject({ passphrase: PASS });
+            expect(b.settings.configEncryptionPassphrase).toBe("step1");
+        });
+
+        it("the same value in two places is tried once; when none matches it asks with 'mismatch'", async () => {
+            await seed("cfg-enc", { ".obsidian/app.json": "{}" }, ENC);
+            const ask = vi.fn<AskConfigPassphrase>(async (_r, tryUnlock) =>
+                (await tryUnlock(PASS)) ? PASS : null);
+            const b = makeDevice("dev-B", {
+                configEncryptionEnabled: true, configEncryptionPassphrase: "same", encryptionPassphrase: "same",
+            }, ask);
+            await apply(b, "cfg-enc");
+            await b.cs.join();
+            expect(ask.mock.calls[0][0]).toBe("mismatch");
+            // One derivation for "same", one for the answer.
+            expect(b.cs.currentBinding()!.keyDerivations).toBe(2);
+        });
+
+        it("cancelling the prompt: 'Join cancelled — nothing was changed', and nothing is", async () => {
+            await seed("cfg-enc", { ".obsidian/app.json": "{}" }, ENC);
+            const b = makeDevice("dev-B", {
+                configEncryptionEnabled: true, configEncryptionPassphrase: "wrong",
+            }, async () => null);
+            await apply(b, "cfg-enc");
+            const store = b.cs.currentStore()!;
+            await store.runWriteTx({
+                docs: [{ doc: {
+                    _id: makeConfigId(".obsidian/local.json"), type: "config",
+                    chunks: [], mtime: 1, size: 0, vclock: { "dev-B": 1 },
+                } as any }],
+            });
+            clearLog();
+            const err = await b.cs.join().catch((e) => e);
+            expect(err).toMatchObject({ name: "AbortError", message: "Join cancelled — nothing was changed." });
+            expect(await attachmentOf(b)).toBeNull();
+            expect(getEntry(b.settings)).toBeUndefined();
+            expect(b.settings.configEncryptionPassphrase).toBe("wrong");
+            expect(await store.get(makeConfigId(".obsidian/local.json"))).not.toBeNull();
+            // Not an outcome of the relation, and not an error.
+            expect(b.cs.currentBinding()!.relation().last).toBeNull();
+            const logs = getLogEntries();
+            expect(logs.filter((e) => e.level === "error")).toEqual([]);
+            expect(logs.some((e) => e.level === "warn"
+                && e.message === "Config Join cancelled — nothing was changed.")).toBe(true);
         });
 
         it("without a passphrase and no prompt: passphrase-missing, nothing recorded", async () => {
@@ -495,7 +566,7 @@ describe("config binding lifecycle", () => {
             expect(getEntry(b.settings)).toBeUndefined();
         });
 
-        it("a wrong passphrase: passphrase-mismatch, never suggests Create, records nothing, keeps the store", async () => {
+        it("a wrong passphrase and no prompt: passphrase-mismatch, never suggests Create, records nothing, keeps the store", async () => {
             await seed("cfg-enc", { ".obsidian/app.json": "{}" }, ENC);
             const b = makeDevice("dev-B", { ...ENC, configEncryptionPassphrase: "wrong" });
             await apply(b, "cfg-enc");
@@ -508,7 +579,7 @@ describe("config binding lifecycle", () => {
             });
             const err = await b.cs.join().catch((e) => e);
             expect(err).toMatchObject({ kind: "passphrase-mismatch" });
-            expect(err.message).toMatch(/Step 1/);
+            expect(err.message).toMatch(/Join in Step 3/);
             expect(err.message).not.toMatch(/Create|Init/);
             expect(await attachmentOf(b)).toBeNull();
             expect(getEntry(b.settings)).toBeUndefined();
@@ -578,30 +649,38 @@ describe("config binding lifecycle", () => {
             await expect(b.cs.pull()).rejects.toMatchObject({ kind: "uninitialized" });
         });
 
-        it("passphrase-mismatch after joining: never suggests Create", async () => {
+        it("Step 1 is not the key after joining: changing or clearing it does not stop sync", async () => {
             await seed("cfg-enc", { ".obsidian/app.json": "{}" }, ENC);
             const b = await joined("cfg-enc");
             b.settings.configEncryptionPassphrase = "a-different-one";
+            expect(await b.cs.pull()).toBe(1);
+            b.settings.configEncryptionPassphrase = "";
+            expect(await b.cs.pull()).toBe(1);
+        });
+
+        it("passphrase-mismatch after joining (the binding's passphrase no longer unlocks): Join, never Create", async () => {
+            await seed("cfg-enc", { ".obsidian/app.json": "{}" }, ENC);
+            const b = await joined("cfg-enc");
+            putEntry(b.settings, { ...getEntry(b.settings)!, passphrase: "a-different-one" });
             const err = await b.cs.pull().catch((e) => e);
-            // The passphrase is non-empty on both sides, so the codec shape is
-            // unchanged and the check reaches the unlock.
             expect(err).toMatchObject({ kind: "passphrase-mismatch" });
+            expect(err.message).toMatch(/Join in Step 3/);
             expect(err.message).not.toMatch(/Create/);
         });
 
-        it("passphrase-missing after joining: clearing the passphrase is not a codec change", async () => {
+        it("passphrase-missing after joining: points to Join, which recovers from the values at hand", async () => {
             await seed("cfg-enc", { ".obsidian/app.json": "{}" }, ENC);
             const b = await joined("cfg-enc");
-            // The codec fingerprint holds encryption and compression only, so
-            // an emptied passphrase reaches the preflight's passphrase check
-            // instead of reading as a codec change that recommends Create.
-            b.settings.configEncryptionPassphrase = "";
+            // A device that joined before passphrases were kept per binding:
+            // the entry has none, Step 1 holds the one it synced with.
+            const { passphrase: _drop, ...rest } = getEntry(b.settings)!;
+            putEntry(b.settings, rest);
             const err = await b.cs.pull().catch((e) => e);
             expect(err).toMatchObject({ kind: "passphrase-missing" });
-            expect(err.message).toMatch(/Step 1/);
+            expect(err.message).toMatch(/Join in Step 3/);
             expect(err.message).not.toMatch(/Create|Init/);
-            // Entering it again recovers without a Join.
-            b.settings.configEncryptionPassphrase = PASS;
+            await b.cs.join();
+            expect(getEntry(b.settings)).toMatchObject({ passphrase: PASS });
             expect(await b.cs.pull()).toBe(1);
         });
 
@@ -970,7 +1049,7 @@ describe("config binding lifecycle", () => {
 
             // A wrong passphrase now. The tree used to run a preflight outside
             // the op lock and drop the key on failure — mid-scan.
-            b.settings.configEncryptionPassphrase = "wrong";
+            putEntry(b.settings, { ...getEntry(b.settings)!, passphrase: "wrong" });
             const getDoc = vi.spyOn(remote("cfg-enc"), "getDoc");
             const lastBefore = binding.relation().last;
             const listing = await b.cs.listRemoteConfigPathsQuiet();
@@ -1087,19 +1166,21 @@ describe("config binding lifecycle", () => {
     // Re-review 2026-09-25 (R1–R3): the scenarios that broke before the
     // passphrase was resolved once and the server Apply was ordered after
     // the rebind.
-    describe("the passphrase is resolved once, at Create / Join (R1)", () => {
+    describe("the passphrase belongs to the binding, and is resolved once at Create / Join", () => {
         /** Config inherits the vault codec and passphrase (no overrides). */
         const VAULT_ENC = { encryptionEnabled: true, encryptionPassphrase: "P" } as const;
 
-        it("Join with the inherited vault passphrase saves it; vault E2E off or a new vault passphrase does not stop Pull", async () => {
+        it("Join with the inherited vault passphrase keeps it on the binding; vault E2E off or a new vault passphrase does not stop Pull", async () => {
             const a = await creator("cfg", { ".obsidian/app.json": `{"v":1}` }, VAULT_ENC);
-            // Create saved the (inherited) passphrase it encrypted with.
-            expect(a.settings.configEncryptionPassphrase).toBe("P");
+            // Create kept the (inherited) passphrase it encrypted with, and
+            // left Step 1 alone.
+            expect(getEntry(a.settings)).toMatchObject({ passphrase: "P" });
+            expect(a.settings.configEncryptionPassphrase).toBeUndefined();
             const b = makeDevice("dev-B", VAULT_ENC);
-            expect(b.settings.configEncryptionPassphrase).toBeUndefined();
             await apply(b, "cfg");
             await b.cs.join();
-            expect(b.settings.configEncryptionPassphrase).toBe("P");
+            expect(getEntry(b.settings)).toMatchObject({ passphrase: "P" });
+            expect(b.settings.configEncryptionPassphrase).toBeUndefined();
             expect(await b.cs.pull()).toBe(1);
 
             // Vault Sync: E2E toggled off (the tab clears the vault passphrase).
@@ -1117,27 +1198,20 @@ describe("config binding lifecycle", () => {
             expect(await a.cs.push()).toBe(1);
             expect(await b.cs.pull()).toBe(1);
             expect(b.vault.readText(".obsidian/app.json")).toBe(`{"v":3}`);
-            expect(b.settings.configEncryptionPassphrase).toBe("P");
+            expect(getEntry(b.settings)).toMatchObject({ passphrase: "P" });
             await a.cs.close();
         });
 
-        it("after joining, ops use only the saved config passphrase — clearing it is passphrase-missing even with a vault passphrase", async () => {
-            await seed("cfg", { ".obsidian/app.json": "{}" }, VAULT_ENC);
-            const b = makeDevice("dev-B", VAULT_ENC);
-            await apply(b, "cfg");
-            await b.cs.join();
-            b.settings.configEncryptionPassphrase = "";
-            await expect(b.cs.pull()).rejects.toMatchObject({ kind: "passphrase-missing" });
-        });
-
-        it("a plaintext DB: Join and Create save no passphrase", async () => {
+        it("a plaintext DB: Join and Create keep no passphrase", async () => {
             const a = await creator("cfg-plain", { ".obsidian/app.json": "{}" }, {
                 encryptionPassphrase: "vault-only",
             });
+            expect(getEntry(a.settings)?.passphrase).toBeUndefined();
             expect(a.settings.configEncryptionPassphrase).toBeUndefined();
             const b = makeDevice("dev-B", { encryptionPassphrase: "vault-only" });
             await apply(b, "cfg-plain");
             await b.cs.join();
+            expect(getEntry(b.settings)?.passphrase).toBeUndefined();
             expect(b.settings.configEncryptionPassphrase).toBeUndefined();
             expect(await b.cs.pull()).toBe(1);
             await a.cs.close();
@@ -1153,11 +1227,57 @@ describe("config binding lifecycle", () => {
             expect(writeTx).toHaveBeenCalled();
             // Settings committed first (passphrase + floor), attachment not:
             // Unattached, and a second Join needs no prompt.
-            expect(b.settings.configEncryptionPassphrase).toBe("P");
-            expect(getEntry(b.settings)).toEqual({ cipherFloor: 3, settingUp: false });
+            expect(getEntry(b.settings)).toEqual({ cipherFloor: 3, settingUp: false, passphrase: "P" });
             expect(await attachmentOf(b)).toBeNull();
             await b.cs.join();
             expect(await b.cs.pull()).toBe(1);
+        });
+
+        it("an encrypting Create with no passphrase at all stops before anything is destroyed, and says Step 1", async () => {
+            await seed("cfg", { ".obsidian/app.json": "{}" });
+            const a = makeDevice("dev-A", {
+                configEncryptionEnabled: true, configEncryptionPassphrase: "", encryptionPassphrase: "",
+            });
+            await apply(a, "cfg");
+            const destroy = vi.spyOn(remote("cfg"), "destroy");
+            const err = await a.cs.create().catch((e) => e);
+            expect(err).toMatchObject({ kind: "create-passphrase-missing" });
+            expect(err.message).toMatch(/Step 1/);
+            expect(destroy).not.toHaveBeenCalled();
+            expect(getEntry(a.settings)).toBeUndefined();
+        });
+
+        it("two DBs with different passphrases: switching between them keeps each one's passphrase", async () => {
+            await seed("cfg-one", { ".obsidian/app.json": `{"db":1}` }, {
+                configEncryptionEnabled: true, configEncryptionPassphrase: "one",
+            });
+            await seed("cfg-two", { ".obsidian/app.json": `{"db":2}` }, {
+                configEncryptionEnabled: true, configEncryptionPassphrase: "two",
+            });
+            const answers: Record<string, string> = { "cfg-one": "one", "cfg-two": "two" };
+            const asked: string[] = [];
+            const d: Device = makeDevice("dev", { configEncryptionEnabled: true }, async (_r, tryUnlock) => {
+                const db = d.settings.couchdbConfigDbName;
+                asked.push(db);
+                return (await tryUnlock(answers[db])) ? answers[db] : null;
+            });
+
+            await apply(d, "cfg-one");
+            await d.cs.join();
+            await apply(d, "cfg-two");
+            await d.cs.join();
+            expect(asked).toEqual(["cfg-one", "cfg-two"]);
+            expect(getEntry(d.settings, "cfg-one")).toMatchObject({ passphrase: "one" });
+            expect(getEntry(d.settings, "cfg-two")).toMatchObject({ passphrase: "two" });
+
+            // Back and forth: each DB still unlocks with its own passphrase,
+            // with no prompt.
+            for (const db of ["cfg-one", "cfg-two", "cfg-one"]) {
+                await apply(d, db);
+                expect(await d.cs.pull()).toBe(1);
+                expect(d.vault.readText(".obsidian/app.json")).toBe(`{"db":${db === "cfg-one" ? 1 : 2}}`);
+            }
+            expect(asked).toEqual(["cfg-one", "cfg-two"]);
         });
     });
 
@@ -1304,7 +1424,7 @@ describe("config binding lifecycle", () => {
             });
             const v = view(b);
             expect(v.tone).toBe("error");
-            expect(v.text).toMatch(/^Last Join: The passphrase does not unlock/);
+            expect(v.text).toMatch(/^Last Join: The passphrase this device has does not unlock/);
             expect(v.text).not.toMatch(/\bCreate\b/);
         });
 

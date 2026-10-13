@@ -2,6 +2,7 @@ import { buildPolicyFromLegacyPaths } from "./sync/config-policy/migrate.ts";
 import { normalizeUnitDefaults } from "./sync/config-policy/policy.ts";
 import Dexie from "dexie";
 import { configBindingKey } from "./sync/config-binding-record.ts";
+import type { ConfigBindingRecord } from "./settings.ts";
 
 /**
  * Migrate legacy settings shapes to the current schema.
@@ -56,8 +57,9 @@ export function migrateSettings(data: Record<string, any>): void {
     //   - attachment (codec, joined root) lives in the binding's local
     //     store, which settings cannot reach — a recorded codec is dropped,
     //     and the device is Unattached until it Joins once;
-    //   - the cipher floor and the Create-interrupted flag stay in settings,
-    //     per binding (`configBindings[configBindingKey(server, db)]`).
+    //   - the cipher floor, the Create-interrupted flag and the DB's
+    //     passphrase stay in settings, per binding
+    //     (`configBindings[configBindingKey(server, db)]`).
     //
     // Same result from every starting state (idempotent, and safe after a
     // downgrade + upgrade, when an older build wrote the globals again next
@@ -72,14 +74,20 @@ export function migrateSettings(data: Record<string, any>): void {
     // the attachment (`codecFingerprint`, `metaFingerprint`); those move to
     // the store and cannot be carried over, so they are dropped. An entry
     // left with nothing to keep is removed.
-    const bindings: Record<string, { cipherFloor?: number; settingUp: boolean }> = {};
+    const bindings: Record<string, ConfigBindingRecord> = {};
     if (data.configBindings && typeof data.configBindings === "object") {
         for (const [key, rec] of Object.entries(data.configBindings as Record<string, any>)) {
             if (!rec || typeof rec !== "object") continue;
             const cipherFloor = typeof rec.cipherFloor === "number" ? rec.cipherFloor : undefined;
             const settingUp = rec.settingUp === true;
-            if (cipherFloor === undefined && !settingUp) continue;
-            bindings[key] = { ...(cipherFloor !== undefined ? { cipherFloor } : {}), settingUp };
+            const passphrase = typeof rec.passphrase === "string" && rec.passphrase !== ""
+                ? rec.passphrase : undefined;
+            if (cipherFloor === undefined && !settingUp && passphrase === undefined) continue;
+            bindings[key] = {
+                ...(cipherFloor !== undefined ? { cipherFloor } : {}),
+                settingUp,
+                ...(passphrase !== undefined ? { passphrase } : {}),
+            };
         }
     }
     const legacyFloor = typeof data.configCipherVersion === "number"
@@ -94,6 +102,7 @@ export function migrateSettings(data: Record<string, any>): void {
         bindings[key] = {
             ...(floors.length > 0 ? { cipherFloor: Math.max(...floors) } : {}),
             settingUp: (prev?.settingUp ?? false) || legacySettingUp,
+            ...(prev?.passphrase !== undefined ? { passphrase: prev.passphrase } : {}),
         };
     }
     data.configBindings = bindings;

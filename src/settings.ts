@@ -28,13 +28,14 @@ export interface MobileStatusPosition {
 }
 
 /**
- * The part of a config binding that must outlive its local store
- * (config-binding design, 状態モデル). Keyed by `configBindingKey`.
+ * The part of a config binding that must outlive its local store. Keyed by
+ * `configBindingKey`.
  *
  * Whether the device is attached, the codec it syncs with and the root it
  * joined live INSIDE the binding's local store (`ConfigAttachment`), so
  * deleting the store detaches the device. What stays here is what deleting
- * the store must not reset: the trust floor and an interrupted Create.
+ * the store must not reset: the trust floor, an interrupted Create, and the
+ * passphrase of the DB.
  */
 export interface ConfigBindingRecord {
     /** Locally-anchored cipherVersion floor for this DB (TOFU). Set by
@@ -44,6 +45,12 @@ export interface ConfigBindingRecord {
     /** This device's Create is in progress; true between the destructive
      *  wipe and the commit (Invariant C, #err-9). */
     settingUp: boolean;
+    /** The passphrase that unlocks this DB's encrypted root: the one Create
+     *  encrypted with, or the one Join unlocked with. Written only by those
+     *  two, and every op on this DB unlocks with it alone. Kept per binding
+     *  so DBs with different passphrases do not overwrite each other's.
+     *  `undefined` for a plaintext DB. */
+    passphrase?: string;
 }
 
 export interface CouchSyncSettings {
@@ -123,6 +130,10 @@ export interface CouchSyncSettings {
      *  already honour them today (invariant 18: cryptoProvider is
      *  per-DB). */
     configEncryptionEnabled?: boolean;
+    /** The passphrase the NEXT Create encrypts the config DB with; empty
+     *  inherits the vault passphrase. Also one of the values Join tries.
+     *  The passphrase of a DB this device joined is on its binding entry
+     *  (`ConfigBindingRecord.passphrase`), not here. */
     configEncryptionPassphrase?: string;
     configCompressionEnabled?: boolean;
 

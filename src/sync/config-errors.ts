@@ -33,8 +33,13 @@ export type ConfigNotReadyKind =
     | "legacy-meta"
     /** This device has not joined the configured config DB. */
     | "unattached"
+    /** Encrypted config DB, and this device has no passphrase for it. */
     | "passphrase-missing"
+    /** The passphrase this device has for the DB does not unlock it. */
     | "passphrase-mismatch"
+    /** Create would encrypt, but neither Step 1 nor Vault Sync has a
+     *  passphrase to encrypt with. */
+    | "create-passphrase-missing"
     /** `config:meta` is a different root than the one this device joined
      *  (new generation id, or new salt / keyCheck on a meta without one) —
      *  another device ran Create. Encrypted or not. */
@@ -129,13 +134,17 @@ export function configNotReady(
                 return `This device has not joined config database ${db}. Press Join in ` +
                     "Step 3 (it does not change the server), then sync.";
             case "passphrase-missing":
-                return `Config database ${db} is encrypted, but no passphrase is set. ` +
-                    "Enter the passphrase it was created with in Step 1 (Encryption & " +
-                    "compression), then try again.";
+                return `Config database ${db} is encrypted, and this device has no ` +
+                    "passphrase for it. Press Join in Step 3 — it asks for the " +
+                    "passphrase the database was set up with.";
             case "passphrase-mismatch":
-                return `The passphrase does not unlock config database ${db}. Enter the ` +
-                    "passphrase this config database was set up with in Step 1 " +
-                    "(Encryption & compression), then try again.";
+                return `The passphrase this device has does not unlock config database ` +
+                    `${db}. Press Join in Step 3 — it asks for the passphrase the ` +
+                    "database was set up with.";
+            case "create-passphrase-missing":
+                return `Encryption is on for ${db}, but there is no passphrase to ` +
+                    "encrypt with. Enter one in Step 1 (Encryption & compression), " +
+                    "or set the Vault Sync passphrase it inherits.";
             case "root-changed":
                 return `Config database ${db} was re-created on another device (it has ` +
                     "a new config:meta root). Press Join in Step 3 to join it again; " +

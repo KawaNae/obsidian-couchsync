@@ -5,11 +5,10 @@
  * database, separate from the vault DB. This tab mirrors the step
  * structure of Vault Sync:
  *
- *   Step 1: Encryption & compression — config-specific codec overrides: the
- *           codec the next Create builds the DB with (sync itself uses the
- *           joined DB's codec), and the passphrase. Create / Join resolve an
- *           empty passphrase to the vault's once and save the one they used
- *           here; Push / Pull use only the saved value.
+ *   Step 1: Encryption & compression — config-specific codec overrides:
+ *           the codec and passphrase the next Create builds the DB with
+ *           (an empty passphrase inherits the vault's). Sync itself uses the
+ *           joined DB's codec and the passphrase on its binding entry.
  *   Step 2: Database — pick the config database name. Server credentials
  *           are shared via the CouchDB tab. Check → Apply confirms.
  *   Step 3: Setup — Create (first device: reset the shared config DB and
@@ -195,21 +194,21 @@ export class ConfigSyncTab {
      * or joined (its attachment), so a toggle never stops sync; when the two
      * differ, the step says so.
      *
-     * The passphrase field holds the value Push and Pull unlock with. Left
-     * empty, it means "use the Vault Sync passphrase" for the next Create or
-     * Join only; a successful Create / Join of an encrypted database saves
-     * the passphrase it used into this field, so later vault-side changes
-     * never reach config sync.
+     * The passphrase field, shown only when Create would encrypt, is what
+     * Create encrypts with; left empty, it inherits the Vault Sync
+     * passphrase. The passphrase of a database this device created or
+     * joined is kept with that database's binding — Join asks for it when
+     * none at hand unlocks the database — so this field never has to be
+     * edited to sync, and two databases never share one field.
      */
     private renderConfigCodecStep(el: HTMLElement, settings: CouchSyncSettings): void {
         el.createEl("h3", { text: "Step 1: Encryption & compression" });
         el.createEl("p", {
             text: "Config sync has its own codec, independent of Vault Sync. " +
-                "Unset values inherit the Vault Sync setting. Encryption and " +
-                "compression are what Create (Step 3) builds the config database " +
-                "with; syncing always uses the codec of the database this device " +
-                "created or joined. The passphrase is what this device unlocks that " +
-                "database with; Create and Join save the one they used below.",
+                "Unset values inherit the Vault Sync setting. These are what Create " +
+                "(Step 3) builds the config database with; syncing always uses the " +
+                "encryption, compression and passphrase of the database this device " +
+                "created or joined.",
             cls: "setting-item-description",
         });
 
@@ -241,28 +240,25 @@ export class ConfigSyncTab {
                 toggle
                     .setValue(encEnabled)
                     .onChange(async (value) => {
-                        // The passphrase is kept: the joined database may
-                        // still be encrypted and need it to sync.
+                        // The passphrase is kept for when encryption is
+                        // turned on again.
                         await this.deps.updateSettings({ configEncryptionEnabled: value });
                         this.deps.refresh();
                     })
             );
 
-        // Shown whenever a passphrase can matter: Create would encrypt, or
-        // the joined database is encrypted.
-        if (encEnabled || joined?.codec.encryption) {
+        // Only Create reads it, and only when it encrypts.
+        if (encEnabled) {
             const passphraseSetting = new Setting(el)
                 .setName("Passphrase")
                 .setDesc(
-                    "Push and Pull unlock the config database with the passphrase " +
-                        "saved here. Empty: the next Create or Join uses the Vault " +
-                        "Sync passphrase (Join asks when that is empty too) and, once " +
-                        "it succeeds, saves the passphrase it used here — later Vault " +
-                        "Sync changes do not affect config sync. Other devices: enter " +
-                        "the passphrase the config database was created with.",
+                    "What the next Create encrypts the config database with. Empty: " +
+                        "the Vault Sync passphrase. Other devices do not need it here — " +
+                        "Join asks for the passphrase when it has none that unlocks " +
+                        "the database.",
                 )
                 .addText((text) => {
-                    text.setPlaceholder("Empty: Create / Join use the Vault Sync passphrase")
+                    text.setPlaceholder("Empty: inherit the Vault Sync passphrase")
                         .setValue(settings.configEncryptionPassphrase ?? "")
                         .onChange(async (value) => {
                             await this.deps.updateSettings({ configEncryptionPassphrase: value });
@@ -383,8 +379,8 @@ export class ConfigSyncTab {
             .setName("Join")
             .setDesc(
                 "Join the existing config database with its own encryption and " +
-                "compression (2nd+ device). Neither the server nor Step 1 is changed. " +
-                "Then Pull.",
+                "compression (2nd+ device); asks for its passphrase when needed. " +
+                "Neither the server nor Step 1 is changed. Then Pull.",
             )
             .addButton((btn) =>
                 btn.setButtonText("Join")

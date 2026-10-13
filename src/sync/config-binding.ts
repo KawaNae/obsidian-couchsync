@@ -11,7 +11,8 @@
  *     record (`ConfigAttachment`: the codec it syncs with and the root it
  *     joined). Deleting the store detaches the device.
  *   - the settings entry `configBindings[key]`: only what must survive the
- *     store — the cipher floor and the Create-interrupted flag.
+ *     store — the cipher floor, the Create-interrupted flag and the
+ *     passphrase that unlocks this DB.
  *   - a memo of the PBKDF2 unlock for that DB's root (in memory only).
  *
  * The binding also pins the server URI it was opened for; its raw clients
@@ -47,7 +48,6 @@ import { computeHash, type ChunkHasher } from "../db/chunker.ts";
 import type { ConfigBindingRecord, CouchSyncSettings } from "../settings.ts";
 import { ConfigLastSynced } from "../db/sync/config-last-synced.ts";
 import { ConfigCheckpoints } from "../db/sync/config-checkpoints.ts";
-import { joinedConfigPassphrase, resolveConfigCodec } from "./config-codec-policy.ts";
 import {
     ConfigNotReadyError,
     configNotReady,
@@ -164,10 +164,26 @@ export interface ConfigVerdict {
     crypto: CryptoProvider | null;
 }
 
+/** Why Join asks for the passphrase: no value to try, or none of the values
+ *  it tried unlocks the DB. */
+export type ConfigPassphraseReason = "missing" | "mismatch";
+
+/**
+ * Ask the user for the passphrase of the config DB being joined. The
+ * prompt checks each answer with `tryUnlock` (true: it unlocks the root)
+ * and stays open on a wrong one, so the user can correct it in place.
+ * Resolves with the passphrase that unlocked, or null when the user
+ * cancelled.
+ */
+export type AskConfigPassphrase = (
+    reason: ConfigPassphraseReason,
+    tryUnlock: (passphrase: string) => Promise<boolean>,
+) => Promise<string | null>;
+
 export interface ConfigJoinOptions {
-    /** Ask the user for the config passphrase when none is set. Returning
-     *  null / "" aborts the Join as `passphrase-missing`. */
-    promptPassphrase?: () => Promise<string | null>;
+    /** Asked when none of the passphrases at hand unlocks the DB. Omitted →
+     *  the Join stops as `passphrase-missing` / `passphrase-mismatch`. */
+    askPassphrase?: AskConfigPassphrase;
     /** Confirm adopting a codec weaker than the one this device trusted for
      *  the DB (encryption removed, or a cipherVersion below the floor).
      *  Omitted or false → the Join is cancelled with nothing changed. */
@@ -259,14 +275,11 @@ export class ConfigBinding {
 
     /** Replace this binding's settings entry and persist settings. The map
      *  is replaced, never mutated in place, so a settings object that
-     *  shares its map with another (e.g. DEFAULT_SETTINGS) is never touched.
-     *  `passphrase`, when given, is stored as the explicit config passphrase
-     *  in the same save (Create / Join, see `join` step 5). */
-    private async putEntry(rec: ConfigBindingRecord, passphrase?: string): Promise<void> {
+     *  shares its map with another (e.g. DEFAULT_SETTINGS) is never touched. */
+    private async putEntry(rec: ConfigBindingRecord): Promise<void> {
         if (this.closed) return;
         const s = this.host.getSettings();
         s.configBindings = { ...(s.configBindings ?? {}), [this.key]: rec };
-        if (passphrase !== undefined) s.configEncryptionPassphrase = passphrase;
         await this.host.saveSettings();
     }
 
@@ -318,7 +331,7 @@ export class ConfigBinding {
     /**
      * Keys for local work outside an op (a bare `ConfigSync.scan`): the
      * attachment's codec, and — when it is encrypted — the key this session
-     * already unlocked for the joined root with the current passphrase.
+     * already unlocked for the joined root with this binding's passphrase.
      * Throws `key-missing` when there is no such key (no op ran yet, or the
      * passphrase changed since); never a plaintext hasher for an encrypted
      * DB. Ops use the keys their preflight froze instead.
@@ -329,7 +342,7 @@ export class ConfigBinding {
         if (codec.encryption) {
             const memo = this.keyCache;
             if (memo && memo.metaFp === this.att?.metaFingerprint
-                && memo.passphrase === joinedConfigPassphrase(this.host.getSettings())) {
+                && memo.passphrase === (this.entry()?.passphrase ?? "")) {
                 crypto = memo.crypto;
             }
         }
@@ -402,9 +415,10 @@ export class ConfigBinding {
      *      other difference root-changed
      *   4. encrypted: passphrase-missing / passphrase-mismatch, else the key
      *      (cached — PBKDF2 once per root + passphrase per session). The
-     *      passphrase is the one Create / Join saved in the config settings
-     *      (`joinedConfigPassphrase`) — never the vault's, so a vault-side
-     *      change after joining cannot stop config sync
+     *      passphrase is the one Create / Join saved on this binding's entry
+     *      — never Step 1's or the vault's, so changing either after joining
+     *      cannot stop config sync, and DBs with different passphrases keep
+     *      their own
      *
      * Never re-joins by itself: a changed root would mix old vclocks into
      * the new DB, so the user Joins explicitly.
@@ -441,7 +455,7 @@ export class ConfigBinding {
 
         let crypto: CryptoProvider | null = null;
         if (meta.encryption.enabled) {
-            const passphrase = joinedConfigPassphrase(this.host.getSettings());
+            const passphrase = this.entry()?.passphrase ?? "";
             if (!passphrase) throw configNotReady("passphrase-missing", this.ctx());
             crypto = await this.unlock(meta, metaFp, passphrase);
             throwIfAborted(signal);
@@ -521,23 +535,22 @@ export class ConfigBinding {
     /**
      * Join: accept the config DB's existing root and attach this device.
      * Touches no config file, never writes to the server, and never changes
-     * the Step 1 codec settings — the DB's codec goes into the attachment.
+     * the Step 1 settings — the DB's codec goes into the attachment, its
+     * passphrase into this binding's entry.
      *
      *   1. read `config:meta` on the raw client and classify it
      *   2. a codec weaker than this device trusted for the DB (encryption
      *      removed, or a cipherVersion below the floor) needs the user's
      *      confirmation; cancelled → nothing changes
-     *   3. unlock with the passphrase — the Step 1 input
-     *      (`resolveConfigCodec`: the config value, else the vault's),
-     *      asking for it when both are empty
+     *   3. encrypted root: unlock it (`unlockJoin`) — with a passphrase at
+     *      hand, else with one the user enters; cancelled → nothing changes
      *   4. empty this binding's local store (cursors of any earlier root
      *      must not be reused) — Unattached from here until 6
      *   5. settings, in ONE save: the floor is SET to the root's (not
      *      ratcheted), the setup flag cleared, and — encrypted root only —
-     *      the passphrase that unlocked it stored as the explicit
-     *      `configEncryptionPassphrase`. From here on every op unlocks with
-     *      that value alone; the vault passphrase is never consulted again
-     *      for this DB. A plaintext root stores no passphrase.
+     *      the passphrase that unlocked it stored on this binding's entry.
+     *      From here on every op on this DB unlocks with that value alone.
+     *      A plaintext root stores no passphrase.
      *   6. commit: the attachment is written into the store
      *
      * Nothing is changed before 1–3 all succeeded (invariant C). A crash in
@@ -545,7 +558,6 @@ export class ConfigBinding {
      */
     async join(raw: ICouchClient, signal: AbortSignal, opts: ConfigJoinOptions = {}): Promise<void> {
         const progress = opts.onProgress ?? (() => {});
-        const s = this.host.getSettings();
 
         progress("Reading config:meta...");
         const meta = await fetchConfigMeta(raw);
@@ -562,26 +574,14 @@ export class ConfigBinding {
         if (weaker) {
             const ok = await (opts.confirmWeaker?.(weaker.title, weaker.message) ?? Promise.resolve(false));
             throwIfAborted(signal);
-            if (!ok) {
-                const e = new Error("Join cancelled — nothing was changed.");
-                e.name = "AbortError";
-                throw e;
-            }
+            if (!ok) throw joinCancelled();
         }
 
         // 3. Unlock.
-        let crypto: CryptoProvider | null = null;
-        let passphrase = resolveConfigCodec(s).passphrase;
+        let passphrase: string | undefined;
         if (meta.encryption.enabled) {
-            if (!passphrase) {
-                passphrase = (await opts.promptPassphrase?.()) ?? "";
-                throwIfAborted(signal);
-                if (!passphrase) throw configNotReady("passphrase-missing", this.ctx());
-            }
             progress("Unlocking config key...");
-            crypto = await this.unlock(meta, metaFp, passphrase);
-            throwIfAborted(signal);
-            if (!crypto) throw configNotReady("passphrase-mismatch", this.ctx());
+            passphrase = await this.unlockJoin(meta, metaFp, signal, opts.askPassphrase);
         }
 
         // 4. Local store.
@@ -601,10 +601,59 @@ export class ConfigBinding {
         await this.putEntry({
             ...(floor !== undefined ? { cipherFloor: floor } : {}),
             settingUp: false,
-        }, meta.encryption.enabled ? passphrase : undefined);
+            ...(passphrase !== undefined ? { passphrase } : {}),
+        });
 
         // 6. Commit.
         await this.writeAttachment({ codec, metaFingerprint: metaFp });
+    }
+
+    /**
+     * Find the passphrase that unlocks an encrypted root being joined.
+     * First the values at hand, each tried once, in this order:
+     *
+     *   1. this binding's own passphrase (a re-Join of the same DB)
+     *   2. the Step 1 passphrase (the value Create would encrypt with — on a
+     *      device that joined before passphrases moved onto the binding, the
+     *      value it synced with)
+     *   3. the vault passphrase (config DBs often share it)
+     *
+     * at most three PBKDF2 derivations. When none unlocks, the user is asked
+     * (`askPassphrase`), told whether none was set or none matched; the
+     * prompt re-asks on a wrong answer. A cancelled prompt cancels the Join
+     * with nothing changed.
+     */
+    private async unlockJoin(
+        meta: ConfigMetaDoc,
+        metaFp: string,
+        signal: AbortSignal,
+        ask: AskConfigPassphrase | undefined,
+    ): Promise<string> {
+        const s = this.host.getSettings();
+        const candidates: string[] = [];
+        for (const p of [this.entry()?.passphrase, s.configEncryptionPassphrase, s.encryptionPassphrase]) {
+            if (p && !candidates.includes(p)) candidates.push(p);
+        }
+        for (const p of candidates) {
+            const crypto = await this.unlock(meta, metaFp, p);
+            throwIfAborted(signal);
+            if (crypto) return p;
+        }
+        const reason: ConfigPassphraseReason = candidates.length === 0 ? "missing" : "mismatch";
+        if (!ask) {
+            throw configNotReady(
+                reason === "missing" ? "passphrase-missing" : "passphrase-mismatch", this.ctx(),
+            );
+        }
+        let unlockedWith: string | null = null;
+        const answer = await ask(reason, async (p) => {
+            if (!p || !(await this.unlock(meta, metaFp, p))) return false;
+            unlockedWith = p;
+            return true;
+        });
+        throwIfAborted(signal);
+        if (answer === null || unlockedWith === null) throw joinCancelled();
+        return unlockedWith;
     }
 
     /** What makes `meta` weaker than what this device trusted for the DB,
@@ -651,9 +700,9 @@ export class ConfigBinding {
      * Create succeeded (remote wiped, new root pushed). In ONE settings save
      * the entry gets the new root's floor and loses the setup flag, and —
      * encrypted root only — `passphrase` (the one Create encrypted with,
-     * possibly inherited from the vault) becomes the explicit
-     * `configEncryptionPassphrase`. Then the attachment (the root's codec
-     * and fingerprint) is written into the emptied store — the commit point.
+     * possibly inherited from the vault) becomes this binding's passphrase;
+     * Step 1 is left as it is. Then the attachment (the root's codec and
+     * fingerprint) is written into the emptied store — the commit point.
      * A crash between the two leaves the device Unattached on a complete
      * remote: Join (or Create again).
      */
@@ -664,9 +713,10 @@ export class ConfigBinding {
     ): Promise<void> {
         const metaFp = await configMetaFingerprint(meta);
         await this.putEntry({
-            ...(meta.encryption.enabled ? { cipherFloor: meta.encryption.cipherVersion } : {}),
+            ...(meta.encryption.enabled
+                ? { cipherFloor: meta.encryption.cipherVersion, passphrase } : {}),
             settingUp: false,
-        }, meta.encryption.enabled ? passphrase : undefined);
+        });
         await this.writeAttachment({ codec: metaCodec(meta), metaFingerprint: metaFp });
         if (!this.closed && crypto) this.keyCache = { metaFp, passphrase, crypto };
     }
@@ -698,6 +748,16 @@ export class ConfigBinding {
         }
         return client;
     }
+}
+
+/** The user declined a confirmation or a passphrase prompt of Join. A
+ *  cancellation (`AbortError`): it is not recorded as an outcome, and the
+ *  notice reads "Config Join cancelled — nothing was changed." */
+function joinCancelled(): Error {
+    const e: any = new Error("Join cancelled — nothing was changed.");
+    e.name = "AbortError";
+    e.userMessage = "nothing was changed.";
+    return e;
 }
 
 function throwIfAborted(signal?: AbortSignal): void {

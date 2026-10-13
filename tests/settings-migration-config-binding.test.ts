@@ -191,3 +191,39 @@ describe("configBindingKey normalisation", () => {
         expect(normalizeServerUri(" not a url/ ")).toBe("not a url");
     });
 });
+
+describe("migrateSettings — a binding's passphrase", () => {
+    it("keeps it, also on an entry that has nothing else", () => {
+        const other = configBindingKey("https://couch.example.com:6984", "other-config");
+        const data = legacy({
+            configBindings: {
+                [KEY]: { cipherFloor: 3, settingUp: false, passphrase: "p1" },
+                [other]: { settingUp: false, passphrase: "p2" },
+            },
+        });
+        migrateSettings(data);
+        expect(data.configBindings).toEqual({
+            [KEY]: { cipherFloor: 3, settingUp: false, passphrase: "p1" },
+            [other]: { settingUp: false, passphrase: "p2" },
+        });
+    });
+
+    it("keeps it when the global floor is merged into the same entry", () => {
+        const data = legacy({
+            configCipherVersion: 3,
+            configBindings: { [KEY]: { settingUp: false, passphrase: "p1" } },
+        });
+        migrateSettings(data);
+        expect(data.configBindings).toEqual({
+            [KEY]: { cipherFloor: 3, settingUp: false, passphrase: "p1" },
+        });
+    });
+
+    it("drops an empty or non-string passphrase", () => {
+        const data = legacy({
+            configBindings: { [KEY]: { cipherFloor: 3, settingUp: false, passphrase: "" } },
+        });
+        migrateSettings(data);
+        expect(data.configBindings).toEqual({ [KEY]: { cipherFloor: 3, settingUp: false } });
+    });
+});

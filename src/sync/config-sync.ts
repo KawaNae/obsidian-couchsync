@@ -7,6 +7,7 @@ import {
     makeConfigOpKeys,
     type ConfigOpKeys,
     type ConfigOpName,
+    type AskConfigPassphrase,
     type ConfigStoreFactory,
 } from "./config-binding.ts";
 import { configBindingKey } from "./config-binding-record.ts";
@@ -127,14 +128,15 @@ export interface ConfigSyncOptions {
      *  default-folder literal when omitted. */
     ownDataJsonPath?: string;
     /** Persist settings. Bindings write their settings entry
-     *  (`settings.configBindings`: cipher floor, setup flag) and the
-     *  passphrase a Create / Join used into the live settings object, then
-     *  call this. Omitted in tests (in-memory only). */
+     *  (`settings.configBindings`: cipher floor, setup flag, the DB's
+     *  passphrase) into the live settings object, then call this. Omitted
+     *  in tests (in-memory only). */
     saveSettings?: () => Promise<void>;
-    /** Ask the user for the config passphrase when Join needs one and
-     *  none is set. Production opens the PassphraseModal. Omitted → Join
-     *  stops with `passphrase-missing`. */
-    promptPassphrase?: () => Promise<string | null>;
+    /** Ask the user for the config passphrase when none of the values at
+     *  hand unlocks the DB being joined. Production opens the
+     *  PassphraseModal, which re-asks on a wrong answer. Omitted → Join
+     *  stops with `passphrase-missing` / `passphrase-mismatch`. */
+    askPassphrase?: AskConfigPassphrase;
     /** Is this device mobile? Drives the receive-side desktop-only gate
      *  (`write`). Production passes `() => Platform.isMobile`; tests inject a
      *  fake. Omitted → treated as desktop (gate never fires). */
@@ -223,7 +225,7 @@ export class ConfigSync {
      *  shared instance is enough. Same class as vault sync. */
     private readonly conflictResolver: ConflictResolver;
     private readonly saveSettings: () => Promise<void>;
-    private readonly promptPassphrase?: () => Promise<string | null>;
+    private readonly askPassphrase?: AskConfigPassphrase;
     private readonly getIsMobile: () => boolean;
 
     constructor(
@@ -245,7 +247,7 @@ export class ConfigSync {
         this.clientFactory = opts.clientFactory;
         this.conflictResolver = new ConflictResolver();
         this.saveSettings = opts.saveSettings ?? (async () => {});
-        this.promptPassphrase = opts.promptPassphrase;
+        this.askPassphrase = opts.askPassphrase;
         this.getIsMobile = opts.getIsMobile ?? (() => false);
         this.skipPaths = new Set([opts.ownDataJsonPath ?? ConfigSync.DEFAULT_OWN_DATA_PATH]);
     }
@@ -519,20 +521,21 @@ export class ConfigSync {
      * local store, and pins a fresh SELF-CONTAINED `config:meta` (new generation id, fresh salt
      * + own keyCheck, invariant 17) built from the current settings' codec.
      * On success this device is joined (its record names the new root) and
-     * the passphrase Create encrypted with is saved as the explicit config
-     * passphrase (`ConfigBinding.commitCreate`). Structural only: the user's
-     * next Push seeds the content. Every other device must Join again.
+     * the passphrase Create encrypted with is saved on the binding's entry
+     * (`ConfigBinding.commitCreate`). Structural only: the user's next Push
+     * seeds the content. Every other device must Join again.
      *
-     * The codec is the Step 1 settings codec (Step 1 is defined as the
-     * input of the next Create); the new root's codec becomes the
-     * attachment every later Push / Pull uses. Encryption on with no
-     * passphrase stops as `passphrase-missing` before anything is destroyed.
+     * The codec and passphrase are the Step 1 settings (Step 1 is defined as
+     * the input of the next Create; an empty passphrase inherits the
+     * vault's); the new root's codec becomes the attachment every later
+     * Push / Pull uses. Encryption on with no passphrase at all stops as
+     * `create-passphrase-missing` before anything is destroyed.
      */
     async create(): Promise<void> {
         return this.runOperation("create", async (ctx, progress, binding) => {
             const codec = resolveConfigCodec(this.getSettings());
             if (codec.encryption && !codec.passphrase) {
-                throw configNotReady("passphrase-missing", { db: binding.dbName });
+                throw configNotReady("create-passphrase-missing", { db: binding.dbName });
             }
             const setup = new ConfigSetupService(
                 () => this.settingsFor(binding),
@@ -626,13 +629,14 @@ export class ConfigSync {
      * device (see `ConfigBinding.join`). Never writes to the server, touches
      * no config file and leaves the Step 1 codec settings alone; the data
      * arrives with the next Pull. Asks for the passphrase through
-     * `promptPassphrase` when none is set, and for a confirmation before
-     * adopting a codec weaker than this device trusted for the DB.
+     * `askPassphrase` when none at hand unlocks the DB, and for a
+     * confirmation before adopting a codec weaker than this device trusted
+     * for the DB.
      */
     async join(): Promise<void> {
         return this.runOperation("join", async (ctx, progress, binding) => {
             await binding.join(ctx.client, ctx.signal, {
-                promptPassphrase: this.promptPassphrase,
+                askPassphrase: this.askPassphrase,
                 confirmWeaker: (title, message) =>
                     this.modal.showConfirmModal(title, message, "Join anyway", true),
                 onProgress: (msg) => progress.update(msg),
