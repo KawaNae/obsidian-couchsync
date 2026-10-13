@@ -167,7 +167,7 @@ export async function repairChunkDrift(
         if (skipped > 0) {
             logWarn(
                 `chunk-repair: skipped deleting ${skipped} local chunk(s) that a local ` +
-                `FileDoc re-referenced since the report was generated (TOCTOU guard, #9)`,
+                `FileDoc re-referenced since the report was generated (TOCTOU guard)`,
             );
         }
     }

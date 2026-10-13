@@ -4,8 +4,8 @@
  * Init builds vault:meta (deriving crypto when encryption is on) and pushes
  * the whole vault through the real codec stack; Clone fetches the meta,
  * unlocks with the passphrase, pulls everything and rebuilds the vault. This
- * is the setup path real devices run on day one — and the one the migration
- * incident lived on. Asserts the vault reconstructs byte-for-byte, the meta
+ * is the setup path real devices run on day one, and the one every
+ * destructive migration (Init on one device, Clone on the rest) runs. Asserts the vault reconstructs byte-for-byte, the meta
  * records the chosen codec, and a wrong passphrase is rejected.
  */
 import "fake-indexeddb/auto";

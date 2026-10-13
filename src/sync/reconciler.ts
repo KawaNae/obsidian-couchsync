@@ -417,10 +417,12 @@ export class Reconciler {
             // we restore to converge. Decide by FIDELITY-ORDERED oracles:
             //
             //   1. lastSynced (per-path integration baseline, written ONLY on a
-            //      successful push/pull apply — vault-sync.ts:271/404) is the
+            //      successful push/pull apply — VaultSync.fileToDb's commit
+            //      and dbToFile's establishBaseline) is the
             //      authoritative "I integrated this content" record.
             //   2. The vault manifest is a coarse fallback: it is written ONLY
-            //      by reconcile (line ~447), so a freshly pulled-but-not-yet-
+            //      by reconcile (the apply-mode persist at the end of
+            //      runOnce), so a freshly pulled-but-not-yet-
             //      reconciled path is invisible to it. Using it as the primary
             //      oracle resurrected user deletions in that window.
             //      Demoted to legacy / first-run / no-lastSynced fallback.

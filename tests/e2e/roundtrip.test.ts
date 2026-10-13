@@ -6,8 +6,9 @@
  * production push/pull pipeline: device A writes to its vault, A's
  * PushPipeline stores chunks as binary attachments, and B's PullPipeline
  * (catchup + longpoll) fetches them via getAttachment and reassembles them
- * into B's vault. This is the path that real devices use — and the only one
- * that would have caught the content-less / still-encrypted field bugs.
+ * into B's vault. This is the path that real devices use, and the only one
+ * that catches a chunk doc arriving without content or a body reaching
+ * decompression still encrypted.
  */
 import "fake-indexeddb/auto";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";

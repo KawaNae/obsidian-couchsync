@@ -1,7 +1,7 @@
 /**
  * ConfigPullWriter — incremental `_changes`-based pull for ConfigSync.
  *
- * Replaces the snapshot-style `pullByPrefix` (`remote-couch.ts:156`) with
+ * Replaces the snapshot-style `pullByPrefix` (`remote-couch.ts`) with
  * a cursor-driven loop:
  *
  *   loop:
@@ -308,8 +308,8 @@ export class ConfigPullWriter {
                             continue;
                         case "silent-merge": {
                             // Same content, drifted vclocks → mergeVC and
-                            // accept. Mirrors vault PullWriter's silent-
-                            // merge handling at pull-writer.ts:217.
+                            // accept. Mirrors the `silent-merge` case of the
+                            // vault PullWriter (pull-writer.ts).
                             const merged = mergeVC(localVC, remoteVC);
                             const mergedDoc: ConfigDoc = {
                                 ...remoteDoc, vclock: merged,
