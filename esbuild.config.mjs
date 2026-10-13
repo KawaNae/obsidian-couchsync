@@ -36,7 +36,7 @@ const buildTime = formatBuildTime(new Date());
 const manifestJson = JSON.parse(fs.readFileSync("./manifest.json") + "");
 const packageJson = JSON.parse(fs.readFileSync("./package.json") + "");
 
-const vaultPath = process.env.OBSIDIAN_VAULT_PATH ?? "C:\\Obsidian\\Dev";
+const vaultPath = process.env.OBSIDIAN_VAULT_PATH ?? "C:\\Develop\\Obsidian\\Dev";
 const outDir = path.join(vaultPath, ".obsidian", "plugins", "obsidian-couchsync");
 
 if (!fs.existsSync(outDir)) {
