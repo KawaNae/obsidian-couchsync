@@ -159,7 +159,7 @@ describe("generateSalt", () => {
     });
 });
 
-describe("encryptBytesIv additional-authenticated-data (#2)", () => {
+describe("encryptBytesIv additional-authenticated-data", () => {
     const enc = new TextEncoder();
 
     it("round-trips when the same AAD is supplied to decrypt", async () => {
@@ -183,7 +183,7 @@ describe("encryptBytesIv additional-authenticated-data (#2)", () => {
     });
 });
 
-describe("KDF parameters regression (#13)", () => {
+describe("KDF parameters regression", () => {
     it("derives with PBKDF2 >= 600k iterations and SHA-256 (GPU-bruteforce resistance floor)", async () => {
         const spy = vi.spyOn(globalThis.crypto.subtle, "deriveBits");
         try {

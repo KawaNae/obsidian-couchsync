@@ -1,7 +1,7 @@
 /**
  * Regression: re-clone leaves pulled content with no integration baseline,
  * causing a self-vclock stamp and a FALSE concurrent on the source device's
- * next edit (incident 2026-06-02).
+ * next edit.
  *
  * Root cause: `dbToFile`'s "content already on disk" early-return
  * (vault-sync.ts) returned `{applied:true}` WITHOUT establishing
@@ -15,7 +15,7 @@
  * the remote with the stale local copy.
  *
  * Fix: the early-return now adopts `fileDoc.vclock` as the integration
- * baseline (Invariant 3: chunks-equal ⇒ fileDoc is the vclock authority),
+ * baseline (chunks-equal ⇒ fileDoc is the vclock authority),
  * exactly like `adoptDocVclock` / the normal write path. So every cloned
  * file carries `lastSynced == fileDoc.vclock`, the reconcile classifies it
  * `identical`, and the author's later edit fast-forwards as `remote-edit`.
@@ -89,7 +89,7 @@ async function seedRemoteDoc(
     return doc;
 }
 
-describe("regression: re-clone false-divergent (incident 2026-06-02)", () => {
+describe("regression: re-clone false-divergent", () => {
     let vault: FakeVaultIO;
     let db: LocalDB;
     let vs: VaultSync;

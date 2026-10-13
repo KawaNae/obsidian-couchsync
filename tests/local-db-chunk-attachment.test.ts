@@ -1,5 +1,5 @@
 /**
- * Phase 4 (data-layer-v2): verify that the LocalDB can round-trip a
+ * Verify that the LocalDB can round-trip a
  * ChunkDoc with its v2 binary `content` field through Dexie / fake-IDB.
  *
  * IndexedDB stores Uint8Array via the structured-clone algorithm, so no
@@ -25,7 +25,7 @@ function open(): DexieStore {
     return s;
 }
 
-describe("LocalDB chunk attachment (Phase 4)", () => {
+describe("LocalDB chunk attachment", () => {
     it("round-trips a ChunkDoc with binary `content` unchanged", async () => {
         const store = open();
         const payload = new Uint8Array([0x00, 0x7f, 0x80, 0xff, 0x42, 0xde, 0xad, 0xbe, 0xef]);

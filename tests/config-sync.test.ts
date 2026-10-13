@@ -151,7 +151,7 @@ describe("ConfigSync", () => {
             expect(await db.get(makeConfigId(".obsidian/plugins/obsidian-couchsync/data.json"))).toBeNull();
         });
 
-        it("skips own data.json under a RENAMED plugin folder via the host-supplied path (#14)", async () => {
+        it("skips own data.json under a RENAMED plugin folder via the host-supplied path", async () => {
             // BRAT / manual install can put the plugin under its repo name, so a
             // hardcoded folder literal would miss the data.json (which holds the
             // plaintext password + passphrase) and push it to the config server.
@@ -216,8 +216,8 @@ describe("ConfigSync", () => {
             expect(await db.get(makeConfigId(".obsidian/plugins/foo/main.js"))).toBeNull();
         });
 
-        // ── short-circuit: lastSynced cache (PR1, audit 2026-05-08) ──
-        // Pre-PR1 every scan rev-bumped every config doc, inflating the
+        // ── short-circuit: lastSynced cache ──
+        // Without it every scan rev-bumped every config doc, inflating the
         // remote rev tree. The cache should detect "vault content same
         // as last sync" via {size, dataHash} and skip the rewrite.
         it("does not rewrite when content is unchanged across scans", async () => {
@@ -257,7 +257,7 @@ describe("ConfigSync", () => {
         });
 
         it("create() clears lastSynced so a subsequent scan rewrites unchanged files", async () => {
-            // This guarantees PR5's destructive Init still rebuilds local
+            // This guarantees the destructive Init still rebuilds local
             // state correctly even before remote-side destroy is wired in.
             vault.addFile(".obsidian/app.json", `{"theme":"dark"}`);
 
@@ -438,7 +438,7 @@ describe("ConfigSync", () => {
         });
     });
 
-    // ── Step 1 codec vs the joined DB (#config-codec) ────
+    // ── Step 1 codec vs the joined DB ────
     //
     // Push and Pull encode with the codec recorded in the store when the
     // device created or joined the DB; Step 1 is only the input of the next

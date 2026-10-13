@@ -61,7 +61,7 @@ describe("E2E: PathKey collision convergence (real engine + real CouchDB)", () =
         expect(await b.vault.exists("scripts/X.md")).toBe(false);
 
         // The tombstone must propagate back to A through real CouchDB — proving
-        // the #sync-005 churn-guard fix (a tombstone is chunk-equal to the alive
+        // the push churn-guard fix (a tombstone is chunk-equal to the alive
         // remote yet must still push). A's lowercase file is removed by the
         // case-safe pull-deletion, leaving A converged to the same canonical.
         await waitFor(

@@ -1,5 +1,5 @@
 /**
- * data-layer-v2 (envelope-aware): cover the EncryptingCouchClient
+ * Envelope-aware (v2 data layer): cover the EncryptingCouchClient
  * attachment path. The decorator must encrypt attachment binaries on
  * push (setting the envelope's `encrypted` bit and prepending IV) and
  * decrypt + strip on pull, transparently to the caller, alongside the

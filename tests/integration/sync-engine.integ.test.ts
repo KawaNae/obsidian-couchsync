@@ -1,5 +1,5 @@
 /**
- * SyncEngine integration tests — Phase 4 migration.
+ * SyncEngine integration tests.
  *
  * Drives a real SyncEngine via the SyncHarness (real LocalDB + shared
  * FakeCouchClient via clientFactory). Verifies state transitions,

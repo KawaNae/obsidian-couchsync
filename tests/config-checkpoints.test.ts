@@ -156,8 +156,9 @@ describe("ConfigCheckpoints", () => {
     });
 
     describe("backwards-compat", () => {
-        it("first run after PR2 deploy sees pullSeq=0 and pushSeq=0", async () => {
-            // Simulates a user upgrading from pre-PR2: no _sync/* meta exists.
+        it("first run after checkpoints were introduced sees pullSeq=0 and pushSeq=0", async () => {
+            // Simulates a user upgrading from a build without config
+            // checkpoints: no _sync/* meta exists.
             // ConfigPullWriter will then do `since=0` catchup, which matches
             // the current pullByPrefix full-fetch semantics.
             const db = makeConfigDb();

@@ -1,6 +1,6 @@
 /**
- * Invariants 11-15 — one focused assertion per invariant established
- * in v0.25.0 schema self-description (plan: dreamy-riding-star.md).
+ * Schema self-description invariants established in v0.25.0 — one
+ * focused assertion per invariant.
  *
  *  11. Replicated docs carry `schemaVersion` (type-level requirement,
  *      writers always stamp).
@@ -47,7 +47,7 @@ beforeAll(async () => {
 
 // ── 11: schemaVersion required on writer paths ─────────────────
 
-describe("invariant 11 — schemaVersion stamped on every writer path", () => {
+describe("schemaVersion stamped on every writer path", () => {
     it("chunker output carries CURRENT_SCHEMA_VERSION", async () => {
         const chunks = await splitIntoChunks(new TextEncoder().encode("body").buffer);
         for (const c of chunks) {
@@ -58,7 +58,7 @@ describe("invariant 11 — schemaVersion stamped on every writer path", () => {
 
 // ── 12: every attachment binary is envelope-formatted ──────────
 
-describe("invariant 12 — attachment envelope universality", () => {
+describe("attachment envelope universality", () => {
     it("plaintext + uncompressed stack still writes the 0x00 codec byte", async () => {
         const inner = new FakeCouchClient();
         // Caller's responsibility (push-pipeline / remote-couch /
@@ -105,7 +105,7 @@ describe("invariant 12 — attachment envelope universality", () => {
 
 // ── 13: encrypted strings are envelope-formatted (legacy shape gone) ─
 
-describe("invariant 13 — encrypted string envelope (legacy iv:cipher shape removed)", () => {
+describe("encrypted string envelope (legacy iv:cipher shape removed)", () => {
     it("CryptoProvider exposes only IV-split binary primitives — no string envelope API", () => {
         const cp = crypto as unknown as Record<string, unknown>;
         expect(typeof cp.encryptBytesIv).toBe("function");
@@ -128,7 +128,7 @@ describe("invariant 13 — encrypted string envelope (legacy iv:cipher shape rem
 
 // ── 14: chunk id carries algorithm tag ─────────────────────────
 
-describe("invariant 14 — chunk id self-declares its hash algorithm", () => {
+describe("chunk id self-declares its hash algorithm", () => {
     it("makeChunkId emits chunk:x64:<hash> by default", () => {
         expect(makeChunkId("deadbeefcafef00d")).toBe("chunk:x64:deadbeefcafef00d");
     });
@@ -166,7 +166,7 @@ describe("invariant 14 — chunk id self-declares its hash algorithm", () => {
 
 // ── 15: each Dexie DB carries _meta.schemaVersion = 1 ──────────
 
-describe("invariant 15 — local schema version stamped on every Dexie DB", () => {
+describe("local schema version stamped on every Dexie DB", () => {
     const uid = (s: string) => `inv15-${s}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
     async function readMeta(dbName: string): Promise<number | null> {

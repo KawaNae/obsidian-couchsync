@@ -76,7 +76,7 @@ describe("E2E: roundtrip over the encrypted + compressed codec stack", () => {
 
     beforeEach(async () => {
         // Real Compressing(Encrypting(raw)) stack with a shared key — the path
-        // G4 (still-encrypted decompress) lived on. A plaintext-only e2e would
+        // where still-encrypted bytes once reached decompress. A plaintext-only e2e would
         // never traverse the encrypt/compress decorators or hmac chunk ids.
         h = await createE2EHarness({ uniqueDb: true, codec: { passphrase: "e2e-secret", compression: true } });
     });

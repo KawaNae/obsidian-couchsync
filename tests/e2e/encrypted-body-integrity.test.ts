@@ -1,5 +1,5 @@
 /**
- * encrypted-body-integrity.test.ts — review finding #2, end to end.
+ * encrypted-body-integrity.test.ts — encBody authenticity and confidentiality, end to end.
  *
  * Under the v3 (encBody) scheme a file/config doc's whole sensitive body is
  * compressed-then-encrypted into a single `encBody` field, GCM-bound to the
@@ -25,7 +25,7 @@ function authHeader(): string {
     return "Basic " + Buffer.from(`${cfg.user}:${cfg.password}`).toString("base64");
 }
 
-describe("Encrypted body integrity (review finding #2: encBody is authenticated + confidential)", () => {
+describe("Encrypted body integrity (encBody is authenticated + confidential)", () => {
     it("seals the body at rest and rejects a server that swaps encBody between docs", async () => {
         const h = await createE2EHarness({ uniqueDb: true, codec: { passphrase: PASS, compression: true } });
         const base = h.config.couchUrl.replace(/\/+$/, "");
@@ -80,7 +80,7 @@ describe("Encrypted body integrity (review finding #2: encBody is authenticated 
         }
     });
 
-    it("cipherVersion-3 floor: a Clone refuses a server-dropped encBody (downgrade, #1/#3)", async () => {
+    it("cipherVersion-3 floor: a Clone refuses a server-dropped encBody (downgrade)", async () => {
         const h = await createE2EHarness({ uniqueDb: true, codec: { passphrase: PASS, compression: true } });
         const base = h.config.couchUrl.replace(/\/+$/, "");
         const db = h.config.dbName;

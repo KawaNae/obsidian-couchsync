@@ -75,7 +75,7 @@ class FakeLocalDb {
     }
 }
 
-// PR3: classifier returns 6 states; the legacy 3-state alias is kept
+// The classifier returns 6 states; the legacy 3-state alias is kept
 // as a typedef so tests reading old fixture names stay obvious.
 type ClassifyResult =
     | "identical"
@@ -109,7 +109,7 @@ interface FakeVaultSync {
     lastSyncedMap: Map<string, LastSynced>;
     getLastSynced(path: string): LastSynced | undefined;
     computeVaultChunks(path: string): Promise<string[]>;
-    // Quarantine (Invariant II). Defaults to "nothing quarantined" so existing
+    // Quarantine of broken FileDocs. Defaults to "nothing quarantined" so existing
     // restore/pull tests are unaffected.
     quarantinedCalls: string[];
     clearedCalls: string[];
@@ -216,7 +216,7 @@ describe("Reconciler", () => {
         });
     });
 
-    describe("disposal barrier (#err-7)", () => {
+    describe("disposal barrier", () => {
         it("skips the trailing manifest/cursor persist when disposed mid-run", async () => {
             const h = setup([makeFile("a.md", 1000)]);
             h.db.fileDocs.set("a.md", makeDoc("a.md", { lastWriter: SELF }));
@@ -287,9 +287,10 @@ describe("Reconciler", () => {
             expect(h.vaultSync.fileToDbCalls).toEqual(["new.md"]);
         });
 
-        // Invariant 7: a vault file over a DB tombstone routes through the
-        // classifier instead of a blind fileToDb (whose divergent guard
-        // skipped every relation except local-edit — the W24 wedged path).
+        // Deletion is an integration event: a vault file over a DB tombstone
+        // routes through the classifier instead of a blind fileToDb (whose
+        // divergent guard skipped every relation except local-edit, so a
+        // recreated file stayed unpushable).
         it("recreate-pushes over a tombstone when classifier says local-edit", async () => {
             const h = setup([makeFile("a.md", 1000)]);
             h.db.fileDocs.set("a.md", makeDoc("a.md", { deleted: true }));
@@ -309,7 +310,7 @@ describe("Reconciler", () => {
             expect(h.vaultSync.fileToDbCalls).toEqual([]);
         });
 
-        it("routes true-divergent (the W24 wedged state) to handleDivergentRecreate", async () => {
+        it("routes true-divergent (the wedged recreate state) to handleDivergentRecreate", async () => {
             const h = setup([makeFile("a.md", 1000)]);
             h.db.fileDocs.set("a.md", makeDoc("a.md", { deleted: true }));
             h.vaultSync.compareResults.set("a.md", "true-divergent");
@@ -372,7 +373,7 @@ describe("Reconciler", () => {
             expect(h.vaultSync.markDeletedCalls).toEqual([]);
         });
 
-        // Invariant II (G2): a broken FileDoc (chunks missing on this device
+        // A broken FileDoc (chunks missing on this device
         // AND the server) must be quarantined, not restore-looped. Reproduces
         // the field ping-pong (couchsync_log_* with GC'd chunks).
         it("quarantines (not restores) when chunks are missing everywhere", async () => {
@@ -412,12 +413,12 @@ describe("Reconciler", () => {
         });
     });
 
-    // H-1: lastSynced (per-path integration baseline) is the PRIMARY oracle
+    // lastSynced (per-path integration baseline) is the PRIMARY oracle
     // for Case D; the manifest is only a fallback. A path this device pulled
     // (lastSynced set) but had not yet reconciled into the manifest must NOT be
     // resurrected when its delete event is dropped — the missing file is a real
     // local delete and must propagate as a tombstone.
-    describe("Case D: lastSynced-primary classification (H-1)", () => {
+    describe("Case D: lastSynced-primary classification (no silent un-delete)", () => {
         it("tombstones a pulled-then-deleted path even when absent from the manifest", async () => {
             const h = setup([]); // vault missing the file (deleted, event dropped)
             h.db.fileDocs.set("a.md", makeDoc("a.md", { lastWriter: OTHER }));
@@ -447,7 +448,7 @@ describe("Reconciler", () => {
         });
     });
 
-    describe("Disposal barrier (Invariant III / G5)", () => {
+    describe("Disposal barrier (no DB work after unload)", () => {
         it("destroy() stops new reconcile work (no DB writes after unload)", async () => {
             const h = setup([]);
             h.db.fileDocs.set("a.md", makeDoc("a.md", { lastWriter: OTHER }));
@@ -717,7 +718,7 @@ describe("Reconciler", () => {
         });
     });
 
-    describe("Case F: PathKey collision (S4/S5)", () => {
+    describe("Case F: PathKey collision", () => {
         it("converges two same-content docs to the vclock-canonical case (DB-only variant)", async () => {
             // The scripts/Scripts incident on a case-insensitive device: vault
             // holds one file (Scripts/X), DB holds BOTH docs. Scripts/X
@@ -776,7 +777,7 @@ describe("Reconciler", () => {
             expect(h.vaultSync.markDeletedCalls).toEqual([]);
         });
 
-        it("fast-path does not short-circuit when the vault holds a case-duplicate (S7)", async () => {
+        it("fast-path does not short-circuit when the vault holds a case-duplicate", async () => {
             // Steady-state inputs that would otherwise short-circuit (cursor +
             // matching manifest + unchanged seq + old mtime), but two files
             // fold to one PathKey → the slow path must run and resolve.
@@ -796,7 +797,7 @@ describe("Reconciler", () => {
             expect(r.collisionsResolved).toEqual(["Scripts/X"]);
         });
 
-        it("concurrent variants pick a path-deterministic canonical, independent of vclock key order (H-2)", async () => {
+        it("concurrent variants pick a path-deterministic canonical, independent of vclock key order", async () => {
             // Genuinely concurrent (no causal dominator): the canonical must be
             // a DEVICE-INVARIANT choice. The old tiebreak used latestDevice(),
             // which depended on vclock key order — and mergeVC can persist the

@@ -162,7 +162,7 @@ describe("EditorAwareVaultWriter", () => {
         );
         expect(result).toEqual({ applied: true });
         expect(io.readText("a.md")).toBe("new");
-        // PR1 — fallback path also suppresses the echo modify event.
+        // The fallback path also suppresses the echo modify event.
         expect(ignoreNextModify).toHaveBeenCalledWith("a.md");
     });
 
@@ -180,7 +180,7 @@ describe("EditorAwareVaultWriter", () => {
     // ── Single editor, not composing ──────────────────────
 
     it("dispatches CM transaction AND writes to disk when single pane is not composing", async () => {
-        // PR1 disk-write invariant: disk write happens even with editor
+        // Disk-write truth: disk write happens even with editor
         // open. CM dispatch is the UX overlay; disk is the truth.
         io.addFile("a.md", "old");
         const ignoreNextModify = vi.fn();
@@ -195,7 +195,7 @@ describe("EditorAwareVaultWriter", () => {
         expect(result).toEqual({ applied: true });
         expect(leaf.view.editor.cm.dispatchSpy).toHaveBeenCalledTimes(1);
         expect(leaf.view.editor.cm.state.doc.toString()).toBe("new");
-        // PR1 invariant — disk has the new content too.
+        // Disk has the new content too.
         expect(io.readText("a.md")).toBe("new");
         // The echo modify event from writeBinary is suppressed.
         expect(ignoreNextModify).toHaveBeenCalledWith("a.md");
@@ -234,7 +234,7 @@ describe("EditorAwareVaultWriter", () => {
         );
         await Promise.resolve();
         expect(leaf.view.editor.cm.dispatchSpy).not.toHaveBeenCalled();
-        // PR1 invariant — disk is NOT touched while composing.
+        // Disk is NOT touched while composing.
         expect(io.readText("a.md")).toBe("old");
 
         // End composition → drain → CM dispatch + disk write

@@ -105,7 +105,7 @@ describe("ConfigSync.create() — wipe-and-replace remote", () => {
         });
         const liveIds = allRows.rows
             .filter((r) => !r.value?.deleted)
-            .filter((r) => r.id !== "config:meta")  // Phase 2: skip self-describing meta
+            .filter((r) => r.id !== "config:meta")  // skip the self-describing meta
             .map((r) => r.id);
         expect(liveIds.sort()).toEqual([
             makeConfigId(".obsidian/app.json"),
@@ -133,7 +133,7 @@ describe("ConfigSync.create() — wipe-and-replace remote", () => {
         });
         const liveIds = allRows.rows
             .filter((r) => !r.value?.deleted)
-            .filter((r) => r.id !== "config:meta")  // Phase 2: skip self-describing meta
+            .filter((r) => r.id !== "config:meta")  // skip the self-describing meta
             .map((r) => r.id);
         expect(liveIds).toEqual([makeConfigId(".obsidian/app.json")]);
     });
@@ -148,7 +148,7 @@ describe("ConfigSync.create() — wipe-and-replace remote", () => {
             endkey: "config:￰",
         })).rows
             .filter((r) => !r.value?.deleted)
-            .filter((r) => r.id !== "config:meta")  // Phase 2: skip self-describing meta
+            .filter((r) => r.id !== "config:meta")  // skip the self-describing meta
             .map((r) => r.id).sort();
 
         await cs.create();
@@ -159,7 +159,7 @@ describe("ConfigSync.create() — wipe-and-replace remote", () => {
             endkey: "config:￰",
         })).rows
             .filter((r) => !r.value?.deleted)
-            .filter((r) => r.id !== "config:meta")  // Phase 2: skip self-describing meta
+            .filter((r) => r.id !== "config:meta")  // skip the self-describing meta
             .map((r) => r.id).sort();
         expect(after).toEqual(before);
     });

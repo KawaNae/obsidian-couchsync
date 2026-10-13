@@ -3,7 +3,7 @@
  * appropriate for the reconnect reason.
  *
  * Mobile app-resume often takes >5s for the network stack to come back.
- * The 2026-04-22 main-vault log showed verify aborts at 5001ms then
+ * A main-vault log showed verify aborts at 5001ms then
  * recovery via retry-backoff (10s+18s wasted). For app-resume /
  * network-online we use a longer ceiling; everything else stays at 5s.
  */

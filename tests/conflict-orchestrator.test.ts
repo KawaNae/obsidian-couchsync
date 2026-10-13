@@ -151,7 +151,7 @@ describe("ConflictOrchestrator", () => {
         await replicator.fireConcurrent("a.md", localDoc, remoteDoc);
 
         // dbToFile should have been called with the remote doc.
-        // Invariant 3: non-deletion take-remote adopts remote vclock
+        // Chunks-equal vclock authority: non-deletion take-remote adopts remote vclock
         // verbatim — no self-component added, no merge with local.
         expect(dbToFileCalls).toHaveLength(1);
         expect(dbToFileCalls[0].vclock).toEqual({ "dev-B": 1 });
@@ -161,7 +161,7 @@ describe("ConflictOrchestrator", () => {
         expect(saveConflictCalls[0][3]).toBe("remote"); // winner
     });
 
-    it("suppresses a duplicate concurrent modal while one is already in flight (#3 re-emit dedup)", async () => {
+    it("suppresses a duplicate concurrent modal while one is already in flight (re-emit dedup)", async () => {
         const replicator = makeReplicator();
         createOrchestrator(replicator);
 
@@ -195,7 +195,7 @@ describe("ConflictOrchestrator", () => {
         const localDoc = await seedFileDoc(db, "a.md", "local text", { "dev-A": 2 });
         const remoteDoc = await seedFileDoc(db, "a.md", "remote text", { "dev-B": 1 });
 
-        // The pull writer persisted this edit-vs-edit conflict (Invariant B).
+        // The pull writer persisted this edit-vs-edit conflict with the cursor advance.
         await db.runWriteTx({
             meta: [{
                 op: "put",

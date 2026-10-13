@@ -138,7 +138,7 @@ describe("ConfigPullWriter — incremental pull", () => {
         expect(Number(cps.getPullSeq())).toBeGreaterThanOrEqual(2);
     });
 
-    it("self-heals on seq regression: remote recreated below cursor (#config-codec)", async () => {
+    it("self-heals on seq regression: remote recreated below cursor", async () => {
         // A Config Init on another device destroys + recreates the remote DB,
         // resetting its update-seq below our cursor. Without regression
         // detection the pull fetches nothing forever; the writer must reset its
@@ -161,7 +161,7 @@ describe("ConfigPullWriter — incremental pull", () => {
         // with the fresh remote at the same {dev-A:1}. Across the Init's key
         // rotation the chunk ids differ even for identical content, so the tie
         // must be ADOPTED from the fresh authority (take-remote) — NOT surfaced
-        // as concurrent (the 2026-06-14 false-positive flood) and NOT silently
+        // as concurrent (a flood of false positives) and NOT silently
         // kept (the non-propagation bug). Drives the real didSeqReset path.
         const localF = await makeConfigDoc(".obsidian/app.json", "stale-old", { "dev-A": 1 });
         await db.runWriteTx({
@@ -210,7 +210,7 @@ describe("ConfigPullWriter — incremental pull", () => {
     });
 
     it("equal vclock but DIFFERENT content (Init stale-collision) → concurrent, NOT converged-skip", async () => {
-        // 2026-06-14 on-device bug: after a Config Init resets all vclocks, a
+        // Seen on device: after a Config Init resets all vclocks, a
         // stale local doc (old content) collides with a freshly-pushed remote
         // doc at the SAME {dev:1}. Content differs, so the truthful verdict is
         // concurrent (surface) — the old code trusted the vclock proxy and
@@ -251,10 +251,10 @@ describe("ConfigPullWriter — incremental pull", () => {
         expect(Number(cps.getPullSeq())).toBeGreaterThanOrEqual(1);
     });
 
-    it("PR-C: silent-merge when vclocks divergent but data identical (audit MEDIUM, Config side)", async () => {
-        // Pre-PR-C this verdict fell through the if-chain into accepted.push
+    it("silent-merge when vclocks divergent but data identical (Config side)", async () => {
+        // This verdict used to fall through the if-chain into accepted.push
         // without merging vclocks → local-only causality info was lost.
-        // Post-PR-C the writer mergeVCs and increments vclockOnlyDrift.
+        // Now the writer mergeVCs and increments vclockOnlyDrift.
         const sharedBody = "shared content";
         const localF = await makeConfigDoc(".obsidian/shared.json", sharedBody, { "dev-B": 1 });
         await db.runWriteTx({
