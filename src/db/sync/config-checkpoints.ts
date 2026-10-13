@@ -1,100 +1,59 @@
 /**
- * ConfigCheckpoints — sync progress markers for the config DB.
+ * ConfigCheckpoints — the pull cursor of the config DB.
  *
- * Mirror of `Checkpoints` (`src/db/sync/checkpoints.ts`) for the vault
- * sync, but against `ConfigLocalDB`. Holds the next-cursor for both
- * directions:
- *   - `pullSeq`: last `_changes` cursor consumed by ConfigPullWriter
- *   - `pushSeq`: last LocalDB.changes cursor pushed by ConfigPushPipeline
+ * `pullSeq` is the last remote `_changes` cursor ConfigPullWriter consumed,
+ * persisted under `_sync/config-pull-seq` in the ConfigLocalDB meta store.
+ * A store without it starts from 0 (a full catch-up).
  *
- * Persisted under `_sync/config-pull-seq` / `_sync/config-push-seq` in
- * the ConfigLocalDB meta store. No legacy migration: builds before these
- * checkpoints existed have
- * no checkpoint stored, so `load()` leaves the in-memory cursors at 0
- * and the first ConfigPullWriter run does a full catchup from `since=0`
- * (== current `pullByPrefix` semantics — backwards compatible).
+ * Push has no cursor: what it sends is the disk's difference from the base
+ * (`config-reconcile.ts`), and the config DB is written only after the
+ * server accepted a doc, so nothing unsent waits in the store.
  *
- * The atomic boundary lives here: a pull batch lands accepted docs +
- * the new pull-seq in a single `runWriteTx`, and `pullSeq` is advanced
+ * The atomic boundary lives with the writers: a pull batch lands its docs
+ * and the new pull-seq in a single `runWriteTx`, and `pullSeq` is advanced
  * inside `onCommit` so callers always observe a consistent cursor.
  */
 
-import type { CouchSyncDoc } from "../../types.ts";
 import type { ConfigLocalDB } from "../config-local-db.ts";
 import { logDebug } from "../../ui/log.ts";
 
 export const META_CONFIG_PULL_SEQ = "_sync/config-pull-seq";
-export const META_CONFIG_PUSH_SEQ = "_sync/config-push-seq";
 
 export class ConfigCheckpoints {
     private pullSeq: number | string = 0;
-    private pushSeq: number | string = 0;
 
     constructor(private db: ConfigLocalDB) {}
 
     getPullSeq(): number | string { return this.pullSeq; }
-    getPushSeq(): number | string { return this.pushSeq; }
     setPullSeq(s: number | string): void { this.pullSeq = s; }
-    setPushSeq(s: number | string): void { this.pushSeq = s; }
 
     async load(): Promise<void> {
         const pull = await this.db.getMeta<number | string>(META_CONFIG_PULL_SEQ);
-        const push = await this.db.getMeta<number | string>(META_CONFIG_PUSH_SEQ);
         // Authoritative reload: load() reflects disk truth, so an ABSENT
         // checkpoint resets the in-memory cursor to 0 rather than keeping a
         // stale value. This matters when the same long-lived instance is
         // reloaded after a config Create destroyed the DB (invalidateCheckpoints
-        // → load): the post-Create push must enumerate from 0 and re-seed, not
-        // skip from the pre-Create cursor. Symmetric with vault-side Checkpoints
-        // (`remote ?? 0`).
+        // → load). Symmetric with vault-side Checkpoints (`remote ?? 0`).
         this.pullSeq = pull ?? 0;
-        this.pushSeq = push ?? 0;
-        logDebug(
-            `config-checkpoints loaded: pullSeq=${this.pullSeq} pushSeq=${this.pushSeq}`,
-        );
+        logDebug(`config-checkpoints loaded: pullSeq=${this.pullSeq}`);
     }
 
     async save(): Promise<void> {
         await this.db.runWriteTx({
-            meta: [
-                { op: "put", key: META_CONFIG_PULL_SEQ, value: this.pullSeq },
-                { op: "put", key: META_CONFIG_PUSH_SEQ, value: this.pushSeq },
-            ],
+            meta: [{ op: "put", key: META_CONFIG_PULL_SEQ, value: this.pullSeq }],
         });
     }
 
     /**
-     * Commit a pull batch atomically: accepted docs + the new pullSeq
-     * land in a single `runWriteTx`. The in-memory `pullSeq` is advanced
-     * at the start of `onCommit` (inside the tx boundary) before the
-     * caller's `onCommit` fires.
-     */
-    async commitPullBatch(params: {
-        docs: CouchSyncDoc[];
-        nextPullSeq: number | string;
-        onCommit: () => Promise<void>;
-    }): Promise<void> {
-        await this.db.runWriteTx({
-            docs: params.docs.map((d) => ({ doc: d as CouchSyncDoc })),
-            meta: [{ op: "put", key: META_CONFIG_PULL_SEQ, value: params.nextPullSeq }],
-            onCommit: async () => {
-                this.pullSeq = params.nextPullSeq;
-                await params.onCommit();
-            },
-        });
-    }
-
-    /**
-     * Advance the pull checkpoint for a batch that produced no accepted
-     * docs (empty fetch, every row converged-skip). Persists the in-memory
-     * cursor change to disk.
+     * Advance the pull checkpoint for a batch that produced no docs (empty
+     * fetch, a seq-regression reset). Persists the in-memory cursor change.
      */
     async saveEmptyPullBatch(nextPullSeq: number | string): Promise<void> {
         // No-op guard, symmetric to the vault-side Checkpoints. Sound
         // because every `pullSeq` mutation is disk-coupled: load() reads
-        // disk, and both commit paths (commitPullBatch, the tx below, the
-        // pull-writer's batch tx) assign it inside onCommit of a tx that
-        // persists the same value — memory == disk always holds here.
+        // disk, and both commit paths (the tx below, the pull-writer's
+        // batch tx) assign it inside onCommit of a tx that persists the
+        // same value — memory == disk always holds here.
         if (nextPullSeq === this.pullSeq) return;
         await this.db.runWriteTx({
             meta: [{ op: "put", key: META_CONFIG_PULL_SEQ, value: nextPullSeq }],

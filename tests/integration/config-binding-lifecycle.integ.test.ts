@@ -843,7 +843,7 @@ describe("config binding lifecycle", () => {
             const storeA = dev.cs.currentStore()!;
             const pullSeqA = bindingA.checkpoints.getPullSeq();
             expect(Number(pullSeqA)).toBeGreaterThan(1);
-            await dev.cs.scan(); // populate A's lastSynced from disk
+            // Pull moved A's bases to what it wrote.
             expect(bindingA.lastSynced.get(".obsidian/app.json")).toBeDefined();
 
             // ── A → B ──
@@ -1037,7 +1037,7 @@ describe("config binding lifecycle", () => {
             b.vault.addFile(".obsidian/appearance.json", `{"b":1}`);
             b.vault.addFile(".obsidian/hotkeys.json", `{"b":2}`);
 
-            // Park the Push inside its scan — after the preflight froze its keys.
+            // Park the Push while it reads the disk — after the preflight froze its keys.
             let release!: () => void;
             const gate = new Promise<void>((r) => { release = r; });
             let parked = false;
@@ -1051,7 +1051,7 @@ describe("config binding lifecycle", () => {
             const binding = b.cs.currentBinding()!;
 
             // A wrong passphrase now. The tree used to run a preflight outside
-            // the op lock and drop the key on failure — mid-scan.
+            // the op lock and drop the key on failure — mid-Push.
             putEntry(b.settings, { ...getEntry(b.settings)!, passphrase: "wrong" });
             const getDoc = vi.spyOn(remote("cfg-enc"), "getDoc");
             const before = binding.relation();
@@ -1254,7 +1254,7 @@ describe("config binding lifecycle", () => {
             await seed("cfg-one", { ".obsidian/app.json": `{"db":1}` }, {
                 configEncryptionEnabled: true, configEncryptionPassphrase: "one",
             });
-            await seed("cfg-two", { ".obsidian/app.json": `{"db":2}` }, {
+            await seed("cfg-two", { ".obsidian/hotkeys.json": `{"db":2}` }, {
                 configEncryptionEnabled: true, configEncryptionPassphrase: "two",
             });
             const answers: Record<string, string> = { "cfg-one": "one", "cfg-two": "two" };
@@ -1275,11 +1275,12 @@ describe("config binding lifecycle", () => {
 
             // Back and forth: each DB still unlocks with its own passphrase,
             // with no prompt.
-            for (const db of ["cfg-one", "cfg-two", "cfg-one"]) {
+            for (const [db, written] of [["cfg-one", 1], ["cfg-two", 1], ["cfg-one", 0]] as const) {
                 await apply(d, db);
-                expect(await d.cs.pull()).toBe(1);
-                expect(d.vault.readText(".obsidian/app.json")).toBe(`{"db":${db === "cfg-one" ? 1 : 2}}`);
+                expect(await d.cs.pull()).toBe(written);
             }
+            expect(d.vault.readText(".obsidian/app.json")).toBe(`{"db":1}`);
+            expect(d.vault.readText(".obsidian/hotkeys.json")).toBe(`{"db":2}`);
             expect(asked).toEqual(["cfg-one", "cfg-two"]);
         });
     });
@@ -1445,30 +1446,6 @@ describe("config binding lifecycle", () => {
             await b.cs.join();
             expect(view(b)).toEqual({ text: 'Joined "cfg-A" — ready to Push and Pull.', tone: "ok" });
             await a.cs.close();
-        });
-    });
-
-    describe("a bare scan() on an encrypted DB (fail-closed hasher)", () => {
-        it("without an unlocked key: key-missing, never xxhash64 chunk ids", async () => {
-            await seed("cfg-enc", { ".obsidian/app.json": "{}" }, ENC);
-            const b = makeDevice("dev-B", ENC);
-            await apply(b, "cfg-enc");
-            await b.cs.join();
-            await b.cs.close();
-            // A new session: the store says encrypted, no key unlocked yet.
-            const b2 = makeDevice("dev-B", {}, undefined, b);
-            await b2.cs.rebind("cfg-enc");
-            b2.vault.addFile(".obsidian/hotkeys.json", "{}");
-            await expect(b2.cs.scan()).rejects.toMatchObject({ kind: "key-missing" });
-            const store = b2.cs.currentStore()!;
-            const x64 = () => store.allDocs({ startkey: "chunk:x64:", endkey: "chunk:x64:￰" });
-            expect((await x64()).rows).toEqual([]);
-            // After an op unlocked it this session, scan mints HMAC ids.
-            expect(await b2.cs.pull()).toBe(1);
-            await b2.cs.scan();
-            const hmac = await store.allDocs({ startkey: "chunk:hmac:", endkey: "chunk:hmac:￰" });
-            expect(hmac.rows.length).toBeGreaterThan(0);
-            expect((await x64()).rows).toEqual([]);
         });
     });
 });

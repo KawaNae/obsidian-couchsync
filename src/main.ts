@@ -294,13 +294,20 @@ export default class CouchSyncPlugin extends Plugin {
             reconnectBridge,
             () => this.settings,
             {
-                // Real own-data.json path so ConfigSync excludes it from
-                // replication even under a renamed plugin folder.
-                // manifest.dir is the actual install dir; fall back to the
-                // configDir + id composition.
-                ownDataJsonPath: this.manifest.dir
-                    ? `${this.manifest.dir}/data.json`
-                    : `${this.app.vault.configDir}/plugins/${this.manifest.id}/data.json`,
+                // This plugin's real folder, so ConfigSync excludes its
+                // data.json and backups even under a renamed plugin folder,
+                // and keeps Pull's backups there. manifest.dir is the actual
+                // install dir; fall back to the configDir + id composition.
+                pluginDir: this.manifest.dir
+                    || `${this.app.vault.configDir}/plugins/${this.manifest.id}`,
+                // Pull writes config files that Obsidian holds in memory;
+                // only a reload makes the app read them instead of writing
+                // its in-memory settings back over them.
+                reload: () => {
+                    setTimeout(() => {
+                        (this.app as any).commands.executeCommandById("app:reload");
+                    }, 500);
+                },
                 // Receive-side platform gate: don't materialise desktop-only
                 // plugins on a mobile device. Mirrors the getPlatform wiring.
                 getIsMobile: () => Platform.isMobile,

@@ -419,7 +419,10 @@ export class ConfigSyncTab {
 
         new Setting(el)
             .setName("Push")
-            .setDesc("Scan .obsidian/ and push the selected units to remote.")
+            .setDesc(
+                "Push this device's changes to the selected units since it last took them from the server. " +
+                "Files changed on the server since then are held until Pull & Reload.",
+            )
             .addButton((btn) =>
                 btn.setButtonText("Push ↑")
                     .setDisabled(!configEnabled)
@@ -443,7 +446,8 @@ export class ConfigSyncTab {
         new Setting(el)
             .setName("Pull & Reload")
             .setDesc(
-                "Pull config from remote, write the selected units to this device, then reload Obsidian if any file changed.",
+                "Pull config from remote and merge it into this device's files (keys this device changed are kept; " +
+                "overwritten files are backed up in the plugin's backups folder), then reload Obsidian if any file changed.",
             )
             .addButton((btn) =>
                 btn.setButtonText("Pull & Reload ↓")
@@ -452,24 +456,16 @@ export class ConfigSyncTab {
                         btn.setButtonText("Pulling...");
                         btn.setDisabled(true);
                         try {
-                            const written = await this.trackOp(this.deps.configSync.pull());
-                            if (written === 0) {
-                                // Nothing on disk changed, so a reload
-                                // would load the same settings again.
-                                showNotice("No config files changed. Skipping reload.");
-                                this.deps.refresh();
-                                return;
-                            }
-                            showNotice("Reloading Obsidian...");
-                            setTimeout(() => {
-                                (this.deps.app as any).commands.executeCommandById("app:reload");
-                            }, 500);
+                            // ConfigSync reports the outcome in one Notice
+                            // and reloads Obsidian when it wrote a file.
+                            await this.trackOp(this.deps.configSync.pull());
                         } catch {
                             // Reported by ConfigSync (ProgressNotice + log);
-                            // no reload on failure. Re-render so the button
-                            // and the status line reflect this attempt.
-                            this.deps.refresh();
+                            // no reload on failure.
                         }
+                        // Re-render so the button and the status line
+                        // reflect this attempt.
+                        this.deps.refresh();
                     })
             );
     }

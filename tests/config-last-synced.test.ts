@@ -1,9 +1,9 @@
 /**
  * ConfigLastSynced — unit tests for the per-config-path baseline cache.
  *
- * Drives the in-memory map + meta-store persistence directly. The
- * ConfigSync.scan() short-circuit that consumes this cache is exercised
- * separately in tests/config-sync.test.ts.
+ * Drives the in-memory map + meta-store persistence directly. Push and
+ * Pull, which read and move these bases, are exercised in
+ * tests/config-sync.test.ts and the config integration tests.
  *
  * v0.26: payload shape switched from `{vclock, size, dataHash}` to
  * `{vclock, size, chunks}` (vault parity). Legacy entries without

@@ -24,8 +24,8 @@ import { logDebug, logWarn } from "../ui/log.ts";
  * **CLASSIFIER:** routes through `classifySyncRelation` (the single source
  * of truth). Do not duplicate the chunks/vclock matrix logic here.
  *
- * Two-instance pattern: one instance for vault DB (FileDoc), one for
- * config DB (ConfigDoc).
+ * Config sync does not use it: config Pull merges three-way instead
+ * (`config-reconcile.ts`).
  */
 
 /** A doc that ConflictResolver can process. Both kinds carry a vclock. */
@@ -41,8 +41,7 @@ type ResolvableDoc = FileDoc | ConfigDoc;
  * silent regression. On the ConfigSync side, a fall-through once dropped
  * `silent-merge` and raised false-positive concurrent conflicts.
  *
- * Current consumers: `pull-writer.ts:classify`,
- * `config-pull-writer.ts:classify`.
+ * Current consumer: `pull-writer.ts:classify`.
  */
 export type PullVerdict = "take-remote" | "keep-local" | "concurrent" | "silent-merge";
 

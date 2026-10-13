@@ -324,30 +324,9 @@ export class ConfigBinding {
         return this.derivations;
     }
 
-    /**
-     * Keys for local work outside an op (a bare `ConfigSync.scan`): the
-     * attachment's codec, and — when it is encrypted — the key this session
-     * already unlocked for the joined root with this binding's passphrase.
-     * Throws `key-missing` when there is no such key (no op ran yet, or the
-     * passphrase changed since); never a plaintext hasher for an encrypted
-     * DB. Ops use the keys their preflight froze instead.
-     */
-    currentKeys(): ConfigOpKeys {
-        const codec = this.att?.codec ?? { encryption: false, compression: false };
-        let crypto: CryptoProvider | null = null;
-        if (codec.encryption) {
-            const memo = this.keyCache;
-            if (memo && memo.metaFp === this.att?.metaFingerprint
-                && memo.passphrase === (this.entry()?.passphrase ?? "")) {
-                crypto = memo.crypto;
-            }
-        }
-        return makeConfigOpKeys(codec, crypto, this.entry()?.cipherFloor, this.dbName);
-    }
-
     // ── Cursors / caches ───────────────────────────────
 
-    /** Lazy-load the persisted pull/push cursors. Idempotent. */
+    /** Lazy-load the persisted pull cursor. Idempotent. */
     async ensureCheckpointsLoaded(): Promise<void> {
         if (this.checkpointsLoaded) return;
         await this.checkpoints.load();
@@ -376,24 +355,6 @@ export class ConfigBinding {
 
     private ctx(extra: ConfigNotReadyContext = {}): ConfigNotReadyContext {
         return { db: this.dbName, ...extra };
-    }
-
-    /**
-     * The local half of readiness — no I/O. An interrupted Create first
-     * (the remote may be half-built), then "not joined".
-     *
-     * `requireAttached: false` is for local-only work (`ConfigSync.write`),
-     * which must still refuse a half-built DB but has no business demanding
-     * a Join.
-     */
-    assertLocalReady(opts: { requireAttached: boolean }): ConfigAttachment | null {
-        if (this.entry()?.settingUp) {
-            throw configNotReady("setup-interrupted", this.ctx());
-        }
-        if (!this.att && opts.requireAttached) {
-            throw configNotReady("unattached", this.ctx());
-        }
-        return this.att;
     }
 
     /**

@@ -141,8 +141,8 @@ export class ConfigLocalDB implements IDocStore<CouchSyncDoc> {
     /**
      * Bulk-fetch chunks by id. Mirrors `LocalDB.getChunks` — the config
      * DB carries its own chunk store now (v0.26+), so config-side
-     * code paths (ConfigPullWriter ensureChunks, ConfigSync.write
-     * joinChunks) read through this method rather than reaching across
+     * code paths (ConfigPullWriter ensureChunks, the reconcile step's
+     * reads of the shared and base contents) read through this method rather than reaching across
      * to the vault DB. Rows whose body is absent (id not found) are
      * silently dropped; callers detect missing chunks by comparing the
      * returned length against the requested ids.
