@@ -31,6 +31,7 @@ import { PullPipeline } from "./pull-pipeline.ts";
 import { PushPipeline } from "./push-pipeline.ts";
 import { logDebug, logError } from "../../ui/log.ts";
 import { ALWAYS_VISIBLE, type VisibilityGate } from "../visibility-gate.ts";
+import type { VaultMetaDoc } from "../vault-meta.ts";
 
 export interface SyncSessionDeps {
     /** Monotonic identifier supplied by SyncEngine. Shows up in pipeline
@@ -54,6 +55,9 @@ export interface SyncSessionDeps {
     /** Invoked from pipelines when a transient upstream error (auth /
      *  5xx) occurs. The supervisor (SyncEngine) decides escalation. */
     onTransientError: (err: unknown) => void;
+    /** Re-check that the remote DB is still the one this device set up
+     *  against (`RemoteAgreement.recheckRoot`). Throws only the pause. */
+    recheckRoot?: (observed?: VaultMetaDoc | null) => Promise<void>;
     /** Optional: gate that pauses live loops while the page is hidden.
      *  Defaults to ALWAYS_VISIBLE for tests / non-browser hosts. */
     visibility?: VisibilityGate;
@@ -123,6 +127,7 @@ export class SyncSession {
             signal: this.signal,
             handleLocalDbError: deps.handleLocalDbError,
             onTransientError: deps.onTransientError,
+            recheckRoot: deps.recheckRoot ?? (async () => {}),
             delay,
         });
         this.pushPipeline = new PushPipeline({

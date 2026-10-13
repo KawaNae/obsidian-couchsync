@@ -9,7 +9,7 @@
  *   2. an Init or Clone is running
  *   3. the server rejects the credentials (the auth latch)
  *   4. live sync is on — setup is locked
- *   5. a failure: the last Init / Clone, or the encryption pause (it says
+ *   5. a failure: the last Init / Clone, or the agreement pause (it says
  *      why sync stopped); when both are known, the one that started later.
  *      A setup left unfinished says so too
  *   6. a setup that did not finish (no failure known since the load)
@@ -48,7 +48,7 @@ export function vaultRelationView(rel: VaultRelation, authError: unknown | null)
             error: rel.lastOp.error,
         });
     }
-    if (rel.pause) failures.push({ at: rel.pause.at, label: "encryption check", error: rel.pause.error });
+    if (rel.pause) failures.push({ at: rel.pause.at, label: "server check", error: rel.pause.error });
     const failed = failures.sort((a, b) => b.at - a.at)[0];
     if (failed) {
         const text = `Last ${failed.label}: ${describeError(failed.error).text}`;

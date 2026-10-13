@@ -262,7 +262,10 @@ export default class CouchSyncPlugin extends Plugin {
             Platform.isMobile,
             this.auth,
             encClientFactory,
-            (signal) => this.vaultBinding.checkAgreement(signal),
+            {
+                check: (signal) => this.vaultBinding.checkAgreement(signal),
+                recheckRoot: (observed) => this.vaultBinding.recheckRoot(observed),
+            },
             async () => { await this.vaultSync.stampVaultDrift(); },
         );
         // Verify pulled chunk bodies hash to their content-addressed id
@@ -596,15 +599,15 @@ export default class CouchSyncPlugin extends Plugin {
             }
 
             // E2E encryption agreement + passphrase unlock now runs inside the
-            // SyncEngine session as the supervised preCatchupCheck
-            // (`reconcileEncryptionAgreement`), NOT as an unsupervised onload
+            // SyncEngine session as the supervised agreement check
+            // (`VaultBinding.checkAgreement`), NOT as an unsupervised onload
             // gate. The old gate's catch `return`ed on a transient fetch
             // failure and left sync permanently dead until a manual reload.
             // Funnelling the single gate through openSession means a
             // network blip now throws into the retry loop and auto-recovers
             // when the network returns; user-actionable states pause via the
             // encryption-paused terminal kind. So onload just starts the
-            // engine — start() → openSession → preCatchupCheck does the rest.
+            // engine — start() → openSession → agreement.check does the rest.
 
             // Load vclock cache BEFORE reconciler or changeTracker run.
             // Without this, compareFileToDoc() misclassifies local edits

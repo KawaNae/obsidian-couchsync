@@ -7,21 +7,25 @@
  *
  *   - the setup state (`settings.connectionState`): every change of it
  *     goes through a method here (Init, Clone, the Live Sync switch, Step 2
- *     Apply, a Step 1 codec change, a server change, an encryption pause);
+ *     Apply, a Step 1 codec change, a server change, a pause);
  *     only the settings migration on load rewrites it elsewhere;
  *   - the codec state the vault decorator stack is built from: the unlocked
  *     key, and the compression flag and cipher floor a Clone applies in
  *     memory before it commits them (`wrapClient`, `chunkHasher`);
  *   - Init and Clone, each run as a preparation that changes nothing and
  *     an execution that is destructive (see `runOperation`);
- *   - the encryption-agreement check the live session runs before catchup
- *     (`checkAgreement`);
+ *   - the agreement check the live session runs before catchup
+ *     (`checkAgreement`): the codec, and whether the server's vault DB is
+ *     still the one this device set up against (`settings.vaultRoot`), also
+ *     re-checked during the session when the pull sees a sign of a
+ *     re-created DB (`recheckRoot`);
  *   - what is known about the setup: how the last Init / Clone ended, why
  *     the agreement check paused sync (persisted with the state it
  *     explains, so a reload keeps both), and what each vault DB was found
  *     to hold (`relation`, which the Step 3 status line is drawn from).
  *     An operation that changes a fact updates what is known about it:
- *     Init refreshes what its DB holds, Init / Clone clear a pause.
+ *     Init refreshes what its DB holds, Init / Clone clear a pause and
+ *     bind the device to the DB's current `vault:meta`.
  *
  * Every change of what `relation` returns is announced (`onChange`), so a
  * view drawn from it can redraw while an operation runs, not only when the
@@ -42,6 +46,7 @@ import type { ChunkHashAlg } from "../types/doc-id.ts";
 import {
     buildInitialVaultMeta,
     fetchVaultMeta,
+    metaFingerprint,
     pushVaultMeta,
     unlockVaultMeta,
     VAULT_META_DOC_ID,
@@ -79,7 +84,7 @@ export type AskVaultPassphrase = (
 
 /** The destructive half of Init and Clone (`SetupService`). */
 export interface VaultSetupRunner {
-    init(onProgress: (msg: string) => void): Promise<SetupResult>;
+    init(onProgress: (msg: string) => void, publishMeta: () => Promise<void>): Promise<SetupResult>;
     clone(onProgress: (msg: string) => void): Promise<SetupResult>;
 }
 
@@ -490,11 +495,15 @@ export class VaultBinding {
         }
     }
 
-    /** A finished Init or Clone, started at `at`: the setup holds, and a
-     *  pause noticed before it no longer does. Changes the settings object
-     *  only; the caller saves. */
-    private settleSetup(at: number): void {
-        this.settings().connectionState = "setupDone";
+    /** A finished Init or Clone, started at `at`, against the DB whose
+     *  `vault:meta` has fingerprint `root` (null: no meta): the setup holds,
+     *  the device is bound to that incarnation of the DB, and a pause
+     *  noticed before it no longer does. Changes the settings object only;
+     *  the caller saves. */
+    private settleSetup(at: number, root: string | null): void {
+        const s = this.settings();
+        s.connectionState = "setupDone";
+        s.vaultRoot = { fingerprint: root, against: vaultTarget(s) };
         this.clearPause(at);
     }
 
@@ -508,8 +517,8 @@ export class VaultBinding {
     }
 
     /**
-     * Init: wipe the remote and the local DB, push this vault, write a new
-     * `vault:meta` from the Step 1 settings.
+     * Init: wipe the remote and the local DB, write a new `vault:meta` from
+     * the Step 1 settings, push this vault.
      *
      * Preparation: a passphrase is required when encryption is on; the
      * server must answer (a missing DB is fine — Init creates it); the meta
@@ -518,6 +527,10 @@ export class VaultBinding {
      * clones again, so nothing of the previous `vault:meta` or of a key
      * unlocked earlier in this session is carried over: a passphrase
      * changed in Step 1 is the one the new vault is encrypted with.
+     *
+     * The new meta carries a fresh `generationId`; the DB it is written to
+     * is a new incarnation, which this device is bound to on success and
+     * every other device tells apart from the one it set up against.
      */
     async init(): Promise<void> {
         return this.runOperation("init", async (progress, at) => {
@@ -544,11 +557,12 @@ export class VaultBinding {
             await this.beginDestructive();
             this.crypto = crypto;
             try {
-                const result = await this.host.setup().init((msg) => progress.update(msg));
-                progress.update("Writing vault metadata...");
-                await pushVaultMeta(raw, meta);
+                const result = await this.host.setup().init(
+                    (msg) => progress.update(msg),
+                    () => pushVaultMeta(raw, meta),
+                );
                 if (!enc) s.encryptionPassphrase = "";
-                this.settleSetup(at);
+                this.settleSetup(at, await metaFingerprint(meta));
                 if (meta.encryption.enabled) {
                     this.ratchetCipherFloor(meta.encryption.cipherVersion);
                 }
@@ -613,7 +627,7 @@ export class VaultBinding {
                 s.encryptionPassphrase = targetPassphrase;
                 s.compressionEnabled = targetCompression;
                 s.vaultCipherVersion = targetCipherVersion;
-                this.settleSetup(at);
+                this.settleSetup(at, meta ? await metaFingerprint(meta) : null);
                 this.encryptionOverride = undefined;
                 this.compressionOverride = undefined;
                 this.cipherVersionOverride = undefined;
@@ -703,13 +717,16 @@ export class VaultBinding {
     }
 
     /**
-     * The encryption-agreement check the live session runs before catchup
-     * (SyncEngine's `preCatchupCheck`), under the engine's retry
-     * supervision.
+     * The agreement check the live session runs before catchup (SyncEngine's
+     * `RemoteAgreement.check`), under the engine's retry supervision.
      *
+     *   - the server's vault DB must be the incarnation this device set up
+     *     against (`settings.vaultRoot`); another device's Init re-created it
+     *     (`root-changed`, see `recheckRoot`)
      *   - agreed: unlock the key once (asking for the passphrase when none
      *     is stored), ratchet the cipher floor, and take the server's
-     *     compression flag. A pause noticed before is cleared.
+     *     compression flag. A pause noticed before is cleared. A device set
+     *     up before the record existed adopts the server's meta here.
      *   - a transient failure while reading `vault:meta` is thrown as is and
      *     changes nothing: the check did not conclude, and the engine
      *     retries (the status bar shows the live session's errors).
@@ -727,6 +744,12 @@ export class VaultBinding {
 
         if (agreement.status === "cipher-downgrade-detected") {
             throw await this.pause(at, against, "cipher-downgrade", { localFloor: agreement.localFloor });
+        }
+        const root = agreement.status !== "legacy-meta-only" && agreement.meta
+            ? await metaFingerprint(agreement.meta)
+            : null;
+        if (this.rootChanged(against, root)) {
+            throw await this.pause(at, against, "root-changed");
         }
         if (agreement.status === "remote-encrypted" || agreement.status === "remote-plaintext") {
             throw await this.pause(at, against, "encryption-changed", {
@@ -773,6 +796,11 @@ export class VaultBinding {
             s.compressionEnabled = agreement.meta.compression.enabled;
             changed = true;
         }
+        const recorded = s.vaultRoot;
+        if (!recorded || recorded.against !== against) {
+            s.vaultRoot = { fingerprint: root, against };
+            changed = true;
+        }
         const pause = s.vaultPause;
         this.clearPause(at);
         if (s.vaultPause !== pause) changed = true;
@@ -780,6 +808,48 @@ export class VaultBinding {
             await this.host.saveSettings();
             this.changed();
         }
+    }
+
+    /**
+     * Re-check, during a live session, that the server's vault DB is still
+     * the one this device set up against. The pull calls it on a sign that
+     * the DB was re-created: a pulled change of `vault:meta` (`observed`:
+     * the pulled meta, or null when the change deleted it), a body that does
+     * not decrypt, or a sequence that went backwards (`observed` omitted:
+     * the meta is read from the server).
+     *
+     * Throws the pause when the DB was re-created; otherwise returns, also
+     * when the meta cannot be read now — the session's own error handling
+     * goes on, and the next session's `checkAgreement` judges again.
+     * Without a record for this DB there is nothing to compare: the
+     * session's `checkAgreement` records it.
+     */
+    async recheckRoot(observed?: VaultMetaDoc | null): Promise<void> {
+        const at = Date.now();
+        const against = vaultTarget(this.settings());
+        const recorded = this.settings().vaultRoot;
+        if (!recorded || recorded.against !== against) return;
+        let meta = observed;
+        if (meta === undefined) {
+            try {
+                meta = await fetchVaultMeta(this.host.makeRawClient());
+            } catch (e) {
+                logWarn(`could not read vault:meta to re-check the vault DB: ${rawErrorMessage(e)}`);
+                return;
+            }
+        }
+        const root = meta ? await metaFingerprint(meta) : null;
+        if (this.rootChanged(against, root)) {
+            throw await this.pause(at, against, "root-changed");
+        }
+    }
+
+    /** The server's vault DB (its meta has fingerprint `root`, null: no
+     *  meta) is not the incarnation this device set up against. Unknown
+     *  (no record for `against`) is not a change. */
+    private rootChanged(against: string, root: string | null): boolean {
+        const recorded = this.settings().vaultRoot;
+        return !!recorded && recorded.against === against && recorded.fingerprint !== root;
     }
 
     /** Pause live sync for a state the user has to act on: persist
@@ -807,6 +877,9 @@ export class VaultBinding {
 export type VaultPauseReason =
     /** `vault:meta` declares a cipher version below this device's floor. */
     | "cipher-downgrade"
+    /** The vault DB is not the incarnation this device set up against:
+     *  another device's Init re-created it, or its `vault:meta` is gone. */
+    | "root-changed"
     /** Another device turned encryption on or off. */
     | "encryption-changed"
     /** Only a pre-v2 `encryption:meta` is on the server. */
@@ -828,6 +901,10 @@ function pauseMessage(reason: VaultPauseReason, d: VaultPauseDetail): string {
             return "Sync paused — the server's vault:meta declares an older cipher version " +
                 `than this device trusts (below ${d.localFloor}), which can mean the server ` +
                 `was tampered with. Verify the server, then ${redo}.`;
+        case "root-changed":
+            return "Sync paused — the vault database on the server is not the one this " +
+                "device was set up with: Init on another device re-created it, or its " +
+                "vault:meta is gone. Run Clone in Vault Sync (Step 3) to sync with it.";
         case "encryption-changed":
             return `Sync paused — another device turned vault encryption ` +
                 `${d.remoteEncrypted ? "on" : "off"}. Match Step 1 in Vault Sync, then ${redo}.`;
@@ -843,7 +920,7 @@ function pauseMessage(reason: VaultPauseReason, d: VaultPauseDetail): string {
 }
 
 /**
- * The live session paused on the encryption agreement. Terminal for the
+ * The live session paused on the agreement check. Terminal for the
  * engine (`encryptionPaused`, see `classifyError`): retrying meets the same
  * server state. Carries its own sentence (`userMessage`).
  */

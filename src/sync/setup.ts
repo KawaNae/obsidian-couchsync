@@ -36,8 +36,20 @@ export class SetupService {
         private reconciler: Reconciler,
     ) {}
 
-    /** Init: clean slate (local + remote) → scan vault → push */
-    async init(onProgress: (msg: string) => void): Promise<SetupResult> {
+    /**
+     * Init: clean slate (local + remote) → publish the new vault:meta → scan
+     * vault → push.
+     *
+     * `publishMeta` writes the new `vault:meta` into the re-created remote
+     * DB before anything else. A device still live-syncing with the DB this
+     * Init replaced tells the replacement by that meta (the pull wakes on
+     * it; the agreement check compares it), so the sooner it is there, the
+     * shorter the time that device can push into the new DB unnoticed.
+     */
+    async init(
+        onProgress: (msg: string) => void,
+        publishMeta: () => Promise<void>,
+    ): Promise<SetupResult> {
         return this.withWakeLock(async () => {
             onProgress("Initializing local database...");
             await this.localDb.destroy();
@@ -45,8 +57,9 @@ export class SetupService {
             await this.localDb.ensureSchemaVersion();
 
             onProgress("Initializing remote database...");
-            await this.remoteOps.destroyRemote();
-            await this.remoteOps.ensureRemoteDb();
+            await this.remoteOps.recreateRemote();
+            onProgress("Writing vault metadata...");
+            await publishMeta();
 
             onProgress("Scanning vault files...");
             const vaultFiles = await this.scanVaultToDb(onProgress);

@@ -45,10 +45,11 @@ export function classifyError(err: unknown): SyncErrorDetail {
         };
     }
 
-    // Encryption-agreement pause (VaultEncryptionPausedError): the
-    // supervised preCatchupCheck found a user-actionable encryption state
-    // (server downgrade, cross-device mismatch, pre-v2 legacy meta, or no /
-    // a wrong passphrase) and set connectionState back to "tested".
+    // Agreement pause (VaultEncryptionPausedError): the supervised agreement
+    // check found a user-actionable state (server downgrade, cross-device
+    // encryption mismatch, pre-v2 legacy meta, no / a wrong passphrase, or a
+    // vault DB re-created by another device's Init) and set connectionState
+    // back to "tested".
     // Terminal — retrying loops against the same remote — so map to a kind
     // the engine halts on and the host surfaces once, with its own sentence.
     if (e?.encryptionPaused === true) {

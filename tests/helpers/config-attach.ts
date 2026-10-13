@@ -13,12 +13,12 @@ import type { ConfigBindingRecord, CouchSyncSettings } from "../../src/settings.
 import {
     buildInitialConfigMeta,
     pushConfigMeta,
+    metaFingerprint,
     type ConfigMetaDoc,
 } from "../../src/db/vault-meta.ts";
 import {
     CONFIG_ATTACHMENT_KEY,
     configBindingKey,
-    configMetaFingerprint,
     metaCodec,
     parseAttachment,
     type ConfigAttachment,
@@ -70,7 +70,7 @@ export async function attachPlain(
     await pushConfigMeta(remote, meta);
     await putAttachment(store, {
         codec: metaCodec(meta),
-        metaFingerprint: await configMetaFingerprint(meta),
+        metaFingerprint: await metaFingerprint(meta),
     });
     return meta;
 }

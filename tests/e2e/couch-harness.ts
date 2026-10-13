@@ -30,7 +30,7 @@ const __noopEvt = () => {};
 };
 
 import { LocalDB } from "../../src/db/local-db.ts";
-import { SyncEngine } from "../../src/db/sync-engine.ts";
+import { SyncEngine, type RemoteAgreement } from "../../src/db/sync-engine.ts";
 import { AuthGate } from "../../src/db/sync/auth-gate.ts";
 import { VaultSync } from "../../src/sync/vault-sync.ts";
 import { ChangeTracker } from "../../src/sync/change-tracker.ts";
@@ -309,6 +309,14 @@ export async function createE2EHarness(opts: CreateE2EHarnessOpts = {}): Promise
         const ct = new ChangeTracker(vaultEvents, vs, getSettings);
         const remoteOps = new VaultRemoteOps(db, getSettings, auth, wrapVaultClient, hasher);
 
+        // The live session's agreement check, as production wires it. A codec
+        // harness device holds a shared key the binding knows nothing about
+        // (no vault:meta on the remote), so it is checked only once a
+        // runInit / runClone handed the codec over to the binding.
+        const agreement: RemoteAgreement = {
+            check: async (signal) => { if (!seeded) await binding.checkAgreement(signal); },
+            recheckRoot: async (observed) => { if (!seeded) await binding.recheckRoot(observed); },
+        };
         const engine = new SyncEngine(
             db,
             getSettings,
@@ -317,6 +325,7 @@ export async function createE2EHarness(opts: CreateE2EHarnessOpts = {}): Promise
             /* isMobile */ false,
             auth,
             clientFactory,
+            agreement,
         );
         engine.setChunkHasher(hasher);
 

@@ -40,7 +40,7 @@ describe("vaultRelationView", () => {
         const pause = new VaultEncryptionPausedError("encryption-changed", { remoteEncrypted: true });
         const v = vaultRelationView(rel({ pause: { at: 1, error: pause } }), null);
         expect(v.tone).toBe("error");
-        expect(v.text).toBe(`Last encryption check: ${pause.userMessage}`);
+        expect(v.text).toBe(`Last server check: ${pause.userMessage}`);
     });
 
     it("a failed Clone in its preparation is shown with the unchanged state", () => {
@@ -64,7 +64,7 @@ describe("vaultRelationView", () => {
             lastOp: outcome({ at: 5, error: new UserFacingError("op") }),
             pause: { at: 9, error: pause },
         }), null);
-        expect(newerPause.text).toBe(`Last encryption check: ${pause.userMessage}`);
+        expect(newerPause.text).toBe(`Last server check: ${pause.userMessage}`);
         const newerOp = vaultRelationView(rel({
             lastOp: outcome({ at: 9, error: new UserFacingError("op") }),
             pause: { at: 5, error: pause },

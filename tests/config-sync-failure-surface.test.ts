@@ -39,7 +39,7 @@ import { FakeModalPresenter } from "./helpers/fake-modal-presenter.ts";
 import { makeSettings } from "./helpers/settings-factory.ts";
 import { makeConfigFixture } from "./helpers/config-fixture.ts";
 import { attachPlain, putEntry } from "./helpers/config-attach.ts";
-import { configMetaFingerprint } from "../src/sync/config-binding-record.ts";
+import { metaFingerprint } from "../src/db/vault-meta.ts";
 
 let counter = 0;
 function uniqueName() { return `cs-fail-${Date.now()}-${counter++}`; }
@@ -420,7 +420,7 @@ describe("the op runner records outcomes on the binding", () => {
         const last = cs.currentBinding()!.relation().lastOp!;
         expect(last.op).toBe("pull");
         expect(last.at).toBeGreaterThanOrEqual(before);
-        expect(last.against).toBe(await configMetaFingerprint(meta));
+        expect(last.against).toBe(await metaFingerprint(meta));
         expect((last.error as Error).message).toBe("Failed to fetch");
     });
 

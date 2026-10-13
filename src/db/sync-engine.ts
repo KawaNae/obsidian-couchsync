@@ -46,12 +46,27 @@ import { SyncSession } from "./sync/sync-session.ts";
 import { BackoffSchedule } from "./sync/backoff.ts";
 import { classifyError } from "./sync/errors.ts";
 import { BrowserVisibilityGate, ALWAYS_VISIBLE, type VisibilityGate } from "./visibility-gate.ts";
+import type { VaultMetaDoc } from "./vault-meta.ts";
 
 // ── Types ────────────────────────────────────────────────
 
 export type { EnsureChunksResult } from "./sync/pending-apply.ts";
 
 // ── Constants ────────────────────────────────────────────
+
+/**
+ * The vault setup's agreement with the remote DB, judged by its owner
+ * (`VaultBinding`). Both throw a terminal pause (`encryption-paused`) for a
+ * state the user has to act on.
+ */
+export interface RemoteAgreement {
+    /** Before every session's catchup. A transient failure is thrown as is
+     *  and retried by the supervisor. */
+    check(signal: AbortSignal): Promise<void>;
+    /** During a session, on a sign that the remote DB was re-created (see
+     *  `PullPipeline`). Throws nothing but the pause. */
+    recheckRoot(observed?: VaultMetaDoc | null): Promise<void>;
+}
 
 const HEALTH_CHECK_INTERVAL = 30000; // 30s
 
@@ -252,7 +267,9 @@ export class SyncEngine {
         private isMobile: boolean = false,
         auth?: AuthGate,
         clientFactory?: (s: CouchSyncSettings) => ICouchClient,
-        private preCatchupCheck?: (signal: AbortSignal) => Promise<void>,
+        /** The vault setup's agreement with the remote DB
+         *  (`VaultBinding`). Absent: sessions open unchecked (tests). */
+        private agreement?: RemoteAgreement,
         private stampVaultDrift?: () => Promise<void>,
     ) {
         this.auth = auth ?? new AuthGate();
@@ -601,10 +618,12 @@ export class SyncEngine {
             `transient error: kind=${detail.kind} code=${detail.code ?? "-"} msg=${detail.message}`,
         );
 
-        if (detail.kind === "auth" || detail.kind === "schema-mismatch") {
+        if (detail.kind === "auth" || detail.kind === "schema-mismatch"
+            || detail.kind === "encryption-paused") {
             // auth is user-gated; schema-mismatch (a doc shape this build can't
             // read, or a non-retriable EncryptionError = cipherVersion
-            // downgrade gate) is terminal. Both must halt immediately rather
+            // downgrade gate) and encryption-paused (the pull found the remote
+            // DB re-created) are terminal. All must halt immediately rather
             // than burn the 10s transient grace window — enterError handles
             // each terminal class.
             this.enterError(detail);
@@ -778,8 +797,8 @@ export class SyncEngine {
         const gen = this.lifecycleGeneration;
         this.openingSession = true;
         try {
-            if (this.preCatchupCheck) {
-                await this.preCatchupCheck(new AbortController().signal);
+            if (this.agreement) {
+                await this.agreement.check(new AbortController().signal);
             }
         } catch (e) {
             this.openingSession = false;
@@ -825,6 +844,7 @@ export class SyncEngine {
             probeUnpushed: (path) => this.probeUnpushed(path),
             handleLocalDbError: (e, ctx) => this.handleLocalDbError(e, ctx),
             onTransientError: (err) => this.handleTransientError(err),
+            recheckRoot: async (observed) => { await this.agreement?.recheckRoot(observed); },
             visibility: this.visibility,
         });
         this.session = session;

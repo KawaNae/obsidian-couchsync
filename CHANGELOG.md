@@ -17,6 +17,21 @@ All notable changes to obsidian-couchsync.
   checking the passphrase, so a missing passphrase disabled Live Sync
   although nothing had been touched. A second Init or Clone while one runs,
   and a run while the server rejects the credentials, are refused.
+- **A device stops syncing with a vault database that another device's Init
+  re-created.** A device still set up against the old database kept its live
+  sync running and could pull the new database's documents into its own
+  vault, or push its documents into the new one — encrypted with the old key,
+  which no other device can read. Each Init now writes a new generation id
+  into `vault:meta`, first, right after re-creating the database. Every
+  device remembers the `vault:meta` its last Init or Clone was set up with
+  and compares it when sync starts, and during live sync whenever the pull
+  sees `vault:meta` change, a document that does not decrypt, or the
+  database's sequence go backwards. On a difference, sync pauses before
+  anything of the new database is applied, and Vault Sync (Step 3) says to
+  run Clone. Existing setups need no action: a device set up before this
+  release takes the server's `vault:meta` as its own the first time sync
+  starts. Init and Config Create also wait until the re-created database
+  answers, instead of failing when CouchDB was still removing the old one.
 - **Clone of an encrypted vault works when Step 1 has encryption off.** Step 1
   says the remote's encryption is detected on Clone, but the pull applied the
   decrypt layer only when Step 1's switch was on, so such a Clone failed

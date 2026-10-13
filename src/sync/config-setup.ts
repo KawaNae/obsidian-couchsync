@@ -109,10 +109,8 @@ export class ConfigSetupService {
         // 4. Wipe remote. DELETE /<db> + PUT /<db> — true rev-tree reset so
         //    the next push lands at rev=1- instead of stacking on top.
         //    Requires admin permission; tolerates 404 (DB already gone).
-        onProgress("Destroying remote config database...");
-        await remoteCouch.destroyRemote(client, signal);
         onProgress("Recreating remote config database...");
-        await client.ensureDb(signal);
+        await remoteCouch.recreateRemote(client, signal);
 
         // 5. Pin the crypto root: config:meta is the FIRST and ONLY write
         //    after ensureDb, so the window in which the remote config DB
