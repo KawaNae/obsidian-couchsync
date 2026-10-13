@@ -32,7 +32,8 @@ export type ConfigCreatePreview = (
     }
     /** The DB does not exist on the server (404). */
     | { kind: "missing" }
-    /** The server could not be read; `message` says why. */
+    /** The server could not be read; `message` says why, as a sentence
+     *  (`describeError`). */
     | { kind: "unreadable"; message: string }
 ) & {
     /** The binding (`configBindingKey`) this preview was read for; null when
@@ -112,8 +113,8 @@ export function describeCreateConfirm(
             server = "On the server now: the database does not exist yet. Create makes it.";
             break;
         case "unreadable":
-            server = `The server could not be read (${p.message}), so what Create would ` +
-                "delete is unknown.";
+            server = "The server could not be read, so what Create would delete is " +
+                `unknown. ${p.message}`;
             break;
     }
 

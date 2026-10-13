@@ -126,7 +126,7 @@ describe("ConfigSync — failures are surfaced, never swallowed", () => {
                 kind: "not-configured",
             });
             expect(errorLogs()).toEqual([
-                expect.stringMatching(/Config Push — Config Push failed: Config sync is not configured/),
+                "Config Push failed — Config sync is not configured — apply a config database name in Step 2.",
             ]);
         });
 
@@ -137,7 +137,7 @@ describe("ConfigSync — failures are surfaced, never swallowed", () => {
             await expect(cs.pull()).rejects.toMatchObject({ kind: "not-configured" });
             const logs = errorLogs();
             expect(logs).toHaveLength(1);
-            expect(logs[0]).toMatch(/Config Pull failed: Config database "config-test" is not active/);
+            expect(logs[0]).toMatch(/^Config Pull failed — Config database "config-test" is not active/);
             expect(logs[0]).toMatch(/Apply the name again/);
         });
 
@@ -148,7 +148,7 @@ describe("ConfigSync — failures are surfaced, never swallowed", () => {
                 kind: "setup-interrupted",
                 message: expect.stringMatching(/run Create in Step 3/),
             });
-            expect(errorLogs()[0]).toMatch(/Config Pull failed: Create was interrupted/);
+            expect(errorLogs()[0]).toMatch(/^Config Pull failed — Create was interrupted/);
         });
 
         it("a Step 1 codec change is not a failure: Push runs with the joined codec, nothing is logged as an error", async () => {
@@ -183,7 +183,7 @@ describe("ConfigSync — failures are surfaced, never swallowed", () => {
 
             await expect(cs.push()).rejects.toMatchObject({ kind: "busy" });
             expect(errorLogs()).toEqual([
-                expect.stringMatching(/Config Push failed: Another config operation is already in progress/),
+                expect.stringMatching(/^Config Push failed — Another config operation is already in progress/),
             ]);
             // The rejected op must not have released the running op's lock.
             expect(cs.isInflight()).toBe(true);
@@ -205,19 +205,32 @@ describe("ConfigSync — failures are surfaced, never swallowed", () => {
             expect(err).toBeInstanceOf(ConfigNotReadyError);
             expect(err.kind).toBe("key-missing");
             expect(err.message).not.toMatch(/Create|Init/);
-            expect(errorLogs()[0]).toMatch(/Config Pull failed: Config DB is encrypted, but its key/);
+            expect(errorLogs()[0]).toMatch(/^Config Pull failed — Config DB is encrypted, but its key/);
             expect(bridge.notifyTransient).not.toHaveBeenCalled();
         });
     });
 
     describe("transport failures are still reported", () => {
-        it("an unreachable server lands in the log and nudges the bridge", async () => {
+        it("an unreachable server is reported with its cause and fix, keeps the raw error, and nudges the bridge", async () => {
             const remote = new FakeCouchClient();
             remote.info = async () => { throw new TypeError("Failed to fetch"); };
             const cs = await makeSync(() => remote);
             await expect(cs.pull()).rejects.toThrow(/Failed to fetch/);
-            expect(errorLogs()[0]).toMatch(/Config Pull failed: Failed to fetch/);
+            const line = errorLogs()[0];
+            expect(line).toMatch(/^Config Pull failed — The server could not be reached/);
+            expect(line).toMatch(/server URI in the CouchDB tab/);
+            expect(line).toMatch(/\(Failed to fetch\)$/);
             expect(bridge.notifyTransient).toHaveBeenCalledTimes(1);
+        });
+
+        it("an auth latch refusal names the CouchDB tab, not Vault Sync", async () => {
+            auth.raise(401, "bad creds");
+            const cs = await makeSync(() => new FakeCouchClient());
+            await expect(cs.pull()).rejects.toMatchObject({ name: "AuthBlockedError" });
+            const line = errorLogs()[0];
+            expect(line).toMatch(/^Config Pull failed — The server rejected the credentials \(401\)/);
+            expect(line).toMatch(/CouchDB tab, then press Test/);
+            expect(line).not.toMatch(/Vault Sync/);
         });
     });
 });

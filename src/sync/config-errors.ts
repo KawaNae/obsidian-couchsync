@@ -55,12 +55,16 @@ export type ConfigNotReadyKind =
     | "key-missing";
 
 export class ConfigNotReadyError extends Error {
+    /** The message is written for the user (cause and fix), so it is also
+     *  the `userMessage` `describeError` shows as is. */
+    readonly userMessage: string;
     constructor(
         readonly kind: ConfigNotReadyKind,
         message: string,
     ) {
         super(message);
         this.name = "ConfigNotReadyError";
+        this.userMessage = message;
     }
 }
 
@@ -96,7 +100,12 @@ export function configNotReady(
     const msg = ((): string => {
         switch (kind) {
             case "not-configured":
-                return "Config sync is not configured — apply a config database name in Step 2.";
+                // With a DB name: the name is applied, but its local store
+                // could not be opened (the cause was logged when it failed).
+                return ctx.db
+                    ? `Config database ${db} is not active on this device — its local ` +
+                        "store could not be opened (see the log). Apply the name again in Step 2."
+                    : "Config sync is not configured — apply a config database name in Step 2.";
             case "busy":
                 return "Another config operation is already in progress. " +
                     "Wait for it to finish or cancel it first.";

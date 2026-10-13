@@ -975,7 +975,7 @@ export default class CouchSyncPlugin extends Plugin {
             if (this.settings.encryptionEnabled) {
                 this.vaultCryptoProvider = undefined;
             }
-            progress.fail(`Init failed: ${e?.message ?? e}`);
+            progress.fail(e);
             throw e;
         }
     }
@@ -1067,7 +1067,7 @@ export default class CouchSyncPlugin extends Plugin {
             if (meta) {
                 this.vaultCryptoProvider = undefined;
             }
-            progress.fail(`Clone failed: ${e?.message ?? e}`);
+            progress.fail(e);
             throw e;
         }
     }

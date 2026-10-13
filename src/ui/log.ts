@@ -10,6 +10,12 @@
  *   logWarn(msg)    → buffer(warn)  + console(always)
  *   logError(msg)   → buffer(error) + console(always)  + notice(always)
  *   notify(msg, d?) → buffer(info)  + notice(always)   — user-facing
+ *
+ * The "CouchSync: " prefix that tells the user which plugin a notice comes
+ * from is added at the exit — the notice function the host passes to
+ * `initLog` — not in the message. Callers pass the bare text; a prefix in
+ * the text shows twice on the notice. Code that creates an Obsidian Notice
+ * directly (outside these functions) adds the prefix itself.
  */
 
 // ── Types ────────────────────────────────────────────────

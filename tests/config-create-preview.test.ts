@@ -58,8 +58,10 @@ describe("describeCreateConfirm", () => {
     });
 
     it("an unreadable server is reported, with no count", () => {
-        const text = describeCreateConfirm("cfg", { kind: "unreadable", message: "timeout", ...K }, ENC3);
-        expect(text).toMatch(/could not be read \(timeout\)/);
+        const text = describeCreateConfirm(
+            "cfg", { kind: "unreadable", message: "The server did not respond in time.", ...K }, ENC3,
+        );
+        expect(text).toMatch(/could not be read, so what Create would delete is unknown\. The server did not respond in time\./);
         expect(text).not.toMatch(/document\(s\)/);
         expect(text).not.toMatch(/\d+ document/);
     });

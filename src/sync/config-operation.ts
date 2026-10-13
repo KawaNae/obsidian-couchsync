@@ -139,7 +139,7 @@ export class ConfigOperation {
 
         // 1. Auth latch.
         if (this.deps.auth.isBlocked()) {
-            throw new Error("Auth blocked — fix credentials in Vault Sync first");
+            throw this.deps.auth.blockedError();
         }
 
         // 2. Visibility — wait until visible, or until cancelled. Never
@@ -149,12 +149,7 @@ export class ConfigOperation {
 
         // 3. Build client. A null return means config sync isn't configured.
         const client = this.deps.makeClient();
-        if (client === null) {
-            throw new ConfigNotReadyError(
-                "not-configured",
-                "Config sync not configured (couchdbConfigDbName is empty)",
-            );
-        }
+        if (client === null) throw configNotReady("not-configured");
 
         // 4. Reachability probe with a short timeout. Bypasses the 30s
         //    DEFAULT_TIMEOUT, so an unreachable server surfaces in ~15s

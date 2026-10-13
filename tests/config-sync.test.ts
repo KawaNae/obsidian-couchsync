@@ -434,7 +434,7 @@ describe("ConfigSync", () => {
             // Seed a doc so push() reaches the remote phase
             vault.addFile(".obsidian/app.json", "{}");
 
-            await expect(cs.push()).rejects.toThrow(/Auth blocked/);
+            await expect(cs.push()).rejects.toMatchObject({ name: "AuthBlockedError" });
         });
     });
 
@@ -493,7 +493,7 @@ describe("ConfigSync", () => {
         it("the auth latch still comes first", async () => {
             settings.configCompressionEnabled = true;
             auth.raise(401, "bad creds");
-            await expect(bound.push()).rejects.toThrow(/Auth blocked/);
+            await expect(bound.push()).rejects.toMatchObject({ name: "AuthBlockedError" });
         });
     });
 });

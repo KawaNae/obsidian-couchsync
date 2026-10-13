@@ -31,6 +31,7 @@ import { chunkListsEqual } from "./chunk-equality.ts";
 import type { ICouchClient } from "../db/interfaces.ts";
 import { makeCouchClient } from "../db/couch-client.ts";
 import { logError, logWarn } from "../ui/log.ts";
+import { describeError } from "../ui/describe-error.ts";
 import { unsafeVaultPathReason } from "../utils/path.ts";
 import { classifyConfigPath } from "./config-policy/classify.ts";
 import {
@@ -51,7 +52,6 @@ import {
     ConfigPullWriter,
     type ConfigConcurrentEntry,
 } from "../db/sync/config-pull-writer.ts";
-import { SchemaVersionMismatchError } from "../db/sync/schema-gate.ts";
 import {
     ConfigPushPipeline,
     type ConfigPushDivergence,
@@ -63,7 +63,6 @@ import { fetchConfigMeta } from "../db/vault-meta.ts";
 import { classifyError } from "../db/sync/errors.ts";
 import { resolveConfigCodec } from "./config-codec-policy.ts";
 import {
-    ConfigNotReadyError,
     configNotReady,
     classifyConfigRemoteFailure,
     type ConfigRemoteFailure,
@@ -398,9 +397,9 @@ export class ConfigSync {
      *      probe, then (sync ops) the binding's preflight, which freezes the
      *      op's keys, and the codec wrap with them, then the body.
      *
-     * Every throw from 2–4 lands in `progress.fail` (Notice + error log) and
-     * is rethrown, so the settings tab's catch only has to restore its
-     * button.
+     * Every throw from 2–4 lands in `progress.fail` — the one place a config
+     * op's failure is worded (`describeError`), shown and logged — and is
+     * rethrown, so the settings tab's catch only has to restore its button.
      *
      * `mode`:
      *   - "sync": preflight + wrapped client (Push, Pull); the body
@@ -423,7 +422,7 @@ export class ConfigSync {
         if (this.inflight !== null || this.rebinding !== null) {
             // Nothing was started — the running op (if any) keeps its lock.
             const e = configNotReady("busy");
-            ConfigSync.reportFailure(label, progress, e);
+            progress.fail(e);
             throw e;
         }
         let op: ConfigOperation | null = null;
@@ -450,7 +449,7 @@ export class ConfigSync {
             });
             return await op.run((ctx) => body(ctx, progress, binding, keys));
         } catch (e) {
-            ConfigSync.reportFailure(label, progress, e);
+            progress.fail(e);
             throw e;
         } finally {
             this.inflight = null;
@@ -474,16 +473,6 @@ export class ConfigSync {
             return await fn(binding);
         } finally {
             this.inflight = null;
-        }
-    }
-
-    /** Terminal failure report for an op: closes the notice and writes the
-     *  error log (ProgressNotice.fail does both). */
-    private static reportFailure(label: string, progress: ProgressNotice, e: any): void {
-        if (e?.name === "AbortError") {
-            progress.fail(`${label} cancelled`);
-        } else {
-            progress.fail(`${label} failed: ${e?.message ?? e}`);
         }
     }
 
@@ -569,7 +558,7 @@ export class ConfigSync {
         const binding = this.binding;
         if (!binding) {
             return {
-                kind: "unreadable", message: "config sync is not active on this device",
+                kind: "unreadable", message: "Config sync is not active on this device.",
                 bindingKey: null,
             };
         }
@@ -577,7 +566,9 @@ export class ConfigSync {
         try {
             const raw = this.makeRawClient(binding);
             if (!raw) {
-                return { kind: "unreadable", message: "config sync is not configured", bindingKey };
+                return {
+                    kind: "unreadable", message: configNotReady("not-configured").message, bindingKey,
+                };
             }
             const quick = raw.withTimeout(CONFIG_TIMEOUTS.reachability);
             let docCount: number;
@@ -602,12 +593,12 @@ export class ConfigSync {
                 },
             };
         } catch (e: any) {
-            const failure = classifyConfigRemoteFailure(e);
+            const text = describeError(e).text;
             logWarn(
                 `CouchSync: reading config database "${binding.dbName}" before Create ` +
-                `failed (${failure.kind}): ${e?.message ?? e}`,
+                `failed: ${text}`,
             );
-            return { kind: "unreadable", message: failure.message, bindingKey };
+            return { kind: "unreadable", message: text, bindingKey };
         }
     }
 
@@ -662,8 +653,8 @@ export class ConfigSync {
             if (result.divergent.length > 0) {
                 const ok = await this.confirmPushDivergence(result.divergent);
                 if (!ok) {
-                    throw new Error(
-                        "Cancelled by user (concurrent edits detected)",
+                    throw abortError(
+                        "the divergent doc(s) were not overwritten; the others were pushed.",
                     );
                 }
                 progress.update("Resolving divergence (advancing vclocks)...");
@@ -708,20 +699,11 @@ export class ConfigSync {
                 signal: ctx.signal,
                 hasher: keys!.hasher,
             });
-            let result;
-            try {
-                result = await writer.run((msg) => progress.update(msg));
-            } catch (e: any) {
-                if (e instanceof SchemaVersionMismatchError) {
-                    // Remote ConfigDoc shape this build can't read — Create
-                    // (then Join on the other devices) required. Surface the error's own version-accurate
-                    // message via the operation's progress.fail path; the
-                    // host's findLegacyConfigDoc startup guard also catches
-                    // the local-side copy on next reload.
-                    throw new Error(e.userMessage);
-                }
-                throw e;
-            }
+            // A remote ConfigDoc shape this build cannot read throws
+            // SchemaVersionMismatchError, whose `userMessage` names the
+            // migration (Create, then Join on the other devices); it reaches
+            // progress.fail as is.
+            const result = await writer.run((msg) => progress.update(msg));
 
             if (result.concurrent.length > 0) {
                 this.notifyConcurrentPull(result.concurrent);
@@ -1083,12 +1065,7 @@ export class ConfigSync {
     private requireBinding(): ConfigBinding {
         if (this.binding) return this.binding;
         const name = this.getSettings().couchdbConfigDbName;
-        if (!name) throw configNotReady("not-configured");
-        throw new ConfigNotReadyError(
-            "not-configured",
-            `Config database "${name}" is not active on this device — its local store ` +
-            "could not be opened (see the log). Apply the name again in Step 2.",
-        );
+        throw configNotReady("not-configured", name ? { db: name } : {});
     }
 
     /** Quiet remote config path list for the settings filter tree's "on
@@ -1225,8 +1202,11 @@ export class ConfigSync {
     }
 }
 
-function abortError(): Error {
+/** A cancellation. `userMessage`, when given, says what the cancel left
+ *  behind; ProgressNotice shows it after "<label> cancelled". */
+function abortError(userMessage?: string): Error {
     const e: any = new Error("The operation was aborted.");
     e.name = "AbortError";
+    if (userMessage) e.userMessage = userMessage;
     return e;
 }

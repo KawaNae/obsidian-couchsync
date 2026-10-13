@@ -7,6 +7,14 @@
  *
  * No I/O, no side effects. The single entry point SyncEngine / pipelines
  * call when an error needs to be classified.
+ *
+ * Convention for domain errors: an error that knows what went wrong in the
+ * user's terms (a config precondition, a schema mismatch, a blocked auth
+ * latch, a local DB failure) carries the sentence to show as
+ * `userMessage: string`. This classifier stays about transport and
+ * retry; turning a failure into text is `describeError`
+ * (src/ui/describe-error.ts), which prefers `userMessage` and otherwise
+ * words the kind classified here.
  */
 
 import type { SyncErrorDetail, SyncErrorKind } from "../reconnect-policy.ts";

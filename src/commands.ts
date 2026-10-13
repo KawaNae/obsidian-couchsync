@@ -1,6 +1,7 @@
 import { Notice } from "obsidian";
 import type CouchSyncPlugin from "./main.ts";
 import { ProgressNotice } from "./ui/notices.ts";
+import { UserFacingError } from "./ui/describe-error.ts";
 import { ConsistencyReportModal } from "./ui/consistency-report-modal.ts";
 import { ChunkConsistencyReportModal } from "./ui/chunk-consistency-report-modal.ts";
 import { totalDiscrepancies } from "./sync/reconciler.ts";
@@ -66,8 +67,8 @@ export function registerCommands(plugin: CouchSyncPlugin): void {
                 new ConsistencyReportModal(plugin.app, report, async () => {
                     await plugin.reconciler.reconcile("manual-repair");
                 }).open();
-            } catch (e: any) {
-                progress.done(`Verify failed: ${e.message ?? e}`);
+            } catch (e) {
+                progress.fail(e);
             }
         },
     });
@@ -101,8 +102,8 @@ export function registerCommands(plugin: CouchSyncPlugin): void {
                     `referenced ${result.referencedChunks}, ` +
                     `deleted ${result.deletedChunks} orphan(s).`,
                 );
-            } catch (e: any) {
-                progress.fail(`Config GC failed: ${e?.message ?? e}`);
+            } catch (e) {
+                progress.fail(e);
             }
         },
     });
@@ -112,11 +113,7 @@ export function registerCommands(plugin: CouchSyncPlugin): void {
         name: "Reconnect sync",
         callback: async () => {
             if (plugin.auth.isBlocked()) {
-                notify(
-                    "CouchSync: auth is blocked. Update credentials in " +
-                        "Vault Sync (Step 1) before reconnecting.",
-                    8000,
-                );
+                notify(plugin.auth.blockedError().userMessage, 8000);
                 return;
             }
             if (plugin.settings.connectionState !== "syncing") {
@@ -190,9 +187,9 @@ export async function runChunkConsistencyReport(
                 // gate; if the vault diverged meanwhile, abort rather than repair.
                 const fresh = await analyze();
                 if (fresh.state !== "converged") {
-                    repairProgress.fail(
-                        "Repair aborted — vault not converged. Let sync settle and retry.",
-                    );
+                    repairProgress.fail(new UserFacingError(
+                        "The vault is not converged, so nothing was repaired. Let sync settle and retry.",
+                    ));
                     return fresh;
                 }
                 const plan = planFromReport(fresh.report);
@@ -210,9 +207,9 @@ export async function runChunkConsistencyReport(
                 if (repairResult.failed.length === 0) {
                     repairProgress.done(`Repair — ${summary}`);
                 } else {
-                    repairProgress.fail(
-                        `Repair — ${summary}, ${repairResult.failed.length} failed`,
-                    );
+                    repairProgress.fail(new UserFacingError(
+                        `${summary}, ${repairResult.failed.length} failed (see the log).`,
+                    ));
                     logWarn(
                         `CouchSync: chunk repair failures: ${
                             repairResult.failed
@@ -250,7 +247,7 @@ export async function runChunkConsistencyReport(
                 return next;
             },
         ).open();
-    } catch (e: any) {
-        progress.fail(`Chunk report failed: ${e?.message ?? e}`);
+    } catch (e) {
+        progress.fail(e);
     }
 }
