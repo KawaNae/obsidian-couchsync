@@ -8,8 +8,9 @@ All notable changes to obsidian-couchsync.
 
 - **The mobile status indicator stays visible while the on-screen keyboard
   is open.** It kept its distance from the bottom of the screen, behind the
-  keyboard. It now rises by the keyboard's height, and never below the top
-  of Obsidian's editing toolbar, and goes back down when the keyboard closes.
+  keyboard. It now rises by the keyboard's height, never below the top of
+  Obsidian's editing toolbar nor above the top of the screen, and goes back
+  down when the keyboard closes.
 - **Vault Init and Clone failures are always reported, and a failure before
   anything is changed leaves the setup as it was.** A Clone that failed while
   reading `vault:meta` or unlocking the vault (an unreachable server, a

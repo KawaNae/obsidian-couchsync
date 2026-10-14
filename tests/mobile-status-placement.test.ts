@@ -54,7 +54,7 @@ function keyboardEvent(name: string, keyboardHeight?: number): Event {
 
 describe("MobileStatusPlacement", () => {
     let win: FakeWindow;
-    let el: { style: Record<string, string> };
+    let el: { style: Record<string, string>; getBoundingClientRect: () => { height: number } };
     let position: MobileStatusPosition;
     let placement: MobileStatusPlacement;
 
@@ -62,7 +62,7 @@ describe("MobileStatusPlacement", () => {
         vi.stubGlobal("MutationObserver", FakeObserver);
         FakeObserver.live.clear();
         win = new FakeWindow();
-        el = { style: {} };
+        el = { style: {}, getBoundingClientRect: () => ({ height: 18 }) };
         position = { align: "left", bottom: 50, offset: 8 };
         placement = new MobileStatusPlacement(
             el as unknown as HTMLElement,
@@ -114,6 +114,29 @@ describe("MobileStatusPlacement", () => {
         win.toolbarTop = 900 - 388;
         win.dispatchEvent(keyboardEvent("keyboardDidShow", 336));
         expect(el.style.bottom).toBe("416px");
+    });
+
+    it("keeps the status inside the screen's top when the settings' bottom and the keyboard reach past it", () => {
+        position = { ...position, bottom: 600 };
+        placement.apply();
+        expect(el.style.bottom).toBe("600px");
+
+        // 600 + 336 would put the status 54px above the screen; it stops
+        // 4px below the top: 900 - 4 - 18.
+        win.dispatchEvent(keyboardEvent("keyboardWillShow", 336));
+        expect(el.style.bottom).toBe("878px");
+
+        win.dispatchEvent(keyboardEvent("keyboardDidHide", 0));
+        expect(el.style.bottom).toBe("600px");
+    });
+
+    it("keeps the status below the visual viewport's top when that is scrolled down", () => {
+        position = { ...position, bottom: 600 };
+        win.visualViewport.offsetTop = 100;
+        win.visualViewport.height = 500;
+        win.visualViewport.dispatchEvent(new Event("resize"));
+        // 900 - 100 - 4 - 18
+        expect(el.style.bottom).toBe("778px");
     });
 
     it("stops following the keyboard and the toolbar on stop", () => {

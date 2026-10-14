@@ -1,8 +1,8 @@
 import type { MobileStatusPosition } from "../settings.ts";
 import { VirtualKeyboard } from "./virtual-keyboard.ts";
 
-/** Space kept between the status and the top of Obsidian's editing toolbar. */
-const TOOLBAR_GAP = 4;
+/** Space kept between the status and what it must not cross: the editing toolbar's top, the screen's top. */
+const EDGE_GAP = 4;
 
 /**
  * Places the floating mobile status (a `position: fixed` element) where the
@@ -16,6 +16,11 @@ const TOOLBAR_GAP = 4;
  * toolbar's opening and closing with a class on the body
  * (`mod-toolbar-open`), which is watched as well as the keyboard, since the
  * toolbar may be laid out after the keyboard's events.
+ *
+ * The status is there to be seen, so it never goes above the top of what is
+ * visible either (the window, or the visual viewport's top where that is
+ * lower), whether the keyboard is open or not: a large `bottom` raised by the
+ * keyboard would otherwise put it off the screen.
  */
 export class MobileStatusPlacement {
     private readonly keyboard: VirtualKeyboard;
@@ -50,13 +55,21 @@ export class MobileStatusPlacement {
     apply(): void {
         const m = this.getPosition();
         const toolbar = this.toolbarCover();
-        const bottom = Math.max(
+        const wanted = Math.max(
             m.bottom + this.keyboard.height(),
-            toolbar > 0 ? toolbar + TOOLBAR_GAP : 0,
+            toolbar > 0 ? toolbar + EDGE_GAP : 0,
         );
+        const bottom = Math.min(wanted, this.highestBottom());
         this.el.style.bottom = `${bottom}px`;
         this.el.style.left = m.align === "left" ? `${m.offset}px` : "";
         this.el.style.right = m.align === "right" ? `${m.offset}px` : "";
+    }
+
+    /** The largest `bottom` that keeps the whole status below the visible top. */
+    private highestBottom(): number {
+        const visibleTop = Math.max(0, this.win.visualViewport?.offsetTop ?? 0);
+        const height = this.el.getBoundingClientRect().height;
+        return Math.max(0, Math.floor(this.win.innerHeight - visibleTop - EDGE_GAP - height));
     }
 
     /** CSS px from the window's bottom up to the editing toolbar's top; 0 without one. */
