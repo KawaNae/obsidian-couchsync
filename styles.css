@@ -212,6 +212,37 @@
     color: var(--text-muted);
 }
 
+/* ─── Partly selected checkbox ──────────────────────────────
+   Obsidian draws only :checked, so an indeterminate box (a file or a group
+   with some of its items selected) would look empty. Fill it like a checked
+   box and draw a dash instead of the tick. */
+
+.cs-push-file input[type="checkbox"]:indeterminate,
+.cs-config-tree input[type="checkbox"]:indeterminate {
+    background-color: var(--checkbox-color);
+    border-color: var(--checkbox-color);
+}
+
+.cs-push-file input[type="checkbox"]:indeterminate::after,
+.cs-config-tree input[type="checkbox"]:indeterminate::after {
+    content: "";
+    position: absolute;
+    top: calc(50% - 1px);
+    left: 20%;
+    width: 60%;
+    height: 2px;
+    border-radius: 1px;
+    background-color: var(--checkbox-marker-color);
+}
+
+@media (hover: hover) {
+    .cs-push-file input[type="checkbox"]:indeterminate:hover,
+    .cs-config-tree input[type="checkbox"]:indeterminate:hover {
+        background-color: var(--checkbox-color-hover);
+        border-color: var(--checkbox-color-hover);
+    }
+}
+
 /* ─── Config Push list ────────────────────────────────────── */
 
 .cs-push-list {
