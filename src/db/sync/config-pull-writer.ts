@@ -1,43 +1,36 @@
 /**
- * ConfigPullWriter — incremental `_changes`-based pull for ConfigSync.
- *
- * Replaces the snapshot-style `pullByPrefix` (`remote-couch.ts`) with
- * a cursor-driven loop:
+ * ConfigPullWriter — copies the server's config docs into the local config
+ * DB, from the `_changes` cursor onward.
  *
  *   loop:
- *     batch = client.changes({since=lastPullSeq, limit, include_docs}, signal)
- *     classify(batch):
- *       deleted          → tombstone in local
- *       vclock-equal     → convergedSkip (silent)
- *       resolver:keep    → skip
- *       resolver:concurrent → divergent[]; caller drives the modal
- *       else             → accepted
- *     commit accepted + deletes + new pullSeq in a single runWriteTx
- *     break when last_seq is unchanged AND batch is empty (= caught up)
+ *     batch = client.changes({since=pullSeq, limit, include_docs}, signal)
+ *     land the batch's docs, tombstones and the new pullSeq in one tx
+ *     fetch the chunks the landed docs reference
+ *     break when caught up
  *
- * Mirror of `PullWriter` (vault sync), but without chunk handling and
- * without the `applyPullWrite` callback — config writes go to filesystem
- * via the separate `ConfigSync.write()` step, not inline per-doc.
+ * The local config DB doc is the copy of the shared state, so the remote
+ * doc always replaces it: nothing is classified here. Comparing the shared
+ * version with the disk is Pull's next step (`config-reconcile.ts`), which
+ * also moves lastSynced. A remote deletion removes the doc and its
+ * lastSynced: the path has no shared version any more, and a file still on
+ * disk is new to the shared state.
  *
  * Atomicity: each batch lands docs + tombstones + new cursor in one tx.
  * Crash mid-loop leaves the next session at the last successful batch's
- * cursor, with no half-applied state. Mirrors the vault PullWriter.
+ * cursor, with no half-applied state.
  */
 
 import type { ConfigDoc, CouchSyncDoc } from "../../types.ts";
 import { isConfigDoc, CONFIG_SCHEMA_VERSION } from "../../types.ts";
 import { configPathFromId, isConfigDocId } from "../../types/doc-id.ts";
 import { stripRev } from "../../utils/doc.ts";
-import { compareVC, mergeVC } from "../../sync/vector-clock.ts";
-import { chunkListsEqual } from "../../sync/chunk-equality.ts";
 import type { ICouchClient } from "../interfaces.ts";
-import type { ChangesResult } from "../interfaces.ts";
 import type { ConfigLocalDB } from "../config-local-db.ts";
-import type { ConflictResolver } from "../../conflict/conflict-resolver.ts";
 import { fetchMissingChunks } from "../chunk-attachment.ts";
 import type { ChunkHasher } from "../chunker.ts";
 import { assertSchemaVersion } from "./schema-gate.ts";
-import { logDebug, logInfo, logWarn } from "../../ui/log.ts";
+import { sameVersion } from "../../sync/config-reconcile.ts";
+import { logInfo, logWarn } from "../../ui/log.ts";
 import {
     ConfigLastSynced,
     configLastSyncedKey,
@@ -62,27 +55,13 @@ function seqNumeric(seq: number | string): number {
  *  beyond any realistic vault. */
 const MAX_PULL_BATCHES = 1000;
 
-export interface ConfigConcurrentEntry {
-    path: string;
-    localDoc: ConfigDoc;
-    remoteDoc: ConfigDoc;
-}
-
 export interface ConfigPullStats {
-    accepted: number;
-    convergedSkip: number;
-    keepLocal: number;
+    /** Docs whose shared version this Pull changed. A doc the store
+     *  already held in that version (this device's own Push) is copied
+     *  but not counted. */
+    received: number;
+    /** Remote deletions of docs the store held. */
     deleted: number;
-    concurrent: number;
-    /** Chunks-equal but vclocks drifted — committed with mergeVC,
-     *  no false-positive concurrent modal (vault PullWriter has the same
-     *  counter under the name `vclockOnlyDriftCount`). */
-    vclockOnlyDrift: number;
-}
-
-export interface ConfigPullResult {
-    stats: ConfigPullStats;
-    concurrent: ConfigConcurrentEntry[];
 }
 
 export interface ConfigPullWriterDeps {
@@ -90,7 +69,6 @@ export interface ConfigPullWriterDeps {
     client: ICouchClient;
     checkpoints: ConfigCheckpoints;
     lastSynced: ConfigLastSynced;
-    getConflictResolver: () => ConflictResolver | undefined;
     signal: AbortSignal;
     /** Optional hasher to verify pulled chunk bodies hash to their id
      *  (the inverse of the mint in `splitIntoChunks`). When unset, chunks
@@ -103,17 +81,11 @@ export class ConfigPullWriter {
 
     /**
      * Drain remote `_changes` from the current pullSeq cursor onward,
-     * landing each batch atomically. Returns aggregate stats and the
-     * full list of concurrent entries collected across all batches —
-     * the caller decides whether to surface a modal or drop them.
+     * landing each batch atomically.
      */
-    async run(onProgress?: (msg: string) => void): Promise<ConfigPullResult> {
+    async run(onProgress?: (msg: string) => void): Promise<ConfigPullStats> {
         await this.deps.lastSynced.ensureLoaded();
-        const stats: ConfigPullStats = {
-            accepted: 0, convergedSkip: 0, keepLocal: 0, deleted: 0,
-            concurrent: 0, vclockOnlyDrift: 0,
-        };
-        const concurrent: ConfigConcurrentEntry[] = [];
+        const stats: ConfigPullStats = { received: 0, deleted: 0 };
 
         let totalReceived = 0;
         // One-shot guard for the seq-regression self-heal. A healthy
@@ -163,8 +135,7 @@ export class ConfigPullWriter {
                 // Durable reset: persist pullSeq=0 to disk, not just the
                 // in-memory cursor. A crash after a memory-only reset would leave
                 // the high cursor on disk and re-trigger this regression (and a
-                // full re-pull) every session. saveEmptyPullBatch writes
-                // META_CONFIG_PULL_SEQ in its own tx and advances the cursor.
+                // full re-pull) every session.
                 await this.deps.checkpoints.saveEmptyPullBatch(0);
                 continue;
             }
@@ -177,28 +148,15 @@ export class ConfigPullWriter {
             }
             totalReceived += batch.results.length;
 
-            // `didSeqReset` is true once the remote-recreated self-heal has
-            // fired this run: the subsequent re-pull is against a fresh
-            // authority, so vclock ties are adopted (take-remote) rather than
-            // surfaced — see classifySyncRelation `recreateAuthority`.
-            const partition = await this.classify(batch, didSeqReset);
+            const { docs, deleted } = this.collect(batch.results);
+            const news = await this.countNew(docs, deleted);
+            await this.commitBatch(docs, deleted, batch.last_seq);
+            stats.received += news.received;
+            stats.deleted += news.deleted;
 
-            await this.commitBatch(partition.accepted, partition.deleted, batch.last_seq);
-
-            stats.accepted += partition.accepted.length;
-            stats.deleted += partition.deleted.length;
-            stats.convergedSkip += partition.convergedSkipCount;
-            stats.keepLocal += partition.keepLocalCount;
-            stats.concurrent += partition.concurrent.length;
-            stats.vclockOnlyDrift += partition.vclockOnlyDriftCount;
-            concurrent.push(...partition.concurrent);
-
-            // No advance + no docs → server is at our cursor, done.
-            if (batch.last_seq === since && partition.accepted.length === 0
-                && partition.deleted.length === 0) {
+            if (batch.last_seq === since && docs.length === 0 && deleted.length === 0) {
                 break;
             }
-
             // Server returned fewer than the limit — almost certainly the
             // tail of changes. One more poll only if last_seq advanced.
             if (batch.results.length < PULL_BATCH_LIMIT
@@ -207,51 +165,23 @@ export class ConfigPullWriter {
             }
         }
 
-        if (stats.accepted + stats.deleted > 0 || stats.convergedSkip > 0
-            || stats.concurrent > 0 || stats.keepLocal > 0
-            || stats.vclockOnlyDrift > 0) {
-            const parts: string[] = [];
-            if (stats.accepted) parts.push(`${stats.accepted} accepted`);
-            if (stats.deleted) parts.push(`${stats.deleted} deleted`);
-            if (stats.convergedSkip) parts.push(`${stats.convergedSkip} converged`);
-            if (stats.keepLocal) parts.push(`${stats.keepLocal} keep-local`);
-            if (stats.vclockOnlyDrift) parts.push(`${stats.vclockOnlyDrift} silent-merge`);
-            if (stats.concurrent) parts.push(`${stats.concurrent} concurrent`);
-            logInfo(`Config Pull: ${parts.join(", ")}`);
+        if (stats.received + stats.deleted > 0) {
+            logInfo(`Config Pull: ${stats.received} received, ${stats.deleted} deleted`);
         }
-
-        return { stats, concurrent };
+        return stats;
     }
 
-    // ── classify ────────────────────────────────────────
-
-    private async classify(
-        batch: ChangesResult<ConfigDoc>,
-        recreateAuthority: boolean,
-    ): Promise<{
-        accepted: ConfigDoc[];
+    private collect(rows: Array<{ id: string; deleted?: boolean; doc?: ConfigDoc }>): {
+        docs: ConfigDoc[];
         deleted: string[];
-        concurrent: ConfigConcurrentEntry[];
-        convergedSkipCount: number;
-        keepLocalCount: number;
-        vclockOnlyDriftCount: number;
-    }> {
-        const accepted: ConfigDoc[] = [];
+    } {
+        const docs: ConfigDoc[] = [];
         const deleted: string[] = [];
-        const concurrent: ConfigConcurrentEntry[] = [];
-        let convergedSkipCount = 0;
-        let keepLocalCount = 0;
-        let vclockOnlyDriftCount = 0;
-        const resolver = this.deps.getConflictResolver();
-
-        for (const row of batch.results) {
-            // Filter to config docs. The config DB also carries chunk
-            // docs (v0.26+); their bodies arrive lazily through
-            // `ensureChunks` and are skipped here. Anything else in
-            // the config DB id space is unexpected — defend against
-            // schema drift and drop.
+        for (const row of rows) {
+            // The config DB also carries chunk docs; their bodies arrive
+            // through `ensureChunks`. Anything else in the id space is
+            // unexpected and dropped.
             if (!isConfigDocId(row.id)) continue;
-
             if (row.deleted) {
                 deleted.push(row.id);
                 continue;
@@ -259,169 +189,61 @@ export class ConfigPullWriter {
             if (!row.doc) continue;
             const remoteDoc = stripRev(row.doc) as ConfigDoc;
             if (!isConfigDoc(remoteDoc)) continue;
-
-            // Schema-version gate. v0.25
-            // shipped ConfigDoc with `data: string` and `schemaVersion: 2`;
-            // v0.26 expects `chunks: string[]` + `schemaVersion: 3`. Mixing
-            // shapes silently corrupts disk writes, so we abort loudly
-            // and route the host to the migration flow. Shared with the
-            // vault pull path via schema-gate.ts.
+            // A ConfigDoc shape this build cannot read aborts the pull
+            // loudly (mixing shapes corrupts disk writes); the error names
+            // the migration. Shared with the vault pull path.
             assertSchemaVersion(remoteDoc, CONFIG_SCHEMA_VERSION, "config");
-
-            const localDoc = (await this.deps.db.get(row.id)) as ConfigDoc | null;
-            if (localDoc) {
-                const localVC = localDoc.vclock ?? {};
-                const remoteVC = remoteDoc.vclock ?? {};
-                // Content-truthful converged skip: skip ONLY when this is
-                // provably the classifier's `identical` case — vclock equal AND
-                // chunks equal AND deleted matches. A vclock TIE with differing
-                // content is the config-Create stale-collision anomaly and MUST
-                // fall through to the resolver (→ true-divergent → concurrent),
-                // not be silently kept — otherwise a first push at vclock {1}
-                // never reaches peers. The predicate is a strict subset of
-                // `identical`, so it can never disagree with classifySyncRelation.
-                if (Object.keys(localVC).length > 0
-                    && compareVC(localVC, remoteVC) === "equal"
-                    && chunkListsEqual(localDoc.chunks, remoteDoc.chunks)
-                    && !!localDoc.deleted === !!remoteDoc.deleted) {
-                    convergedSkipCount++;
-                    continue;
-                }
-                if (resolver) {
-                    const verdict = await resolver.resolveOnPull(
-                        localDoc, remoteDoc, { recreateAuthority },
-                    );
-                    const path = configPathFromId(remoteDoc._id);
-                    // **PullVerdict exhaustive.** Every verdict
-                    // must be handled explicitly — a fall-through once
-                    // silently dropped `silent-merge` here. The final
-                    // `_exhaustive: never` makes future verdict additions
-                    // a compile error rather than a silent regression.
-                    switch (verdict) {
-                        case "keep-local":
-                            logDebug(`  × ${path} (keep-local)`);
-                            keepLocalCount++;
-                            continue;
-                        case "concurrent":
-                            logDebug(`  ⚡ ${path} (concurrent)`);
-                            concurrent.push({ path, localDoc, remoteDoc });
-                            continue;
-                        case "silent-merge": {
-                            // Same content, drifted vclocks → mergeVC and
-                            // accept. Mirrors the `silent-merge` case of the
-                            // vault PullWriter (pull-writer.ts).
-                            const merged = mergeVC(localVC, remoteVC);
-                            const mergedDoc: ConfigDoc = {
-                                ...remoteDoc, vclock: merged,
-                            };
-                            logDebug(`  ⊔ ${path} (silent-merge)`);
-                            vclockOnlyDriftCount++;
-                            accepted.push(mergedDoc);
-                            continue;
-                        }
-                        case "take-remote":
-                            // Fall through to the accepted.push below.
-                            break;
-                        default: {
-                            const _exhaustive: never = verdict;
-                            void _exhaustive;
-                            break;
-                        }
-                    }
-                }
-            }
-            accepted.push(remoteDoc);
+            docs.push(remoteDoc);
         }
-
-        return {
-            accepted, deleted, concurrent,
-            convergedSkipCount, keepLocalCount, vclockOnlyDriftCount,
-        };
+        return { docs, deleted };
     }
 
-    // ── commit ─────────────────────────────────────────
+    /** How many of `docs` and `deletes` change what the store holds. */
+    private async countNew(docs: readonly ConfigDoc[], deletes: readonly string[]): Promise<ConfigPullStats> {
+        let received = 0;
+        for (const doc of docs) {
+            const cur = await this.deps.db.get(doc._id);
+            if (!cur || cur.deleted || !sameVersion(cur, doc)) received++;
+        }
+        let deleted = 0;
+        for (const id of deletes) {
+            const cur = await this.deps.db.get(id);
+            if (cur && !cur.deleted) deleted++;
+        }
+        return { received, deleted };
+    }
 
     /**
-     * Land accepted docs + tombstones + new pullSeq in one runWriteTx.
-     * Updates the in-memory `lastSynced` cache + cursor only after the
-     * durable write succeeds, so callers always observe consistent state.
-     *
-     * Note: we don't use `ConfigCheckpoints.commitPullBatch` here because
-     * that helper accepts only docs, not deletes. Inlining the runWriteTx
-     * keeps the atomic boundary clean and lets us also write `lastSynced`
-     * meta entries in the same tx.
+     * Land docs + tombstones + new pullSeq in one runWriteTx, then fetch the
+     * chunks the docs reference outside the tx (the attachment round-trips
+     * must not keep the IDB write transaction open). A chunk that cannot be
+     * fetched only holds back that one path; the merge step skips it.
      */
     private async commitBatch(
-        accepted: ConfigDoc[],
+        docs: ConfigDoc[],
         deletes: string[],
         nextPullSeq: number | string,
     ): Promise<void> {
-        // Build per-path lastSynced meta entries. v0.26 stores the
-        // chunk-id list directly — same fingerprint the next scan()
-        // compares against, so the short-circuit and the integration
-        // baseline share one shape (vault symmetry).
-        const lastSyncedMeta: Array<{
-            op: "put"; key: string;
-            value: {
-                vclock: ConfigDoc["vclock"];
-                size: number;
-                chunks: string[];
-            };
-        }> = [];
-        for (const doc of accepted) {
-            const path = configPathFromId(doc._id);
-            lastSyncedMeta.push({
-                op: "put",
-                key: configLastSyncedKey(path),
-                value: { vclock: doc.vclock, size: doc.size, chunks: doc.chunks },
-            });
-        }
-        const lastSyncedDeletes = deletes
-            .filter(isConfigDocId)
-            .map((id) => ({
-                op: "delete" as const,
-                key: configLastSyncedKey(configPathFromId(id)),
-            }));
-
-        if (accepted.length === 0 && deletes.length === 0) {
-            // Pure cursor advance (only convergedSkip / keep-local in batch).
+        if (docs.length === 0 && deletes.length === 0) {
             await this.deps.checkpoints.saveEmptyPullBatch(nextPullSeq);
             return;
         }
-
         await this.deps.db.runWriteTx({
-            docs: accepted.map((d) => ({ doc: d as CouchSyncDoc })),
+            docs: docs.map((d) => ({ doc: d as CouchSyncDoc })),
             deletes,
             meta: [
                 { op: "put", key: META_CONFIG_PULL_SEQ, value: nextPullSeq },
-                ...lastSyncedMeta,
-                ...lastSyncedDeletes,
+                ...deletes.map((id) => ({
+                    op: "delete" as const,
+                    key: configLastSyncedKey(configPathFromId(id)),
+                })),
             ],
             onCommit: () => {
                 this.deps.checkpoints.setPullSeq(nextPullSeq);
-                for (const doc of accepted) {
-                    const path = configPathFromId(doc._id);
-                    this.deps.lastSynced.set(path, {
-                        vclock: doc.vclock,
-                        size: doc.size,
-                        chunks: doc.chunks,
-                    });
-                }
-                for (const id of deletes) {
-                    if (isConfigDocId(id)) {
-                        this.deps.lastSynced.delete(configPathFromId(id));
-                    }
-                }
+                for (const id of deletes) this.deps.lastSynced.delete(configPathFromId(id));
             },
         });
-
-        // After the batch's docs and tombstones land durably, pull any
-        // referenced chunks that aren't already local. ensureChunks runs
-        // outside the runWriteTx so the per-chunk attachment fetch
-        // round-trips don't keep the IDB write transaction open. A
-        // missing chunk only blocks the eventual `ConfigSync.write()`
-        // for that one path — config-pull stats already advanced.
-        for (const doc of accepted) {
+        for (const doc of docs) {
             try {
                 await this.ensureChunks(doc);
             } catch (e: any) {
@@ -440,10 +262,10 @@ export class ConfigPullWriter {
      * within reasonable latency over HTTP/2-multiplexed transports.
      *
      * Missing-on-server chunks are logged via WARN and left missing —
-     * the next `ConfigSync.write()` will skip that path with a clear
-     * diagnostic rather than blocking the whole pull.
+     * the merge step skips that path with a clear diagnostic rather than
+     * blocking the whole pull, and tries the fetch again on a later Pull.
      */
-    private async ensureChunks(configDoc: ConfigDoc): Promise<void> {
+    async ensureChunks(configDoc: ConfigDoc): Promise<void> {
         const existing = await this.deps.db.getChunks(configDoc.chunks);
         // Availability: content-less doc counts as missing so it
         // is re-fetched rather than trusted by id. Symmetric with the vault

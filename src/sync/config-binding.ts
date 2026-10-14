@@ -47,7 +47,9 @@ import { EncryptingCouchClient } from "../db/encrypting-couch-client.ts";
 import { CompressingCouchClient } from "../db/compressing-couch-client.ts";
 import { computeHash, type ChunkHasher } from "../db/chunker.ts";
 import type { ConfigBindingRecord, CouchSyncSettings } from "../settings.ts";
-import { ConfigLastSynced } from "../db/sync/config-last-synced.ts";
+import { ConfigLastSynced, configLastSyncedKey } from "../db/sync/config-last-synced.ts";
+import type { MetaWrite } from "../db/write-transaction.ts";
+import { CONFIG_LOCAL_FIRST_PREFIX } from "./config-migration.ts";
 import { ConfigCheckpoints } from "../db/sync/config-checkpoints.ts";
 import {
     ConfigNotReadyError,
@@ -189,6 +191,10 @@ export interface ConfigJoinOptions {
     onProgress?: (msg: string) => void;
 }
 
+/** Store meta: the vault's `configDiskWriteId` this store's bases are
+ *  valid for (see `ConfigBinding.alignBasesWithDisk`). */
+export const META_CONFIG_DISK_WRITE_ID = "_sync/config-disk-write-id";
+
 export class ConfigBinding {
     /** `configBindingKey(serverUri, dbName)` — the identity of this binding. */
     readonly key: string;
@@ -324,30 +330,9 @@ export class ConfigBinding {
         return this.derivations;
     }
 
-    /**
-     * Keys for local work outside an op (a bare `ConfigSync.scan`): the
-     * attachment's codec, and — when it is encrypted — the key this session
-     * already unlocked for the joined root with this binding's passphrase.
-     * Throws `key-missing` when there is no such key (no op ran yet, or the
-     * passphrase changed since); never a plaintext hasher for an encrypted
-     * DB. Ops use the keys their preflight froze instead.
-     */
-    currentKeys(): ConfigOpKeys {
-        const codec = this.att?.codec ?? { encryption: false, compression: false };
-        let crypto: CryptoProvider | null = null;
-        if (codec.encryption) {
-            const memo = this.keyCache;
-            if (memo && memo.metaFp === this.att?.metaFingerprint
-                && memo.passphrase === (this.entry()?.passphrase ?? "")) {
-                crypto = memo.crypto;
-            }
-        }
-        return makeConfigOpKeys(codec, crypto, this.entry()?.cipherFloor, this.dbName);
-    }
-
     // ── Cursors / caches ───────────────────────────────
 
-    /** Lazy-load the persisted pull/push cursors. Idempotent. */
+    /** Lazy-load the persisted pull cursor. Idempotent. */
     async ensureCheckpointsLoaded(): Promise<void> {
         if (this.checkpointsLoaded) return;
         await this.checkpoints.load();
@@ -358,6 +343,60 @@ export class ConfigBinding {
      *  was wiped). */
     invalidateCheckpoints(): void {
         this.checkpointsLoaded = false;
+    }
+
+    // ── Bases and the disk ─────────────────────────────
+
+    /**
+     * Drop this store's bases when another config DB's Pull wrote the disk
+     * since they were last valid, so the next Pull merges as after a Join:
+     * the shared values win and keys only the disk has stay. The values
+     * that other Pull wrote were never edited against this DB, and against
+     * the old bases they would look like this device's changes and be
+     * pushed.
+     *
+     * The store records the vault's `configDiskWriteId` its bases are valid
+     * for; a different id means it missed a write. Returns the number of
+     * bases dropped.
+     */
+    async alignBasesWithDisk(): Promise<number> {
+        const disk = this.host.getSettings().configDiskWriteId ?? null;
+        const mine = await this.store.getMeta<string>(META_CONFIG_DISK_WRITE_ID);
+        if ((mine ?? null) === disk) return 0;
+        await this.lastSynced.ensureLoaded();
+        const paths = this.lastSynced.paths();
+        const localFirst = await this.store.getMetaByPrefix(CONFIG_LOCAL_FIRST_PREFIX);
+        const meta: MetaWrite[] = [
+            ...paths.map((p) => ({ op: "delete" as const, key: configLastSyncedKey(p) })),
+            ...localFirst.map((r) => ({ op: "delete" as const, key: r.key })),
+            disk === null
+                ? { op: "delete", key: META_CONFIG_DISK_WRITE_ID }
+                : { op: "put", key: META_CONFIG_DISK_WRITE_ID, value: disk },
+        ];
+        await this.store.runWriteTx({
+            meta,
+            onCommit: () => { for (const p of paths) this.lastSynced.delete(p); },
+        });
+        return paths.length;
+    }
+
+    /**
+     * A Pull of this DB is about to write the disk: draw a new
+     * `configDiskWriteId` and record it for this store, so every other
+     * store's bases are dropped when it is used next. Called before the
+     * first file is written; a write that then fails keeps that path's old
+     * base, which is still this DB's.
+     */
+    async recordDiskWrite(): Promise<void> {
+        const bytes = new Uint8Array(16);
+        crypto.getRandomValues(bytes);
+        const id = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+        const s = this.host.getSettings();
+        s.configDiskWriteId = id;
+        await this.host.saveSettings();
+        await this.store.runWriteTx({
+            meta: [{ op: "put", key: META_CONFIG_DISK_WRITE_ID, value: id }],
+        });
     }
 
     /** Empty this binding's local store (docs, chunks, cursors, lastSynced
@@ -376,24 +415,6 @@ export class ConfigBinding {
 
     private ctx(extra: ConfigNotReadyContext = {}): ConfigNotReadyContext {
         return { db: this.dbName, ...extra };
-    }
-
-    /**
-     * The local half of readiness — no I/O. An interrupted Create first
-     * (the remote may be half-built), then "not joined".
-     *
-     * `requireAttached: false` is for local-only work (`ConfigSync.write`),
-     * which must still refuse a half-built DB but has no business demanding
-     * a Join.
-     */
-    assertLocalReady(opts: { requireAttached: boolean }): ConfigAttachment | null {
-        if (this.entry()?.settingUp) {
-            throw configNotReady("setup-interrupted", this.ctx());
-        }
-        if (!this.att && opts.requireAttached) {
-            throw configNotReady("unattached", this.ctx());
-        }
-        return this.att;
     }
 
     /**

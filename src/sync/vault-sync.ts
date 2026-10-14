@@ -194,17 +194,23 @@ export class VaultSync {
         // intentionally empty: state is never buffered
     }
 
-    async fileToDb(path: string): Promise<void> {
+    /**
+     * Record the vault file at `path` in the local DB. True when this call
+     * wrote its FileDoc; false when the file is not recorded (gone, over the
+     * size limit, kept out by the filters) or needs no write (unchanged, or
+     * a remote edit not yet integrated).
+     */
+    async fileToDb(path: string): Promise<boolean> {
         const settings = this.getSettings();
         const fileStat = await this.vault.stat(path);
-        if (!fileStat) return; // file disappeared before we could read it
+        if (!fileStat) return false; // file disappeared before we could read it
 
         const sizeMB = fileStat.size / (1024 * 1024);
         if (sizeMB > settings.maxFileSizeMB) {
             await this.recordSkipped(path, sizeMB, settings.maxFileSizeMB);
-            return;
+            return false;
         }
-        if (!this.shouldSync(path)) return;
+        if (!this.shouldSync(path)) return false;
 
         if (await this.wasSkipped(path)) {
             await this.forgetSkipped(path);
@@ -221,7 +227,7 @@ export class VaultSync {
         // inside the store. This function only decides WHAT to write based
         // on the current doc state.
         try {
-            await this.db.runWriteBuilder(
+            return await this.db.runWriteBuilder(
                 async (snap) => {
                     const existing = (await snap.get(fileId)) as FileDoc | null;
                     // The chunksEqual short-circuit must not match a tombstone:
@@ -1443,7 +1449,9 @@ export class VaultSync {
         return this.localChunkIds(path);
     }
 
-    private shouldSync(path: string): boolean {
+    /** Whether `path` is synced on this device: not a dot path, and kept
+     *  in by the sync and ignore filters. */
+    shouldSync(path: string): boolean {
         const settings = this.getSettings();
         if (path.startsWith(".")) return false;
 

@@ -23,8 +23,10 @@ function formatDocIdForProgress(id: string): string {
 }
 
 export interface SetupResult {
-    /** Init: vault files scanned into the local DB. Clone: vault files
-     *  written from the remote (deletions and declined docs excluded). */
+    /** Init: vault files recorded in the local DB, and so pushed (files
+     *  kept out by the filters or over the size limit excluded). Clone:
+     *  vault files written from the remote (deletions and declined docs
+     *  excluded). */
     vaultFiles: number;
     totalDocs: number;
 }
@@ -93,20 +95,24 @@ export class SetupService {
             });
 
             // Every FileDoc goes through dbToFile, tombstones included (they
-            // establish the deleted baseline). Only an alive doc that landed
-            // in the vault counts as a file written: a tombstone is a file
-            // deleted elsewhere, and a doc dbToFile declines (filtered,
-            // unsafe path, collision) or fails on is not in the vault.
+            // establish the deleted baseline). The progress counts the alive
+            // docs this device's filters keep in: the files Clone writes.
+            // Only one that landed in the vault counts as a file written: a
+            // tombstone is a file deleted elsewhere, and a doc dbToFile
+            // declines (filtered, unsafe path, collision) or fails on is not
+            // in the vault.
             const allFiles = await this.localDb.allFileDocs();
-            const alive = allFiles.filter((d) => !d.deleted).length;
-            onProgress(`Writing ${alive} vault files...`);
+            const toWrite = allFiles.filter(
+                (d) => !d.deleted && this.vaultSync.shouldSync(filePathFromId(d._id)),
+            ).length;
+            onProgress(`Writing ${toWrite} vault files...`);
             let vaultFiles = 0;
             let done = 0;
             for (const fileDoc of allFiles) {
                 const vaultPath = filePathFromId(fileDoc._id);
                 try {
-                    if (!fileDoc.deleted) {
-                        onProgress(`Writing: ${vaultPath} (${++done}/${alive})`);
+                    if (!fileDoc.deleted && this.vaultSync.shouldSync(vaultPath)) {
+                        onProgress(`Writing: ${vaultPath} (${++done}/${toWrite})`);
                     }
                     const result = await this.vaultSync.dbToFile(fileDoc);
                     if (!fileDoc.deleted && result.applied) vaultFiles++;
@@ -141,7 +147,9 @@ export class SetupService {
         }
     }
 
-    /** Scan all vault files to local DB (no mtime check — clean start) */
+    /** Scan all vault files to local DB (no mtime check — clean start).
+     *  Returns how many were recorded: a file fileToDb keeps out (filters,
+     *  size limit) or fails on is not pushed. */
     private async scanVaultToDb(onProgress: (msg: string) => void): Promise<number> {
         const files = this.vault.getFiles();
         let synced = 0;
@@ -149,8 +157,7 @@ export class SetupService {
             const file = files[i];
             try {
                 onProgress(`Scanning: ${file.path} (${i + 1}/${files.length})`);
-                await this.vaultSync.fileToDb(file.path);
-                synced++;
+                if (await this.vaultSync.fileToDb(file.path)) synced++;
             } catch (e) {
                 logError(`Failed to scan ${file.path}: ${e?.message ?? e}`);
             }

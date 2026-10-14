@@ -13,34 +13,18 @@ import {
 import { configBindingKey } from "./config-binding-record.ts";
 import type { AuthGate } from "../db/sync/auth-gate.ts";
 import type { VisibilityGate } from "../db/visibility-gate.ts";
-import type { ConfigDoc, CouchSyncDoc, ChunkDoc } from "../types.ts";
-import { CONFIG_SCHEMA_VERSION } from "../types.ts";
 import {
     DOC_ID,
-    makeConfigId,
     configPathFromId,
 } from "../types/doc-id.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import { ProgressNotice } from "../ui/notices.ts";
-import {
-    splitIntoChunks,
-    joinChunks,
-    MAX_CHUNK_BYTES_CONFIG,
-    type ChunkHasher,
-} from "../db/chunker.ts";
-import { incrementVC } from "./vector-clock.ts";
-import { chunkListsEqual } from "./chunk-equality.ts";
 import type { ICouchClient } from "../db/interfaces.ts";
 import { makeCouchClient } from "../db/couch-client.ts";
-import { logError, logWarn } from "../ui/log.ts";
+import { logError, logInfo, logWarn } from "../ui/log.ts";
 import { describeError } from "../ui/describe-error.ts";
-import { unsafeVaultPathReason } from "../utils/path.ts";
 import { classifyConfigPath } from "./config-policy/classify.ts";
-import {
-    sendDecision,
-    receiveDecision,
-    type ReceiveContext,
-} from "./config-policy/policy.ts";
+import { participates, type DeviceContext } from "./config-policy/policy.ts";
 import { readLocalIsDesktopOnly } from "./config-policy/manifest.ts";
 import * as remoteCouch from "../db/remote-couch.ts";
 import {
@@ -50,15 +34,33 @@ import {
 } from "./config-operation.ts";
 import type { ReconnectBridge } from "./reconnect-bridge.ts";
 import { configLastSyncedKey } from "../db/sync/config-last-synced.ts";
-import {
-    ConfigPullWriter,
-    type ConfigConcurrentEntry,
-} from "../db/sync/config-pull-writer.ts";
+import { ConfigPullWriter } from "../db/sync/config-pull-writer.ts";
 import {
     ConfigPushPipeline,
-    type ConfigPushDivergence,
+    type ConfigPushHoldReason,
+    type ConfigPushResult,
 } from "../db/sync/config-push-pipeline.ts";
-import { ConflictResolver } from "../conflict/conflict-resolver.ts";
+import {
+    planOverwrite,
+    planPull,
+    planPush,
+    pushContent,
+    type PullPlan,
+    type PullPlanEntry,
+    type ReconcileDeps,
+} from "./config-reconcile.ts";
+import { backupConfigFiles } from "./config-backup.ts";
+import {
+    applyPushSelection,
+    buildPushReview,
+    hasUndeclaredChange,
+    type AppliedSelection,
+} from "./config-push-review.ts";
+import {
+    configLocalFirstKey,
+    loadLocalFirst,
+    migrateConfigBase,
+} from "./config-migration.ts";
 import { ConfigSetupService } from "./config-setup.ts";
 import type { ConfigCreatePreview } from "./config-create-preview.ts";
 import { fetchConfigMeta } from "../db/vault-meta.ts";
@@ -67,8 +69,8 @@ import { resolveConfigCodec } from "./config-codec-policy.ts";
 import { configNotReady } from "./config-errors.ts";
 
 /**
- * ConfigSync — scan-based replication of `.obsidian/` configuration files
- * against a SEPARATE CouchDB database from the vault (v0.11.0+).
+ * ConfigSync — replication of `.obsidian/` configuration files against a
+ * SEPARATE CouchDB database from the vault (v0.11.0+).
  *
  * Why separate? Because vault content is shared across all peer devices,
  * but `.obsidian/` may legitimately differ between device pools (mobile
@@ -77,7 +79,10 @@ import { configNotReady } from "./config-errors.ts";
  * different resolution policies.
  *
  * Architecturally:
- *   - Local storage: `ConfigLocalDB` (Dexie-backed IndexedDB store)
+ *   - Local storage: `ConfigLocalDB` (Dexie-backed IndexedDB store). Its
+ *     config docs are the shared versions — what the server accepted —
+ *     and lastSynced is, per path, the shared version the disk took in
+ *     (the base). A local change is the disk's difference from the base.
  *   - Remote storage: `settings.couchdbConfigDbName` on the same CouchDB
  *     server as the vault DB (auth shared via a common `AuthGate`)
  *   - Replication: every public op runs inside a `ConfigOperation` epoch
@@ -85,9 +90,9 @@ import { configNotReady } from "./config-errors.ts";
  *     waits for visibility=visible before fetching. Vault sync's session
  *     lifecycle disciplines the live loops; ConfigOperation is the same
  *     discipline for one-shot user-triggered ops.
- *   - Ordering: every write increments the device's `vclock` counter,
- *     same VC discipline as FileDoc — concurrent edits are detected
- *     and surfaced rather than silently LWW-merged.
+ *   - Pull merges three-way (JSON key by key, other files as a whole);
+ *     Push sends the local changes of paths whose shared version is
+ *     current and holds the rest until a Pull merged them.
  */
 function defaultClientFactory(settings: CouchSyncSettings): ICouchClient | null {
     if (!settings.couchdbConfigDbName) return null;
@@ -99,8 +104,8 @@ function defaultClientFactory(settings: CouchSyncSettings): ICouchClient | null 
     );
 }
 
-/** Optional ConfigSync wiring. Production sets `ownDataJsonPath` and the
- *  persistence hooks; tests inject `storeFactory` / `rawClientFactory` /
+/** Optional ConfigSync wiring. Production sets `pluginDir`, `reload` and
+ *  the persistence hooks; tests inject `storeFactory` / `rawClientFactory` /
  *  `clientFactory` fakes. Bundled into one object so call sites name what
  *  they pass.
  *
@@ -123,10 +128,22 @@ export interface ConfigSyncOptions {
      *  `binding.wrapClient(raw, keys)` after the preflight. Production never
      *  sets it. */
     clientFactory?: (settings: CouchSyncSettings) => ICouchClient | null;
-    /** The plugin's real own-data.json path (host passes `manifest.dir` +
-     *  "/data.json"); excluded from replication. Falls back to the
-     *  default-folder literal when omitted. */
-    ownDataJsonPath?: string;
+    /** This plugin's folder (host passes `manifest.dir`). Its data.json —
+     *  the deviceId and the plaintext CouchDB password / passphrase — and
+     *  its `backups/` folder are excluded from replication, and Pull keeps
+     *  its backups there. Falls back to the default folder name when
+     *  omitted. */
+    pluginDir?: string;
+    /** Reload the app. Pull calls it after writing files; omitted in
+     *  tests. */
+    reload?: () => void;
+    /** Unload the community plugins installed in these folders
+     *  (`.obsidian/plugins/<folder>`), without changing which plugins are
+     *  enabled. Pull calls it before it writes or deletes a plugin's files,
+     *  so a running plugin cannot save its in-memory state over them before
+     *  the reload. Resolves to the ids of the plugins it stopped (a plugin
+     *  that was not running is not among them). Omitted in tests. */
+    stopPlugins?: (pluginDirs: string[]) => Promise<string[]>;
     /** Persist settings. Bindings write their settings entry
      *  (`settings.configBindings`: cipher floor, setup flag, the DB's
      *  passphrase) into the live settings object, then call this. Omitted
@@ -138,7 +155,7 @@ export interface ConfigSyncOptions {
      *  stops with `passphrase-missing` / `passphrase-mismatch`. */
     askPassphrase?: AskConfigPassphrase;
     /** Is this device mobile? Drives the receive-side desktop-only gate
-     *  (`write`). Production passes `() => Platform.isMobile`; tests inject a
+     *  (Pull). Production passes `() => Platform.isMobile`; tests inject a
      *  fake. Omitted → treated as desktop (gate never fires). */
     getIsMobile?: () => boolean;
 }
@@ -174,6 +191,12 @@ export interface ConfigRebindOptions {
  *  tree's check). */
 type LockedConfigOp = Exclude<ConfigOpName, "check">;
 
+/** Why a path was held, worded once for both the Notice and the log. */
+const HOLD_REASONS: Record<ConfigPushHoldReason, string> = {
+    "remote-changed": "the server has a newer version",
+    "not-merged": "this device has not taken in the shared version yet",
+};
+
 const OP_LABELS: Record<LockedConfigOp, string> = {
     push: "Config Push",
     pull: "Config Pull",
@@ -184,19 +207,28 @@ const OP_LABELS: Record<LockedConfigOp, string> = {
 export class ConfigSync {
     private static readonly SKIP_DIRS = new Set(["node_modules", ".git"]);
     private static readonly SKIP_FILES = new Set(["workspace.json", "workspace-mobile.json"]);
-    /** Fallback own-data.json path, used only when the host does not supply
-     *  the real install path. Fragile (assumes the default folder name) — see
-     *  `skipPaths`, which prefers the manifest-derived path. */
-    private static readonly DEFAULT_OWN_DATA_PATH =
-        ".obsidian/plugins/obsidian-couchsync/data.json";
+    /** Fallback plugin folder, used only when the host does not supply the
+     *  real install path. Fragile (assumes the default folder name). */
+    private static readonly DEFAULT_PLUGIN_DIR = ".obsidian/plugins/obsidian-couchsync";
 
-    /** Paths excluded from config replication. The plugin's OWN data.json
-     *  carries the deviceId AND the plaintext CouchDB password / encryption
-     *  passphrase, so it must NEVER be pushed to the (untrusted) config server.
-     *  Derived from the real install path the host passes in (`manifest.dir`),
-     *  not a hardcoded folder name — a BRAT / manually-renamed plugin folder
-     *  still gets its data.json excluded. */
-    private readonly skipPaths: Set<string>;
+    /** This plugin's OWN data.json. It carries the deviceId AND the
+     *  plaintext CouchDB password / encryption passphrase, so it must NEVER
+     *  be pushed to the (untrusted) config server. Derived from the real
+     *  install path the host passes in (`manifest.dir`), not a hardcoded
+     *  folder name — a BRAT / manually-renamed plugin folder still gets its
+     *  data.json excluded. */
+    private readonly ownDataPath: string;
+    /** This plugin's backups folder, excluded from replication like
+     *  `ownDataPath`: the copies include other plugins' data.json, which
+     *  may hold secrets. */
+    private readonly backupsDir: string;
+    /** Where Pull keeps copies of the files it overwrites. */
+    private readonly backupRoot: string;
+    private readonly reload: () => void;
+    private readonly stopPlugins: (pluginDirs: string[]) => Promise<string[]>;
+    /** This plugin's folder: an overwriting Pull deletes nothing in it,
+     *  and Pull never stops this plugin. */
+    private readonly pluginDir: string;
     private static readonly MAX_CONFIG_SIZE = 5 * 1024 * 1024; // 5MB
 
     /** In-flight op (a ConfigOperation, or a local `runExclusive` task),
@@ -221,9 +253,6 @@ export class ConfigSync {
     /** Test seam replacing `binding.wrapClient(raw)`; see ConfigSyncOptions. */
     private readonly clientFactory?: (settings: CouchSyncSettings) => ICouchClient | null;
 
-    /** vclock-based pull-time conflict classifier. Stateless; one
-     *  shared instance is enough. Same class as vault sync. */
-    private readonly conflictResolver: ConflictResolver;
     private readonly saveSettings: () => Promise<void>;
     private readonly askPassphrase?: AskConfigPassphrase;
     private readonly getIsMobile: () => boolean;
@@ -245,11 +274,16 @@ export class ConfigSync {
         this.storeFactory = opts.storeFactory ?? defaultConfigStoreFactory;
         this.rawClientFactory = opts.rawClientFactory ?? defaultClientFactory;
         this.clientFactory = opts.clientFactory;
-        this.conflictResolver = new ConflictResolver();
         this.saveSettings = opts.saveSettings ?? (async () => {});
         this.askPassphrase = opts.askPassphrase;
         this.getIsMobile = opts.getIsMobile ?? (() => false);
-        this.skipPaths = new Set([opts.ownDataJsonPath ?? ConfigSync.DEFAULT_OWN_DATA_PATH]);
+        const pluginDir = opts.pluginDir ?? ConfigSync.DEFAULT_PLUGIN_DIR;
+        this.pluginDir = pluginDir;
+        this.ownDataPath = `${pluginDir}/data.json`;
+        this.backupsDir = `${pluginDir}/backups`;
+        this.backupRoot = `${this.backupsDir}/config`;
+        this.reload = opts.reload ?? (() => {});
+        this.stopPlugins = opts.stopPlugins ?? (async () => []);
     }
 
     // ── Binding lifecycle ──────────────────────────────
@@ -431,9 +465,9 @@ export class ConfigSync {
             binding: ConfigBinding,
             keys: ConfigOpKeys | undefined,
         ) => Promise<T>,
-        opts: { gate?: (binding: ConfigBinding) => void } = {},
+        opts: { gate?: (binding: ConfigBinding) => void; label?: string } = {},
     ): Promise<T> {
-        const progress = new ProgressNotice(OP_LABELS[opName]);
+        const progress = new ProgressNotice(opts.label ?? OP_LABELS[opName]);
         if (this.inflight !== null || this.rebinding !== null) {
             // Nothing was started — the running op (if any) keeps its lock.
             const e = configNotReady("busy");
@@ -645,53 +679,118 @@ export class ConfigSync {
         });
     }
 
-    /** Push: scan .obsidian/ → enumerate local delta via changes feed →
-     *  per-doc remote-rev fetch → bulkDocs.
+    /**
+     * Push: send the disk's changes against the base.
      *
-     *  Replaces the snapshot-style push (full `fetchRemoteConfigDocs` +
-     *  `pushDocs` by id list). Divergence is
-     *  detected per pair via `compareVC`; on hit, the modal asks for
-     *  confirm-and-overwrite (matches the prior UX). Confirmed → bump
-     *  local vclocks above remote and re-run the pipeline. */
+     *   1. plan: every file that takes part in sharing here, compared with
+     *      its base (`planPush`); unchanged files are not sent
+     *   2. check (`ConfigPushPipeline.check`): a path whose server doc is
+     *      not the shared version held here, or whose disk has not taken
+     *      that version in, is held — Pull & Reload merges it first
+     *   3. select: the Push list shows every change of the ready paths
+     *      (`config-push-review.ts`); what is left out becomes this
+     *      device's own and is saved in the policy
+     *   4. send the selection; the accepted docs become the shared version
+     *      and the base
+     *
+     * A Push whose only changes are this device's own keys sends nothing
+     * and shows no list. Cancelling the list sends nothing and keeps the
+     * declarations as they were. Returns the number of files pushed.
+     */
     async push(): Promise<number> {
         return this.runOperation("push", async (ctx, progress, binding, keys) => {
             await binding.ensureCheckpointsLoaded();
+            const writer = this.makePullWriter(binding, ctx, keys!);
+            const deps = await this.prepare(binding, ctx, keys!, writer);
 
-            // Chunk ids are minted with the op's frozen hasher: the same key
-            // space the wrapped client encrypts under, for the whole run.
-            const scanned = await this.scanWith(binding, keys!.hasher, (path, i, total) => {
-                progress.update(`Scanning: ${path} (${i}/${total})`);
+            const files: string[] = [];
+            await this.listFilesRecursive(".obsidian", files);
+            const plan = await planPush(deps, files, (path, i, total) => {
+                progress.update(`Comparing: ${path} (${i}/${total})`);
             });
+            const policy = this.getSettings().configSyncPolicy;
+            const active = plan.filter((e) => hasUndeclaredChange(e, policy));
+            if (active.length === 0) {
+                progress.done(plan.length === 0
+                    ? "No local changes to push."
+                    : `No local changes to push. ${plan.length} file(s) differ only in keys ` +
+                      `kept on this device.`);
+                return 0;
+            }
 
             const pipeline = new ConfigPushPipeline({
                 db: binding.store,
                 client: ctx.client,
-                checkpoints: binding.checkpoints,
+                lastSynced: binding.lastSynced,
+                hasher: keys!.hasher,
                 getDeviceId: () => this.getSettings().deviceId,
                 signal: ctx.signal,
             });
+            progress.update(`Checking the server for ${plan.length} changed file(s)...`);
+            const check = await pipeline.check(plan);
+            // A file with only this device's own keys would send nothing:
+            // holding it is not news.
+            const activePaths = new Set(active.map((e) => e.path));
+            const held = check.held.filter((h) => activePaths.has(h.path));
 
-            let result = await pipeline.run((msg) => progress.update(msg));
-
-            if (result.divergent.length > 0) {
-                const ok = await this.confirmPushDivergence(result.divergent);
-                if (!ok) {
-                    throw abortError(
-                        "the divergent doc(s) were not overwritten; the others were pushed.",
-                    );
-                }
-                progress.update("Resolving divergence (advancing vclocks)...");
-                await pipeline.forcePushAdvanceVclocks(result.divergent);
-                result = await pipeline.run((msg) => progress.update(msg));
+            let pushedResult: ConfigPushResult = { pushed: [], held: [], failed: [] };
+            let leftOut = 0;
+            const readyActive = check.ready.filter((r) => activePaths.has(r.entry.path));
+            if (readyActive.length > 0) {
+                const entries = check.ready.map((r) => r.entry);
+                const review = buildPushReview(entries, policy, held.length);
+                progress.update("Choose what to push...");
+                const chosen = await this.modal.showConfigPushModal(review);
+                if (chosen === null) throw abortError("Nothing was pushed.");
+                const applied = applyPushSelection(entries, policy, new Set(chosen));
+                await this.saveDeclarations(applied);
+                leftOut = applied.declared.length + applied.filesLeftOut.length;
+                const byPath = new Map(check.ready.map((r) => [r.entry.path, r]));
+                pushedResult = await pipeline.send(
+                    applied.sends.map((sd) => ({
+                        ready: byPath.get(sd.entry.path)!,
+                        content: pushContent(sd.entry.path, sd.entry.diff, sd.entry.local, sd.selected, sd.deviceOnly),
+                    })),
+                    (msg) => progress.update(msg),
+                );
             }
+            const result = {
+                pushed: pushedResult.pushed,
+                held: [...held, ...pushedResult.held],
+                failed: pushedResult.failed,
+            };
 
-            const summaryParts: string[] = [];
-            if (result.stats.pushed) summaryParts.push(`${result.stats.pushed} pushed`);
-            if (result.stats.skipped) summaryParts.push(`${result.stats.skipped} skipped`);
-            if (result.stats.conflicts) summaryParts.push(`${result.stats.conflicts} conflicts (will retry)`);
-            const summary = summaryParts.length > 0 ? summaryParts.join(", ") : "no changes";
-            progress.done(`${summary}. (Scanned ${scanned} local file(s).)`);
-            return result.stats.pushed;
+            if (result.held.length > 0) {
+                logWarn(
+                    `Config Push held ${result.held.length} file(s); run Pull & Reload, then Push again:\n` +
+                    result.held.map((h) => `  • ${h.path} (${HOLD_REASONS[h.reason]})`).join("\n"),
+                );
+            }
+            if (result.failed.length > 0) {
+                logWarn(
+                    `Config Push: the server rejected ${result.failed.length} file(s):\n` +
+                    result.failed.map((p) => `  • ${p}`).join("\n"),
+                );
+            }
+            const parts: string[] = [];
+            parts.push(result.pushed.length > 0
+                ? `${result.pushed.length} file(s) pushed.`
+                : "Nothing pushed.");
+            if (leftOut > 0) {
+                parts.push(`${leftOut} item(s) left out are kept on this device (see log).`);
+            }
+            if (result.held.length > 0) {
+                for (const reason of Object.keys(HOLD_REASONS) as ConfigPushHoldReason[]) {
+                    const n = result.held.filter((h) => h.reason === reason).length;
+                    if (n > 0) parts.push(`${n} held (${HOLD_REASONS[reason]}).`);
+                }
+                parts.push("Run Pull & Reload, then Push again.");
+            }
+            if (result.failed.length > 0) {
+                parts.push(`${result.failed.length} rejected by the server (see log).`);
+            }
+            progress.done(parts.join(" "));
+            return result.pushed.length;
         }, {
             // Push advances vclocks under this device's name.
             gate: (binding) => {
@@ -702,370 +801,429 @@ export class ConfigSync {
         });
     }
 
-    /** Pull: incremental `_changes`-based delta + write the policy-selected config to filesystem.
-     *
-     *  Replaces the snapshot-style pullByPrefix.
-     *  Concurrent edits are surfaced AFTER the batch commit (informational),
-     *  not pre-flight — the resolver classifies them as keep-local equivalents
-     *  and the cursor advances past them, so re-running pull() will surface
-     *  them again until manually resolved (matches vault-sync semantics).
-     *  Returns the number of files written; 0 means the disk already
-     *  matched and there is nothing to reload. */
-    async pull(): Promise<number> {
-        return this.runOperation("pull", async (ctx, progress, binding, keys) => {
-            await binding.ensureCheckpointsLoaded();
+    /** Save what a Push selection declared this device's own (or no longer
+     *  so), and log it without values. */
+    private async saveDeclarations(applied: AppliedSelection): Promise<void> {
+        if (applied.declared.length + applied.released.length + applied.filesLeftOut.length === 0) return;
+        this.getSettings().configSyncPolicy = applied.policy;
+        await this.saveSettings();
+        const lines = (xs: Array<{ path: string; pointer: string }>) =>
+            xs.map((x) => `  • ${x.path}: ${x.pointer === "" ? "(whole value)" : x.pointer}`).join("\n");
+        if (applied.declared.length > 0) {
+            logInfo(
+                `Config Push: ${applied.declared.length} key(s) left out are kept on this device ` +
+                `(not sent, not taken in):\n${lines(applied.declared)}`,
+            );
+        }
+        if (applied.released.length > 0) {
+            logInfo(
+                `Config Push: ${applied.released.length} key(s) kept on this device are shared again:\n` +
+                lines(applied.released),
+            );
+        }
+        if (applied.filesLeftOut.length > 0) {
+            logInfo(
+                `Config Push: ${applied.filesLeftOut.length} file(s) left out no longer sync on this ` +
+                `device (turn them back on in the Filter):\n` +
+                applied.filesLeftOut.map((p) => `  • ${p}`).join("\n"),
+            );
+        }
+    }
 
-            const writer = new ConfigPullWriter({
-                db: binding.store,
-                client: ctx.client,
-                checkpoints: binding.checkpoints,
-                lastSynced: binding.lastSynced,
-                getConflictResolver: () => this.conflictResolver,
-                signal: ctx.signal,
-                hasher: keys!.hasher,
-            });
+    /**
+     * Pull & Reload.
+     *
+     *   1. copy: the server's docs since the cursor replace the config DB's
+     *      (`ConfigPullWriter`)
+     *   2. plan: each received path whose shared version the disk has not
+     *      taken in is merged three-way with its base and the disk
+     *      (`planPull`); nothing is written yet
+     *   3. back up the files about to be written (`config-backup.ts`)
+     *   4. stop the community plugins whose files are written
+     *      (`stopPlugins`), write the files, and move each path's base to
+     *      its shared version
+     *   5. one Notice, then reload Obsidian when a file was written — the
+     *      app must re-read the files, or it writes its in-memory settings
+     *      back over them
+     *
+     * Keys both sides changed keep the disk's value; they are counted on
+     * the Notice and named (without values) in the log. Returns the number
+     * of files written.
+     */
+    async pull(): Promise<number> {
+        const outcome = await this.runOperation("pull", async (ctx, progress, binding, keys) => {
+            await binding.ensureCheckpointsLoaded();
+            const writer = this.makePullWriter(binding, ctx, keys!);
+            const deps = await this.prepare(binding, ctx, keys!, writer);
+
             // A remote ConfigDoc shape this build cannot read throws
             // SchemaVersionMismatchError, whose `userMessage` names the
             // migration (Create, then Join on the other devices); it reaches
             // progress.fail as is.
-            const result = await writer.run((msg) => progress.update(msg));
+            const received = await writer.run((msg) => progress.update(msg));
 
-            if (result.concurrent.length > 0) {
-                this.notifyConcurrentPull(result.concurrent);
-            }
-
-            progress.update("Writing config files...");
-            const written = await this.write((path, i, total) => {
-                progress.update(`Writing: ${path} (${i}/${total})`);
+            const plan = await planPull(deps, (path, i, total) => {
+                progress.update(`Comparing: ${path} (${i}/${total})`);
             });
+            await this.backupPlan(plan, progress);
+            const applied = await this.applyPlan(binding, plan, progress, "Config Pull");
 
-            const summaryParts: string[] = [];
-            if (result.stats.accepted) summaryParts.push(`${result.stats.accepted} accepted`);
-            if (result.stats.deleted) summaryParts.push(`${result.stats.deleted} deleted`);
-            if (result.stats.convergedSkip) summaryParts.push(`${result.stats.convergedSkip} converged`);
-            if (result.stats.concurrent) summaryParts.push(`${result.stats.concurrent} concurrent`);
-            const summary = summaryParts.length > 0 ? summaryParts.join(", ") : "no changes";
-            progress.done(written > 0
-                ? `${summary}. Wrote ${written} file(s). Reload Obsidian to apply.`
-                : `${summary}. Files up to date.`);
-            return written;
+            const conflicts = plan.entries.filter((e) => e.decision.conflicts.length > 0);
+            if (conflicts.length > 0) {
+                logWarn(
+                    `Config Pull kept this device's value where both sides changed ` +
+                    `(${conflicts.length} file(s)); Push sends them, overwriting the shared value:\n` +
+                    conflicts.map((e) => `  • ${e.path}: ${e.decision.conflicts
+                        .map((p) => p === "" ? "(whole file)" : p).join(", ")}`).join("\n"),
+                );
+            }
+            const kept = plan.entries.reduce((n, e) => n + e.decision.deviceOnlyKept, 0);
+            if (kept > 0) {
+                logInfo(`Config Pull: ${kept} key(s) kept on this device were not taken in.`);
+            }
+            const parts: string[] = [];
+            if (received.received + received.deleted > 0) {
+                parts.push(`Received ${received.received + received.deleted} change(s).`);
+            }
+            if (conflicts.length > 0) {
+                parts.push(`${conflicts.length} file(s) kept this device's value where both sides changed (see log).`);
+            }
+            if (plan.unavailable.length > 0) {
+                parts.push(`${plan.unavailable.length} file(s) skipped (see log).`);
+            }
+            parts.push(applied.written > 0
+                ? `Wrote ${applied.written} file(s). Reloading Obsidian...`
+                : applied.reload
+                    ? "No config files changed. Reloading Obsidian to restart the plugins stopped for writing..."
+                    : "No config files changed; no reload needed.");
+            progress.done(parts.join(" "));
+            return applied;
         });
+        if (outcome.reload) this.reload();
+        return outcome.written;
     }
 
     /**
-     * Surface concurrent-edit findings collected during a diff pull.
-     * Pull is already committed by the time this runs — concurrent docs
-     * were filtered out of `accepted` by the resolver, so the only effect
-     * here is informational. Logs the full list and shows a single-button
-     * notice modal so the user can investigate without blocking the op.
+     * Pull & Overwrite: make this device's config the shared state.
      *
-     * Re-running pull() will re-classify the same docs as concurrent
-     * until the local copy is causally advanced (i.e., the user edits
-     * the file or accepts a manual resolve), matching the vault-sync
-     * conflict-orchestrator UX.
+     *   1. copy, as in Pull
+     *   2. plan (`planOverwrite`): every shared file that takes part in
+     *      sharing here is written as it is where the disk differs, and every
+     *      file that takes part but is not shared is deleted. Files that do
+     *      not take part (left out by the Filter, a plugin not installed
+     *      here, a desktop-only plugin on mobile, this plugin's own folder)
+     *      are not touched
+     *   3. confirm: the files to delete and to write are listed; Cancel
+     *      changes nothing on disk, in the bases or in the declarations
+     *   4. back up every file about to change, drop the keys kept on this
+     *      device (`deviceOnlyKeys`; file overrides in the Filter stay)
+     *   5. write and delete as Pull does; every planned path's base becomes
+     *      its shared version, a deleted path loses its base
+     *   6. reload
+     *
+     * Refused when the shared state has nothing for this device: deleting
+     * every selected file is never what an overwrite means. Returns the
+     * number of files written or deleted.
      */
-    private notifyConcurrentPull(entries: ConfigConcurrentEntry[]): void {
-        const paths = entries.map((e) => `  • ${e.path}`).join("\n");
-        logWarn(
-            `Config pull surfaced ${entries.length} concurrent edit(s):\n${paths}`,
-        );
-        const previewLimit = 5;
-        const preview = entries.slice(0, previewLimit).map((e) => e.path).join(", ");
-        const more = entries.length > previewLimit ? ` (+${entries.length - previewLimit} more)` : "";
-        // Fire-and-forget: this is informational, the op already completed.
-        // Observe rejection so a modal-presentation failure lands in the log
-        // instead of an unhandled promise rejection.
-        this.modal.showConfirmModal(
-            `Config pull: ${entries.length} concurrent edit(s) detected`,
-            `Local copies of ${preview}${more} have diverged from remote. ` +
-            `See the Log View for the full list. ` +
-            `To keep this device's copy, edit the file here and Push (confirm the overwrite).`,
-            "OK",
-            false,
-        ).catch((e) => logWarn(`config concurrent-pull notice failed: ${e?.message ?? e}`));
+    async overwrite(): Promise<number> {
+        const outcome = await this.runOperation("pull", async (ctx, progress, binding, keys) => {
+            await binding.ensureCheckpointsLoaded();
+            const writer = this.makePullWriter(binding, ctx, keys!);
+            const deps = await this.prepare(binding, ctx, keys!, writer);
+            await writer.run((msg) => progress.update(msg));
+
+            const files: string[] = [];
+            await this.listFilesRecursive(".obsidian", files);
+            const deletable = files.filter((p) => !p.startsWith(this.pluginDir + "/"));
+            const plan = await planOverwrite(deps, deletable, (path, i, total) => {
+                progress.update(`Comparing: ${path} (${i}/${total})`);
+            });
+            if (plan.entries.length === 0) {
+                progress.done(
+                    "The server has no shared config for this device's selection " +
+                    "(or none is available). Nothing was changed.",
+                );
+                return { written: 0, deleted: 0, reload: false };
+            }
+
+            const writes = plan.entries.filter((e) => e.decision.write !== null);
+            const declared = this.getSettings().configSyncPolicy.deviceOnlyKeys;
+            const keptKeys = Object.values(declared).reduce((n, ps) => n + ps.length, 0);
+            if (writes.length === 0 && plan.deletes.length === 0 && keptKeys === 0) {
+                await this.applyPlan(binding, plan, progress, "Config Pull & Overwrite");
+                progress.done("This device's config already is the shared config. Nothing was changed.");
+                return { written: 0, deleted: 0, reload: false };
+            }
+
+            progress.update("Confirm what to overwrite...");
+            const go = await this.modal.showConfigOverwriteModal({
+                writes: writes.map((e) => ({ path: e.path, created: e.local === null })),
+                deletes: plan.deletes.map((d) => d.path),
+                keptKeys,
+                skipped: plan.unavailable,
+            });
+            if (!go) throw abortError("Nothing was changed.");
+
+            await this.backupPlan(plan, progress);
+            if (keptKeys > 0) {
+                const s = this.getSettings();
+                s.configSyncPolicy = { ...s.configSyncPolicy, deviceOnlyKeys: {} };
+                await this.saveSettings();
+                logInfo(`Config Pull & Overwrite: ${keptKeys} key(s) kept on this device are shared again.`);
+            }
+            const applied = await this.applyPlan(binding, plan, progress, "Config Pull & Overwrite");
+            if (applied.deleted > 0) {
+                logInfo(
+                    `Config Pull & Overwrite deleted ${applied.deleted} file(s) the shared config does not have:\n` +
+                    plan.deletes.map((d) => `  • ${d.path}`).join("\n"),
+                );
+            }
+
+            const parts: string[] = [`Wrote ${applied.written} file(s), deleted ${applied.deleted}.`];
+            if (keptKeys > 0) parts.push(`${keptKeys} key(s) kept on this device are shared again.`);
+            if (plan.unavailable.length > 0) {
+                parts.push(`${plan.unavailable.length} file(s) skipped (see log).`);
+            }
+            if (applied.reload) parts.push("Reloading Obsidian...");
+            progress.done(parts.join(" "));
+            return applied;
+        }, { label: "Config Pull & Overwrite" });
+        if (outcome.reload) this.reload();
+        return outcome.written + outcome.deleted;
+    }
+
+    /** Back up the files a plan changes: those it writes over and those it
+     *  deletes. Throws when a copy fails, so nothing is changed that could
+     *  not be backed up. */
+    private async backupPlan(plan: PullPlan, progress: ProgressNotice): Promise<void> {
+        const backups = [
+            ...plan.entries
+                .filter((e) => e.decision.write !== null && e.local !== null)
+                .map((e) => ({ path: e.path, bytes: e.local! })),
+            ...plan.deletes.map((d) => ({ path: d.path, bytes: d.local })),
+        ];
+        if (backups.length === 0) return;
+        progress.update(`Backing up ${backups.length} file(s)...`);
+        await backupConfigFiles(this.vault, this.backupRoot, backups);
     }
 
     /**
-     * Push-side confirm for divergent local↔remote vclock pairs.
-     * Returns true on "push anyway", false on cancel.
-     *
-     * "Push anyway" means: bump each divergent doc's local vclock to
-     * dominate remote (mergeVC + bump), then retry the push pipeline.
-     * Peers will see the new revision as a normal `dominated` update,
-     * not a conflict — same end-state as the legacy snapshot push, but
-     * without the rev-tree inflation.
+     * Carry out a backed-up plan: stop the plugins whose files change,
+     * write and delete the planned files, and move every planned path's
+     * base to its shared version (a deleted path loses its base). A file
+     * that fails to write or delete keeps its old base, so the next Pull
+     * tries it again. `reload` is true when the disk changed or a plugin
+     * was stopped.
      */
-    private async confirmPushDivergence(
-        divergent: ConfigPushDivergence[],
-    ): Promise<boolean> {
-        const paths = divergent
-            .map((d) => `  • ${d.path} (${d.relation})`).join("\n");
-        logWarn(
-            `Config push would overwrite ${divergent.length} divergent doc(s):\n${paths}`,
-        );
-        const previewLimit = 5;
-        const preview = divergent.slice(0, previewLimit)
-            .map((d) => d.path).join(", ");
-        const more = divergent.length > previewLimit
-            ? ` (+${divergent.length - previewLimit} more)` : "";
-        const message =
-            `Pushing would overwrite remote for ${divergent.length} doc(s) ` +
-            `with concurrent / outdated edits: ${preview}${more}. ` +
-            `See the Log View for the full list. Continue anyway?`;
-        return await this.modal.showConfirmModal(
-            `Config push: ${divergent.length} divergent doc(s)`,
-            message,
-            "Push anyway",
-            true,
-        );
-    }
-
-    // ── Low-level operations ───────────────────────────
-
-    /** Scan entire .obsidian/ directory to local DB.
-     *
-     *  Short-circuit: if the per-path lastSynced cache reports a matching
-     *  `{size, chunks}`, skip the rewrite entirely. v0.26 symmetric to
-     *  VaultSync.fileToDb's `chunksEqual` early-out — without it every
-     *  scan rev-bumps every config doc, which inflates the remote rev
-     *  tree and produces phantom divergence for peers.
-     *  Chunk-list comparison is O(N) over chunk ids; the full payload
-     *  is never re-encoded for the equality check.
-     *
-     *  v0.26 chunking: each config file is split into ChunkDocs via
-     *  `splitIntoChunks` (256 KiB chunks). The ConfigDoc carries only
-     *  `chunks: string[]`; chunk bodies live as separate docs with
-     *  envelope-formatted attachment "c" (gzip + encrypt transparently
-     *  applied by the wrapped client). */
-    async scan(onProgress?: (path: string, index: number, total: number) => void): Promise<number> {
-        const binding = this.requireBinding();
-        // Encrypted DB with no key unlocked this session → key-missing
-        // (never the plaintext hasher).
-        return this.scanWith(binding, binding.currentKeys().hasher, onProgress);
-    }
-
-    /** `scan` with an explicit chunk hasher (Push passes its op's). */
-    private async scanWith(
+    private async applyPlan(
         binding: ConfigBinding,
-        hasher: ChunkHasher,
-        onProgress?: (path: string, index: number, total: number) => void,
-    ): Promise<number> {
-        const db = binding.store;
-        const lastSynced = binding.lastSynced;
-        await lastSynced.ensureLoaded();
+        plan: PullPlan,
+        progress: ProgressNotice,
+        label: string,
+    ): Promise<{ written: number; deleted: number; reload: boolean }> {
+        const writes = plan.entries.filter((e) => e.decision.write !== null);
+        const changed = [...writes.map((e) => e.path), ...plan.deletes.map((d) => d.path)];
+        const stopped = await this.stopPluginsOf(changed, label);
+        if (changed.length > 0) await binding.recordDiskWrite();
 
-        const files: string[] = [];
-        await this.listFilesRecursive(".obsidian", files);
-
-        const deviceId = this.getSettings().deviceId;
-        let count = 0;
-        for (let i = 0; i < files.length; i++) {
-            const file = files[i];
-            const fileName = file.split("/").pop() ?? "";
-            if (ConfigSync.SKIP_FILES.has(fileName)) continue;
-            if (this.skipPaths.has(file)) continue;
-            // Policy SEND projection. Excluded files never enter the local
-            // config DB, so they never reach the push pipeline's changes feed
-            // — the lastPushSeq cursor stays consistent without the pipeline
-            // knowing anything about the policy (it remains a pure transport).
-            if (!sendDecision(this.getSettings().configSyncPolicy, classifyConfigPath(file))) {
-                continue;
-            }
-
+        let written = 0;
+        for (let i = 0; i < writes.length; i++) {
+            const e = writes[i];
+            progress.update(`Writing: ${e.path} (${i + 1}/${writes.length})`);
             try {
-                onProgress?.(file, i + 1, files.length);
-                const stat = await this.vault.stat(file);
-                if (!stat || stat.size > ConfigSync.MAX_CONFIG_SIZE) continue;
-
-                const buf = await this.vault.readBinary(file);
-                const chunks = await splitIntoChunks(
-                    buf,
-                    { hasher, chunkBytes: MAX_CHUNK_BYTES_CONFIG },
-                );
-                const chunkIds = chunks.map((c) => c._id);
-
-                const cached = lastSynced.get(file);
-                if (cached && cached.size === stat.size
-                    && chunkListsEqual(cached.chunks, chunkIds)) {
-                    continue; // unchanged since last sync — no rewrite
-                }
-
-                const configId = makeConfigId(file);
-                await db.runWriteBuilder(async (snap) => {
-                    const existing = (await snap.get(configId)) as ConfigDoc | null;
-                    const newVclock = incrementVC(existing?.vclock, deviceId);
-                    const doc: ConfigDoc = {
-                        _id: configId,
-                        schemaVersion: CONFIG_SCHEMA_VERSION,
-                        type: "config",
-                        chunks: chunkIds,
-                        mtime: stat.mtime,
-                        size: stat.size,
-                        vclock: newVclock,
-                    };
-                    return {
-                        chunks: chunks as unknown as CouchSyncDoc[],
-                        docs: [{ doc: doc as unknown as CouchSyncDoc }],
-                        meta: [{
-                            op: "put",
-                            key: configLastSyncedKey(file),
-                            value: {
-                                vclock: newVclock,
-                                size: stat.size,
-                                chunks: chunkIds,
-                            },
-                        }],
-                        onCommit: () => {
-                            lastSynced.set(file, {
-                                vclock: newVclock,
-                                size: stat.size,
-                                chunks: chunkIds,
-                            });
-                        },
-                    };
-                });
-                count++;
-            } catch (e) {
-                logError(`Failed to scan config ${file}: ${e?.message ?? e}`);
-            }
-        }
-        return count;
-    }
-
-    /** Write config docs to filesystem, filtered by the policy RECEIVE
-     *  projection (`receiveDecision`): the meaning-unit selection narrowed by
-     *  this device's platform + which plugins are installed locally.
-     *
-     *  v0.26 chunking: assembles each config file's binary content by
-     *  fetching the referenced ChunkDocs from the config DB and joining
-     *  them. Missing chunks cause a WARN + skip (symmetric with
-     *  VaultSync.dbToFile); the missing chunk is expected to arrive on
-     *  the next pull. Tombstones (`deleted: true`) are silently skipped
-     *  \u2014 config-sync currently has no continuous tombstone-driven flow,
-     *  but the field is honoured for safety.
-     *
-     *  Idempotent: only files whose disk content differs from the DB are
-     *  written (symmetric to `scanWith`'s unchanged short-circuit on the
-     *  push side). Returns the number of files actually written, so 0
-     *  means the disk already matched. */
-    async write(onProgress?: (path: string, index: number, total: number) => void): Promise<number> {
-        const binding = this.requireBinding();
-        // Local-only: refuse a half-built DB, but don't demand a Join (the
-        // store's docs are this device's own).
-        binding.assertLocalReady({ requireAttached: false });
-        const db = binding.store;
-        const policy = this.getSettings().configSyncPolicy;
-        // Build the receive-side context once per write (not per doc): this
-        // device's platform + which plugins are installed locally + their
-        // local desktop-only flags. These are the receiver-only inputs the
-        // sender cannot know \u2014 see receiveDecision.
-        const ctx = await this.buildReceiveContext();
-
-        // Enumerate every config doc and apply the policy RECEIVE projection
-        // (replaces the legacy per-path/prefix configSyncPaths lookup).
-        const result = await db.allDocs({
-            startkey: DOC_ID.CONFIG,
-            endkey: DOC_ID.CONFIG + "\ufff0",
-            include_docs: true,
-        });
-        const docs: ConfigDoc[] = [];
-        for (const row of result.rows) {
-            if (!row.doc) continue;
-            const doc = row.doc as unknown as ConfigDoc;
-            if (doc.type !== "config" || doc.deleted) continue;
-            docs.push(doc);
-        }
-
-        let count = 0;
-        for (let i = 0; i < docs.length; i++) {
-            const doc = docs[i];
-            const path = configPathFromId(doc._id);
-            // Trust boundary: config paths are written via the adapter
-            // (mkdir + writeBinary) with no index mediation — the most direct
-            // traversal vector. Reject vault-escaping paths before ensureDir.
-            const pathViolation = unsafeVaultPathReason(path);
-            if (pathViolation) {
-                logWarn(`rejecting unsafe remote config path "${path}" — ${pathViolation}`);
-                continue;
-            }
-            if (this.skipPaths.has(path)) continue;
-            // Policy RECEIVE projection = SEND projection ∩ receiver gates
-            // (local plugin presence / platform). receive ⊆ send.
-            if (!receiveDecision(policy, classifyConfigPath(path), ctx)) continue;
-            try {
-                onProgress?.(path, i + 1, docs.length);
-                const chunks = await db.getChunks(doc.chunks);
-                // Availability: a content-less chunk doc is
-                // unavailable, same as an absent one. Filter to usable chunks
-                // before the completeness check so config write skips cleanly
-                // (its existing non-throwing policy) instead of letting a
-                // content-less doc reach joinChunks.
-                const usableIds = new Set(
-                    chunks
-                        .filter((c) => c.content instanceof Uint8Array)
-                        .map((c) => c._id),
-                );
-                if (usableIds.size !== doc.chunks.length) {
-                    const missing = doc.chunks.filter((id) => !usableIds.has(id));
-                    logWarn(
-                        `Skipping config write ${path} \u2014 ` +
-                        `missing ${missing.length} chunk(s): ${missing.slice(0, 3).join(", ")}`,
-                    );
-                    continue;
-                }
-                // Size ceiling before assembleChunks allocates the full
-                // buffer — symmetric to the push scan's MAX_CONFIG_SIZE gate.
-                const sizeBytes = chunks.reduce(
-                    (n, c) => n + (c.content instanceof Uint8Array ? c.content.length : 0), 0,
-                );
-                if (sizeBytes > ConfigSync.MAX_CONFIG_SIZE) {
-                    logWarn(
-                        `Skipping config write ${path} — ` +
-                        `${(sizeBytes / (1024 * 1024)).toFixed(1)} MB exceeds ` +
-                        `${ConfigSync.MAX_CONFIG_SIZE / (1024 * 1024)} MB config limit`,
-                    );
-                    continue;
-                }
-                const buf = ConfigSync.assembleChunks(doc.chunks, chunks);
-                // A file whose bytes already match is left alone: rewriting
-                // it bumps its mtime, and Obsidian re-reads app.json,
-                // appearance.json or a plugin's data.json on that, replacing
-                // settings held in memory.
-                if (await this.diskMatches(path, buf)) continue;
-                await this.ensureDir(path);
-                if (await this.vault.exists(path)) {
-                    await this.vault.writeBinary(path, buf);
+                const buf = e.decision.write!.slice().buffer as ArrayBuffer;
+                await this.ensureDir(e.path);
+                if (await this.vault.exists(e.path)) {
+                    await this.vault.writeBinary(e.path, buf);
                 } else {
-                    await this.vault.createBinary(path, buf);
+                    await this.vault.createBinary(e.path, buf);
                 }
-                count++;
-            } catch (e) {
-                logError(`Failed to write config ${path}: ${e?.message ?? e}`);
+            } catch (err: any) {
+                logError(`Failed to write config ${e.path}: ${err?.message ?? err}`);
+                continue;
             }
+            await this.settleBase(binding, [e]);
+            written++;
         }
-        return count;
+
+        let deleted = 0;
+        for (let i = 0; i < plan.deletes.length; i++) {
+            const d = plan.deletes[i];
+            progress.update(`Deleting: ${d.path} (${i + 1}/${plan.deletes.length})`);
+            try {
+                await this.vault.delete(d.path);
+                await this.removeEmptyFolders(d.path);
+            } catch (err: any) {
+                logError(`Failed to delete config ${d.path}: ${err?.message ?? err}`);
+                continue;
+            }
+            await this.dropBase(binding, d.path);
+            deleted++;
+        }
+
+        await this.settleBase(binding, plan.entries.filter((e) => e.decision.write === null));
+        return { written, deleted, reload: written + deleted > 0 || stopped };
     }
 
-    /** True when `path` is a file on disk whose bytes equal `buf`. The size
-     *  is compared first, so most changed files are told apart without a
-     *  read. */
-    private async diskMatches(path: string, buf: ArrayBuffer): Promise<boolean> {
-        const stat = await this.vault.stat(path);
-        if (!stat || stat.size !== buf.byteLength) return false;
-        const disk = new Uint8Array(await this.vault.readBinary(path));
-        const want = new Uint8Array(buf);
-        if (disk.length !== want.length) return false;
-        for (let i = 0; i < want.length; i++) {
-            if (disk[i] !== want[i]) return false;
+    /** Stop the community plugins (other than this one) whose files are in
+     *  `paths`, and log the ones stopped. Returns whether any was asked to
+     *  stop. A failure is logged: the reload that follows unloads them
+     *  anyway. */
+    private async stopPluginsOf(paths: readonly string[], label: string): Promise<boolean> {
+        const dirs = new Set<string>();
+        for (const path of paths) {
+            const dir = classifyConfigPath(path).pluginDir;
+            if (dir && dir !== this.pluginDir) dirs.add(dir);
+        }
+        if (dirs.size === 0) return false;
+        try {
+            const ids = await this.stopPlugins([...dirs]);
+            if (ids.length > 0) {
+                logInfo(
+                    `${label}: stopped ${ids.length} plugin(s) before writing their files ` +
+                    `(Obsidian reloads them): ${ids.join(", ")}`,
+                );
+            }
+        } catch (e: any) {
+            logWarn(`${label}: stopping plugins before writing their files failed: ${e?.message ?? e}`);
         }
         return true;
     }
 
-    /** Build the per-write receive context: this device's platform + the set
+    /** Remove the folders a delete left empty, up to (not including) the
+     *  top folders of `.obsidian/` (`plugins`, `themes`, `snippets`): an
+     *  empty plugin folder would still count as an installed plugin. */
+    private async removeEmptyFolders(path: string): Promise<void> {
+        const segs = path.split("/");
+        for (let n = segs.length - 1; n >= 3; n--) {
+            const dir = segs.slice(0, n).join("/");
+            let listing: { files: string[]; folders: string[] };
+            try {
+                listing = await this.vault.list(dir);
+            } catch {
+                return;
+            }
+            if (listing.files.length > 0 || listing.folders.length > 0) return;
+            await this.vault.delete(dir);
+        }
+    }
+
+    /** A deleted file has no base: if the shared state gets it again, the
+     *  next Pull writes it as after a Join. */
+    private async dropBase(binding: ConfigBinding, path: string): Promise<void> {
+        await binding.store.runWriteTx({
+            meta: [
+                { op: "delete", key: configLastSyncedKey(path) },
+                { op: "delete", key: configLocalFirstKey(path) },
+            ],
+            onCommit: () => binding.lastSynced.delete(path),
+        });
+    }
+
+    /** The disk of `entries` has taken in their shared versions. */
+    private async settleBase(binding: ConfigBinding, entries: readonly PullPlanEntry[]): Promise<void> {
+        if (entries.length === 0) return;
+        const values = entries.map((e) => ({
+            path: e.path,
+            value: { vclock: e.shared.vclock, size: e.shared.size, chunks: e.shared.chunks },
+        }));
+        await binding.store.runWriteTx({
+            meta: values.flatMap(({ path, value }) => [
+                { op: "put" as const, key: configLastSyncedKey(path), value },
+                { op: "delete" as const, key: configLocalFirstKey(path) },
+            ]),
+            onCommit: () => {
+                for (const { path, value } of values) binding.lastSynced.set(path, value);
+            },
+        });
+    }
+
+    private makePullWriter(binding: ConfigBinding, ctx: ConfigOpContext, keys: ConfigOpKeys): ConfigPullWriter {
+        return new ConfigPullWriter({
+            db: binding.store,
+            client: ctx.client,
+            checkpoints: binding.checkpoints,
+            lastSynced: binding.lastSynced,
+            signal: ctx.signal,
+            hasher: keys.hasher,
+        });
+    }
+
+    /**
+     * Shared start of Push and Pull: drop the bases when another config
+     * DB's Pull wrote the disk since this one was used
+     * (`ConfigBinding.alignBasesWithDisk`), bring an old store to the
+     * shared / base meaning once (`migrateConfigBase`), and build the
+     * planner's inputs.
+     */
+    private async prepare(
+        binding: ConfigBinding,
+        ctx: ConfigOpContext,
+        keys: ConfigOpKeys,
+        writer: ConfigPullWriter,
+    ): Promise<ReconcileDeps> {
+        const participating = await this.participation();
+        const dropped = await binding.alignBasesWithDisk();
+        if (dropped > 0) {
+            logInfo(
+                `Config: another config database's Pull wrote this vault's config since ` +
+                `"${binding.dbName}" was last used; ${dropped} file(s) are merged as after ` +
+                `a Join (the shared values win, keys only this device has stay).`,
+            );
+        }
+        await migrateConfigBase({
+            store: binding.store,
+            lastSynced: binding.lastSynced,
+            client: ctx.client,
+            signal: ctx.signal,
+            participates: participating,
+            ensureChunks: (doc) => writer.ensureChunks(doc).catch((e: any) => {
+                logWarn(`config migration: chunks of ${doc._id}: ${e?.message ?? e}`);
+            }),
+        });
+        return {
+            vault: this.vault,
+            store: binding.store,
+            lastSynced: binding.lastSynced,
+            hasher: keys.hasher,
+            maxSize: ConfigSync.MAX_CONFIG_SIZE,
+            participates: participating,
+            fetchChunks: (doc) => writer.ensureChunks(doc),
+            localFirst: await loadLocalFirst(binding.store),
+            deviceOnly: (path) => this.getSettings().configSyncPolicy.deviceOnlyKeys[path] ?? [],
+        };
+    }
+
+    // ── Low-level operations ───────────────────────────
+
+    /** Paths never replicated: workspace layout, this plugin's own
+     *  data.json (credentials) and its backups folder (copies of other
+     *  plugins' data.json). */
+    private isExcluded(path: string): boolean {
+        const name = path.split("/").pop() ?? "";
+        if (ConfigSync.SKIP_FILES.has(name)) return true;
+        if (path === this.ownDataPath) return true;
+        return path === this.backupsDir || path.startsWith(this.backupsDir + "/");
+    }
+
+    /**
+     * The one decision of which paths take part in sharing on this device,
+     * for the op about to run: not physically excluded, and `participates`
+     * under the policy and this device's state. Push and Pull both use it,
+     * so a file is sent exactly when it would also be written here.
+     */
+    private async participation(): Promise<(path: string) => boolean> {
+        const device = await this.buildDeviceContext();
+        const policy = () => this.getSettings().configSyncPolicy;
+        return (path) =>
+            !this.isExcluded(path) && participates(policy(), classifyConfigPath(path), device);
+    }
+
+    /** Build the per-op device context: this device's platform + the set
      *  of locally-installed plugin folders + their local desktop-only flags.
      *  The plugins folder is listed once; each present plugin's local manifest
      *  is read only on mobile, where the desktop-only gate can fire. */
-    private async buildReceiveContext(): Promise<ReceiveContext> {
+    private async buildDeviceContext(): Promise<DeviceContext> {
         const isMobile = this.getIsMobile();
         const present = new Set<string>();
         try {
@@ -1085,22 +1243,6 @@ export class ConfigSync {
             pluginPresent: (dir) => present.has(dir),
             isDesktopOnly: (dir) => desktopOnly.get(dir),
         };
-    }
-
-    /** Order the fetched chunks by the ConfigDoc.chunks reference list
-     *  and join into a single ArrayBuffer. The fetch order from
-     *  `getChunks` is not guaranteed (keys-array allDocs returns rows
-     *  in id order, not request order), so we re-order through a map. */
-    private static assembleChunks(
-        order: readonly string[],
-        chunks: readonly ChunkDoc[],
-    ): ArrayBuffer {
-        const byId = new Map<string, ChunkDoc>();
-        for (const c of chunks) byId.set(c._id, c);
-        const ordered = order
-            .map((id) => byId.get(id))
-            .filter((c): c is ChunkDoc => c != null);
-        return joinChunks(ordered as ChunkDoc[]);
     }
 
     // ── Utilities (public for settings UI) ─────────────
@@ -1208,17 +1350,14 @@ export class ConfigSync {
 
     /** List all local `.obsidian/` config file paths for the settings tree
      *  UI, applying the same physical exclusions as `scan` (SKIP_FILES /
-     *  SKIP_DIRS via listFilesRecursive, and the own-data.json skipPaths).
+     *  SKIP_DIRS via listFilesRecursive, own data.json and backups).
      *  Policy is NOT applied here — the UI shows every selectable path and
      *  reflects the policy decision per node itself. */
     async listLocalConfigPaths(): Promise<string[]> {
         const files: string[] = [];
         await this.listFilesRecursive(".obsidian", files);
         return files
-            .filter((f) => {
-                const name = f.split("/").pop() ?? "";
-                return !ConfigSync.SKIP_FILES.has(name) && !this.skipPaths.has(f);
-            })
+            .filter((f) => !this.isExcluded(f))
             .sort();
     }
 
@@ -1251,6 +1390,7 @@ export class ConfigSync {
             for (const folder of listing.folders) {
                 const folderName = folder.split("/").pop() ?? "";
                 if (ConfigSync.SKIP_DIRS.has(folderName)) continue;
+                if (this.isExcluded(folder)) continue;
                 await this.listFilesRecursive(folder, result);
             }
         } catch (e: any) {

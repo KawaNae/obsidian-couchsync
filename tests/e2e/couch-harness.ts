@@ -168,6 +168,8 @@ export interface E2EDeviceHarness {
      * harness answers no prompt. Resolves with the summary the notice shows.
      */
     runClone(opts?: { passphrase?: string }): Promise<string>;
+    /** The progress lines the notice of the last runInit / runClone showed. */
+    readonly progress: readonly string[];
     destroy(): Promise<void>;
 }
 
@@ -278,6 +280,7 @@ export async function createE2EHarness(opts: CreateE2EHarnessOpts = {}): Promise
         // first runInit / runClone hands the codec over to the binding.
         let setupService!: SetupService;
         let summary = "";
+        const progress: string[] = [];
         const binding = new VaultBinding({
             getSettings,
             saveSettings: async () => {},
@@ -287,10 +290,15 @@ export async function createE2EHarness(opts: CreateE2EHarnessOpts = {}): Promise
             stopLive: () => { engine.stop(); ct.stop(); },
             startLive: async () => {},
             checkDatabase: (db) => remoteOps.checkDatabaseWith(cfg.couchUrl, cfg.user, cfg.password, db),
-            openProgress: () => ({ update: () => {}, done: (s) => { summary = s; }, fail: () => {} }),
+            openProgress: () => {
+                progress.length = 0;
+                return { update: (m) => { progress.push(m); }, done: (s) => { summary = s; }, fail: () => {} };
+            },
             askPassphrase: async (reason) => {
                 throw new Error(`the harness answers no passphrase prompt (${reason} passphrase)`);
             },
+            // The user confirms every Init and Clone the test runs.
+            confirmSetup: async () => true,
         });
         let seeded: CryptoProvider | undefined = sharedCrypto;
         const wrapVaultClient = (raw: ICouchClient): ICouchClient => {
@@ -384,6 +392,7 @@ export async function createE2EHarness(opts: CreateE2EHarnessOpts = {}): Promise
             client,
             runInit,
             runClone,
+            progress,
             get settings() {
                 return settingsRef.current;
             },

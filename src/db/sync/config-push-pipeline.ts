@@ -1,356 +1,237 @@
 /**
- * ConfigPushPipeline — incremental push for ConfigSync.
+ * ConfigPushPipeline — checks a Push plan against the server, then sends
+ * what the user selected.
  *
- * Replaces the snapshot push (`fetchRemoteConfigDocs` 全件 + `pushDocs`
- * by id list) with a delta-based pipeline:
+ *   1. check: read the server docs of the planned paths (one allDocs).
+ *      A path is ready to send only when
+ *        - the server doc is the shared version this device holds (the
+ *          config DB doc), and
+ *        - the disk took that version in (the base is the shared version),
+ *      or when the path is new everywhere (no server doc, no shared, no
+ *      base). Any other path is held: the server or the disk is behind,
+ *      and a Pull & Reload has to merge first. Pushing it would overwrite
+ *      shared changes this device never saw.
+ *   2. send: chunks first, then the docs, each with the vclock of its base
+ *      advanced by this device and the server's `_rev` read in step 1. A
+ *      server doc that moved in between is a conflict: the path is held.
+ *   3. record: for each doc the server accepted, the config DB doc and
+ *      lastSynced become the sent version, in one tx. A doc the server
+ *      rejected leaves both as they were.
  *
- *   1. enumerate local changes since `lastPushSeq` via ConfigLocalDB.changes()
- *   2. fetch remote `_rev` for the affected ids only (per-doc allDocs,
- *      not the legacy "fetch every config from remote" anti-pattern)
- *   3. classify per pair via vclock relation:
- *        concurrent  → divergent[] (caller drives the modal)
- *        dominated   → push skip (next pull will integrate)
- *        equal       → push skip (already converged)
- *        dominates   → proceed
- *   4. if any divergent, return without push — caller decides whether to
- *      cancel or trigger forcePush()
- *   5. bulkDocs the proceed[] set with attached _rev
- *   6. ALL-OR-NOTHING: any `error: "conflict"` row blocks the cursor
- *      advance, so the next run() re-enumerates the same delta and
- *      retries. Mirrors how the vault push pipeline keeps a conflict
- *      from silently dropping an id.
- *
- * `forcePush(divergent)` is the post-modal continuation: bumps each
- * divergent doc's local vclock to dominate remote (mergeVC + bump),
- * then re-runs the pipeline. The cursor only advances on a clean run.
+ * The pipeline never asks to overwrite: a path whose server doc moved is
+ * held, never forced.
  */
 
 import type { ConfigDoc, CouchSyncDoc, ChunkDoc } from "../../types.ts";
-import { isConfigDoc } from "../../types.ts";
-import {
-    configPathFromId, isConfigDocId,
-} from "../../types/doc-id.ts";
-import { stripRev } from "../../utils/doc.ts";
-import { compareVC, mergeVC, incrementVC, type VectorClock }
-    from "../../sync/vector-clock.ts";
-import { chunkListsEqual } from "../../sync/chunk-equality.ts";
-import type {
-    BulkDocsResult,
-    DocWithAttachments,
-    ICouchClient,
-} from "../interfaces.ts";
+import { CONFIG_SCHEMA_VERSION } from "../../types.ts";
+import { makeConfigId } from "../../types/doc-id.ts";
+import { incrementVC } from "../../sync/vector-clock.ts";
+import { sameVersion, type PushPlanEntry } from "../../sync/config-reconcile.ts";
+import type { DocWithAttachments, ICouchClient } from "../interfaces.ts";
 import type { ConfigLocalDB } from "../config-local-db.ts";
 import { buildChunkAttachment } from "../chunk-attachment.ts";
+import { splitIntoChunks, MAX_CHUNK_BYTES_CONFIG, type ChunkHasher } from "../chunker.ts";
 import { logDebug, logInfo } from "../../ui/log.ts";
-import type { ConfigCheckpoints } from "./config-checkpoints.ts";
+import {
+    configLastSyncedKey,
+    type ConfigLastSynced,
+} from "./config-last-synced.ts";
 
-export interface ConfigPushDivergence {
-    path: string;
-    localVclock: VectorClock;
-    remoteVclock: VectorClock;
-    relation: "concurrent" | "dominated";
-}
-
-export interface ConfigPushStats {
-    pushed: number;
-    skipped: number;
-    conflicts: number;
-    divergent: number;
-    /** Number of chunk docs pushed alongside ConfigDocs. Content-
-     *  addressed; conflicts on chunks are benign (same hash = same
-     *  content) and not counted as failures. */
-    chunksPushed: number;
-}
+/** Why a path was not sent.
+ *   - remote-changed: the server doc is not the shared version held here
+ *   - not-merged: the disk has not taken in the shared version (no base,
+ *     or an older one) */
+export type ConfigPushHoldReason = "remote-changed" | "not-merged";
 
 export interface ConfigPushResult {
-    stats: ConfigPushStats;
-    divergent: ConfigPushDivergence[];
-    /** True iff the cursor was advanced. Always false when divergent or
-     *  conflicts are nonzero — see all-or-nothing rule. */
-    cursorAdvanced: boolean;
+    pushed: string[];
+    held: Array<{ path: string; reason: ConfigPushHoldReason }>;
+    /** Rejected by the server for a reason other than a conflict. */
+    failed: string[];
+}
+
+/** A path that can be sent: its plan entry and the server's `_rev` (null:
+ *  no server doc). */
+export interface ConfigPushReady {
+    entry: PushPlanEntry;
+    rev: string | null;
+}
+
+export interface ConfigPushCheck {
+    ready: ConfigPushReady[];
+    held: Array<{ path: string; reason: ConfigPushHoldReason }>;
+}
+
+/** A ready path and the content to send for it. */
+export interface ConfigPushOutgoing {
+    ready: ConfigPushReady;
+    content: Uint8Array;
 }
 
 export interface ConfigPushPipelineDeps {
     db: ConfigLocalDB;
     client: ICouchClient;
-    checkpoints: ConfigCheckpoints;
+    lastSynced: ConfigLastSynced;
+    hasher: ChunkHasher;
     getDeviceId: () => string;
     signal: AbortSignal;
+}
+
+interface Outgoing {
+    path: string;
+    doc: ConfigDoc & { _rev?: string };
+    chunks: ChunkDoc[];
 }
 
 export class ConfigPushPipeline {
     constructor(private deps: ConfigPushPipelineDeps) {}
 
-    /**
-     * Drain the local changes feed and push delta to remote. Stops at
-     * the first divergence: returns without pushing so the caller can
-     * surface a confirm modal and decide on `forcePush`.
-     */
-    async run(onProgress?: (msg: string) => void): Promise<ConfigPushResult> {
-        const since = this.deps.checkpoints.getPushSeq();
-        onProgress?.(`Enumerating local changes (since=${since})...`);
-
-        const localChanges = await this.deps.db.changes(since, { include_docs: true });
-
-        const toPush: ConfigDoc[] = [];
-        for (const r of localChanges.results) {
-            if (!isConfigDocId(r.id)) continue;
-            if (r.deleted) continue; // config tombstones are not pushed
-            if (!r.doc) continue;
-            const doc = stripRev(r.doc) as ConfigDoc;
-            if (!isConfigDoc(doc)) continue;
-            toPush.push(doc);
-        }
-
-        if (toPush.length === 0) {
-            // Nothing to push and no config doc in this batch. Don't
-            // advance the cursor — the local DB's `_update_seq` may have
-            // moved due to meta writes (checkpoints, lastSynced, …) which
-            // are unrelated to push and shouldn't pretend "we caught up
-            // through seq N" when in fact no config delta was processed.
-            // Leaving the cursor at `since` means re-running run() is a
-            // cheap no-op (same since, same empty result).
-            return {
-                stats: ConfigPushPipeline.emptyStats(),
-                divergent: [],
-                cursorAdvanced: false,
-            };
-        }
-
-        onProgress?.(`Checking remote revs for ${toPush.length} doc(s)...`);
-        // include_docs:true is required because vclock lives in doc body —
-        // we need the full remote doc to run compareVC on each pair, not
-        // just the rev. The fetch is bounded by the local delta size, so
-        // it's still O(delta) instead of the legacy O(all-config).
+    /** Step 1: which planned paths can be sent now. */
+    async check(plan: readonly PushPlanEntry[]): Promise<ConfigPushCheck> {
+        const out: ConfigPushCheck = { ready: [], held: [] };
+        if (plan.length === 0) return out;
+        const ids = plan.map((e) => makeConfigId(e.path));
         const remoteRows = await this.deps.client.allDocs<ConfigDoc>(
-            { keys: toPush.map((d) => d._id), include_docs: true },
-            this.deps.signal,
+            { keys: ids, include_docs: true }, this.deps.signal,
         );
-        const remoteRevMap = new Map<string, string>();
-        const remoteVcMap = new Map<string, VectorClock>();
-        // Full remote doc, so the equal-vclock skip can verify content
-        // (chunks + deleted) rather than trusting the vclock proxy.
-        const remoteDocMap = new Map<string, ConfigDoc>();
+        const remote = new Map<string, { rev: string; doc: ConfigDoc }>();
         for (const row of remoteRows.rows) {
-            if (row.value?.rev && !row.value?.deleted) {
-                remoteRevMap.set(row.id, row.value.rev);
-            }
-            if (row.doc) {
-                const rdoc = row.doc as ConfigDoc;
-                if (rdoc.vclock) remoteVcMap.set(row.id, rdoc.vclock);
-                remoteDocMap.set(row.id, rdoc);
+            if (row.value?.rev && !row.value.deleted && row.doc) {
+                remote.set(row.id, { rev: row.value.rev, doc: row.doc as ConfigDoc });
             }
         }
-
-        // Classify per pair.
-        const proceed: Array<ConfigDoc & { _rev?: string }> = [];
-        const divergent: ConfigPushDivergence[] = [];
-        let skipped = 0;
-        for (const doc of toPush) {
-            const remoteVc = remoteVcMap.get(doc._id);
-            const path = configPathFromId(doc._id);
-            const localVc = doc.vclock ?? {};
-            if (!remoteVc) {
-                // Remote-absent → safe to push (new doc).
-                const stripped = stripRev(doc) as ConfigDoc & { _rev?: string };
-                proceed.push(stripped);
+        for (const entry of plan) {
+            const id = makeConfigId(entry.path);
+            const server = remote.get(id) ?? null;
+            const shared = await this.deps.db.get(id);
+            const sharedLive = shared && !shared.deleted ? shared : null;
+            const fresh = server && sharedLive
+                ? sameVersion(server.doc, sharedLive)
+                : !server && !sharedLive;
+            if (!fresh) {
+                out.held.push({ path: entry.path, reason: "remote-changed" });
                 continue;
             }
-            const cmp = compareVC(localVc, remoteVc);
-            if (cmp === "concurrent") {
-                divergent.push({
-                    path, localVclock: localVc, remoteVclock: remoteVc,
-                    relation: "concurrent",
-                });
+            const merged = entry.base && sharedLive
+                ? sameVersion(entry.base, sharedLive)
+                : !entry.base && !sharedLive;
+            if (!merged) {
+                out.held.push({ path: entry.path, reason: "not-merged" });
                 continue;
             }
-            if (cmp === "dominated") {
-                // Remote ahead of local — push would clobber. Skip; next
-                // pull integrates. Surface as divergent so the modal can
-                // explain the situation.
-                divergent.push({
-                    path, localVclock: localVc, remoteVclock: remoteVc,
-                    relation: "dominated",
-                });
-                continue;
-            }
-            if (cmp === "equal") {
-                // Content-truthful skip: only converged when chunks AND the
-                // deleted flag also match. A vclock tie with differing content
-                // is the config-Create stale-collision anomaly — surface it as
-                // divergent so the modal arbitrates, rather than silently
-                // dropping the local content (symmetric with the pull-side
-                // truthful skip and the dominates-case churn guard).
-                const rDoc = remoteDocMap.get(doc._id);
-                if (rDoc && chunkListsEqual(doc.chunks, rDoc.chunks)
-                    && !!doc.deleted === !!rDoc.deleted) {
-                    skipped++;
-                    continue;
-                }
-                divergent.push({
-                    path, localVclock: localVc, remoteVclock: remoteVc,
-                    relation: "concurrent",
-                });
-                continue;
-            }
-            // dominates — push proceeds.
-            const stripped = stripRev(doc) as ConfigDoc & { _rev?: string };
-            stripped._rev = remoteRevMap.get(doc._id);
-            proceed.push(stripped);
+            out.ready.push({ entry, rev: server?.rev ?? null });
         }
-
-        if (divergent.length > 0) {
-            // Don't push anything when any divergence exists — caller
-            // decides via modal whether to forcePush. Cursor stays put.
-            return {
-                stats: {
-                    ...ConfigPushPipeline.emptyStats(),
-                    skipped,
-                    divergent: divergent.length,
-                },
-                divergent,
-                cursorAdvanced: false,
-            };
-        }
-
-        if (proceed.length === 0) {
-            // All skipped (every local change was already converged).
-            // Advance cursor since the local seq has moved.
-            if (localChanges.last_seq !== since) {
-                this.deps.checkpoints.setPushSeq(localChanges.last_seq);
-                await this.deps.checkpoints.save();
-            }
-            return {
-                stats: { ...ConfigPushPipeline.emptyStats(), skipped },
-                divergent: [],
-                cursorAdvanced: localChanges.last_seq !== since,
-            };
-        }
-
-        // Resolve chunks referenced by proceed[]. Chunks ride as
-        // separate docs with envelope-formatted attachment "c" so the
-        // wrapped client (compress + encrypt) sees one unified bytes
-        // path for both push and pull. Content-addressed: pushing the
-        // same chunk id twice across devices is a 409 conflict the
-        // remote silently absorbs — no follow-up needed.
-        const chunkAttachments = await this.buildChunkAttachments(proceed);
-
-        onProgress?.(
-            `Pushing ${proceed.length} doc(s)` +
-            (chunkAttachments.length > 0
-                ? ` + ${chunkAttachments.length} chunk(s)...`
-                : `...`),
-        );
-        const [docResults, chunkResults] = await Promise.all([
-            this.deps.client.bulkDocs(proceed, this.deps.signal),
-            chunkAttachments.length > 0
-                ? this.deps.client.bulkDocsWithAttachments(
-                      chunkAttachments, this.deps.signal,
-                  )
-                : Promise.resolve([] as BulkDocsResult[]),
-        ]);
-
-        let conflicts = 0;
-        let pushed = 0;
-        for (const r of docResults) {
-            if (r.error === "conflict") {
-                conflicts++;
-                logDebug(`  → ${r.id} (conflict, will retry next push)`);
-            } else if (r.error) {
-                logDebug(`  → ${r.id} (${r.error}: ${r.reason ?? ""})`);
-            } else {
-                pushed++;
-            }
-        }
-
-        let chunksPushed = 0;
-        for (const r of chunkResults) {
-            // Chunk conflicts are benign (content-addressed); only count
-            // successful new writes for diagnostics.
-            if (!r.error) chunksPushed++;
-        }
-
-        const cursorAdvanced = conflicts === 0;
-        if (cursorAdvanced) {
-            this.deps.checkpoints.setPushSeq(localChanges.last_seq);
-            await this.deps.checkpoints.save();
-        }
-        // else: leave cursor alone — next run() re-enumerates the same
-        // delta and retries. All-or-nothing.
-
-        if (pushed + conflicts + chunksPushed > 0) {
-            const parts: string[] = [];
-            if (pushed > 0) parts.push(`${pushed} pushed`);
-            if (chunksPushed > 0) parts.push(`${chunksPushed} chunks`);
-            if (skipped > 0) parts.push(`${skipped} skipped`);
-            if (conflicts > 0) parts.push(`${conflicts} conflicts`);
-            logInfo(`Config Push: ${parts.join(", ")}`);
-        }
-
-        return {
-            stats: { pushed, skipped, conflicts, divergent: 0, chunksPushed },
-            divergent: [],
-            cursorAdvanced,
-        };
+        return out;
     }
 
-    /** Empty-stats helper so the various "nothing to push" returns share
-     *  a single source of truth for which counters exist. */
-    private static emptyStats(): ConfigPushStats {
-        return {
-            pushed: 0, skipped: 0, conflicts: 0, divergent: 0, chunksPushed: 0,
-        };
-    }
+    /** Steps 2 and 3: send `items` (ready paths with their content). */
+    async send(
+        items: readonly ConfigPushOutgoing[],
+        onProgress?: (msg: string) => void,
+    ): Promise<ConfigPushResult> {
+        const result: ConfigPushResult = { pushed: [], held: [], failed: [] };
+        if (items.length === 0) return result;
 
-    /** Read referenced ChunkDocs for the proceed[] ConfigDocs from the
-     *  local DB, build envelope-formatted attachment items ready for
-     *  `bulkDocsWithAttachments`. De-duped by chunk id so the same
-     *  chunk referenced by multiple configs ships once. */
-    private async buildChunkAttachments(
-        proceed: ConfigDoc[],
-    ): Promise<DocWithAttachments[]> {
-        const allChunkIds = new Set<string>();
-        for (const doc of proceed) {
-            for (const cid of doc.chunks) allChunkIds.add(cid);
-        }
-        if (allChunkIds.size === 0) return [];
-
-        const chunks = await this.deps.db.getChunks([...allChunkIds]);
-        // `keepRev: false`: local Dexie tracks revisions on its own store;
-        // CouchDB's /_bulk_docs rejects a doc that already claims a rev when
-        // the destination has no prior version (silent forbidden/conflict
-        // per row). Vault's push pipeline keeps the rev because it has
-        // back-filled the remote rev first — see buildChunkAttachment.
-        return chunks.map((chunk) =>
-            buildChunkAttachment(chunk as ChunkDoc & { _rev?: string }, { keepRev: false }),
-        );
-    }
-
-    /**
-     * Continuation after a confirm-divergence modal: causally advance
-     * each divergent doc's local vclock so it dominates remote, then
-     * caller re-runs `run()` to push. The vclock advance is committed
-     * to LocalDB inside a runWriteBuilder so a CAS conflict (someone
-     * else just edited the same path) restarts the merge cleanly.
-     *
-     * mergeVC + incrementVC produces a vclock strictly greater than both
-     * sides — pull-side resolvers on peers will treat it as `dominated`
-     * (i.e., a normal update), not a conflict.
-     */
-    async forcePushAdvanceVclocks(divergent: ConfigPushDivergence[]): Promise<void> {
         const deviceId = this.deps.getDeviceId();
-        for (const entry of divergent) {
-            const id = `config:${entry.path}`;
-            await this.deps.db.runWriteBuilder(async (snap) => {
-                const local = (await snap.get(id)) as ConfigDoc | null;
-                if (!local) return null;
-                const merged = mergeVC(local.vclock ?? {}, entry.remoteVclock);
-                const bumped = incrementVC(merged, deviceId);
-                const next: ConfigDoc = { ...local, vclock: bumped };
-                return {
-                    docs: [{ doc: next as CouchSyncDoc, expectedVclock: local.vclock ?? {} }],
-                };
-            });
+        const outgoing: Outgoing[] = [];
+        for (const { ready: { entry, rev }, content } of items) {
+            const chunks = content === entry.local
+                ? entry.chunks
+                : await splitIntoChunks(
+                    content.slice().buffer as ArrayBuffer,
+                    { hasher: this.deps.hasher, chunkBytes: MAX_CHUNK_BYTES_CONFIG },
+                );
+            const doc: ConfigDoc & { _rev?: string } = {
+                _id: makeConfigId(entry.path),
+                schemaVersion: CONFIG_SCHEMA_VERSION,
+                type: "config",
+                chunks: chunks.map((c) => c._id),
+                mtime: entry.mtime,
+                size: content.byteLength,
+                vclock: incrementVC(entry.base?.vclock, deviceId),
+            };
+            if (rev) doc._rev = rev;
+            outgoing.push({ path: entry.path, doc, chunks });
         }
+
+        // Chunks first: a peer never sees a doc whose chunks are not on
+        // the server yet. Content-addressed, so a chunk already there is a
+        // benign conflict.
+        const attachments = this.chunkAttachments(outgoing);
+        onProgress?.(`Pushing ${outgoing.length} file(s) + ${attachments.length} chunk(s)...`);
+        const badChunks = new Set<string>();
+        if (attachments.length > 0) {
+            const chunkResults = await this.deps.client.bulkDocsWithAttachments(
+                attachments, this.deps.signal,
+            );
+            for (const r of chunkResults) {
+                if (r.error && r.error !== "conflict") badChunks.add(r.id);
+            }
+        }
+        const sendable: Outgoing[] = [];
+        for (const o of outgoing) {
+            if (o.chunks.some((c) => badChunks.has(c._id))) {
+                logDebug(`  → ${o.path} (a chunk was rejected by the server)`);
+                result.failed.push(o.path);
+            } else {
+                sendable.push(o);
+            }
+        }
+        if (sendable.length === 0) return result;
+        const docResults = await this.deps.client.bulkDocs(
+            sendable.map((o) => o.doc), this.deps.signal,
+        );
+        const byId = new Map(docResults.map((r) => [r.id, r]));
+
+        for (const o of sendable) {
+            const r = byId.get(o.doc._id);
+            if (!r || r.error) {
+                if (r?.error === "conflict") {
+                    result.held.push({ path: o.path, reason: "remote-changed" });
+                } else {
+                    logDebug(`  → ${o.path} (${r?.error ?? "no result"}: ${r?.reason ?? ""})`);
+                    result.failed.push(o.path);
+                }
+                continue;
+            }
+            await this.record(o);
+            result.pushed.push(o.path);
+        }
+
+        if (result.pushed.length > 0) {
+            logInfo(
+                `Config Push: ${result.pushed.length} pushed:\n` +
+                result.pushed.map((p) => `  • ${p}`).join("\n"),
+            );
+        }
+        return result;
+    }
+
+    /** The server accepted `o`: it is now the shared version and the base. */
+    private async record(o: Outgoing): Promise<void> {
+        const { _rev: _r, ...doc } = o.doc;
+        void _r;
+        const value = { vclock: doc.vclock, size: doc.size, chunks: doc.chunks };
+        await this.deps.db.runWriteTx({
+            docs: [{ doc: doc as CouchSyncDoc }],
+            chunks: o.chunks as unknown as CouchSyncDoc[],
+            meta: [{ op: "put", key: configLastSyncedKey(o.path), value }],
+            onCommit: () => this.deps.lastSynced.set(o.path, value),
+        });
+    }
+
+    /** Envelope-formatted chunk attachments, de-duplicated by id.
+     *  `keepRev: false`: the server would reject a rev it never issued. */
+    private chunkAttachments(outgoing: readonly Outgoing[]): DocWithAttachments[] {
+        const seen = new Set<string>();
+        const out: DocWithAttachments[] = [];
+        for (const o of outgoing) {
+            for (const c of o.chunks) {
+                if (seen.has(c._id)) continue;
+                seen.add(c._id);
+                out.push(buildChunkAttachment(c, { keepRev: false }));
+            }
+        }
+        return out;
     }
 }

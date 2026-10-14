@@ -40,7 +40,7 @@ import {
     type ConfigUnit,
 } from "../sync/config-policy/classify.ts";
 import {
-    sendDecision,
+    policySelects,
     type ConfigSyncPolicy,
 } from "../sync/config-policy/policy.ts";
 
@@ -416,10 +416,14 @@ export class ConfigSyncTab {
         // ── Filter (meaning-unit policy tree) — the "what", shown first
         //    since it governs both Push and Pull below. ────────
         this.renderFilterTree(el, configEnabled);
+        this.renderDeviceOnlyKeys(el);
 
         new Setting(el)
             .setName("Push")
-            .setDesc("Scan .obsidian/ and push the selected units to remote.")
+            .setDesc(
+                "Push this device's changes to the selected units since it last took them from the server. " +
+                "Files changed on the server since then are held until Pull & Reload.",
+            )
             .addButton((btn) =>
                 btn.setButtonText("Push ↑")
                     .setDisabled(!configEnabled)
@@ -443,7 +447,8 @@ export class ConfigSyncTab {
         new Setting(el)
             .setName("Pull & Reload")
             .setDesc(
-                "Pull config from remote, write the selected units to this device, then reload Obsidian if any file changed.",
+                "Pull config from remote and merge it into this device's files (keys this device changed are kept; " +
+                "overwritten files are backed up in the plugin's backups folder), then reload Obsidian if any file changed.",
             )
             .addButton((btn) =>
                 btn.setButtonText("Pull & Reload ↓")
@@ -452,24 +457,40 @@ export class ConfigSyncTab {
                         btn.setButtonText("Pulling...");
                         btn.setDisabled(true);
                         try {
-                            const written = await this.trackOp(this.deps.configSync.pull());
-                            if (written === 0) {
-                                // Nothing on disk changed, so a reload
-                                // would load the same settings again.
-                                showNotice("No config files changed. Skipping reload.");
-                                this.deps.refresh();
-                                return;
-                            }
-                            showNotice("Reloading Obsidian...");
-                            setTimeout(() => {
-                                (this.deps.app as any).commands.executeCommandById("app:reload");
-                            }, 500);
+                            // ConfigSync reports the outcome in one Notice
+                            // and reloads Obsidian when it wrote a file.
+                            await this.trackOp(this.deps.configSync.pull());
                         } catch {
                             // Reported by ConfigSync (ProgressNotice + log);
-                            // no reload on failure. Re-render so the button
-                            // and the status line reflect this attempt.
-                            this.deps.refresh();
+                            // no reload on failure.
                         }
+                        // Re-render so the button and the status line
+                        // reflect this attempt.
+                        this.deps.refresh();
+                    })
+            );
+
+        new Setting(el)
+            .setName("Pull & Overwrite")
+            .setDesc(
+                "Make this device's selected config exactly the shared config: no merge, so changes not " +
+                "pushed are lost; selected files the server does not have are deleted, and keys kept on " +
+                "this device take the shared value. Files the Filter leaves out are not touched. Lists the " +
+                "files to delete and write first, backs them up, then reloads Obsidian.",
+            )
+            .addButton((btn) =>
+                btn.setButtonText("Overwrite ↓")
+                    .setWarning()
+                    .setDisabled(!configEnabled)
+                    .onClick(async () => {
+                        btn.setButtonText("Overwriting...");
+                        btn.setDisabled(true);
+                        try {
+                            await this.trackOp(this.deps.configSync.overwrite());
+                        } catch {
+                            // Reported by ConfigSync (ProgressNotice + log).
+                        }
+                        this.deps.refresh();
                     })
             );
     }
@@ -617,6 +638,42 @@ export class ConfigSyncTab {
         void this.populateFilterTree(treeEl);
     }
 
+    /** The keys a Push left out, each with a button that shares it again.
+     *  Shown only when there are some. */
+    private renderDeviceOnlyKeys(el: HTMLElement): void {
+        const policy = this.deps.getSettings().configSyncPolicy;
+        const paths = Object.keys(policy.deviceOnlyKeys)
+            .filter((p) => policy.deviceOnlyKeys[p].length > 0)
+            .sort();
+        if (paths.length === 0) return;
+        el.createEl("h4", { text: "Kept on this device" });
+        el.createEl("p", {
+            text: "Keys left out of a Push. Push does not send them and Pull does not " +
+                "change them. \"Share again\" makes a key sync as usual: if this " +
+                "device's value differs from the shared one, the next Push lists it.",
+            cls: "setting-item-description",
+        });
+        const box = el.createDiv({ cls: "cs-config-tree" });
+        for (const path of paths) {
+            for (const pointer of policy.deviceOnlyKeys[path]) {
+                const row = box.createDiv({ cls: "cs-device-only" });
+                row.createSpan({
+                    text: `${path.replace(/^\.obsidian\//, "")}  ${pointer === "" ? "(whole value)" : pointer}`,
+                });
+                const btn = row.createEl("button", { text: "Share again" });
+                btn.addEventListener("click", async () => {
+                    const cur = this.deps.getSettings().configSyncPolicy.deviceOnlyKeys;
+                    const rest = (cur[path] ?? []).filter((p) => p !== pointer);
+                    const next = { ...cur };
+                    if (rest.length > 0) next[path] = rest;
+                    else delete next[path];
+                    await this.updatePolicy({ deviceOnlyKeys: next });
+                    this.deps.refresh();
+                });
+            }
+        }
+    }
+
     private async populateFilterTree(treeEl: HTMLElement): Promise<void> {
         let localPaths: string[];
         try {
@@ -734,7 +791,7 @@ export class ConfigSyncTab {
         const groupCb = summary.createEl("input", { cls: "cs-unit-group" }) as HTMLInputElement;
         groupCb.type = "checkbox";
 
-        const effs = items.map((it) => sendDecision(policy, it.c));
+        const effs = items.map((it) => policySelects(policy, it.c));
         const allOn = effs.length > 0 && effs.every(Boolean);
         const anyOn = effs.some(Boolean);
         groupCb.checked = items.length > 0 ? allOn : (policy.unitDefaults[unit] ?? false);
@@ -768,7 +825,7 @@ export class ConfigSyncTab {
             const row = list.createDiv({ cls: "cs-unit-child" });
             const cb = row.createEl("input") as HTMLInputElement;
             cb.type = "checkbox";
-            cb.checked = sendDecision(policy, c);
+            cb.checked = policySelects(policy, c);
             cb.disabled = locked;
             row.createSpan({
                 text: ` ${c.path.replace(".obsidian/", "")}${c.isPluginCode ? " ⚠️" : ""}`,

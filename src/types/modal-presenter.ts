@@ -6,6 +6,8 @@
  * choice programmatically via `FakeModalPresenter`.
  */
 
+import type { PushReview } from "../sync/config-push-review.ts";
+
 /**
  * A conflict resolution choice.
  *
@@ -51,6 +53,19 @@ export type BatchDecision =
     | { kind: "all-defer" }
     | { kind: "dismissed" };
 
+/** What an overwriting config Pull is about to do, for its confirmation. */
+export interface ConfigOverwritePreview {
+    /** Files written with the shared content; `created` when the file is
+     *  not on disk yet. */
+    writes: Array<{ path: string; created: boolean }>;
+    /** Files deleted: on disk, taking part in sharing, not shared. */
+    deletes: string[];
+    /** Keys kept on this device (`deviceOnlyKeys`) that stop being kept. */
+    keptKeys: number;
+    /** Paths left alone because their content is not available. */
+    skipped: string[];
+}
+
 export interface IModalPresenter {
     /**
      * Show a side-by-side conflict diff and wait for the user to pick a
@@ -88,4 +103,17 @@ export interface IModalPresenter {
         confirmLabel: string,
         danger?: boolean,
     ): Promise<boolean>;
+
+    /**
+     * Show the config Push list and wait for the user. Resolves the ids of
+     * the items to send, or null when the user cancelled (nothing is sent).
+     */
+    showConfigPushModal(review: PushReview): Promise<string[] | null>;
+
+    /**
+     * Show what an overwriting config Pull will write and delete, and wait
+     * for the user. Resolves true to go ahead, false on cancel or close
+     * (nothing is changed).
+     */
+    showConfigOverwriteModal(preview: ConfigOverwritePreview): Promise<boolean>;
 }

@@ -1,9 +1,8 @@
 /**
- * Tests for ConfigSync — focused on network-free paths (scan, write,
- * filtering, configuration gates). Remote push/pull/init are not
- * covered here because ConfigSync instantiates its CouchClient via a
- * module-level factory that can't be injected without vi.mock, which
- * this codebase avoids.
+ * Tests for ConfigSync on one device: configuration gates, what Push sends
+ * and what Pull writes (policy, exclusions, unchanged files), against a
+ * FakeCouchClient. Multi-device merges are in
+ * tests/integration/config-three-way.integ.test.ts.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
@@ -17,8 +16,7 @@ import { FakeVaultIO } from "./helpers/fake-vault-io.ts";
 import { FakeModalPresenter } from "./helpers/fake-modal-presenter.ts";
 import { makeSettings } from "./helpers/settings-factory.ts";
 import { makeConfigId } from "../src/types/doc-id.ts";
-import { makeConfigFixture } from "./helpers/config-fixture.ts";
-import type { CouchSyncDoc } from "../src/types.ts";
+import { makeConfigFixture, seedRemoteConfig } from "./helpers/config-fixture.ts";
 import { FakeCouchClient } from "./helpers/fake-couch-client.ts";
 import { attachPlain } from "./helpers/config-attach.ts";
 
@@ -81,9 +79,9 @@ describe("ConfigSync", () => {
             expect(cs.currentStore()).toBeNull();
         });
 
-        it("scan throws not-configured when unbound", async () => {
+        it("pull throws not-configured when unbound", async () => {
             const unbound = makeCs();
-            await expect(unbound.scan()).rejects.toMatchObject({
+            await expect(unbound.pull()).rejects.toMatchObject({
                 name: "ConfigNotReadyError",
                 kind: "not-configured",
                 message: expect.stringMatching(/not configured/),
@@ -91,7 +89,7 @@ describe("ConfigSync", () => {
             // A name in settings without an open binding (the last rebind
             // failed) says so instead of pretending nothing is configured.
             settings.couchdbConfigDbName = "vault-config";
-            await expect(unbound.scan()).rejects.toMatchObject({
+            await expect(unbound.pull()).rejects.toMatchObject({
                 kind: "not-configured",
                 message: expect.stringMatching(/not active on this device/),
             });
@@ -103,329 +101,219 @@ describe("ConfigSync", () => {
         });
     });
 
-    // ── scan ────────────────────────────────────────────
+    // ── Push and Pull against a fake server ─────────────
 
-    describe("scan", () => {
-        it("stores config files as base64 docs with incremented vclock", async () => {
-            vault.addFile(".obsidian/app.json", `{"theme":"dark"}`);
+    describe("Push and Pull against a server", () => {
+        let remote: FakeCouchClient;
+        let bound: ConfigSync;
 
-            const count = await cs.scan();
-
-            expect(count).toBe(1);
-            const doc = await db.get(makeConfigId(".obsidian/app.json"));
-            expect(doc).not.toBeNull();
-            expect(doc!.type).toBe("config");
-            expect(doc!.vclock).toEqual({ "dev-A": 1 });
-        });
-
-        it("increments vclock on re-scan with changed content", async () => {
-            vault.addFile(".obsidian/app.json", "v1");
-            await cs.scan();
-
-            vault.addFile(".obsidian/app.json", "v2");
-            await cs.scan();
-
-            const doc = await db.get(makeConfigId(".obsidian/app.json"));
-            expect(doc!.vclock["dev-A"]).toBe(2);
-        });
-
-        it("skips workspace.json (SKIP_FILES)", async () => {
-            vault.addFile(".obsidian/workspace.json", "layout");
-
-            const count = await cs.scan();
-
-            expect(count).toBe(0);
-            expect(await db.get(makeConfigId(".obsidian/workspace.json"))).toBeNull();
-        });
-
-        it("skips workspace-mobile.json (SKIP_FILES)", async () => {
-            vault.addFile(".obsidian/workspace-mobile.json", "layout");
-            const count = await cs.scan();
-            expect(count).toBe(0);
-        });
-
-        it("skips own plugin data.json (SKIP_PATHS)", async () => {
-            vault.addFile(".obsidian/plugins/obsidian-couchsync/data.json", "{}");
-            const count = await cs.scan();
-            expect(count).toBe(0);
-            expect(await db.get(makeConfigId(".obsidian/plugins/obsidian-couchsync/data.json"))).toBeNull();
-        });
-
-        it("skips own data.json under a RENAMED plugin folder via the host-supplied path", async () => {
-            // BRAT / manual install can put the plugin under its repo name, so a
-            // hardcoded folder literal would miss the data.json (which holds the
-            // plaintext password + passphrase) and push it to the config server.
-            const renamed = ".obsidian/plugins/KawaNae-obsidian-couchsync/data.json";
-            const cs2 = await makeBoundCs(
-                { ownDataJsonPath: renamed }, // = manifest.dir + "/data.json"
-            );
-            vault.addFile(renamed, `{"couchdbPassword":"SECRET","encryptionPassphrase":"SECRET"}`);
-            // A normal config file alongside it, to prove scan still runs.
-            vault.addFile(".obsidian/app.json", `{"theme":"dark"}`);
-
-            const count = await cs2.scan();
-            expect(count).toBe(1); // only app.json
-            expect(await db.get(makeConfigId(renamed))).toBeNull(); // secret data.json excluded
-            expect(await db.get(makeConfigId(".obsidian/app.json"))).not.toBeNull();
-            // And the default-folder literal is NOT special-cased away here.
-            vault.addFile(".obsidian/plugins/obsidian-couchsync/data.json", "{}");
-            await cs2.scan();
-            expect(await db.get(makeConfigId(".obsidian/plugins/obsidian-couchsync/data.json"))).not.toBeNull();
-        });
-
-        it("skips files exceeding MAX_CONFIG_SIZE (5MB)", async () => {
-            const big = "x".repeat(6 * 1024 * 1024);
-            vault.addFile(".obsidian/big.json", big);
-            const count = await cs.scan();
-            expect(count).toBe(0);
-        });
-
-        it("skips nested .git and node_modules dirs (SKIP_DIRS)", async () => {
-            vault.addFile(".obsidian/.git/HEAD", "ref: refs/heads/main");
-            vault.addFile(".obsidian/node_modules/pkg/file.json", "{}");
-            vault.addFile(".obsidian/app.json", "{}");
-
-            const count = await cs.scan();
-
-            // Only app.json should be picked up
-            expect(count).toBe(1);
-            expect(await db.get(makeConfigId(".obsidian/.git/HEAD"))).toBeNull();
-            expect(await db.get(makeConfigId(".obsidian/node_modules/pkg/file.json"))).toBeNull();
-        });
-
-        it("invokes onProgress for each scanned file", async () => {
-            vault.addFile(".obsidian/app.json", "{}");
-            vault.addFile(".obsidian/hotkeys.json", "{}");
-
-            const calls: Array<{ path: string; i: number; total: number }> = [];
-            await cs.scan((path, i, total) => calls.push({ path, i, total }));
-
-            expect(calls.length).toBe(2);
-            expect(calls[0].total).toBe(2);
-        });
-
-        it("recurses into subdirectories; SEND filter lands theme CSS, drops plugin code", async () => {
-            vault.addFile(".obsidian/plugins/foo/main.js", "code"); // install-state → filtered
-            vault.addFile(".obsidian/themes/bar/theme.css", "css"); // theme-css → synced
-
-            await cs.scan();
-
-            // Recursion reached both subtrees; the policy SEND projection keeps
-            // the theme CSS and drops the plugin executable code (JS safety).
-            expect(await db.get(makeConfigId(".obsidian/themes/bar/theme.css"))).not.toBeNull();
-            expect(await db.get(makeConfigId(".obsidian/plugins/foo/main.js"))).toBeNull();
-        });
-
-        // ── short-circuit: lastSynced cache ──
-        // Without it every scan rev-bumped every config doc, inflating the
-        // remote rev tree. The cache should detect "vault content same
-        // as last sync" via {size, dataHash} and skip the rewrite.
-        it("does not rewrite when content is unchanged across scans", async () => {
-            vault.addFile(".obsidian/app.json", `{"theme":"dark"}`);
-
-            await cs.scan();
-            const after1 = await db.get(makeConfigId(".obsidian/app.json"));
-            expect(after1!.vclock).toEqual({ "dev-A": 1 });
-
-            // Second scan with identical content → must not bump vclock.
-            await cs.scan();
-            const after2 = await db.get(makeConfigId(".obsidian/app.json"));
-            expect(after2!.vclock).toEqual({ "dev-A": 1 });
-            expect(after2!._rev).toBe(after1!._rev);
-        });
-
-        it("rewrites when content changes (size diff)", async () => {
-            vault.addFile(".obsidian/app.json", "v1");
-            await cs.scan();
-
-            vault.addFile(".obsidian/app.json", "v22");
-            await cs.scan();
-
-            const doc = await db.get(makeConfigId(".obsidian/app.json"));
-            expect(doc!.vclock["dev-A"]).toBe(2);
-        });
-
-        it("rewrites when content changes at the same size (hash diff)", async () => {
-            vault.addFile(".obsidian/app.json", "abc");
-            await cs.scan();
-
-            vault.addFile(".obsidian/app.json", "xyz"); // same size, different bytes
-            await cs.scan();
-
-            const doc = await db.get(makeConfigId(".obsidian/app.json"));
-            expect(doc!.vclock["dev-A"]).toBe(2);
-        });
-
-        it("create() clears lastSynced so a subsequent scan rewrites unchanged files", async () => {
-            // This guarantees the destructive Init still rebuilds local
-            // state correctly even before remote-side destroy is wired in.
-            vault.addFile(".obsidian/app.json", `{"theme":"dark"}`);
-
-            await cs.scan();
-            const before = await db.get(makeConfigId(".obsidian/app.json"));
-            expect(before!.vclock).toEqual({ "dev-A": 1 });
-
-            // init wipes local docs + lastSynced meta, then re-scans.
-            // (The remote-side phases need a CouchClient, so they're
-            // exercised only via integration tests; here we just verify
-            // the local clearing→rescan path.)
-            try {
-                await cs.create();
-            } catch {
-                // remote-side phases will fail with no client, but the
-                // local clearing happens first. Tolerate the error.
-            }
-
-            const after = await db.get(makeConfigId(".obsidian/app.json"));
-            expect(after).not.toBeNull();
-            // After init, the doc has been re-created from scratch — vclock
-            // resets because init's deleteByPrefix dropped the existing one.
-            expect(after!.vclock).toEqual({ "dev-A": 1 });
-        });
-    });
-
-    // ── write ───────────────────────────────────────────
-
-    describe("write", () => {
-        async function seedConfigDoc(path: string, content: string): Promise<void> {
-            const { doc, chunks } = await makeConfigFixture(path, content);
-            await db.runWriteTx({
-                docs: [{ doc: doc as unknown as CouchSyncDoc }],
-                chunks: chunks as unknown as CouchSyncDoc[],
-            });
+        async function attach(opts: ConfigSyncOptions = {}): Promise<ConfigSync> {
+            const c = await makeBoundCs({ rawClientFactory: () => remote, ...opts });
+            await attachPlain(settings, remote, db);
+            // The binding read its attachment when it opened: re-open it.
+            await c.rebind(null);
+            await c.rebind("vault-config");
+            return c;
         }
 
-        it("writes portable settings (app.json) by default", async () => {
-            await seedConfigDoc(".obsidian/app.json", `{"theme":"dark"}`);
-
-            const count = await cs.write();
-
-            expect(count).toBe(1);
-            expect(vault.readText(".obsidian/app.json")).toBe(`{"theme":"dark"}`);
+        beforeEach(async () => {
+            settings.couchdbUri = "http://localhost:5984";
+            settings.couchdbConfigDbName = "vault-config";
+            settings.compressionEnabled = false;
+            remote = new FakeCouchClient();
+            bound = await attach();
         });
 
-        it("does NOT write plugin code (install-state) by default — JS safety", async () => {
-            await seedConfigDoc(".obsidian/plugins/foo/main.js", "code-a");
-            await seedConfigDoc(".obsidian/plugins/foo/manifest.json", "{}");
+        const onServer = async (path: string) => remote.getDoc<any>(makeConfigId(path));
 
-            const count = await cs.write();
+        describe("Push: what is sent", () => {
+            it("sends a config file and records it as the shared version and the base", async () => {
+                vault.addFile(".obsidian/app.json", `{"theme":"dark"}`);
 
-            expect(count).toBe(0);
-            expect(vault.files.has(".obsidian/plugins/foo/main.js")).toBe(false);
-            expect(vault.files.has(".obsidian/plugins/foo/manifest.json")).toBe(false);
+                expect(await bound.push()).toBe(1);
+
+                const doc = await onServer(".obsidian/app.json");
+                expect(doc.vclock).toEqual({ "dev-A": 1 });
+                expect((await db.get(makeConfigId(".obsidian/app.json")))!.vclock).toEqual({ "dev-A": 1 });
+                expect(bound.currentBinding()!.lastSynced.get(".obsidian/app.json")!.chunks).toEqual(doc.chunks);
+            });
+
+            it("sends nothing for a file unchanged since the last Push", async () => {
+                vault.addFile(".obsidian/app.json", `{"theme":"dark"}`);
+                await bound.push();
+                const rev = (await onServer(".obsidian/app.json"))._rev;
+
+                expect(await bound.push()).toBe(0);
+
+                expect((await onServer(".obsidian/app.json"))._rev).toBe(rev);
+            });
+
+            it("sends a changed file with the base's vclock advanced", async () => {
+                vault.addFile(".obsidian/app.json", "abc");
+                await bound.push();
+                vault.addFile(".obsidian/app.json", "xyz"); // same size, other bytes
+
+                expect(await bound.push()).toBe(1);
+
+                expect((await onServer(".obsidian/app.json")).vclock).toEqual({ "dev-A": 2 });
+            });
+
+            it("skips layout files, .git, node_modules and files over 5MB", async () => {
+                vault.addFile(".obsidian/workspace.json", "layout");
+                vault.addFile(".obsidian/workspace-mobile.json", "layout");
+                vault.addFile(".obsidian/.git/HEAD", "ref: refs/heads/main");
+                vault.addFile(".obsidian/node_modules/pkg/file.json", "{}");
+                vault.addFile(".obsidian/big.json", "x".repeat(6 * 1024 * 1024));
+                vault.addFile(".obsidian/app.json", "{}");
+
+                expect(await bound.push()).toBe(1);
+                expect(await onServer(".obsidian/app.json")).not.toBeNull();
+            });
+
+            it("never sends this plugin's data.json or backups, even under a renamed folder", async () => {
+                // BRAT / manual install can put the plugin under its repo
+                // name, so a hardcoded folder literal would miss the
+                // data.json (which holds the plaintext password +
+                // passphrase) and push it to the config server.
+                const dir = ".obsidian/plugins/KawaNae-obsidian-couchsync";
+                const renamed = await attach({ pluginDir: dir });
+                vault.addFile(`${dir}/data.json`, `{"couchdbPassword":"SECRET"}`);
+                vault.addFile(`${dir}/backups/config/2026-01-01_00-00-00/plugins/x/data.json`, `{"token":"SECRET"}`);
+                vault.addFile(".obsidian/app.json", `{"theme":"dark"}`);
+
+                expect(await renamed.push()).toBe(1);
+
+                expect(await onServer(`${dir}/data.json`)).toBeNull();
+                expect((await renamed.listLocalConfigPaths()).some((p) => p.startsWith(dir))).toBe(false);
+            });
+
+            it("the policy keeps theme CSS and drops plugin code", async () => {
+                vault.addFile(".obsidian/plugins/foo/main.js", "code");
+                vault.addFile(".obsidian/themes/bar/theme.css", "css");
+
+                expect(await bound.push()).toBe(1);
+
+                expect(await onServer(".obsidian/themes/bar/theme.css")).not.toBeNull();
+                expect(await onServer(".obsidian/plugins/foo/main.js")).toBeNull();
+            });
         });
 
-        it("writes a plugin's data.json only when the plugin is present locally", async () => {
-            await seedConfigDoc(".obsidian/plugins/foo/data.json", `{"k":1}`);
+        describe("Pull: what is written", () => {
+            async function serve(path: string, content: string, n = 1): Promise<void> {
+                await seedRemoteConfig(remote, [
+                    await makeConfigFixture(path, content, { vclock: { "dev-Z": n } }),
+                ]);
+            }
 
-            // plugin not installed locally → presence gate skips it
-            expect(await cs.write()).toBe(0);
-            expect(vault.files.has(".obsidian/plugins/foo/data.json")).toBe(false);
+            it("writes portable settings (app.json) by default", async () => {
+                await serve(".obsidian/app.json", `{"theme":"dark"}`);
 
-            // install the plugin locally (folder now exists) → materialised
-            vault.addFile(".obsidian/plugins/foo/manifest.json", `{"id":"foo"}`);
-            const count = await cs.write();
-            expect(count).toBe(1);
-            expect(vault.readText(".obsidian/plugins/foo/data.json")).toBe(`{"k":1}`);
-        });
+                expect(await bound.pull()).toBe(1);
 
-        it("skips own plugin data.json (SKIP_PATHS) even when present", async () => {
-            vault.addFile(".obsidian/plugins/obsidian-couchsync/manifest.json", "{}");
-            await seedConfigDoc(".obsidian/plugins/obsidian-couchsync/data.json", "{}");
+                expect(vault.readText(".obsidian/app.json")).toBe(`{"theme":"dark"}`);
+            });
 
-            const count = await cs.write();
+            it("does NOT write plugin code (install-state) by default — JS safety", async () => {
+                await serve(".obsidian/plugins/foo/main.js", "code-a");
+                await serve(".obsidian/plugins/foo/manifest.json", "{}");
 
-            expect(count).toBe(0);
-            expect(vault.files.has(".obsidian/plugins/obsidian-couchsync/data.json")).toBe(false);
-        });
+                expect(await bound.pull()).toBe(0);
 
-        it("an explicit override enables a single main.js when safety is off", async () => {
-            settings.configSyncPolicy = {
-                ...settings.configSyncPolicy,
-                blockPluginCode: false,
-                overrides: { ".obsidian/plugins/foo/main.js": true },
-            };
-            await seedConfigDoc(".obsidian/plugins/foo/main.js", "code");
+                expect(vault.files.has(".obsidian/plugins/foo/main.js")).toBe(false);
+                expect(vault.files.has(".obsidian/plugins/foo/manifest.json")).toBe(false);
+            });
 
-            const count = await cs.write();
+            it("writes a plugin's data.json only when the plugin is present locally", async () => {
+                await serve(".obsidian/plugins/foo/data.json", `{"k":1}`);
 
-            expect(count).toBe(1);
-            expect(vault.readText(".obsidian/plugins/foo/main.js")).toBe("code");
-        });
+                expect(await bound.pull()).toBe(0);
+                expect(vault.files.has(".obsidian/plugins/foo/data.json")).toBe(false);
 
-        it("does not materialise a desktop-only plugin's data.json on mobile", async () => {
-            const mobileCs = await makeBoundCs({ getIsMobile: () => true });
-            // plugin present locally, but its local manifest is desktop-only
-            vault.addFile(".obsidian/plugins/term/manifest.json", `{"id":"term","isDesktopOnly":true}`);
-            await seedConfigDoc(".obsidian/plugins/term/data.json", `{"k":1}`);
+                vault.addFile(".obsidian/plugins/foo/manifest.json", `{"id":"foo"}`);
+                expect(await bound.pull()).toBe(1);
+                expect(vault.readText(".obsidian/plugins/foo/data.json")).toBe(`{"k":1}`);
+            });
 
-            expect(await mobileCs.write()).toBe(0);
-            expect(vault.files.has(".obsidian/plugins/term/data.json")).toBe(false);
+            it("never writes this plugin's own data.json", async () => {
+                vault.addFile(".obsidian/plugins/obsidian-couchsync/manifest.json", "{}");
+                await serve(".obsidian/plugins/obsidian-couchsync/data.json", "{}");
 
-            // a non-desktop-only plugin on the same mobile device is fine
-            vault.addFile(".obsidian/plugins/dv/manifest.json", `{"id":"dv","isDesktopOnly":false}`);
-            await seedConfigDoc(".obsidian/plugins/dv/data.json", `{"k":2}`);
-            expect(await mobileCs.write()).toBe(1);
-            expect(vault.readText(".obsidian/plugins/dv/data.json")).toBe(`{"k":2}`);
-        });
+                expect(await bound.pull()).toBe(0);
 
-        it("overwrites an existing file whose content differs", async () => {
-            vault.addFile(".obsidian/app.json", "old");
-            await seedConfigDoc(".obsidian/app.json", "new");
+                expect(vault.files.has(".obsidian/plugins/obsidian-couchsync/data.json")).toBe(false);
+            });
 
-            expect(await cs.write()).toBe(1);
+            it("an explicit override enables a single main.js when safety is off", async () => {
+                settings.configSyncPolicy = {
+                    ...settings.configSyncPolicy,
+                    blockPluginCode: false,
+                    overrides: { ".obsidian/plugins/foo/main.js": true },
+                };
+                await serve(".obsidian/plugins/foo/main.js", "code");
 
-            expect(vault.readText(".obsidian/app.json")).toBe("new");
-        });
+                expect(await bound.pull()).toBe(1);
 
-        it("overwrites a same-size file whose bytes differ", async () => {
-            vault.addFile(".obsidian/app.json", `{"a":1}`);
-            await seedConfigDoc(".obsidian/app.json", `{"a":2}`);
+                expect(vault.readText(".obsidian/plugins/foo/main.js")).toBe("code");
+            });
 
-            expect(await cs.write()).toBe(1);
+            it("does not materialise a desktop-only plugin's data.json on mobile", async () => {
+                const mobile = await attach({ getIsMobile: () => true });
+                vault.addFile(".obsidian/plugins/term/manifest.json", `{"id":"term","isDesktopOnly":true}`);
+                await serve(".obsidian/plugins/term/data.json", `{"k":1}`);
 
-            expect(vault.readText(".obsidian/app.json")).toBe(`{"a":2}`);
-        });
+                expect(await mobile.pull()).toBe(0);
+                expect(vault.files.has(".obsidian/plugins/term/data.json")).toBe(false);
 
-        it("leaves a file whose content already matches untouched", async () => {
-            vault.addFile(".obsidian/app.json", `{"theme":"dark"}`, { mtime: 1000 });
-            await seedConfigDoc(".obsidian/app.json", `{"theme":"dark"}`);
-            const writes: string[] = [];
-            const writeBinary = vault.writeBinary.bind(vault);
-            const createBinary = vault.createBinary.bind(vault);
-            vault.writeBinary = async (p, d) => { writes.push(p); return writeBinary(p, d); };
-            vault.createBinary = async (p, d) => { writes.push(p); return createBinary(p, d); };
+                vault.addFile(".obsidian/plugins/dv/manifest.json", `{"id":"dv","isDesktopOnly":false}`);
+                await serve(".obsidian/plugins/dv/data.json", `{"k":2}`);
+                expect(await mobile.pull()).toBe(1);
+                expect(vault.readText(".obsidian/plugins/dv/data.json")).toBe(`{"k":2}`);
+            });
 
-            expect(await cs.write()).toBe(0);
+            it("leaves a file whose content already matches untouched", async () => {
+                vault.addFile(".obsidian/app.json", `{"theme":"dark"}`, { mtime: 1000 });
+                await serve(".obsidian/app.json", `{"theme":"dark"}`);
+                const writes: string[] = [];
+                const writeBinary = vault.writeBinary.bind(vault);
+                const createBinary = vault.createBinary.bind(vault);
+                vault.writeBinary = async (p, d) => { writes.push(p); return writeBinary(p, d); };
+                vault.createBinary = async (p, d) => { writes.push(p); return createBinary(p, d); };
 
-            expect(writes).toEqual([]);
-            // An unchanged mtime is what keeps Obsidian from re-reading it.
-            expect((await vault.stat(".obsidian/app.json"))!.mtime).toBe(1000);
-        });
+                expect(await bound.pull()).toBe(0);
 
-        it("writes only the files that differ and counts them", async () => {
-            vault.addFile(".obsidian/app.json", "{}");
-            vault.addFile(".obsidian/hotkeys.json", "old");
-            await seedConfigDoc(".obsidian/app.json", "{}");
-            await seedConfigDoc(".obsidian/hotkeys.json", "new");
-            await seedConfigDoc(".obsidian/appearance.json", `{"x":1}`);
+                expect(writes).toEqual([]);
+                // An unchanged mtime is what keeps Obsidian from re-reading it.
+                expect((await vault.stat(".obsidian/app.json"))!.mtime).toBe(1000);
+            });
 
-            expect(await cs.write()).toBe(2);
-            expect(vault.readText(".obsidian/hotkeys.json")).toBe("new");
-            expect(vault.readText(".obsidian/appearance.json")).toBe(`{"x":1}`);
+            it("writes only the files that differ, and a second Pull reads no file", async () => {
+                vault.addFile(".obsidian/app.json", "{}");
+                vault.addFile(".obsidian/hotkeys.json", "old");
+                await serve(".obsidian/app.json", "{}");
+                await serve(".obsidian/hotkeys.json", "new");
+                await serve(".obsidian/appearance.json", `{"x":1}`);
 
-            // A second write finds the disk in step with the DB.
-            expect(await cs.write()).toBe(0);
-        });
+                expect(await bound.pull()).toBe(2);
+                expect(vault.readText(".obsidian/hotkeys.json")).toBe("new");
+                expect(vault.readText(".obsidian/appearance.json")).toBe(`{"x":1}`);
 
-        it("invokes onProgress for each entry it considers", async () => {
-            await seedConfigDoc(".obsidian/app.json", "{}");
-            await seedConfigDoc(".obsidian/hotkeys.json", "{}");
+                const reads: string[] = [];
+                const readBinary = vault.readBinary.bind(vault);
+                vault.readBinary = async (p) => { reads.push(p); return readBinary(p); };
+                expect(await bound.pull()).toBe(0);
+                expect(reads.filter((p) => !p.endsWith("manifest.json"))).toEqual([]);
+            });
 
-            const calls: string[] = [];
-            await cs.write((path) => calls.push(path));
+            it("calls the host's reload only when it wrote a file", async () => {
+                let reloads = 0;
+                const withReload = await attach({ reload: () => { reloads++; } });
+                await serve(".obsidian/app.json", `{"a":1}`);
 
-            expect(calls.sort()).toEqual([".obsidian/app.json", ".obsidian/hotkeys.json"]);
+                expect(await withReload.pull()).toBe(1);
+                expect(reloads).toBe(1);
+                expect(await withReload.pull()).toBe(0);
+                expect(reloads).toBe(1);
+            });
         });
     });
 

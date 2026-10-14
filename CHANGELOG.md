@@ -87,13 +87,19 @@ All notable changes to obsidian-couchsync.
   empty database with "The database is empty — use Init to push your
   vault." What Check, Clone and Init last found in each database is kept
   until Obsidian restarts, so checking another name does not drop the
-  applied database's, and Clone stays disabled only for a database known to
-  be empty. Init reads its database back and Clone records what it read,
-  so the document count shown after either is current.
-- **Clone reports the files it wrote.** "Clone — N files written." counted
-  every file document in the database, including files deleted on another
-  device and files this device's filters keep out, so it could say 10 for a
-  vault that received 2. It now counts only the files written to the vault.
+  applied database's. That finding no longer disables Clone either: a device
+  that found the database empty kept Clone disabled after another device's
+  Init filled it, until Check was pressed again. For a database found empty,
+  Clone's description now points to Init, and Clone reads the database
+  again when pressed. Init reads its database back and Clone records what
+  it read, so the document count shown after either is current.
+- **Init and Clone count the files they send or write.** "Clone — N files
+  written." counted every file document in the database, including files
+  deleted on another device and files this device's filters keep out, so it
+  could say 10 for a vault that received 2. It now counts only the files
+  written to the vault, and Clone's "Writing N vault files..." only the
+  files the filters let in. Init's "N files, M docs pushed" no longer counts
+  files the filters keep out or that exceed the size limit.
 - **Live sync no longer re-sends chunks the server already holds.** The first
   live sync after an Init or Clone wrote every chunk to the server again as
   a new revision of the same content, which advanced the database's
@@ -183,9 +189,17 @@ All notable changes to obsidian-couchsync.
   matched, so all of them got a new modification time. Obsidian re-reads
   `app.json`, `appearance.json` and plugins' `data.json` on that, which could
   undo a setting just changed in the settings window. Pull now writes only
-  the files whose content differs and reports `Files up to date.` when there
-  were none. Pull & Reload then does not reload Obsidian and says
-  `No config files changed. Skipping reload.`
+  the files whose content changes. When there are none, Pull & Reload does
+  not reload Obsidian and its one notice says
+  `No config files changed; no reload needed.`
+- **A config Pull no longer undoes edits that were not pushed yet.** A Pull
+  wrote the last synced version of every config file over the disk, so a
+  setting changed on this device but not pushed went back to its old value,
+  with no warning. See "Config Pull merges" below.
+- **A config Push no longer overwrites what other devices changed.** Push
+  sent whole files, so a desktop pushing `app.json` put back an old value of
+  a key only the phone had changed, after a confirmation that did not say
+  which keys. See "Config Push sends this device's changes" below.
 - **Changing a codec setting no longer stops config sync.** Push and Pull
   now use the encryption and compression of the config database this device
   created or joined. Step 1 in Config Sync is what the next Create builds a
@@ -210,6 +224,82 @@ All notable changes to obsidian-couchsync.
 
 ### Changed
 
+- **Vault Init and Clone ask before they change anything.** Init deletes the
+  vault database on the server and creates it again; Clone rebuilds this
+  device's local vault database from the server and writes the server's
+  files into the vault. Both used to start on the button press. Each now
+  first checks what it can (the server answers, the passphrase, a database
+  that is not empty), then shows what it is about to do: the database name,
+  how many documents it holds and the encryption and compression of the
+  vault. Init also says that every other device must Clone again, and that
+  a device that notices the re-created database stops its live sync until
+  then. The dialog opens with the focus on Cancel. Cancel changes nothing:
+  live sync keeps running and the setup state stays as it was. Clone asks
+  for a missing passphrase before this dialog.
+- **Config Pull merges.** Pull compares each config file the server changed
+  with the version this device last took in and with the disk. In
+  `app.json`, `appearance.json`, `hotkeys.json`, the other `.obsidian/*.json`
+  files and plugins' `data.json`, every key is compared on its own: a key
+  only the server changed takes the server's value, a key only this device
+  changed keeps this device's value. `community-plugins.json` is merged as a
+  set of plugin ids. Other files (snippets, themes, plugin code) and files
+  that are not valid JSON are compared as a whole. Where both sides changed
+  the same key (or file) differently, this device's value stays; the notice
+  counts such files and the log names each file and key (never the value),
+  and the next Push sends this device's value. Without a version taken in
+  before (after Join), the server's values win and keys only this device
+  has stay. Before writing, Pull copies the files it is about to overwrite
+  to `backups/config/<date_time>/` in the plugin's folder and keeps the
+  newest 10 of these backups; they are never pushed. Written files keep
+  their indentation and key order. Pull & Reload shows one notice and
+  reloads Obsidian only when it wrote a file. The notice's "Received" counts
+  the changes this device did not have yet; its own pushed files are not
+  counted.
+- **Config Push sends this device's changes.** Push sends the config files
+  that changed on this device since it last pushed or pulled them. A file
+  whose server copy changed since this device last pulled, or whose server
+  copy this device has not taken in, is not sent: the notice counts such
+  files by that reason and asks to run Pull & Reload, then Push again (the
+  log names each file with the same reason). The confirmation that offered to overwrite the server
+  copy is gone. A file this device's Pull would not write is not sent
+  either: a plugin's `data.json` on a device where the plugin is not
+  installed, or a desktop-only plugin's files on mobile, stay this device's
+  own.
+- **Config Push lists its changes and lets you keep some on this device.**
+  Before sending, Push lists every change: each key of a JSON settings
+  file (each plugin enabled or disabled in `community-plugins.json`), or a
+  whole file, with the shared value next to this device's. A plugin's
+  `data.json` may hold API keys or tokens, so its values appear only after
+  "Show values". Everything is checked; one button sends the checked
+  items, and Cancel sends nothing. An unchecked key stays this device's
+  own: later Pushes do not send it and Pulls do not change it, and neither
+  reports it as a conflict. An unchecked file stops syncing on this device,
+  as if turned off in the Filter. These choices are device settings and
+  are not synced. A key is shared again by checking it in a later Push
+  list or with "Share again" under "Kept on this device" in the Config
+  Sync tab. A Push whose only changes are keys kept on this device shows
+  no list.
+- **Pull & Overwrite makes this device's config the shared config.** A new
+  button in the Config Sync tab, next to Pull & Reload. It does not merge:
+  every selected file the server has is written as the server has it,
+  selected files the server does not have are deleted, and keys kept on
+  this device take the shared value and are shared again. Files the Filter
+  leaves out, a plugin's files where the plugin is not installed, a
+  desktop-only plugin's files on mobile, the workspace layout and the
+  CouchSync plugin's own folder are not touched; per-file choices in the
+  Filter stay. A confirmation lists the files it deletes and writes; Cancel
+  changes nothing. The files are backed up to `backups/config/` first, as
+  with Pull & Reload, and Obsidian reloads. When the server has no config
+  for this device's selection, nothing is deleted. Pull & Reload and Pull &
+  Overwrite stop a community plugin before writing or deleting its files,
+  so it cannot save its settings over them before the reload.
+- **Coming back to a config database merges as after a Join.** When another
+  config database's Pull wrote this vault's config since this database was
+  last used, the next Push or Pull here no longer treats those values as
+  this device's changes, which Push would have sent. Pull takes this
+  database's values (keys only this device has stay, and the files are
+  backed up first); Push holds the files until that Pull. Switching to
+  another database and back without a Pull there changes nothing.
 - **Config Init is renamed Create, and Join is new.** Config Sync's Step 3
   now has Create (first device: reset the config database with a new root,
   then Push) and Join (every other device: sync with the existing
@@ -244,6 +334,14 @@ All notable changes to obsidian-couchsync.
 
 ### Migration
 
+- **Config sync state moves to the new merge by itself.** The first config
+  Push or Pull after updating compares each file this device knows with the
+  server copy once. Edits that were never pushed are kept as this device's
+  changes: where the server also changed the same file since, the keys that
+  differ keep this device's value and are reported like a conflict. If a
+  plugin was installed after the last Pull, its default settings look like
+  this device's changes; the first Push lists them (keys the shared version
+  lacks are marked "new key"), so they can be left out.
 - **Existing devices Join once.** Whether a device has joined a config
   database, and with which codec, is now recorded inside that database's
   local store, which is also renamed to include the server. The previous

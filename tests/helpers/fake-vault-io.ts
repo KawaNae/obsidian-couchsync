@@ -88,9 +88,17 @@ export class FakeVaultIO implements IVaultIO {
         });
     }
 
+    /** Deletes the file at `path`, or every file under the folder `path`. */
     async delete(path: string): Promise<void> {
         const key = this.resolveKey(path);
-        if (key !== null) this.files.delete(key);
+        if (key !== null) {
+            this.files.delete(key);
+            return;
+        }
+        const prefix = path.endsWith("/") ? path : path + "/";
+        for (const k of [...this.files.keys()]) {
+            if (k.startsWith(prefix)) this.files.delete(k);
+        }
     }
 
     async exists(path: string): Promise<boolean> {

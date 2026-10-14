@@ -188,6 +188,12 @@ export interface CouchSyncSettings {
      *  which ignored the DB name and leaked from one config DB to another.
      *  Attachment itself is recorded in the binding's local store. */
     configBindings: Record<string, ConfigBindingRecord>;
+    /** Id drawn by the last config Pull that wrote files into this vault's
+     *  `.obsidian/`, whichever config DB it pulled from. Each config store
+     *  records the id its bases were last valid for; a store holding
+     *  another id has not seen that write, so its bases no longer describe
+     *  the disk. Unset until the first such Pull. */
+    configDiskWriteId?: string;
 
     // Internal
     /** Server reachable + auth verified (CouchDB tab Test+Apply). */

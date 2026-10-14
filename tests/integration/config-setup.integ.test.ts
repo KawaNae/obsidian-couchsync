@@ -28,7 +28,6 @@ import { makeSettings } from "../helpers/settings-factory.ts";
 import { makeConfigId } from "../../src/types/doc-id.ts";
 import {
     META_CONFIG_PULL_SEQ,
-    META_CONFIG_PUSH_SEQ,
 } from "../../src/db/sync/config-checkpoints.ts";
 import { CONFIG_LAST_SYNCED_PREFIX } from "../../src/db/sync/config-last-synced.ts";
 import type { CouchClient } from "../../src/db/couch-client.ts";
@@ -125,22 +124,19 @@ describe("ConfigSetupService — clean-slate init", () => {
         expect(await db.get(makeConfigId(".obsidian/a.json"))).not.toBeNull();
     });
 
-    it("init resets pullSeq / pushSeq meta (cursors start from 0 in the new DB)", async () => {
+    it("init resets the pull cursor (it starts from 0 in the new DB)", async () => {
         // Pre-seed lingering cursor values in meta.
         await db.runWriteTx({
             meta: [
                 { op: "put", key: META_CONFIG_PULL_SEQ, value: 999 },
-                { op: "put", key: META_CONFIG_PUSH_SEQ, value: 888 },
             ],
         });
         vault.addFile(".obsidian/a.json", `{}`);
 
         await cs.create();
 
-        // After destroy + reopen, those meta entries no longer exist.
+        // After destroy + reopen, the cursor is gone.
         const pullSeq = await db.getMeta<number | string>(META_CONFIG_PULL_SEQ);
-        // After a fresh push of one doc the push-seq advances above 0; what
-        // matters is that the legacy 888 / 999 are gone.
         expect(pullSeq).not.toBe(999);
     });
 
@@ -302,11 +298,10 @@ describe("ConfigSetupService — setup atomicity", () => {
         expect(settingUpCalls).toEqual([]); // latch never set — fully pre-destructive
     });
 
-    it("blocks push/pull/write while a prior init is unfinished (gating)", async () => {
+    it("blocks push/pull while a prior init is unfinished (gating)", async () => {
         putEntry(settings, { settingUp: true });
         await expect(cs.push()).rejects.toThrow(/interrupted/);
         await expect(cs.pull()).rejects.toThrow(/interrupted/);
-        await expect(cs.write()).rejects.toThrow(/interrupted/);
     });
 
     it("first encrypted Create succeeds despite a fail-closed wrapped client (#config-init)", async () => {
@@ -338,11 +333,9 @@ describe("ConfigSetupService — setup atomicity", () => {
         await cs2.create();
 
         expect(wrapped).not.toHaveBeenCalled();
-        // The freshly derived key is usable on the binding Create ran
-        // against (HMAC chunk ids for local work), the passphrase it used is
-        // kept on the binding (Step 1 unchanged), and the device is joined
-        // with the new root and a floor.
-        expect(cs2.currentBinding()!.currentKeys().hasher.alg).toBe("hmac");
+        // The passphrase Create used is kept on the binding (Step 1
+        // unchanged), and the device is joined with the new root and a
+        // floor.
         expect(settings.configEncryptionPassphrase).toBe("test-pass-123");
         expect(cs2.currentBinding()!.attachment).not.toBeNull();
         expect(getEntry(settings)).toEqual({

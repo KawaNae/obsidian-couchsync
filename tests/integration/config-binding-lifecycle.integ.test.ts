@@ -843,7 +843,7 @@ describe("config binding lifecycle", () => {
             const storeA = dev.cs.currentStore()!;
             const pullSeqA = bindingA.checkpoints.getPullSeq();
             expect(Number(pullSeqA)).toBeGreaterThan(1);
-            await dev.cs.scan(); // populate A's lastSynced from disk
+            // Pull moved A's bases to what it wrote.
             expect(bindingA.lastSynced.get(".obsidian/app.json")).toBeDefined();
 
             // ── A → B ──
@@ -898,6 +898,53 @@ describe("config binding lifecycle", () => {
             // The unlocked key survives: no second PBKDF2.
             expect(await dev.cs.pull()).toBe(1);
             expect(binding.keyDerivations).toBe(1);
+        });
+    });
+
+    describe("coming back to a config DB after another DB's Pull wrote the disk", () => {
+        const APP = ".obsidian/app.json";
+        const serverApp = async (db: string) =>
+            (await remote(db).getDoc<{ vclock: Record<string, number> }>(makeConfigId(APP)))!.vclock;
+
+        it("merges as after a Join: the other DB's values are not pushed, and the shared values come back", async () => {
+            await seed("cfg-one", { [APP]: `{"k":1,"x":1}` });
+            await seed("cfg-two", { [APP]: `{"k":2,"x":1}` });
+            const dev = makeDevice("dev-X", { configCompressionEnabled: false });
+            await apply(dev, "cfg-one");
+            await dev.cs.join();
+            expect(await dev.cs.pull()).toBe(1);
+            await apply(dev, "cfg-two");
+            await dev.cs.join();
+            expect(await dev.cs.pull()).toBe(1);
+            // A key added while on two is this device's own.
+            dev.vault.addFile(APP, `{"k":2,"x":1,"mine":true}`);
+
+            await apply(dev, "cfg-one");
+            const before = await serverApp("cfg-one");
+            // Two's value of k is not a change made against one.
+            expect(await dev.cs.push()).toBe(0);
+            expect(await serverApp("cfg-one")).toEqual(before);
+
+            expect(await dev.cs.pull()).toBe(1);
+            expect(JSON.parse(dev.vault.readText(APP))).toEqual({ k: 1, x: 1, mine: true });
+        });
+
+        it("a DB that only pushed meanwhile leaves the bases alone", async () => {
+            await seed("cfg-one", { [APP]: `{"k":1}` });
+            await seed("cfg-two", { ".obsidian/hotkeys.json": `{}` });
+            const dev = makeDevice("dev-X", { configCompressionEnabled: false });
+            await apply(dev, "cfg-one");
+            await dev.cs.join();
+            expect(await dev.cs.pull()).toBe(1);
+            // On two, only a Push: it writes no file.
+            await apply(dev, "cfg-two");
+            await dev.cs.join();
+            expect(await dev.cs.push()).toBe(1);
+
+            await apply(dev, "cfg-one");
+            dev.vault.addFile(APP, `{"k":1,"y":5}`);
+            // The edit is a change against one's base, sent as such.
+            expect(await dev.cs.push()).toBe(1);
         });
     });
 
@@ -1037,7 +1084,7 @@ describe("config binding lifecycle", () => {
             b.vault.addFile(".obsidian/appearance.json", `{"b":1}`);
             b.vault.addFile(".obsidian/hotkeys.json", `{"b":2}`);
 
-            // Park the Push inside its scan — after the preflight froze its keys.
+            // Park the Push while it reads the disk — after the preflight froze its keys.
             let release!: () => void;
             const gate = new Promise<void>((r) => { release = r; });
             let parked = false;
@@ -1051,7 +1098,7 @@ describe("config binding lifecycle", () => {
             const binding = b.cs.currentBinding()!;
 
             // A wrong passphrase now. The tree used to run a preflight outside
-            // the op lock and drop the key on failure — mid-scan.
+            // the op lock and drop the key on failure — mid-Push.
             putEntry(b.settings, { ...getEntry(b.settings)!, passphrase: "wrong" });
             const getDoc = vi.spyOn(remote("cfg-enc"), "getDoc");
             const before = binding.relation();
@@ -1274,7 +1321,8 @@ describe("config binding lifecycle", () => {
             expect(getEntry(d.settings, "cfg-two")).toMatchObject({ passphrase: "two" });
 
             // Back and forth: each DB still unlocks with its own passphrase,
-            // with no prompt.
+            // with no prompt. Coming back to a DB merges as after a Join, so
+            // each Pull puts that DB's values on the disk.
             for (const db of ["cfg-one", "cfg-two", "cfg-one"]) {
                 await apply(d, db);
                 expect(await d.cs.pull()).toBe(1);
@@ -1445,30 +1493,6 @@ describe("config binding lifecycle", () => {
             await b.cs.join();
             expect(view(b)).toEqual({ text: 'Joined "cfg-A" — ready to Push and Pull.', tone: "ok" });
             await a.cs.close();
-        });
-    });
-
-    describe("a bare scan() on an encrypted DB (fail-closed hasher)", () => {
-        it("without an unlocked key: key-missing, never xxhash64 chunk ids", async () => {
-            await seed("cfg-enc", { ".obsidian/app.json": "{}" }, ENC);
-            const b = makeDevice("dev-B", ENC);
-            await apply(b, "cfg-enc");
-            await b.cs.join();
-            await b.cs.close();
-            // A new session: the store says encrypted, no key unlocked yet.
-            const b2 = makeDevice("dev-B", {}, undefined, b);
-            await b2.cs.rebind("cfg-enc");
-            b2.vault.addFile(".obsidian/hotkeys.json", "{}");
-            await expect(b2.cs.scan()).rejects.toMatchObject({ kind: "key-missing" });
-            const store = b2.cs.currentStore()!;
-            const x64 = () => store.allDocs({ startkey: "chunk:x64:", endkey: "chunk:x64:￰" });
-            expect((await x64()).rows).toEqual([]);
-            // After an op unlocked it this session, scan mints HMAC ids.
-            expect(await b2.cs.pull()).toBe(1);
-            await b2.cs.scan();
-            const hmac = await store.allDocs({ startkey: "chunk:hmac:", endkey: "chunk:hmac:￰" });
-            expect(hmac.rows.length).toBeGreaterThan(0);
-            expect((await x64()).rows).toEqual([]);
         });
     });
 });

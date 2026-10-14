@@ -27,8 +27,13 @@ export class ObsidianAdapterIO implements IVaultIO {
         await this.app.vault.adapter.writeBinary(path, data);
     }
 
+    /** A folder is removed with its contents (`remove` only takes files). */
     async delete(path: string): Promise<void> {
-        if (await this.app.vault.adapter.exists(path)) {
+        const s = await this.app.vault.adapter.stat(path);
+        if (!s) return;
+        if (s.type === "folder") {
+            await this.app.vault.adapter.rmdir(path, true);
+        } else {
             await this.app.vault.adapter.remove(path);
         }
     }

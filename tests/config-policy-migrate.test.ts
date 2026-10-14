@@ -71,4 +71,21 @@ describe("migrateSettings: configSyncPaths → configSyncPolicy", () => {
         expect(data.configSyncPolicy.unitDefaults["app-behavior"]).toBe(false); // preserved
         expect(data.configSyncPolicy.unitDefaults["theme-css"]).toBe(true); // backfilled
     });
+
+    it("starts a policy without this device's own keys with none, and keeps existing ones", () => {
+        const older: Record<string, any> = {
+            configSyncPolicy: { schemaVersion: 1, unitDefaults: {}, overrides: {}, blockPluginCode: true },
+        };
+        migrateSettings(older);
+        expect(older.configSyncPolicy.deviceOnlyKeys).toEqual({});
+
+        const kept = { ".obsidian/app.json": ["/a"] };
+        const current: Record<string, any> = {
+            configSyncPolicy: {
+                schemaVersion: 1, unitDefaults: {}, overrides: {}, blockPluginCode: true, deviceOnlyKeys: kept,
+            },
+        };
+        migrateSettings(current);
+        expect(current.configSyncPolicy.deviceOnlyKeys).toEqual(kept);
+    });
 });

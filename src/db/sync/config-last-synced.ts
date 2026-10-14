@@ -1,20 +1,18 @@
 /**
- * ConfigLastSynced — per-config-path integration baseline.
+ * ConfigLastSynced — the base of each config path: the shared version
+ * (`{vclock, chunks, size}` of a config DB doc) that the disk last took in.
  *
- * Records, for each `.obsidian/...` path, the `{vclock, chunks, size}` at
- * the moment the local DB and vault file were last reconciled. Loaded on
- * first use into an in-memory map keyed by config path; persisted to the
- * ConfigLocalDB meta store under `_local/config-last-synced/<path>`.
+ * Written only when the disk takes in a shared version: by Pull's merge
+ * (after writing the file, or finding it needs no write) and by a
+ * successful Push (the sent content is the disk's). The chunks are the
+ * shared version's, not the disk's, and stay in the config DB as long as
+ * this names them (`gcOrphanConfigChunks` counts them as referenced). A
+ * local change is the difference between the disk and this base.
  *
- * v0.26 (ConfigSync chunking) aligns this shape with vault's `LastSynced`:
- * `chunks: string[]` replaces the old `dataHash: string` because ConfigDoc
- * is now chunked just like FileDoc. The cheap-equality check in
- * `ConfigSync.scan()` becomes the same `chunksEqual` test the vault scan
- * uses — a true symmetry rather than a stand-in.
- *
- * Persistence layer: `WriteTransaction.meta` (`{op:"put",key,value}`)
- * lands the meta write atomically with the doc upsert, so the in-memory
- * cache update in `onCommit` always reflects committed state.
+ * Loaded on first use into an in-memory map keyed by config path;
+ * persisted to the ConfigLocalDB meta store under
+ * `_local/config-last-synced/<path>`. Writers put the meta entry in their
+ * WriteTransaction and update the cache from `onCommit`.
  */
 
 import type { VectorClock } from "../../sync/vector-clock.ts";
@@ -22,9 +20,8 @@ import type { ConfigLocalDB } from "../config-local-db.ts";
 
 export interface ConfigLastSyncedValue {
     vclock: VectorClock;
-    /** Ordered chunk id list at integration. Same fingerprint the vault
-     *  scanner uses; `chunksEqual` against the freshly-chunked disk
-     *  produces the scan() short-circuit. */
+    /** Chunk ids of the shared version. A disk whose freshly cut chunks
+     *  equal these has no local change. */
     chunks: string[];
     size: number;
 }
@@ -44,14 +41,14 @@ export class ConfigLastSynced {
     constructor(private db: ConfigLocalDB) {}
 
     /** Lazy-load the on-disk meta into the in-memory cache. Idempotent —
-     *  subsequent calls are no-ops. Called from ConfigSync.scan() / push()
-     *  / pull() before any read of the cache.
+     *  subsequent calls are no-ops. Called by Push and Pull before any
+     *  read of the cache.
      *
      *  v0.25 → v0.26 legacy entries carry a `dataHash: string` field
-     *  instead of `chunks`. Such entries are silently dropped during
-     *  load — the scan() short-circuit will simply re-derive on first
-     *  scan, and the migration guard (`findLegacyConfigDoc`) ensures
-     *  the DB rebuild path runs before live sync resumes anyway. */
+     *  instead of `chunks`. Such entries are dropped during load — the
+     *  path then has no base — and the migration guard
+     *  (`findLegacyConfigDoc`) ensures the DB rebuild path runs before
+     *  live sync resumes anyway. */
     async ensureLoaded(): Promise<void> {
         if (this.loaded) return;
         const rows = await this.db.getMetaByPrefix<unknown>(
@@ -75,6 +72,11 @@ export class ConfigLastSynced {
 
     get(path: string): ConfigLastSyncedValue | undefined {
         return this.cache.get(path);
+    }
+
+    /** Paths with a base. */
+    paths(): string[] {
+        return [...this.cache.keys()];
     }
 
     /** Update the in-memory cache. Persistence is the caller's job —

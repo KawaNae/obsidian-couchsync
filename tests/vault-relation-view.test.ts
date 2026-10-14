@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
-    cloneAvailability, encryptionChangedElsewhere, vaultRelationView,
+    cloneDescription, encryptionChangedElsewhere, vaultRelationView,
 } from "../src/settings-tab/vault-relation-view.ts";
 import {
     VaultEncryptionPausedError, type VaultOutcome, type VaultRelation,
@@ -80,27 +80,22 @@ describe("vaultRelationView", () => {
     });
 });
 
-describe("cloneAvailability", () => {
+describe("cloneDescription", () => {
     const check = (result: any) => ({ at: 1, against: "t", result });
+    const ready = "Pull remote database to local vault (2nd+ device)";
 
-    it("without a finding, or after a failed check, offers Clone: its preparation reads the DB", () => {
-        expect(cloneAvailability(null, true)).toEqual({
-            enabled: true, desc: "Pull remote database to local vault (2nd+ device)",
-        });
-        expect(cloneAvailability(check({ status: "error", error: new Error("x") }), true).enabled).toBe(true);
+    it("without a finding, after a failed check, or for a DB with documents, describes Clone", () => {
+        expect(cloneDescription(null)).toBe(ready);
+        expect(cloneDescription(check({ status: "error", error: new Error("x") }))).toBe(ready);
+        expect(cloneDescription(check({ status: "exists", docCount: 3 }))).toBe(ready);
     });
 
-    it("an empty or new DB points to Init", () => {
+    it("a DB found empty or new points to Init, and says Clone reads it again", () => {
         for (const result of [{ status: "exists", docCount: 0 }, { status: "created" }]) {
-            const c = cloneAvailability(check(result), true);
-            expect(c.enabled).toBe(false);
-            expect(c.desc).toMatch(/empty/);
+            const d = cloneDescription(check(result));
+            expect(d).toMatch(/empty when last read — use Init/);
+            expect(d).toMatch(/Clone reads it again/);
         }
-    });
-
-    it("a DB with documents enables Clone when the setup state allows it", () => {
-        expect(cloneAvailability(check({ status: "exists", docCount: 3 }), true).enabled).toBe(true);
-        expect(cloneAvailability(check({ status: "exists", docCount: 3 }), false).enabled).toBe(false);
     });
 });
 

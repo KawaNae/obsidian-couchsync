@@ -33,8 +33,8 @@
  * view's own button resolves.
  *
  * Has no dependency on Obsidian: the host injects settings, the setup
- * runner, the live-sync switch, the progress notice and the passphrase
- * prompt.
+ * runner, the live-sync switch, the progress notice, the passphrase
+ * prompt and the confirm dialog.
  */
 import type { CouchSyncSettings, ConnectionState, VaultPauseRecord } from "../settings.ts";
 import type { DbInfo, ICouchClient } from "../db/interfaces.ts";
@@ -60,6 +60,7 @@ import { logWarn } from "../ui/log.ts";
 import { OutcomeLedger, type OpOutcome } from "./op-outcome.ts";
 import type { SetupResult } from "./setup.ts";
 import type { DbCheckResult } from "../db/sync/vault-remote-ops.ts";
+import type { VaultSetupPlan } from "./vault-setup-confirm.ts";
 
 /** The one-shot run's notice: progress lines, then a summary or the error.
  *  The host builds it (`ProgressNotice`), which also logs. */
@@ -107,6 +108,9 @@ export interface VaultBindingHost {
     startLive(): Promise<void>;
     openProgress(label: string): VaultProgress;
     askPassphrase: AskVaultPassphrase;
+    /** Ask the user to confirm the destructive half of Init or Clone, as
+     *  `plan` describes it. Resolves false when the user declined. */
+    confirmSetup(plan: VaultSetupPlan): Promise<boolean>;
 }
 
 /** The user's operations on the vault setup. */
@@ -450,7 +454,8 @@ export class VaultBinding {
      * run while the auth latch is raised. Neither refusal is recorded:
      * nothing was attempted. `body` prepares (reads, derives, asks —
      * nothing is changed, and a failure leaves the setup state and live
-     * sync as they were), then calls `beginDestructive` and executes.
+     * sync as they were), then calls `beginDestructive`, which asks the
+     * user to confirm, and executes.
      *
      * This is the one exit of an Init / Clone failure: the outcome is
      * recorded, and the notice words the error. Two failures are not
@@ -508,11 +513,19 @@ export class VaultBinding {
         this.clearPause(at);
     }
 
-    /** The point of no return of Init and Clone: stop live sync and persist
-     *  `settingUp` before anything is destroyed, so a failure (or a crash)
-     *  from here on never leaves `setupDone` / `syncing` behind on a
-     *  half-built DB. */
-    private async beginDestructive(): Promise<void> {
+    /**
+     * The point of no return of Init and Clone. The user confirms first,
+     * shown what the preparation found: every check that can refuse the
+     * run has passed by now, so a dialog is never answered for a run that
+     * is then refused, and what it says was read just before. Declining is
+     * a cancellation and changes nothing. On a yes, stop live sync and
+     * persist `settingUp` before anything is destroyed, so a failure (or a
+     * crash) from here on never leaves `setupDone` / `syncing` behind on a
+     * half-built DB.
+     */
+    private async beginDestructive(progress: VaultProgress, plan: VaultSetupPlan): Promise<void> {
+        progress.update("Waiting for confirmation...");
+        if (!(await this.host.confirmSetup(plan))) throw setupCancelled(plan.op);
         this.host.stopLive();
         await this.writeState("settingUp");
     }
@@ -524,7 +537,7 @@ export class VaultBinding {
      * Preparation: a passphrase is required when encryption is on; the
      * server must answer (a missing DB is fine — Init creates it); the meta
      * and its key are built from the Step 1 settings alone, with a fresh
-     * salt and keyCheck. Init creates a new vault that every other device
+     * salt and keyCheck; last, the user confirms, shown what the DB holds. Init creates a new vault that every other device
      * clones again, so nothing of the previous `vault:meta` or of a key
      * unlocked earlier in this session is carried over: a passphrase
      * changed in Step 1 is the one the new vault is encrypted with.
@@ -545,7 +558,7 @@ export class VaultBinding {
             }
             const raw = this.host.makeRawClient();
             progress.update("Checking the server...");
-            await probeServer(raw, { allowMissing: true });
+            const info = await probeServer(raw, { allowMissing: true });
 
             progress.update(enc ? "Deriving encryption keys..." : "Preparing vault metadata...");
             const { meta, crypto: derived } = await buildInitialVaultMeta({
@@ -555,7 +568,10 @@ export class VaultBinding {
             });
             const crypto = derived ?? undefined;
 
-            await this.beginDestructive();
+            await this.beginDestructive(progress, {
+                op: "init", dbName: s.couchdbDbName, docCount: info ? info.doc_count : null,
+                encryption: enc, compression: compress,
+            });
             this.crypto = crypto;
             try {
                 const result = await this.host.setup().init(
@@ -589,8 +605,10 @@ export class VaultBinding {
      * documents (what it holds is recorded, as a Check would); `vault:meta`
      * is read; an encrypted vault is unlocked — with the Step 1 passphrase,
      * else with one the user enters (the prompt stays open on a wrong one;
-     * cancelling changes nothing). The preparation reads the DB itself, so
-     * Clone does not depend on a Check made before it.
+     * cancelling changes nothing); last, the user confirms, shown what the
+     * DB holds. The passphrase comes before the confirmation because a
+     * wrong or missing one refuses the run. The preparation reads the DB
+     * itself, so Clone does not depend on a Check made before it.
      *
      * Execution runs the pull under the remote's codec held in memory; the
      * settings (encryption, passphrase, compression, cipher floor) are
@@ -626,7 +644,10 @@ export class VaultBinding {
             const targetEncryption = crypto !== undefined;
             const targetCompression = meta ? meta.compression.enabled : s.compressionEnabled;
 
-            await this.beginDestructive();
+            await this.beginDestructive(progress, {
+                op: "clone", dbName: s.couchdbDbName, docCount,
+                encryption: targetEncryption, compression: targetCompression,
+            });
             this.crypto = crypto;
             this.encryptionOverride = targetEncryption;
             this.compressionOverride = targetCompression;
@@ -685,7 +706,7 @@ export class VaultBinding {
             unlocked = { crypto: r.crypto, passphrase: p };
             return true;
         });
-        if (answer === null || unlocked === null) throw setupCancelled();
+        if (answer === null || unlocked === null) throw setupCancelled("clone");
         return unlocked;
     }
 
@@ -956,11 +977,11 @@ async function probeServer(raw: ICouchClient, opts: { allowMissing: boolean }): 
     }
 }
 
-/** The user cancelled the passphrase prompt of Clone: a cancellation, not
- *  recorded as an outcome; the notice reads "Clone cancelled — nothing
- *  was changed." */
-function setupCancelled(): Error {
-    const e: any = new Error("Clone cancelled — nothing was changed.");
+/** The user declined the confirmation of Init or Clone, or cancelled the
+ *  passphrase prompt of Clone: a cancellation, not recorded as an outcome;
+ *  the notice reads "<Init|Clone> cancelled — nothing was changed." */
+function setupCancelled(op: VaultOpName): Error {
+    const e: any = new Error(`${OP_LABELS[op]} cancelled — nothing was changed.`);
     e.name = "AbortError";
     e.userMessage = "nothing was changed.";
     return e;

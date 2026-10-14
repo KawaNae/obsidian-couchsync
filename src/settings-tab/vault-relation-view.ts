@@ -59,28 +59,21 @@ export function vaultRelationView(rel: VaultRelation, authError: unknown | null)
     return { text: "Setup complete. You can re-run if needed.", tone: "ok" };
 }
 
-export interface CloneAvailability {
-    enabled: boolean;
-    desc: string;
-}
-
 /**
- * Whether Clone can run, from what the applied DB was last found to hold
+ * Clone's description, from what the applied DB was last found to hold
  * (Step 2's Check, Clone's preparation, or the read-back after an Init).
- * Clone's preparation reads the DB itself and refuses an empty one, so
- * Clone needs no Check before it: without a finding, or after a failed
- * Check, it is offered. Only a DB known to be empty points to Init.
- *
- * @param setupAllowed the setup state allows Init / Clone (`setupGating`).
+ * The finding never disables Clone: another device can fill the DB at any
+ * time without this one knowing, and Clone's preparation reads the DB
+ * again and refuses an empty one before it changes anything. A DB found
+ * empty only points to Init.
  */
-export function cloneAvailability(dbCheck: VaultDbCheck | null, setupAllowed: boolean): CloneAvailability {
-    const ready = "Pull remote database to local vault (2nd+ device)";
-    if (!setupAllowed) return { enabled: false, desc: ready };
+export function cloneDescription(dbCheck: VaultDbCheck | null): string {
     const r = dbCheck?.result;
     if (r && (r.status === "created" || (r.status === "exists" && r.docCount === 0))) {
-        return { enabled: false, desc: "Database is empty — use Init to push your vault." };
+        return "The database was empty when last read — use Init to push your vault. " +
+            "Clone reads it again.";
     }
-    return { enabled: true, desc: ready };
+    return "Pull remote database to local vault (2nd+ device)";
 }
 
 /** Sync is paused because another device turned vault encryption on or

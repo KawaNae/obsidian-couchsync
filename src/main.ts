@@ -37,6 +37,7 @@ import { EditorAwareVaultWriter } from "./adapters/editor-aware-vault-writer.ts"
 import { CompositionGate } from "./sync/composition-gate.ts";
 import { makeCouchClient } from "./db/couch-client.ts";
 import { VaultBinding } from "./sync/vault-binding.ts";
+import { describeVaultSetupConfirm } from "./sync/vault-setup-confirm.ts";
 import { PassphraseModal } from "./ui/passphrase-modal.ts";
 import type { ICouchClient } from "./db/interfaces.ts";
 
@@ -211,6 +212,11 @@ export default class CouchSyncPlugin extends Plugin {
                         : "This passphrase does not unlock the vault.",
                 },
             ).waitForResult(),
+            // Destructive: the dialog opens with the focus on Cancel.
+            confirmSetup: (plan) => {
+                const c = describeVaultSetupConfirm(plan);
+                return modalPresenter.showConfirmModal(c.title, c.message, c.confirmText, true);
+            },
         });
         const vaultChunkHasher = this.vaultBinding.chunkHasher;
         const wrapVaultClient = this.vaultBinding.wrapClient;
@@ -297,13 +303,39 @@ export default class CouchSyncPlugin extends Plugin {
             reconnectBridge,
             () => this.settings,
             {
-                // Real own-data.json path so ConfigSync excludes it from
-                // replication even under a renamed plugin folder.
-                // manifest.dir is the actual install dir; fall back to the
-                // configDir + id composition.
-                ownDataJsonPath: this.manifest.dir
-                    ? `${this.manifest.dir}/data.json`
-                    : `${this.app.vault.configDir}/plugins/${this.manifest.id}/data.json`,
+                // This plugin's real folder, so ConfigSync excludes its
+                // data.json and backups even under a renamed plugin folder,
+                // and keeps Pull's backups there. manifest.dir is the actual
+                // install dir; fall back to the configDir + id composition.
+                pluginDir: this.manifest.dir
+                    || `${this.app.vault.configDir}/plugins/${this.manifest.id}`,
+                // Pull writes config files that Obsidian holds in memory;
+                // only a reload makes the app read them instead of writing
+                // its in-memory settings back over them.
+                reload: () => {
+                    setTimeout(() => {
+                        (this.app as any).commands.executeCommandById("app:reload");
+                    }, 500);
+                },
+                // Pull unloads a plugin before writing or deleting its files,
+                // so its unload cannot save in-memory settings over them.
+                // `disablePlugin` only unloads; the enabled list on disk is
+                // what the reload starts the plugins from.
+                stopPlugins: async (dirs) => {
+                    const plugins = (this.app as any).plugins;
+                    const manifests = Object.values(plugins.manifests ?? {}) as Array<{ id: string; dir?: string }>;
+                    const stopped: string[] = [];
+                    for (const m of manifests) {
+                        if (!m.dir || !dirs.includes(m.dir) || !plugins.plugins?.[m.id]) continue;
+                        try {
+                            await plugins.disablePlugin(m.id);
+                            stopped.push(m.id);
+                        } catch (e: any) {
+                            logWarn(`could not stop plugin "${m.id}" before writing its config: ${e?.message ?? e}`);
+                        }
+                    }
+                    return stopped;
+                },
                 // Receive-side platform gate: don't materialise desktop-only
                 // plugins on a mobile device. Mirrors the getPlatform wiring.
                 getIsMobile: () => Platform.isMobile,
