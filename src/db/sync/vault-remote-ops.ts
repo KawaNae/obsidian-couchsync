@@ -33,6 +33,13 @@ export type DbCheckResult =
     /** What was thrown, for `describeError` to word. */
     | { status: "error"; error: unknown };
 
+/** What a Check found, worded once for the notice and the Step 2 row:
+ *  "found — 12 docs.", "found — empty.", "created — empty.". */
+export function describeDbFound(r: Exclude<DbCheckResult, { status: "error" }>): string {
+    if (r.status === "created") return "created — empty.";
+    return r.docCount > 0 ? `found — ${r.docCount.toLocaleString()} docs.` : "found — empty.";
+}
+
 export class VaultRemoteOps {
     constructor(
         private localDb: LocalDB,

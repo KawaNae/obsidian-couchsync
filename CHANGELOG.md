@@ -99,7 +99,9 @@ All notable changes to obsidian-couchsync.
   could say 10 for a vault that received 2. It now counts only the files
   written to the vault, and Clone's "Writing N vault files..." only the
   files the filters let in. Init's "N files, M docs pushed" no longer counts
-  files the filters keep out or that exceed the size limit.
+  files the filters keep out or that exceed the size limit, and its
+  "Scanning (n/N)" counts only the files the filters let in. A reconcile's
+  "N pushed" in the log counts only the files it recorded for sending.
 - **Live sync no longer re-sends chunks the server already holds.** The first
   live sync after an Init or Clone wrote every chunk to the server again as
   a new revision of the same content, which advanced the database's
@@ -221,6 +223,15 @@ All notable changes to obsidian-couchsync.
 - **Clearing the config passphrase is no longer a codec change.** It used to
   be reported as a codec change that recommended Create; it is now reported
   as a missing passphrase.
+- **A config Pull no longer stops a vault Init or Clone half-way.** A Pull
+  that writes files reloads Obsidian, which stopped an Init or Clone running
+  at the time: an Init left the server's vault database sent only in part,
+  and every other device stopped on it. Pull & Reload, Pull & Overwrite and
+  Share again are now refused while an Init or Clone runs, and Init and
+  Clone while one of them runs; the notice says which one to wait for, and
+  the buttons are disabled until it ends. After a Pull that reloads, Init,
+  Clone, Config Create and Join stay refused until Obsidian has restarted. Push
+  and Join still run beside an Init or Clone.
 
 ### Changed
 
@@ -236,6 +247,15 @@ All notable changes to obsidian-couchsync.
   then. The dialog opens with the focus on Cancel. Cancel changes nothing:
   live sync keeps running and the setup state stays as it was. Clone asks
   for a missing passphrase before this dialog.
+- **Config Sync's buttons are disabled while a config operation runs.**
+  Config operations never ran at the same time: a second one was refused
+  with a notice. But while one ran, including while its confirmation
+  (the Push list, Pull & Overwrite's or Share again's) was open, the other
+  buttons stayed enabled, and the Filter could be changed under it. Now
+  Create, Join, Push, Pull & Reload, Pull & Overwrite, Share again, the
+  Filter and Apply are disabled until it ends, as Init and Clone are in
+  Vault Sync. Create's confirmation is now part of the operation too, so
+  no other config operation can start while it is open.
 - **Config Pull merges.** Pull compares each config file the server changed
   with the version this device last took in and with the disk. In
   `app.json`, `appearance.json`, `hotkeys.json`, the other `.obsidian/*.json`
@@ -313,12 +333,12 @@ All notable changes to obsidian-couchsync.
   the server is not changed, then Pull). Push and Pull on a device that has
   not joined stop and ask it to Join. Join does not change the Step 1
   settings.
-  Create's confirmation shows how many documents
-  the server holds and whether `config:meta` exists — or that the server
-  could not be read —, the encryption, compression and cipher version it
-  will build (highlighted when that is weaker than the database's current
-  one, e.g. encrypted → unencrypted), and that every other device must Join
-  again.
+  Create first checks that the server answers; a server that cannot be
+  read fails Create before it asks. Its confirmation shows how many
+  documents the server holds and whether `config:meta` exists, the
+  encryption, compression and cipher version it will build (highlighted
+  when that is weaker than the database's current one, e.g. encrypted →
+  unencrypted), and that every other device must Join again.
 - **The config passphrase belongs to the database you Create or Join.**
   Create and Join keep the passphrase of an encrypted config database with
   that database (per server and database name, in settings). Push and Pull

@@ -147,11 +147,12 @@ export class SetupService {
         }
     }
 
-    /** Scan all vault files to local DB (no mtime check — clean start).
-     *  Returns how many were recorded: a file fileToDb keeps out (filters,
-     *  size limit) or fails on is not pushed. */
+    /** Scan the vault files the filters keep in to local DB (no mtime
+     *  check — clean start); the progress counts those, as Clone's does.
+     *  Returns how many were recorded: a file fileToDb keeps out (size
+     *  limit) or fails on is not pushed. */
     private async scanVaultToDb(onProgress: (msg: string) => void): Promise<number> {
-        const files = this.vault.getFiles();
+        const files = this.vault.getFiles().filter((f) => this.vaultSync.shouldSync(f.path));
         let synced = 0;
         for (let i = 0; i < files.length; i++) {
             const file = files[i];

@@ -2,11 +2,11 @@
  * config-create-preview.ts — what the Create confirm dialog tells the user
  * about the server before they wipe it, and what Create will build.
  *
- * `ConfigSync.previewCreate` reads the remote config DB (raw client, no key
- * needed) and returns a `ConfigCreatePreview`; `describeCreateConfirm` turns
- * it, plus the codec Create will build with, into the dialog text. When the
- * server cannot be read the text says so — a document count is never
- * guessed.
+ * `ConfigSync.create` reads the remote config DB (raw client, no key
+ * needed) into a `ConfigCreatePreview` inside its op, before anything is
+ * destroyed; `describeCreateConfirm` turns it, plus the codec Create will
+ * build with, into the dialog text. A server that cannot be read fails
+ * Create before the dialog, so a document count is never guessed.
  */
 
 /** A root's codec as the dialog shows it. `cipherVersion` is set iff
@@ -17,7 +17,7 @@ export interface CreateCodec {
     cipherVersion?: number;
 }
 
-export type ConfigCreatePreview = (
+export type ConfigCreatePreview =
     /** The DB exists and was read. */
     | {
         kind: "read";
@@ -30,15 +30,16 @@ export type ConfigCreatePreview = (
         codec?: CreateCodec;
     }
     /** The DB does not exist on the server (404). */
-    | { kind: "missing" }
-    /** The server could not be read; `message` says why, as a sentence
-     *  (`describeError`). */
-    | { kind: "unreadable"; message: string }
-) & {
-    /** The binding (`configBindingKey`) this preview was read for; null when
-     *  there was none. Create must run against the same binding. */
-    bindingKey: string | null;
-};
+    | { kind: "missing" };
+
+/** What Create's confirmation shows: the DB it wipes, what that DB holds
+ *  now, and the codec of the root Create builds (Step 1, with the
+ *  cipherVersion this build writes). */
+export interface ConfigCreateConfirm {
+    dbName: string;
+    server: ConfigCreatePreview;
+    next: CreateCodec;
+}
 
 /** "encryption on (cipherVersion 3), compression off" */
 export function describeCreateCodec(c: CreateCodec): string {
@@ -71,7 +72,7 @@ export function weakerCodecReason(current: CreateCodec, next: CreateCodec): stri
  *   0. (only when weaker than the current root) the warning
  *   1. what Create does, the codec it builds with, and that it cannot be
  *      undone
- *   2. what is on the server now (or that it could not be read)
+ *   2. what is on the server now
  *   3. every other device must Join again
  *   4. this device: local store emptied, files untouched, Push next
  *
@@ -110,10 +111,6 @@ export function describeCreateConfirm(
         }
         case "missing":
             server = "On the server now: the database does not exist yet. Create makes it.";
-            break;
-        case "unreadable":
-            server = "The server could not be read, so what Create would delete is " +
-                `unknown. ${p.message}`;
             break;
     }
 

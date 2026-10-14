@@ -23,9 +23,11 @@ export class CouchSyncSettingTab extends PluginSettingTab {
     }
 
     /**
-     * Redraw while the tab is open whenever the vault setup or the auth
-     * latch changes: an Init or Clone starts or ends, the live session
-     * pauses, a Test clears the latch. Changes in one task are drawn once.
+     * Redraw while the tab is open whenever the vault setup, a config op,
+     * the reload guard or the auth latch changes: an Init or Clone starts
+     * or ends, the live session pauses, a config op or rebind starts or
+     * ends, a config Pull holds the guard until the reload, a Test clears
+     * the latch. Changes in one task are drawn once.
      */
     private subscribe(): void {
         if (this.unsubscribers.length > 0) return;
@@ -39,6 +41,8 @@ export class CouchSyncSettingTab extends PluginSettingTab {
         };
         this.unsubscribers.push(
             this.plugin.vaultBinding.onChange(queueRedraw),
+            this.plugin.configSync.onChange(queueRedraw),
+            this.plugin.reloadGuard.onChange(queueRedraw),
             this.plugin.auth.onChange(queueRedraw),
         );
     }
@@ -165,7 +169,6 @@ export class CouchSyncSettingTab extends PluginSettingTab {
             replicator: this.plugin.replicator,
             auth: this.plugin.auth,
             remoteOps: this.plugin.remoteOps,
-            modalPresenter: this.plugin.modalPresenter,
             refresh: () => this.display(),
         };
         if (!this.configSyncTab) {

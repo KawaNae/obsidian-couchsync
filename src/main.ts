@@ -37,6 +37,7 @@ import { EditorAwareVaultWriter } from "./adapters/editor-aware-vault-writer.ts"
 import { CompositionGate } from "./sync/composition-gate.ts";
 import { makeCouchClient } from "./db/couch-client.ts";
 import { VaultBinding } from "./sync/vault-binding.ts";
+import { ReloadGuard } from "./sync/reload-guard.ts";
 import { describeVaultSetupConfirm } from "./sync/vault-setup-confirm.ts";
 import { PassphraseModal } from "./ui/passphrase-modal.ts";
 import type { ICouchClient } from "./db/interfaces.ts";
@@ -72,6 +73,9 @@ export default class CouchSyncPlugin extends Plugin {
     /** Owner of the vault DB's setup: the codec state, Init / Clone, the
      *  encryption-agreement check and their outcomes. */
     vaultBinding!: VaultBinding;
+    /** Keeps the config ops that reload Obsidian and the operations a
+     *  reload would break (vault Init / Clone, config Create / Join) apart. */
+    readonly reloadGuard = new ReloadGuard();
 
     /** Cross-platform OS label for the log frontmatter. Desktop uses Node
      *  `process.platform` (win32/darwin/linux); mobile has no Node, so derive
@@ -217,6 +221,7 @@ export default class CouchSyncPlugin extends Plugin {
                 const c = describeVaultSetupConfirm(plan);
                 return modalPresenter.showConfirmModal(c.title, c.message, c.confirmText, true);
             },
+            reloadGuard: this.reloadGuard,
         });
         const vaultChunkHasher = this.vaultBinding.chunkHasher;
         const wrapVaultClient = this.vaultBinding.wrapClient;
@@ -312,6 +317,7 @@ export default class CouchSyncPlugin extends Plugin {
                 // Pull writes config files that Obsidian holds in memory;
                 // only a reload makes the app read them instead of writing
                 // its in-memory settings back over them.
+                reloadGuard: this.reloadGuard,
                 reload: () => {
                     setTimeout(() => {
                         (this.app as any).commands.executeCommandById("app:reload");

@@ -26,6 +26,12 @@ accordingly:
 
 Vault sync is **continuous** once Live Sync is on. **Init**, **Clone**, and
 config-sync operations are the manual, full-DB actions.
+A config **Pull & Reload**, **Pull & Overwrite** or **Share again** that
+writes files reloads Obsidian, which would stop an Init or Clone half-way.
+So these three and Init / Clone never run together: while one side runs,
+the other's buttons are disabled and a start is refused with a notice
+naming what to wait for. After a Pull that reloads, Init, Clone and Config
+**Create** and **Join** stay refused until Obsidian has restarted.
 
 ---
 
@@ -150,9 +156,9 @@ current database, the step says so.
 **Step 3: Setup**
 - **Create** (first device) — ⚠️ **destructive**: deletes the config
   database on the server and re-creates it empty, with a new root
-  (`config:meta`) built from Step 1. The confirm dialog shows how many
-  documents the server holds and whether `config:meta` exists (or that the
-  server could not be read), the encryption, compression and cipher version
+  (`config:meta`) built from Step 1. Create first checks that the server
+  answers, then a confirm dialog shows how many documents the server holds
+  and whether `config:meta` exists, the encryption, compression and cipher version
   Create will build — with a warning when that is weaker than the current
   database — and that every other device must Join again. Create does not
   send content; run **Push** afterwards.
@@ -174,6 +180,10 @@ current database, the step says so.
   operation. In order of priority it shows: rejected credentials, an
   unfinished Create, the last failure (e.g. `Last Join: …`), `Not joined
   yet`, then that the device is joined and ready.
+
+Config operations (Create, Join, Push, both Pulls, Share again) run one at
+a time. While one runs, its confirmation dialog included, the buttons that
+start another, the Filter and Apply are disabled.
 
 **Step 4: Sync**
 - **Filter** — what this device syncs, by meaning. The same selection

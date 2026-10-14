@@ -58,8 +58,9 @@ import { classifyError } from "../db/sync/errors.ts";
 import { describeError, rawErrorMessage, UserFacingError } from "../ui/describe-error.ts";
 import { logWarn } from "../ui/log.ts";
 import { OutcomeLedger, type OpOutcome } from "./op-outcome.ts";
+import { ReloadGuard } from "./reload-guard.ts";
 import type { SetupResult } from "./setup.ts";
-import type { DbCheckResult } from "../db/sync/vault-remote-ops.ts";
+import { describeDbFound, type DbCheckResult } from "../db/sync/vault-remote-ops.ts";
 import type { VaultSetupPlan } from "./vault-setup-confirm.ts";
 
 /** The one-shot run's notice: progress lines, then a summary or the error.
@@ -111,6 +112,12 @@ export interface VaultBindingHost {
     /** Ask the user to confirm the destructive half of Init or Clone, as
      *  `plan` describes it. Resolves false when the user declined. */
     confirmSetup(plan: VaultSetupPlan): Promise<boolean>;
+    /** The plugin-wide guard that keeps a reload away from the operations
+     *  it would break; config sync enters the same one. Init and Clone
+     *  enter it as `uninterruptible`: stopped half-way, they leave a vault
+     *  DB sent in part or an emptied local DB. Omitted → a guard of its
+     *  own. */
+    reloadGuard?: ReloadGuard;
 }
 
 /** The user's operations on the vault setup. */
@@ -186,6 +193,7 @@ export class VaultBinding {
     /** What each vault DB was found to hold, keyed by `vaultTarget`. */
     private readonly dbChecks = new Map<string, VaultDbCheck>();
     private readonly listeners = new Set<() => void>();
+    private readonly reloadGuard: ReloadGuard;
 
     /** The vault chunk hasher: HMAC under the key when the vault is
      *  encrypted and unlocked, xxhash64 otherwise. Reads the key on every
@@ -193,6 +201,7 @@ export class VaultBinding {
     readonly chunkHasher: ChunkHasher;
 
     constructor(private readonly host: VaultBindingHost) {
+        this.reloadGuard = host.reloadGuard ?? new ReloadGuard();
         const binding = this;
         this.chunkHasher = {
             get alg(): ChunkHashAlg {
@@ -312,6 +321,14 @@ export class VaultBinding {
         return this.inflight
             ? `${OP_LABELS[this.inflight]} is running — wait for it to finish.`
             : null;
+    }
+
+    /** Why Init and Clone cannot start now because of an operation outside
+     *  the vault setup (a config Pull, or the reload after it), or null.
+     *  The run is refused with this text; the tab disables the buttons.
+     *  Redraw on the guard's `onChange`. */
+    reloadConflict(): string | null {
+        return this.reloadGuard.blocker("uninterruptible");
     }
 
     private assertIdle(): void {
@@ -439,9 +456,7 @@ export class VaultBinding {
             progress.fail(result.error);
         } else {
             this.host.auth.clear();
-            progress.done(result.status === "created"
-                ? `"${dbName}" created — empty.`
-                : `"${dbName}" found — ${result.docCount.toLocaleString()} docs.`);
+            progress.done(`"${dbName}" ${describeDbFound(result)}`);
         }
         return result;
     }
@@ -451,26 +466,30 @@ export class VaultBinding {
     /**
      * Run Init or Clone. The notice is opened first, so no failure goes
      * unreported. A second run while one is in flight is refused; so is a
-     * run while the auth latch is raised. Neither refusal is recorded:
+     * run while an operation that reloads Obsidian runs (`ReloadGuard`),
+     * and a run while the auth latch is raised. Neither refusal is recorded:
      * nothing was attempted. `body` prepares (reads, derives, asks —
      * nothing is changed, and a failure leaves the setup state and live
      * sync as they were), then calls `beginDestructive`, which asks the
      * user to confirm, and executes.
      *
      * This is the one exit of an Init / Clone failure: the outcome is
-     * recorded, and the notice words the error. Two failures are not
-     * recorded, because something else already tells them: a cancellation,
-     * and a rejection of the credentials (401/403), which raises the auth
+     * recorded, and the notice words the error. Three failures are not
+     * recorded, because something else already tells them: a cancellation;
+     * a rejection of the credentials (401/403), which raises the auth
      * latch — the status line shows the latch while it is raised, and once
-     * a Test clears it the rejection no longer holds. The error is rethrown
-     * so the caller only has to restore its button.
+     * a Test clears it the rejection no longer holds; and a Clone of an
+     * empty DB, which is what the DB was found to hold — kept as its check
+     * (Clone's description says it), which the next read of the DB
+     * replaces. The error is rethrown so the caller only has to restore its
+     * button.
      */
     private async runOperation(
         op: VaultOpName,
         body: (progress: VaultProgress, at: number) => Promise<string>,
     ): Promise<void> {
         const progress = this.host.openProgress(OP_LABELS[op]);
-        const busy = this.changeBlocker();
+        const busy = this.changeBlocker() ?? this.reloadConflict();
         const refusal = busy !== null
             ? new UserFacingError(busy)
             : this.host.auth.isBlocked() ? this.host.auth.blockedError() : null;
@@ -479,6 +498,7 @@ export class VaultBinding {
             throw refusal;
         }
         this.inflight = op;
+        const lease = this.reloadGuard.enter(`Vault ${OP_LABELS[op]}`, "uninterruptible");
         this.changed();
         const at = Date.now();
         const against = vaultTarget(this.settings());
@@ -490,13 +510,17 @@ export class VaultBinding {
             const d = classifyError(e);
             const rejected = d.kind === "auth" && typeof d.code === "number";
             if (rejected) this.host.auth.raise(d.code!, rawErrorMessage(e));
-            if (!rejected && !(e instanceof AuthBlockedError) && !describeError(e).cancelled) {
+            if (
+                !rejected && !(e instanceof AuthBlockedError)
+                && !(e instanceof VaultDbEmptyError) && !describeError(e).cancelled
+            ) {
                 this.outcomes.record({ op, at, against, error: e });
             }
             progress.fail(e);
             throw e;
         } finally {
             this.inflight = null;
+            lease.release();
             this.changed();
         }
     }
@@ -627,7 +651,7 @@ export class VaultBinding {
                 at: Date.now(), against: vaultTarget(s), result: { status: "exists", docCount },
             });
             if (docCount === 0) {
-                throw new UserFacingError("The database is empty — use Init to push your vault.");
+                throw new VaultDbEmptyError();
             }
             const meta = await fetchVaultMeta(raw);
 
@@ -974,6 +998,14 @@ async function probeServer(raw: ICouchClient, opts: { allowMissing: boolean }): 
     } catch (e) {
         if (opts.allowMissing && classifyError(e).kind === "not-found") return null;
         throw e;
+    }
+}
+
+/** Clone found the vault DB empty: there is nothing to clone. Recorded as
+ *  what the DB holds (its check), not as an outcome of the Clone. */
+class VaultDbEmptyError extends UserFacingError {
+    constructor() {
+        super("The database is empty — use Init to push your vault.");
     }
 }
 
