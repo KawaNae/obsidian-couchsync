@@ -111,7 +111,10 @@ interface FakeVaultSync {
     applyRemoteDeletionCalls: string[];
     /** Paths the test marks as having unpushed local edits (Case F gate). */
     unpushed: Set<string>;
-    fileToDb(path: string): Promise<void>;
+    /** Paths the filters keep out: fileToDb records nothing for them. */
+    filtered: Set<string>;
+    fileToDb(path: string): Promise<boolean>;
+    shouldSync(path: string): boolean;
     dbToFile(doc: FileDoc): Promise<{ applied: true }>;
     markDeleted(path: string): Promise<void>;
     applyRemoteDeletion(path: string): Promise<void>;
@@ -135,8 +138,10 @@ function makeVaultSync(): FakeVaultSync {
         alignCalls: [],
         applyRemoteDeletionCalls: [],
         unpushed: new Set<string>(),
+        filtered: new Set<string>(),
         compareResults: new Map(),
-        async fileToDb(path) { this.fileToDbCalls.push(path); },
+        async fileToDb(path) { this.fileToDbCalls.push(path); return !this.filtered.has(path); },
+        shouldSync(path) { return !this.filtered.has(path); },
         // Record the bare vault path (not the prefixed _id) so tests can
         // keep asserting `expect(dbToFileCalls).toEqual(["a.md"])`.
         async dbToFile(doc) { this.dbToFileCalls.push(filePathFromId(doc._id)); return { applied: true as const }; },
@@ -288,6 +293,14 @@ describe("Reconciler", () => {
             const r = await h.reconciler.reconcile("manual");
             expect(r.pushed).toEqual(["new.md"]);
             expect(h.vaultSync.fileToDbCalls).toEqual(["new.md"]);
+        });
+
+        it("a file fileToDb does not record (kept out by the filters) is not counted as pushed", async () => {
+            const h = setup([makeFile("new.md", 1000), makeFile("out.md", 1000)]);
+            h.vaultSync.filtered.add("out.md");
+            const r = await h.reconciler.reconcile("manual");
+            expect(r.pushed).toEqual(["new.md"]);
+            expect(h.vaultSync.fileToDbCalls.sort()).toEqual(["new.md", "out.md"]);
         });
 
         // Deletion is an integration event: a vault file over a DB tombstone
@@ -632,6 +645,13 @@ describe("Reconciler", () => {
             // No side effects
             expect(h.vaultSync.fileToDbCalls).toEqual([]);
             expect(h.vaultSync.markDeletedCalls).toEqual([]);
+        });
+
+        it("report mode does not count a file the filters keep out as one to push", async () => {
+            const h = setup([makeFile("new.md", 1000), makeFile("out.md", 1000)]);
+            h.vaultSync.filtered.add("out.md");
+            const r = await h.reconciler.reconcile("manual", { mode: "report" });
+            expect(r.pushed).toEqual(["new.md"]);
         });
 
         it("report mode does not update manifest or cursor", async () => {

@@ -99,7 +99,9 @@ All notable changes to obsidian-couchsync.
   could say 10 for a vault that received 2. It now counts only the files
   written to the vault, and Clone's "Writing N vault files..." only the
   files the filters let in. Init's "N files, M docs pushed" no longer counts
-  files the filters keep out or that exceed the size limit.
+  files the filters keep out or that exceed the size limit, and its
+  "Scanning (n/N)" counts only the files the filters let in. A reconcile's
+  "N pushed" in the log counts only the files it recorded for sending.
 - **Live sync no longer re-sends chunks the server already holds.** The first
   live sync after an Init or Clone wrote every chunk to the server again as
   a new revision of the same content, which advanced the database's

@@ -366,7 +366,7 @@ export class Reconciler {
             if (file && (!doc || doc.deleted)) {
                 if (!doc) {
                     // No doc at all — plain new-file push.
-                    if (await this.tryStep(displayPath, "push", () => this.vaultSync.fileToDb(file.path), mode)) {
+                    if (await this.tryPush(displayPath, file.path, mode)) {
                         report.pushed.push(displayPath);
                     }
                     continue;
@@ -388,7 +388,7 @@ export class Reconciler {
                         // Deleted baseline matches the tombstone — the file is
                         // a legitimate recreate. fileToDb increments past the
                         // tombstone's vclock (recreate push).
-                        if (await this.tryStep(displayPath, "push", () => this.vaultSync.fileToDb(file.path), mode)) {
+                        if (await this.tryPush(displayPath, file.path, mode)) {
                             report.pushed.push(displayPath);
                         }
                         break;
@@ -579,7 +579,7 @@ export class Reconciler {
                         // returns true-divergent when local has drifted from
                         // baseline AND remote dominates, so the local-edit
                         // case here is genuinely a push.
-                        if (await this.tryStep(displayPath, "push", () => this.vaultSync.fileToDb(file.path), mode)) {
+                        if (await this.tryPush(displayPath, file.path, mode)) {
                             report.localWins.push(displayPath);
                         }
                         break;
@@ -689,6 +689,21 @@ export class Reconciler {
             this.autoPendingTotal = 0;
             this.autoPendingTimer = null;
         }, AUTO_NOTIFY_DEBOUNCE_MS);
+    }
+
+    /**
+     * Push the vault file at `path` (`fileToDb`). True when it was recorded:
+     * a file the filters or the size limit keep out, or one that needs no
+     * write, is not counted as pushed. In report mode nothing is written;
+     * a file the filters keep in counts as one the run would push.
+     */
+    private async tryPush(display: string, path: string, mode: ReconcileMode): Promise<boolean> {
+        if (mode !== "apply") return this.vaultSync.shouldSync(path);
+        let recorded = false;
+        const ok = await this.tryStep(display, "push", async () => {
+            recorded = await this.vaultSync.fileToDb(path);
+        }, mode);
+        return ok && recorded;
     }
 
     /**
