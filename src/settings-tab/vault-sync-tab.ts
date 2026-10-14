@@ -17,7 +17,7 @@ import { setupGating } from "./setup-gating.ts";
 import { showNotice } from "../ui/notices.ts";
 import { describeError } from "../ui/describe-error.ts";
 import type { VaultBinding, VaultRelation } from "../sync/vault-binding.ts";
-import { cloneAvailability, encryptionChangedElsewhere, vaultRelationView } from "./vault-relation-view.ts";
+import { cloneDescription, encryptionChangedElsewhere, vaultRelationView } from "./vault-relation-view.ts";
 
 export interface VaultSyncTabDeps {
     app: App;
@@ -176,15 +176,13 @@ export class VaultSyncTab {
                     })
             );
 
-        const clone = cloneAvailability(relation.dbCheck, cloneEnabled && idle);
-
         new Setting(el)
             .setName("Clone")
-            .setDesc(clone.desc)
+            .setDesc(cloneDescription(relation.dbCheck))
             .addButton((btn) =>
                 btn
                     .setButtonText("Clone")
-                    .setDisabled(!clone.enabled)
+                    .setDisabled(!cloneEnabled || !idle)
                     .onClick(async () => {
                         btn.setButtonText("Pulling...");
                         btn.setDisabled(true);

@@ -18,7 +18,7 @@ export interface SetupGating {
     locked: boolean;
     /** Init button enabled. */
     initEnabled: boolean;
-    /** Clone button enabled (tab further restricts based on DB doc_count). */
+    /** Clone button enabled. */
     cloneEnabled: boolean;
     /** Live Sync toggle enabled. */
     syncToggleEnabled: boolean;
