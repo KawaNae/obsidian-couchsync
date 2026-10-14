@@ -22,6 +22,7 @@ import { ConfigPushModal } from "../ui/config-push-modal.ts";
 import { ConfigOverwriteModal } from "../ui/config-overwrite-modal.ts";
 import { ConfigShareAgainModal } from "../ui/config-share-again-modal.ts";
 import type { PushReview } from "../sync/config-push-review.ts";
+import { describeCreateConfirm, type ConfigCreateConfirm } from "../sync/config-create-preview.ts";
 
 export class ObsidianModalPresenter implements IModalPresenter {
     constructor(private app: App) {}
@@ -69,5 +70,14 @@ export class ObsidianModalPresenter implements IModalPresenter {
 
     showConfigShareAgainModal(preview: ConfigShareAgainPreview): Promise<boolean> {
         return new ConfigShareAgainModal(this.app, preview).waitForResult();
+    }
+
+    showConfigCreateModal(c: ConfigCreateConfirm): Promise<boolean> {
+        return this.showConfirmModal(
+            `Create config database "${c.dbName}"?`,
+            describeCreateConfirm(c.dbName, c.server, c.next),
+            "Create",
+            true,
+        );
     }
 }

@@ -13,6 +13,7 @@ import type {
     ConfigShareAgainPreview,
 } from "../../src/types/modal-presenter.ts";
 import { defaultSelection, type PushReview } from "../../src/sync/config-push-review.ts";
+import type { ConfigCreateConfirm } from "../../src/sync/config-create-preview.ts";
 
 export class FakeModalPresenter implements IModalPresenter {
     /** Queue of responses for showConflictModal. */
@@ -43,6 +44,11 @@ export class FakeModalPresenter implements IModalPresenter {
     shareAgainResponses: boolean[] = [];
     /** Record of all Share again confirmations shown (for assertions). */
     shareAgainCalls: ConfigShareAgainPreview[] = [];
+
+    /** Answers the config Create confirmation. Default: go ahead. */
+    createResponder: (confirm: ConfigCreateConfirm) => boolean | Promise<boolean> = () => true;
+    /** Record of all Create confirmations shown (for assertions). */
+    createCalls: ConfigCreateConfirm[] = [];
 
     /** Dismiss callbacks for currently open conflict modals. */
     private openDismiss = new Map<string, () => void>();
@@ -106,6 +112,11 @@ export class FakeModalPresenter implements IModalPresenter {
     async showConfigShareAgainModal(preview: ConfigShareAgainPreview): Promise<boolean> {
         this.shareAgainCalls.push(preview);
         return this.shareAgainResponses.shift() ?? false;
+    }
+
+    async showConfigCreateModal(confirm: ConfigCreateConfirm): Promise<boolean> {
+        this.createCalls.push(confirm);
+        return this.createResponder(confirm);
     }
 
     /** Dismiss the open conflict modal for the given path (simulates auto-resolve). */

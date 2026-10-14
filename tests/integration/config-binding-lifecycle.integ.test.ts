@@ -421,35 +421,45 @@ describe("config binding lifecycle", () => {
         });
     });
 
-    describe("Create preview (confirm dialog)", () => {
-        it("reads the doc count and the meta; reports a missing DB and an unreadable server", async () => {
+    describe("Create confirmation", () => {
+        it("shows the doc count and the meta, or a missing DB; a server that cannot be read fails before it", async () => {
             await seed("cfg-enc", { ".obsidian/app.json": "{}" }, ENC);
             const b = makeDevice("dev-B");
+            b.modal.createResponder = () => false;
             await apply(b, "cfg-enc");
-            const p = await b.cs.previewCreate();
-            expect(p).toMatchObject({
-                kind: "read", meta: "present",
-                codec: { encryption: true, compression: false, cipherVersion: 3 },
-                bindingKey: b.cs.currentBinding()!.key,
+            const encCount = (await remote("cfg-enc").info()).doc_count;
+            await expect(b.cs.create()).rejects.toMatchObject({ name: "AbortError" });
+            expect(b.modal.createCalls.at(-1)).toEqual({
+                dbName: "cfg-enc",
+                server: {
+                    kind: "read", docCount: encCount, meta: "present",
+                    codec: { encryption: true, compression: false, cipherVersion: 3 },
+                },
+                next: { encryption: false, compression: false },
             });
-            expect(p.kind === "read" && p.docCount).toBeGreaterThan(1);
+            expect(encCount).toBeGreaterThan(1);
+            // Cancel changed nothing on the server.
+            expect((await remote("cfg-enc").info()).doc_count).toBe(encCount);
 
             await apply(b, "cfg-empty");
-            expect(await b.cs.previewCreate()).toEqual({
-                kind: "read", docCount: 0, meta: "absent", bindingKey: b.cs.currentBinding()!.key,
+            await remote("cfg-empty").ensureDb();
+            await expect(b.cs.create()).rejects.toMatchObject({ name: "AbortError" });
+            expect(b.modal.createCalls.at(-1)!.server).toEqual({
+                kind: "read", docCount: 0, meta: "absent",
             });
 
             const gone = remote("cfg-gone");
             gone.info = async () => { throw Object.assign(new Error("not_found"), { status: 404 }); };
             await apply(b, "cfg-gone");
-            expect(await b.cs.previewCreate()).toEqual({
-                kind: "missing", bindingKey: b.cs.currentBinding()!.key,
-            });
+            await expect(b.cs.create()).rejects.toMatchObject({ name: "AbortError" });
+            expect(b.modal.createCalls.at(-1)!.server).toEqual({ kind: "missing" });
 
+            const shown = b.modal.createCalls.length;
             const down = remote("cfg-down");
             down.info = async () => { throw new TypeError("Failed to fetch"); };
             await apply(b, "cfg-down");
-            expect(await b.cs.previewCreate()).toMatchObject({ kind: "unreadable" });
+            await expect(b.cs.create()).rejects.toThrow();
+            expect(b.modal.createCalls).toHaveLength(shown);
         });
     });
 
@@ -1336,7 +1346,7 @@ describe("config binding lifecycle", () => {
         const X = "http://x.example:5984";
         const Y = "http://y.example:5984";
 
-        it("refused and nothing saved; Create's preview and Create both hit the server the settings name", async () => {
+        it("refused and nothing saved; Create's confirmation and Create both hit the server the settings name", async () => {
             // Y holds a shared config DB.
             const y = await creator("cfg", {
                 ".obsidian/app.json": "{}", ".obsidian/hotkeys.json": "{}",
@@ -1361,14 +1371,12 @@ describe("config binding lifecycle", () => {
             await running;
             expect(d.cs.bindingChangeBlocker()).toBeNull();
 
-            // Settings and binding agree on X: the preview reads X, and
-            // Create wipes X — the DB the dialog described. Y is untouched.
-            const preview = await d.cs.previewCreate();
-            expect(preview).toMatchObject({
-                kind: "read", docCount: 0, bindingKey: d.cs.currentBinding()!.key,
-            });
+            // Settings and binding agree on X: Create's confirmation reads
+            // X, and Create wipes X — the DB the dialog described. Y is
+            // untouched.
             expect(d.cs.currentBinding()!.serverUri).toBe(X);
             await d.cs.create();
+            expect(d.modal.createCalls.at(-1)!.server).toMatchObject({ kind: "read", docCount: 0 });
             expect((await remote("cfg", Y).info()).doc_count).toBe(yCount);
             expect((await remote("cfg", X).info()).doc_count).toBe(1); // X's new meta
 
@@ -1376,7 +1384,9 @@ describe("config binding lifecycle", () => {
             expect(await applyServer(d, Y)).toEqual({ kind: "saved" });
             expect(d.settings.couchdbUri).toBe(Y);
             expect(d.cs.currentBinding()!.serverUri).toBe(Y);
-            expect(await d.cs.previewCreate()).toMatchObject({ kind: "read", docCount: yCount });
+            d.modal.createResponder = () => false;
+            await expect(d.cs.create()).rejects.toMatchObject({ name: "AbortError" });
+            expect(d.modal.createCalls.at(-1)!.server).toMatchObject({ kind: "read", docCount: yCount });
             await y.cs.close();
         });
 

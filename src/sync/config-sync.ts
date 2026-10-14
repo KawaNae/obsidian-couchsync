@@ -65,7 +65,7 @@ import {
 } from "./config-migration.ts";
 import { ConfigSetupService } from "./config-setup.ts";
 import type { ConfigCreatePreview } from "./config-create-preview.ts";
-import { fetchConfigMeta } from "../db/vault-meta.ts";
+import { CURRENT_CIPHER_VERSION, fetchConfigMeta } from "../db/vault-meta.ts";
 import { classifyError } from "../db/sync/errors.ts";
 import { resolveConfigCodec } from "./config-codec-policy.ts";
 import { configNotReady } from "./config-errors.ts";
@@ -234,8 +234,12 @@ export class ConfigSync {
     private static readonly MAX_CONFIG_SIZE = 5 * 1024 * 1024; // 5MB
 
     /** In-flight op (a ConfigOperation, or a local `runExclusive` task),
-     *  or null. Concurrent ops are rejected. */
+     *  or null. Concurrent ops are rejected. An op's confirmation dialogs
+     *  are shown inside it, so nothing else runs while one is open. */
     private inflight: { cancel(): void } | null = null;
+
+    /** Listeners of `bindingChangeBlocker()` (see `onChange`). */
+    private readonly listeners = new Set<() => void>();
 
     /** The config DB this device is pointed at, with its store, cursors,
      *  lastSynced cache and key memo. Null = config sync disabled (or the
@@ -314,7 +318,7 @@ export class ConfigSync {
      *     no `commit`: settings and binding both stay as they were. The tabs
      *     also disable Apply while `bindingChangeBlocker()` says so.
      * Because of it, the paths that read the binding WITHOUT the op lock
-     * (Create's confirm preview, the filter tree listing, Maintenance) see
+     * (the filter tree listing, Maintenance) see
      * the binding the settings name, and an op never has to re-align.
      *
      * If opening the new store fails the device is left unbound (never on
@@ -341,10 +345,12 @@ export class ConfigSync {
             if (openError) throw openError;
         })();
         this.rebinding = run;
+        this.changed();
         try {
             await run;
         } finally {
             this.rebinding = null;
+            this.changed();
         }
     }
 
@@ -356,6 +362,30 @@ export class ConfigSync {
             return "A config operation is running — Apply is available when it finishes.";
         }
         return null;
+    }
+
+    /** Subscribe to changes of `bindingChangeBlocker()`: an op or a rebind
+     *  starts or ends. A view that enables the ops redraws on it, so its
+     *  buttons are disabled while one runs, not only after its own button
+     *  resolves. Returns the unsubscribe function. */
+    onChange(listener: () => void): () => void {
+        this.listeners.add(listener);
+        return () => { this.listeners.delete(listener); };
+    }
+
+    private changed(): void {
+        for (const l of this.listeners) {
+            try {
+                l();
+            } catch (e: any) {
+                logWarn(`config sync listener failed: ${e?.message ?? e}`);
+            }
+        }
+    }
+
+    private setInflight(op: { cancel(): void } | null): void {
+        this.inflight = op;
+        this.changed();
     }
 
     private async switchBinding(serverUri: string, target: string | null): Promise<void> {
@@ -480,7 +510,7 @@ export class ConfigSync {
         let op: ConfigOperation | null = null;
         let cancelled = false;
         let binding: ConfigBinding | null = null;
-        this.inflight = { cancel: () => { cancelled = true; op?.cancel(); } };
+        this.setInflight({ cancel: () => { cancelled = true; op?.cancel(); } });
         try {
             const b = this.requireBinding();
             binding = b;
@@ -514,7 +544,7 @@ export class ConfigSync {
             progress.fail(e);
             throw e;
         } finally {
-            this.inflight = null;
+            this.setInflight(null);
         }
     }
 
@@ -530,11 +560,11 @@ export class ConfigSync {
             throw configNotReady("busy");
         }
         const binding = this.requireBinding();
-        this.inflight = { cancel: () => {} };
+        this.setInflight({ cancel: () => {} });
         try {
             return await fn(binding);
         } finally {
-            this.inflight = null;
+            this.setInflight(null);
         }
     }
 
@@ -566,6 +596,13 @@ export class ConfigSync {
      * vault's); the new root's codec becomes the attachment every later
      * Push / Pull uses. Encryption on with no passphrase at all stops as
      * `create-passphrase-missing` before anything is destroyed.
+     *
+     * Before anything is destroyed the user confirms, shown what the
+     * server holds now (read inside the op, so the dialog describes the DB
+     * Create then wipes) and the codec Create builds. Declining is a
+     * cancellation and changes nothing. The dialog is shown inside the op
+     * lock, as Push's list and Pull & Overwrite's confirmation are: no other
+     * config op runs while it is open.
      */
     async create(): Promise<void> {
         return this.runOperation("create", async (ctx, progress, binding) => {
@@ -573,6 +610,19 @@ export class ConfigSync {
             if (codec.encryption && !codec.passphrase) {
                 throw configNotReady("create-passphrase-missing", { db: binding.dbName });
             }
+            progress.update("Reading the config database...");
+            const server = await readCreatePreview(ctx.client);
+            progress.update("Waiting for confirmation...");
+            const go = await this.modal.showConfigCreateModal({
+                dbName: binding.dbName,
+                server,
+                next: {
+                    encryption: codec.encryption,
+                    compression: codec.compression,
+                    ...(codec.encryption ? { cipherVersion: CURRENT_CIPHER_VERSION } : {}),
+                },
+            });
+            if (!go) throw abortError("Nothing was changed.");
             const setup = new ConfigSetupService(
                 () => this.settingsFor(binding),
                 {
@@ -597,67 +647,6 @@ export class ConfigSync {
                 "Other devices must Join again.",
             );
         });
-    }
-
-    /**
-     * What Create would delete, for its confirm dialog: the remote doc
-     * count and whether `config:meta` is there (with its codec). Read on
-     * the raw client (no key needed), outside the op lock and without a
-     * ProgressNotice — it is a read-only look before the user decides. Never
-     * throws: a server that cannot be read is reported as `unreadable` (and
-     * logged), so the dialog says so instead of guessing a count.
-     *
-     * `bindingKey` names the binding it read. The caller starts Create only
-     * if that is still the current binding, in the same tick as the check
-     * (`create()` takes the op lock synchronously), so the dialog can never
-     * describe one DB while Create wipes another.
-     */
-    async previewCreate(): Promise<ConfigCreatePreview> {
-        const binding = this.binding;
-        if (!binding) {
-            return {
-                kind: "unreadable", message: "Config sync is not active on this device.",
-                bindingKey: null,
-            };
-        }
-        const bindingKey = binding.key;
-        try {
-            const raw = this.makeRawClient(binding);
-            if (!raw) {
-                return {
-                    kind: "unreadable", message: configNotReady("not-configured").message, bindingKey,
-                };
-            }
-            const quick = raw.withTimeout(CONFIG_TIMEOUTS.reachability);
-            let docCount: number;
-            try {
-                docCount = (await quick.info()).doc_count ?? 0;
-            } catch (e) {
-                if (classifyError(e).kind === "not-found") return { kind: "missing", bindingKey };
-                throw e;
-            }
-            const meta = await fetchConfigMeta(quick);
-            if (!meta) return { kind: "read", docCount, meta: "absent", bindingKey };
-            if (meta.schemaVersion !== 2) {
-                return { kind: "read", docCount, meta: "legacy", bindingKey };
-            }
-            return {
-                kind: "read", docCount, meta: "present", bindingKey,
-                codec: {
-                    encryption: meta.encryption.enabled,
-                    compression: meta.compression.enabled,
-                    ...(meta.encryption.enabled
-                        ? { cipherVersion: meta.encryption.cipherVersion } : {}),
-                },
-            };
-        } catch (e: any) {
-            const text = describeError(e).text;
-            logWarn(
-                `reading config database "${binding.dbName}" before Create ` +
-                `failed: ${text}`,
-            );
-            return { kind: "unreadable", message: text, bindingKey };
-        }
     }
 
     /**
@@ -1469,6 +1458,35 @@ export class ConfigSync {
             logWarn(`listFilesRecursive skipped ${dir}: ${e?.message ?? e}`);
         }
     }
+}
+
+/**
+ * What Create would delete, for its confirmation: the remote doc count and
+ * whether `config:meta` is there (with its codec). Read on the raw client
+ * (no key needed). A missing DB is fine (Create makes it); any other
+ * failure fails Create before the dialog, so the dialog never guesses a
+ * count.
+ */
+async function readCreatePreview(raw: ICouchClient): Promise<ConfigCreatePreview> {
+    const quick = raw.withTimeout(CONFIG_TIMEOUTS.reachability);
+    let docCount: number;
+    try {
+        docCount = (await quick.info()).doc_count ?? 0;
+    } catch (e) {
+        if (classifyError(e).kind === "not-found") return { kind: "missing" };
+        throw e;
+    }
+    const meta = await fetchConfigMeta(quick);
+    if (!meta) return { kind: "read", docCount, meta: "absent" };
+    if (meta.schemaVersion !== 2) return { kind: "read", docCount, meta: "legacy" };
+    return {
+        kind: "read", docCount, meta: "present",
+        codec: {
+            encryption: meta.encryption.enabled,
+            compression: meta.compression.enabled,
+            ...(meta.encryption.enabled ? { cipherVersion: meta.encryption.cipherVersion } : {}),
+        },
+    };
 }
 
 /** A cancellation. `userMessage`, when given, says what the cancel left

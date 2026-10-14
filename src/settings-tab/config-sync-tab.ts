@@ -28,12 +28,10 @@ import type { ConfigSync, RemoteConfigListing } from "../sync/config-sync.ts";
 import type { SyncEngine } from "../db/sync-engine.ts";
 import type { AuthGate } from "../db/sync/auth-gate.ts";
 import type { VaultRemoteOps } from "../db/sync/vault-remote-ops.ts";
-import type { IModalPresenter } from "../types/modal-presenter.ts";
 import { addPasswordToggle } from "./vault-sync-tab.ts";
 import { logWarn } from "../ui/log.ts";
 import { ConfigNotReadyError } from "../sync/config-errors.ts";
 import { configRelationView } from "./config-relation-view.ts";
-import { describeCreateConfirm } from "../sync/config-create-preview.ts";
 import {
     classifyConfigPath,
     type ClassifiedPath,
@@ -68,7 +66,6 @@ import {
     isInheritingConfigCompression,
 } from "../sync/config-codec-policy.ts";
 import { describeCodec, sameCodec } from "../sync/config-binding-record.ts";
-import { CURRENT_CIPHER_VERSION } from "../db/vault-meta.ts";
 import { ProgressNotice, showNotice } from "../ui/notices.ts";
 
 export interface ConfigSyncTabDeps {
@@ -79,7 +76,6 @@ export interface ConfigSyncTabDeps {
     replicator: SyncEngine;
     auth: AuthGate;
     remoteOps: VaultRemoteOps;
-    modalPresenter: IModalPresenter;
     refresh: () => void;
 }
 
@@ -170,6 +166,14 @@ export class ConfigSyncTab {
         // doesn't require Test. Non-empty must be Tested first.
         if (this.draft.db.trim() === "") return true;
         return this.testPassed;
+    }
+
+    /** No config op or rebind runs. ConfigSync refuses an op while one
+     *  runs (its confirmation dialogs included); the controls that start an
+     *  op, or change the Filter an op reads, are disabled to show it. The
+     *  settings tab redraws when this changes (`ConfigSync.onChange`). */
+    private idle(): boolean {
+        return this.deps.configSync.bindingChangeBlocker() === null;
     }
 
     private applyDescText(): string {
@@ -362,6 +366,7 @@ export class ConfigSyncTab {
         el.createEl("h3", { text: "Step 3: Setup" });
 
         const configEnabled = settings.couchdbConfigDbName.trim() !== "";
+        const canRun = configEnabled && this.idle();
         this.renderSetupState(el);
 
         new Setting(el)
@@ -372,7 +377,7 @@ export class ConfigSyncTab {
             )
             .addButton((btn) =>
                 btn.setButtonText("Create").setWarning()
-                    .setDisabled(!configEnabled)
+                    .setDisabled(!canRun)
                     .onClick(async () => this.handleCreate(btn))
             );
 
@@ -385,7 +390,7 @@ export class ConfigSyncTab {
             )
             .addButton((btn) =>
                 btn.setButtonText("Join")
-                    .setDisabled(!configEnabled)
+                    .setDisabled(!canRun)
                     .onClick(async () => {
                         btn.setButtonText("Joining...");
                         btn.setDisabled(true);
@@ -426,7 +431,7 @@ export class ConfigSyncTab {
             )
             .addButton((btn) =>
                 btn.setButtonText("Push ↑")
-                    .setDisabled(!configEnabled)
+                    .setDisabled(!canRun)
                     .onClick(async () => {
                         btn.setButtonText("Pushing...");
                         btn.setDisabled(true);
@@ -452,7 +457,7 @@ export class ConfigSyncTab {
             )
             .addButton((btn) =>
                 btn.setButtonText("Pull & Reload ↓")
-                    .setDisabled(!configEnabled)
+                    .setDisabled(!canRun)
                     .onClick(async () => {
                         btn.setButtonText("Pulling...");
                         btn.setDisabled(true);
@@ -481,7 +486,7 @@ export class ConfigSyncTab {
             .addButton((btn) =>
                 btn.setButtonText("Overwrite ↓")
                     .setWarning()
-                    .setDisabled(!configEnabled)
+                    .setDisabled(!canRun)
                     .onClick(async () => {
                         btn.setButtonText("Overwriting...");
                         btn.setDisabled(true);
@@ -524,44 +529,11 @@ export class ConfigSyncTab {
             : view.tone === "error" ? "var(--text-error)" : "";
     }
 
-    /** Create: show what it would delete (read from the server now, never
-     *  guessed) and the codec it builds, confirm, run — against the binding
-     *  the dialog described, or not at all. */
+    /** Create: ConfigSync shows what it would delete and the codec it
+     *  builds, and runs only when the user confirms. */
     private async handleCreate(btn: ButtonComponent): Promise<void> {
-        const settings = this.deps.getSettings();
-        const dbName = settings.couchdbConfigDbName;
-        const step1 = resolveConfigCodec(settings);
-        const next = {
-            encryption: step1.encryption,
-            compression: step1.compression,
-            ...(step1.encryption ? { cipherVersion: CURRENT_CIPHER_VERSION } : {}),
-        };
-        btn.setButtonText("Checking server...");
-        btn.setDisabled(true);
-        const preview = await this.deps.configSync.previewCreate();
-        const ok = await this.deps.modalPresenter.showConfirmModal(
-            `Create config database "${dbName}"?`,
-            describeCreateConfirm(dbName, preview, next),
-            "Create",
-            true,
-        );
-        if (!ok) {
-            btn.setButtonText("Create");
-            btn.setDisabled(false);
-            return;
-        }
-        // The dialog described `preview.bindingKey`. Checked in the same tick
-        // as create() takes the op lock, so nothing can switch in between.
-        if (this.deps.configSync.currentBinding()?.key !== preview.bindingKey) {
-            showNotice(
-                "the config database changed while the dialog was open — " +
-                    "Create was not run. Press Create again.",
-                10000,
-            );
-            this.afterRelationOp();
-            return;
-        }
         btn.setButtonText("Creating...");
+        btn.setDisabled(true);
         try {
             await this.trackOp(this.deps.configSync.create());
         } catch {
@@ -619,7 +591,7 @@ export class ConfigSyncTab {
             )
             .addToggle((t) =>
                 t.setValue(policy.blockPluginCode)
-                    .setDisabled(!configEnabled)
+                    .setDisabled(!configEnabled || !this.idle())
                     .onChange(async (v) => {
                         await this.updatePolicy({ blockPluginCode: v });
                         this.deps.refresh();
@@ -662,7 +634,7 @@ export class ConfigSyncTab {
                     text: `${path.replace(/^\.obsidian\//, "")}  ${pointer === "" ? "(whole value)" : pointer}`,
                 });
                 const btn = row.createEl("button", { text: "Share again" });
-                btn.disabled = !configEnabled;
+                btn.disabled = !configEnabled || !this.idle();
                 btn.addEventListener("click", async () => {
                     btn.disabled = true;
                     try {
@@ -790,6 +762,7 @@ export class ConfigSyncTab {
         policy: ConfigSyncPolicy,
     ): void {
         const locked = policy.blockPluginCode && unit === "install-state";
+        const frozen = locked || !this.idle();
         const details = parent.createEl("details", { cls: "cs-unit" });
         const summary = details.createEl("summary");
         const groupCb = summary.createEl("input", { cls: "cs-unit-group" }) as HTMLInputElement;
@@ -800,7 +773,7 @@ export class ConfigSyncTab {
         const anyOn = effs.some(Boolean);
         groupCb.checked = items.length > 0 ? allOn : (policy.unitDefaults[unit] ?? false);
         groupCb.indeterminate = anyOn && !allOn;
-        groupCb.disabled = locked;
+        groupCb.disabled = frozen;
         // Count shows the union size, calling out items that exist only on the
         // server (not yet on this device) so the "+N on server" is visible
         // without expanding the group.
@@ -830,7 +803,7 @@ export class ConfigSyncTab {
             const cb = row.createEl("input") as HTMLInputElement;
             cb.type = "checkbox";
             cb.checked = policySelects(policy, c);
-            cb.disabled = locked;
+            cb.disabled = frozen;
             row.createSpan({
                 text: ` ${c.path.replace(".obsidian/", "")}${c.isPluginCode ? " ⚠️" : ""}`,
             });

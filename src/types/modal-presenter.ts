@@ -8,6 +8,7 @@
 
 import type { PushReview } from "../sync/config-push-review.ts";
 import type { SharedAtPointer } from "../sync/config-reconcile.ts";
+import type { ConfigCreateConfirm } from "../sync/config-create-preview.ts";
 
 /**
  * A conflict resolution choice.
@@ -135,4 +136,11 @@ export interface IModalPresenter {
      * (nothing is changed; the key stays kept on this device).
      */
     showConfigShareAgainModal(preview: ConfigShareAgainPreview): Promise<boolean>;
+
+    /**
+     * Show what config Create would delete and the root it builds, and wait
+     * for the user. Resolves true to go ahead, false on cancel or close
+     * (nothing is changed).
+     */
+    showConfigCreateModal(confirm: ConfigCreateConfirm): Promise<boolean>;
 }
