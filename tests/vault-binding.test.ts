@@ -397,6 +397,21 @@ describe("VaultBinding.clone", () => {
         expect(r.binding.relation().dbCheck?.result).toEqual({ status: "exists", docCount: 0 });
     });
 
+    it("an empty DB is kept as what the DB holds, not as a failed Clone: a later read replaces it", async () => {
+        const r = rig({ settings: { encryptionEnabled: false, encryptionPassphrase: "pw", compressionEnabled: false } });
+        await expect(r.binding.clone()).rejects.toThrow(/empty — use Init/);
+        expect(r.binding.relation().lastOp).toBeNull();
+        expect(r.binding.relation().dbCheck?.result).toEqual({ status: "exists", docCount: 0 });
+
+        // Another device fills the DB; this one's Clone reads it and is
+        // cancelled at the confirmation. Nothing says the DB is empty.
+        await encryptedRemote(r.remote, "pw");
+        r.confirmAnswer = false;
+        await expect(r.binding.clone()).rejects.toMatchObject({ name: "AbortError" });
+        expect(r.binding.relation().lastOp).toBeNull();
+        expect(r.binding.relation().dbCheck?.result).toEqual({ status: "exists", docCount: 1 });
+    });
+
     it("asks for the passphrase first, then to confirm, shown the server's codec", async () => {
         const r = rig({
             settings: { encryptionEnabled: false, encryptionPassphrase: "" },
@@ -782,6 +797,15 @@ describe("VaultBinding.checkDatabase", () => {
         await r.binding.checkDatabase("other");
         expect(r.binding.relation().dbCheck?.result).toEqual({ status: "exists", docCount: 5 });
         expect(r.binding.dbCheckFor("other")?.result).toEqual({ status: "created" });
+    });
+
+    it("an empty DB is worded as empty, found or created", async () => {
+        const r = rig();
+        r.dbCheckResult = { status: "exists", docCount: 0 };
+        await r.binding.checkDatabase("vault");
+        r.dbCheckResult = { status: "created" };
+        await r.binding.checkDatabase("other");
+        expect(r.dones).toEqual(['"vault" found — empty.', '"other" created — empty.']);
     });
 
     it("a failure goes to the notice as the error itself", async () => {

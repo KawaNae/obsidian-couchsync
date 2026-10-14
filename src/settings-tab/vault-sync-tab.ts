@@ -10,7 +10,7 @@ import { type App, Setting, type ButtonComponent } from "obsidian";
 import { MAX_PREVIOUS_DEVICE_IDS, type ConnectionState, type CouchSyncSettings } from "../settings.ts";
 import type { SyncEngine } from "../db/sync-engine.ts";
 import type { AuthGate } from "../db/sync/auth-gate.ts";
-import type { DbCheckResult } from "../db/sync/vault-remote-ops.ts";
+import { describeDbFound, type DbCheckResult } from "../db/sync/vault-remote-ops.ts";
 import type { LocalDB } from "../db/local-db.ts";
 import { validateDeviceName } from "../utils/device-name.ts";
 import { setupGating } from "./setup-gating.ts";
@@ -257,11 +257,10 @@ export class VaultSyncTab {
     }
 
     private renderCheckResult(el: HTMLElement, r: DbCheckResult): void {
-        const text = r.status === "exists"
-            ? (r.docCount > 0 ? `Database found — ${r.docCount.toLocaleString()} docs.` : "Database found — empty.")
-            : r.status === "created"
-                ? "Database created — empty. Use Init to push your vault."
-                : `Error: ${describeError(r.error).text}`;
+        // An empty DB's next step (Init) is on Clone's description.
+        const text = r.status === "error"
+            ? `Error: ${describeError(r.error).text}`
+            : `Database ${describeDbFound(r)}`;
         const p = el.createEl("p", {
             text,
             cls: r.status === "error" ? "setting-item-description mod-warning" : "setting-item-description",

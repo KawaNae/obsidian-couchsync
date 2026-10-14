@@ -59,7 +59,7 @@ import { describeError, rawErrorMessage, UserFacingError } from "../ui/describe-
 import { logWarn } from "../ui/log.ts";
 import { OutcomeLedger, type OpOutcome } from "./op-outcome.ts";
 import type { SetupResult } from "./setup.ts";
-import type { DbCheckResult } from "../db/sync/vault-remote-ops.ts";
+import { describeDbFound, type DbCheckResult } from "../db/sync/vault-remote-ops.ts";
 import type { VaultSetupPlan } from "./vault-setup-confirm.ts";
 
 /** The one-shot run's notice: progress lines, then a summary or the error.
@@ -439,9 +439,7 @@ export class VaultBinding {
             progress.fail(result.error);
         } else {
             this.host.auth.clear();
-            progress.done(result.status === "created"
-                ? `"${dbName}" created — empty.`
-                : `"${dbName}" found — ${result.docCount.toLocaleString()} docs.`);
+            progress.done(`"${dbName}" ${describeDbFound(result)}`);
         }
         return result;
     }
@@ -458,12 +456,15 @@ export class VaultBinding {
      * user to confirm, and executes.
      *
      * This is the one exit of an Init / Clone failure: the outcome is
-     * recorded, and the notice words the error. Two failures are not
-     * recorded, because something else already tells them: a cancellation,
-     * and a rejection of the credentials (401/403), which raises the auth
+     * recorded, and the notice words the error. Three failures are not
+     * recorded, because something else already tells them: a cancellation;
+     * a rejection of the credentials (401/403), which raises the auth
      * latch — the status line shows the latch while it is raised, and once
-     * a Test clears it the rejection no longer holds. The error is rethrown
-     * so the caller only has to restore its button.
+     * a Test clears it the rejection no longer holds; and a Clone of an
+     * empty DB, which is what the DB was found to hold — kept as its check
+     * (Clone's description says it), which the next read of the DB
+     * replaces. The error is rethrown so the caller only has to restore its
+     * button.
      */
     private async runOperation(
         op: VaultOpName,
@@ -490,7 +491,10 @@ export class VaultBinding {
             const d = classifyError(e);
             const rejected = d.kind === "auth" && typeof d.code === "number";
             if (rejected) this.host.auth.raise(d.code!, rawErrorMessage(e));
-            if (!rejected && !(e instanceof AuthBlockedError) && !describeError(e).cancelled) {
+            if (
+                !rejected && !(e instanceof AuthBlockedError)
+                && !(e instanceof VaultDbEmptyError) && !describeError(e).cancelled
+            ) {
                 this.outcomes.record({ op, at, against, error: e });
             }
             progress.fail(e);
@@ -627,7 +631,7 @@ export class VaultBinding {
                 at: Date.now(), against: vaultTarget(s), result: { status: "exists", docCount },
             });
             if (docCount === 0) {
-                throw new UserFacingError("The database is empty — use Init to push your vault.");
+                throw new VaultDbEmptyError();
             }
             const meta = await fetchVaultMeta(raw);
 
@@ -974,6 +978,14 @@ async function probeServer(raw: ICouchClient, opts: { allowMissing: boolean }): 
     } catch (e) {
         if (opts.allowMissing && classifyError(e).kind === "not-found") return null;
         throw e;
+    }
+}
+
+/** Clone found the vault DB empty: there is nothing to clone. Recorded as
+ *  what the DB holds (its check), not as an outcome of the Clone. */
+class VaultDbEmptyError extends UserFacingError {
+    constructor() {
+        super("The database is empty — use Init to push your vault.");
     }
 }
 

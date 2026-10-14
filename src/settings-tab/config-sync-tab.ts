@@ -27,7 +27,7 @@ import type { CouchSyncSettings } from "../settings.ts";
 import type { ConfigSync, RemoteConfigListing } from "../sync/config-sync.ts";
 import type { SyncEngine } from "../db/sync-engine.ts";
 import type { AuthGate } from "../db/sync/auth-gate.ts";
-import type { VaultRemoteOps } from "../db/sync/vault-remote-ops.ts";
+import { describeDbFound, type VaultRemoteOps } from "../db/sync/vault-remote-ops.ts";
 import { addPasswordToggle } from "./vault-sync-tab.ts";
 import { logWarn } from "../ui/log.ts";
 import { ConfigNotReadyError } from "../sync/config-errors.ts";
@@ -882,9 +882,7 @@ export class ConfigSyncTab {
         } else {
             this.testPassed = true;
             this.deps.auth.clear();
-            progress.done(result.status === "created"
-                ? `"${this.draft.db}" created.`
-                : `"${this.draft.db}" found — ${result.docCount.toLocaleString()} docs.`);
+            progress.done(`"${this.draft.db}" ${describeDbFound(result)}`);
         }
         this.deps.refresh();
     }
