@@ -296,6 +296,98 @@ export function applyJsonChanges(base: JsonValue, changes: readonly JsonChange[]
     return root;
 }
 
+// ── Positions declared as this device's own ─────────────
+
+/** Where a change is: its JSON Pointer, or `/<element>` for a member of a
+ *  set (the set read as an object keyed by its members). */
+export function changePointer(c: JsonChange): string {
+    return c.kind === "set-add" || c.kind === "set-remove"
+        ? childPointer("", c.element)
+        : c.pointer;
+}
+
+/** Is `pointer` at `declared` or under it? */
+export function pointerCovers(declared: string, pointer: string): boolean {
+    return pointer === declared || pointer.startsWith(declared + "/");
+}
+
+function slotAt(v: Slot, tokens: readonly string[]): Slot {
+    let cur: Slot = v;
+    for (const t of tokens) cur = slotOf(cur, t);
+    return cur;
+}
+
+/** The value at `pointer` in `v`, or undefined when there is none. */
+export function valueAt(v: JsonValue, pointer: string): JsonValue | undefined {
+    const s = slotAt(v, pointerTokens(pointer));
+    return s === MISSING ? undefined : s;
+}
+
+/** Do `a` and `b` agree at `pointer` (both absent, or equal values)? With
+ *  `set`, a pointer `/<element>` compares membership. */
+export function sameAtPointer(
+    a: JsonValue,
+    b: JsonValue,
+    pointer: string,
+    opts: { set?: boolean } = {},
+): boolean {
+    const tokens = pointerTokens(pointer);
+    if (opts.set && isStringSet(a) && isStringSet(b) && tokens.length === 1) {
+        return a.includes(tokens[0]) === b.includes(tokens[0]);
+    }
+    return jsonEqual(slotAt(a, tokens), slotAt(b, tokens));
+}
+
+/**
+ * `value` with each position in `pointers` as it is in `source`: set to
+ * the source's value, or removed where the source has none. With `set`
+ * (both roots sets of strings), a pointer `/<element>` names a member, and
+ * the member is kept in or left out of `value` as in `source`.
+ */
+export function pinPointers(
+    value: JsonValue,
+    source: JsonValue,
+    pointers: readonly string[],
+    opts: { set?: boolean } = {},
+): JsonValue {
+    if (pointers.length === 0) return value;
+    if (opts.set && isStringSet(value) && isStringSet(source)) {
+        const out = [...value];
+        for (const p of pointers) {
+            const tokens = pointerTokens(p);
+            if (tokens.length !== 1) continue;
+            const e = tokens[0];
+            const i = out.indexOf(e);
+            if (source.includes(e) && i < 0) out.push(e);
+            if (!source.includes(e) && i >= 0) out.splice(i, 1);
+        }
+        return out;
+    }
+    let root = clone(value);
+    for (const p of pointers) {
+        const tokens = pointerTokens(p);
+        const src = slotAt(source, tokens);
+        if (tokens.length === 0) {
+            if (src !== MISSING) root = clone(src);
+            continue;
+        }
+        const last = tokens[tokens.length - 1];
+        if (src === MISSING) {
+            const parent = slotAt(root, tokens.slice(0, -1));
+            if (isObject(parent)) delete parent[last];
+            continue;
+        }
+        if (!isObject(root)) root = {};
+        let parent = root as JsonObject;
+        for (const t of tokens.slice(0, -1)) {
+            if (!isObject(parent[t] ?? MISSING)) parent[t] = {};
+            parent = parent[t] as JsonObject;
+        }
+        parent[last] = clone(src);
+    }
+    return root;
+}
+
 /** Reorder object keys in `value` to follow `reference` where both have
  *  them; keys only `value` has follow in their own order. */
 export function orderLike(value: JsonValue, reference: JsonValue | undefined): JsonValue {

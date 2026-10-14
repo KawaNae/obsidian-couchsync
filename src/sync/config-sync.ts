@@ -38,15 +38,23 @@ import { ConfigPullWriter } from "../db/sync/config-pull-writer.ts";
 import {
     ConfigPushPipeline,
     type ConfigPushHoldReason,
+    type ConfigPushResult,
 } from "../db/sync/config-push-pipeline.ts";
 import {
     planPull,
     planPush,
+    pushContent,
     type PullPlan,
     type PullPlanEntry,
     type ReconcileDeps,
 } from "./config-reconcile.ts";
 import { backupConfigFiles } from "./config-backup.ts";
+import {
+    applyPushSelection,
+    buildPushReview,
+    hasUndeclaredChange,
+    type AppliedSelection,
+} from "./config-push-review.ts";
 import {
     configLocalFirstKey,
     loadLocalFirst,
@@ -662,13 +670,18 @@ export class ConfigSync {
      *
      *   1. plan: every file that takes part in sharing here, compared with
      *      its base (`planPush`); unchanged files are not sent
-     *   2. send (`ConfigPushPipeline`): a path whose server doc is not the
-     *      shared version held here, or whose disk has not taken that
-     *      version in, is held — Pull & Reload merges it first
-     *   3. the accepted docs become the shared version and the base
+     *   2. check (`ConfigPushPipeline.check`): a path whose server doc is
+     *      not the shared version held here, or whose disk has not taken
+     *      that version in, is held — Pull & Reload merges it first
+     *   3. select: the Push list shows every change of the ready paths
+     *      (`config-push-review.ts`); what is left out becomes this
+     *      device's own and is saved in the policy
+     *   4. send the selection; the accepted docs become the shared version
+     *      and the base
      *
-     * Every change is sent; the config DB is written only for what the
-     * server accepted. Returns the number of files pushed.
+     * A Push whose only changes are this device's own keys sends nothing
+     * and shows no list. Cancelling the list sends nothing and keeps the
+     * declarations as they were. Returns the number of files pushed.
      */
     async push(): Promise<number> {
         return this.runOperation("push", async (ctx, progress, binding, keys) => {
@@ -681,6 +694,15 @@ export class ConfigSync {
             const plan = await planPush(deps, files, (path, i, total) => {
                 progress.update(`Comparing: ${path} (${i}/${total})`);
             });
+            const policy = this.getSettings().configSyncPolicy;
+            const active = plan.filter((e) => hasUndeclaredChange(e, policy));
+            if (active.length === 0) {
+                progress.done(plan.length === 0
+                    ? "No local changes to push."
+                    : `No local changes to push. ${plan.length} file(s) differ only in keys ` +
+                      `kept on this device.`);
+                return 0;
+            }
 
             const pipeline = new ConfigPushPipeline({
                 db: binding.store,
@@ -690,7 +712,39 @@ export class ConfigSync {
                 getDeviceId: () => this.getSettings().deviceId,
                 signal: ctx.signal,
             });
-            const result = await pipeline.run(plan, (msg) => progress.update(msg));
+            progress.update(`Checking the server for ${plan.length} changed file(s)...`);
+            const check = await pipeline.check(plan);
+            // A file with only this device's own keys would send nothing:
+            // holding it is not news.
+            const activePaths = new Set(active.map((e) => e.path));
+            const held = check.held.filter((h) => activePaths.has(h.path));
+
+            let pushedResult: ConfigPushResult = { pushed: [], held: [], failed: [] };
+            let leftOut = 0;
+            const readyActive = check.ready.filter((r) => activePaths.has(r.entry.path));
+            if (readyActive.length > 0) {
+                const entries = check.ready.map((r) => r.entry);
+                const review = buildPushReview(entries, policy, held.length);
+                progress.update("Choose what to push...");
+                const chosen = await this.modal.showConfigPushModal(review);
+                if (chosen === null) throw abortError("Nothing was pushed.");
+                const applied = applyPushSelection(entries, policy, new Set(chosen));
+                await this.saveDeclarations(applied);
+                leftOut = applied.declared.length + applied.filesLeftOut.length;
+                const byPath = new Map(check.ready.map((r) => [r.entry.path, r]));
+                pushedResult = await pipeline.send(
+                    applied.sends.map((sd) => ({
+                        ready: byPath.get(sd.entry.path)!,
+                        content: pushContent(sd.entry.path, sd.entry.diff, sd.entry.local, sd.selected, sd.deviceOnly),
+                    })),
+                    (msg) => progress.update(msg),
+                );
+            }
+            const result = {
+                pushed: pushedResult.pushed,
+                held: [...held, ...pushedResult.held],
+                failed: pushedResult.failed,
+            };
 
             if (result.held.length > 0) {
                 logWarn(
@@ -707,7 +761,10 @@ export class ConfigSync {
             const parts: string[] = [];
             parts.push(result.pushed.length > 0
                 ? `${result.pushed.length} file(s) pushed.`
-                : plan.length === 0 ? "No local changes to push." : "Nothing pushed.");
+                : "Nothing pushed.");
+            if (leftOut > 0) {
+                parts.push(`${leftOut} item(s) left out are kept on this device (see log).`);
+            }
             if (result.held.length > 0) {
                 for (const reason of Object.keys(HOLD_REASONS) as ConfigPushHoldReason[]) {
                     const n = result.held.filter((h) => h.reason === reason).length;
@@ -728,6 +785,35 @@ export class ConfigSync {
                 }
             },
         });
+    }
+
+    /** Save what a Push selection declared this device's own (or no longer
+     *  so), and log it without values. */
+    private async saveDeclarations(applied: AppliedSelection): Promise<void> {
+        if (applied.declared.length + applied.released.length + applied.filesLeftOut.length === 0) return;
+        this.getSettings().configSyncPolicy = applied.policy;
+        await this.saveSettings();
+        const lines = (xs: Array<{ path: string; pointer: string }>) =>
+            xs.map((x) => `  • ${x.path}: ${x.pointer === "" ? "(whole value)" : x.pointer}`).join("\n");
+        if (applied.declared.length > 0) {
+            logInfo(
+                `Config Push: ${applied.declared.length} key(s) left out are kept on this device ` +
+                `(not sent, not taken in):\n${lines(applied.declared)}`,
+            );
+        }
+        if (applied.released.length > 0) {
+            logInfo(
+                `Config Push: ${applied.released.length} key(s) kept on this device are shared again:\n` +
+                lines(applied.released),
+            );
+        }
+        if (applied.filesLeftOut.length > 0) {
+            logInfo(
+                `Config Push: ${applied.filesLeftOut.length} file(s) left out no longer sync on this ` +
+                `device (turn them back on in the Filter):\n` +
+                applied.filesLeftOut.map((p) => `  • ${p}`).join("\n"),
+            );
+        }
     }
 
     /**
@@ -773,6 +859,10 @@ export class ConfigSync {
                     conflicts.map((e) => `  • ${e.path}: ${e.decision.conflicts
                         .map((p) => p === "" ? "(whole file)" : p).join(", ")}`).join("\n"),
                 );
+            }
+            const kept = plan.entries.reduce((n, e) => n + e.decision.deviceOnlyKept, 0);
+            if (kept > 0) {
+                logInfo(`Config Pull: ${kept} key(s) kept on this device were not taken in.`);
             }
             const parts: string[] = [];
             if (received.received + received.deleted > 0) {
@@ -905,6 +995,7 @@ export class ConfigSync {
             participates: participating,
             fetchChunks: (doc) => writer.ensureChunks(doc),
             localFirst: await loadLocalFirst(binding.store),
+            deviceOnly: (path) => this.getSettings().configSyncPolicy.deviceOnlyKeys[path] ?? [],
         };
     }
 

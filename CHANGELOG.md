@@ -247,6 +247,20 @@ All notable changes to obsidian-couchsync.
   either: a plugin's `data.json` on a device where the plugin is not
   installed, or a desktop-only plugin's files on mobile, stay this device's
   own.
+- **Config Push lists its changes and lets you keep some on this device.**
+  Before sending, Push lists every change: each key of a JSON settings
+  file (each plugin enabled or disabled in `community-plugins.json`), or a
+  whole file, with the shared value next to this device's. A plugin's
+  `data.json` may hold API keys or tokens, so its values appear only after
+  "Show values". Everything is checked; one button sends the checked
+  items, and Cancel sends nothing. An unchecked key stays this device's
+  own: later Pushes do not send it and Pulls do not change it, and neither
+  reports it as a conflict. An unchecked file stops syncing on this device,
+  as if turned off in the Filter. These choices are device settings and
+  are not synced. A key is shared again by checking it in a later Push
+  list or with "Share again" under "Kept on this device" in the Config
+  Sync tab. A Push whose only changes are keys kept on this device shows
+  no list.
 - **Coming back to a config database merges as after a Join.** When another
   config database's Pull wrote this vault's config since this database was
   last used, the next Push or Pull here no longer treats those values as
@@ -294,7 +308,8 @@ All notable changes to obsidian-couchsync.
   changes: where the server also changed the same file since, the keys that
   differ keep this device's value and are reported like a conflict. If a
   plugin was installed after the last Pull, its default settings look like
-  this device's changes; the log of each Push names the files it sent.
+  this device's changes; the first Push lists them (keys the shared version
+  lacks are marked "new key"), so they can be left out.
 - **Existing devices Join once.** Whether a device has joined a config
   database, and with which codec, is now recorded inside that database's
   local store, which is also renamed to include the server. The previous

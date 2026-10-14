@@ -10,6 +10,7 @@ import type {
     ConflictBatchItem,
     BatchDecision,
 } from "../../src/types/modal-presenter.ts";
+import { defaultSelection, type PushReview } from "../../src/sync/config-push-review.ts";
 
 export class FakeModalPresenter implements IModalPresenter {
     /** Queue of responses for showConflictModal. */
@@ -25,6 +26,11 @@ export class FakeModalPresenter implements IModalPresenter {
     confirmCalls: Array<{ title: string; message: string }> = [];
     /** Record of all batch modals shown (for assertions). */
     batchCalls: ConflictBatchItem[][] = [];
+    /** Answers the config Push list. Default: send what the list selects
+     *  at the start. Return null to cancel. */
+    pushResponder: (review: PushReview) => string[] | null = defaultSelection;
+    /** Record of all config Push lists shown (for assertions). */
+    pushCalls: PushReview[] = [];
 
     /** Dismiss callbacks for currently open conflict modals. */
     private openDismiss = new Map<string, () => void>();
@@ -73,6 +79,11 @@ export class FakeModalPresenter implements IModalPresenter {
     ): Promise<boolean> {
         this.confirmCalls.push({ title, message });
         return this.confirmResponses.shift() ?? false;
+    }
+
+    async showConfigPushModal(review: PushReview): Promise<string[] | null> {
+        this.pushCalls.push(review);
+        return this.pushResponder(review);
     }
 
     /** Dismiss the open conflict modal for the given path (simulates auto-resolve). */

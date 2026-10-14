@@ -16,6 +16,8 @@ import type {
 import { ConflictModal } from "../ui/conflict-modal.ts";
 import { ConflictBatchModal } from "../ui/conflict-batch-modal.ts";
 import { ConfirmModal } from "../ui/confirm-modal.ts";
+import { ConfigPushModal } from "../ui/config-push-modal.ts";
+import type { PushReview } from "../sync/config-push-review.ts";
 
 export class ObsidianModalPresenter implements IModalPresenter {
     constructor(private app: App) {}
@@ -51,5 +53,9 @@ export class ObsidianModalPresenter implements IModalPresenter {
             this.app, title, message, confirmLabel, danger,
         );
         return modal.waitForResult();
+    }
+
+    showConfigPushModal(review: PushReview): Promise<string[] | null> {
+        return new ConfigPushModal(this.app, review).waitForResult();
     }
 }

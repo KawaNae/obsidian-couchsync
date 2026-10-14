@@ -97,8 +97,15 @@ describe("ConfigPushPipeline", () => {
         };
     }
 
+    /** Check `plan`, then send every ready path with its disk content. */
+    async function checkAndSend(plan: PushPlanEntry[]) {
+        const check = await pipeline.check(plan);
+        const sent = await pipeline.send(check.ready.map((ready) => ({ ready, content: ready.entry.local })));
+        return { ...sent, held: [...check.held, ...sent.held] };
+    }
+
     it("a file new everywhere is sent and becomes the shared version and the base", async () => {
-        const result = await pipeline.run([await entry(`{"a":1}`, null)]);
+        const result = await checkAndSend([await entry(`{"a":1}`, null)]);
 
         expect(result).toEqual({ pushed: [PATH], held: [], failed: [] });
         const onServer = await remote.getDoc<ConfigDoc>(`config:${PATH}`);
@@ -119,7 +126,7 @@ describe("ConfigPushPipeline", () => {
         await share(v1);
         await setBase(v1);
 
-        const result = await pipeline.run([await entry(`{"a":2}`, v1)]);
+        const result = await checkAndSend([await entry(`{"a":2}`, v1)]);
 
         expect(result.pushed).toEqual([PATH]);
         const onServer = await remote.getDoc<ConfigDoc>(`config:${PATH}`);
@@ -134,7 +141,7 @@ describe("ConfigPushPipeline", () => {
         const v2 = await makeConfigFixture(PATH, `{"a":1,"m":1}`, { vclock: { "dev-B": 2 } });
         await remote.bulkDocs([{ ...v2.doc }]);
 
-        const result = await pipeline.run([await entry(`{"a":2}`, v1)]);
+        const result = await checkAndSend([await entry(`{"a":2}`, v1)]);
 
         expect(result).toEqual({ pushed: [], held: [{ path: PATH, reason: "remote-changed" }], failed: [] });
         expect((await remote.getDoc<ConfigDoc>(`config:${PATH}`))!.vclock).toEqual({ "dev-B": 2 });
@@ -145,7 +152,7 @@ describe("ConfigPushPipeline", () => {
         const v1 = await makeConfigFixture(PATH, `{"a":1}`, { vclock: { "dev-B": 1 } });
         await share(v1);
 
-        const result = await pipeline.run([await entry(`{"a":2}`, null)]);
+        const result = await checkAndSend([await entry(`{"a":2}`, null)]);
 
         expect(result.held).toEqual([{ path: PATH, reason: "not-merged" }]);
         expect((await remote.getDoc<ConfigDoc>(`config:${PATH}`))!.vclock).toEqual({ "dev-B": 1 });
@@ -157,7 +164,7 @@ describe("ConfigPushPipeline", () => {
         await setBase(v1);
         await share(v2);
 
-        const result = await pipeline.run([await entry(`{"a":2}`, v1)]);
+        const result = await checkAndSend([await entry(`{"a":2}`, v1)]);
 
         expect(result.held).toEqual([{ path: PATH, reason: "not-merged" }]);
     });
@@ -166,7 +173,7 @@ describe("ConfigPushPipeline", () => {
         remote.bulkDocs = async (docs: any[]) =>
             docs.map((d) => ({ id: d._id, error: "conflict" as const, reason: "synthetic" }));
 
-        const result = await pipeline.run([await entry(`{"a":1}`, null)]);
+        const result = await checkAndSend([await entry(`{"a":1}`, null)]);
 
         expect(result.held).toEqual([{ path: PATH, reason: "remote-changed" }]);
         expect(await db.get(`config:${PATH}`)).toBeNull();
@@ -177,7 +184,7 @@ describe("ConfigPushPipeline", () => {
         remote.bulkDocsWithAttachments = async (items: any[]) =>
             items.map((i) => ({ id: i.doc._id, error: "forbidden", reason: "synthetic" }));
 
-        const result = await pipeline.run([await entry(`{"a":1}`, null)]);
+        const result = await checkAndSend([await entry(`{"a":1}`, null)]);
 
         expect(result).toEqual({ pushed: [], held: [], failed: [PATH] });
         expect(await remote.getDoc(`config:${PATH}`)).toBeNull();

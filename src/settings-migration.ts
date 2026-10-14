@@ -133,6 +133,9 @@ export function migrateSettings(data: Record<string, any>): void {
         if (data.configSyncPolicy.overrides === undefined) {
             data.configSyncPolicy.overrides = {};
         }
+        if (data.configSyncPolicy.deviceOnlyKeys === undefined) {
+            data.configSyncPolicy.deviceOnlyKeys = {};
+        }
     }
 }
 

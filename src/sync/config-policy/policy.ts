@@ -39,6 +39,12 @@ export interface ConfigSyncPolicy {
      *  RCE channel and the manifest-`main`-repoint bypass (manifest is part
      *  of install-state, so it is never synced while this is on). */
     blockPluginCode: boolean;
+    /** Keys this device keeps as its own, per file path: JSON Pointers
+     *  (`/editor/tabSize`; a member of community-plugins.json is
+     *  `/<plugin id>`). Push does not send them and Pull does not take them
+     *  in. A change left out of a Push is added here; selecting it again in
+     *  a Push removes it. A whole file is declared through `overrides`. */
+    deviceOnlyKeys: Record<string, string[]>;
 }
 
 /** This device's state the gates of `participates` read. Built once per
@@ -118,6 +124,7 @@ export function defaultConfigSyncPolicy(): ConfigSyncPolicy {
         unitDefaults: defaultUnitDefaults(),
         overrides: {},
         blockPluginCode: true,
+        deviceOnlyKeys: {},
     };
 }
 

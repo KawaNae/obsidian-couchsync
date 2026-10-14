@@ -1,8 +1,9 @@
 /**
- * ConfigPushPipeline — sends a Push plan to the server.
+ * ConfigPushPipeline — checks a Push plan against the server, then sends
+ * what the user selected.
  *
- *   1. freshness: read the server docs of the planned paths (one allDocs).
- *      A path is sent only when
+ *   1. check: read the server docs of the planned paths (one allDocs).
+ *      A path is ready to send only when
  *        - the server doc is the shared version this device holds (the
  *          config DB doc), and
  *        - the disk took that version in (the base is the shared version),
@@ -11,7 +12,8 @@
  *      and a Pull & Reload has to merge first. Pushing it would overwrite
  *      shared changes this device never saw.
  *   2. send: chunks first, then the docs, each with the vclock of its base
- *      advanced by this device and the server's `_rev`.
+ *      advanced by this device and the server's `_rev` read in step 1. A
+ *      server doc that moved in between is a conflict: the path is held.
  *   3. record: for each doc the server accepted, the config DB doc and
  *      lastSynced become the sent version, in one tx. A doc the server
  *      rejected leaves both as they were.
@@ -24,7 +26,7 @@ import type { ConfigDoc, CouchSyncDoc, ChunkDoc } from "../../types.ts";
 import { CONFIG_SCHEMA_VERSION } from "../../types.ts";
 import { makeConfigId } from "../../types/doc-id.ts";
 import { incrementVC } from "../../sync/vector-clock.ts";
-import { sameVersion, pushContent, type PushPlanEntry } from "../../sync/config-reconcile.ts";
+import { sameVersion, type PushPlanEntry } from "../../sync/config-reconcile.ts";
 import type { DocWithAttachments, ICouchClient } from "../interfaces.ts";
 import type { ConfigLocalDB } from "../config-local-db.ts";
 import { buildChunkAttachment } from "../chunk-attachment.ts";
@@ -48,6 +50,24 @@ export interface ConfigPushResult {
     failed: string[];
 }
 
+/** A path that can be sent: its plan entry and the server's `_rev` (null:
+ *  no server doc). */
+export interface ConfigPushReady {
+    entry: PushPlanEntry;
+    rev: string | null;
+}
+
+export interface ConfigPushCheck {
+    ready: ConfigPushReady[];
+    held: Array<{ path: string; reason: ConfigPushHoldReason }>;
+}
+
+/** A ready path and the content to send for it. */
+export interface ConfigPushOutgoing {
+    ready: ConfigPushReady;
+    content: Uint8Array;
+}
+
 export interface ConfigPushPipelineDeps {
     db: ConfigLocalDB;
     client: ICouchClient;
@@ -66,14 +86,10 @@ interface Outgoing {
 export class ConfigPushPipeline {
     constructor(private deps: ConfigPushPipelineDeps) {}
 
-    async run(
-        plan: readonly PushPlanEntry[],
-        onProgress?: (msg: string) => void,
-    ): Promise<ConfigPushResult> {
-        const result: ConfigPushResult = { pushed: [], held: [], failed: [] };
-        if (plan.length === 0) return result;
-
-        onProgress?.(`Checking the server for ${plan.length} changed file(s)...`);
+    /** Step 1: which planned paths can be sent now. */
+    async check(plan: readonly PushPlanEntry[]): Promise<ConfigPushCheck> {
+        const out: ConfigPushCheck = { ready: [], held: [] };
+        if (plan.length === 0) return out;
         const ids = plan.map((e) => makeConfigId(e.path));
         const remoteRows = await this.deps.client.allDocs<ConfigDoc>(
             { keys: ids, include_docs: true }, this.deps.signal,
@@ -84,9 +100,6 @@ export class ConfigPushPipeline {
                 remote.set(row.id, { rev: row.value.rev, doc: row.doc as ConfigDoc });
             }
         }
-
-        const deviceId = this.deps.getDeviceId();
-        const outgoing: Outgoing[] = [];
         for (const entry of plan) {
             const id = makeConfigId(entry.path);
             const server = remote.get(id) ?? null;
@@ -96,17 +109,32 @@ export class ConfigPushPipeline {
                 ? sameVersion(server.doc, sharedLive)
                 : !server && !sharedLive;
             if (!fresh) {
-                result.held.push({ path: entry.path, reason: "remote-changed" });
+                out.held.push({ path: entry.path, reason: "remote-changed" });
                 continue;
             }
             const merged = entry.base && sharedLive
                 ? sameVersion(entry.base, sharedLive)
                 : !entry.base && !sharedLive;
             if (!merged) {
-                result.held.push({ path: entry.path, reason: "not-merged" });
+                out.held.push({ path: entry.path, reason: "not-merged" });
                 continue;
             }
-            const content = pushContent(entry.diff, entry.local);
+            out.ready.push({ entry, rev: server?.rev ?? null });
+        }
+        return out;
+    }
+
+    /** Steps 2 and 3: send `items` (ready paths with their content). */
+    async send(
+        items: readonly ConfigPushOutgoing[],
+        onProgress?: (msg: string) => void,
+    ): Promise<ConfigPushResult> {
+        const result: ConfigPushResult = { pushed: [], held: [], failed: [] };
+        if (items.length === 0) return result;
+
+        const deviceId = this.deps.getDeviceId();
+        const outgoing: Outgoing[] = [];
+        for (const { ready: { entry, rev }, content } of items) {
             const chunks = content === entry.local
                 ? entry.chunks
                 : await splitIntoChunks(
@@ -114,7 +142,7 @@ export class ConfigPushPipeline {
                     { hasher: this.deps.hasher, chunkBytes: MAX_CHUNK_BYTES_CONFIG },
                 );
             const doc: ConfigDoc & { _rev?: string } = {
-                _id: id,
+                _id: makeConfigId(entry.path),
                 schemaVersion: CONFIG_SCHEMA_VERSION,
                 type: "config",
                 chunks: chunks.map((c) => c._id),
@@ -122,10 +150,9 @@ export class ConfigPushPipeline {
                 size: content.byteLength,
                 vclock: incrementVC(entry.base?.vclock, deviceId),
             };
-            if (server) doc._rev = server.rev;
+            if (rev) doc._rev = rev;
             outgoing.push({ path: entry.path, doc, chunks });
         }
-        if (outgoing.length === 0) return result;
 
         // Chunks first: a peer never sees a doc whose chunks are not on
         // the server yet. Content-addressed, so a chunk already there is a

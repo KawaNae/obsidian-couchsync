@@ -6,6 +6,8 @@
  * choice programmatically via `FakeModalPresenter`.
  */
 
+import type { PushReview } from "../sync/config-push-review.ts";
+
 /**
  * A conflict resolution choice.
  *
@@ -88,4 +90,10 @@ export interface IModalPresenter {
         confirmLabel: string,
         danger?: boolean,
     ): Promise<boolean>;
+
+    /**
+     * Show the config Push list and wait for the user. Resolves the ids of
+     * the items to send, or null when the user cancelled (nothing is sent).
+     */
+    showConfigPushModal(review: PushReview): Promise<string[] | null>;
 }

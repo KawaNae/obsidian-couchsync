@@ -416,6 +416,7 @@ export class ConfigSyncTab {
         // ── Filter (meaning-unit policy tree) — the "what", shown first
         //    since it governs both Push and Pull below. ────────
         this.renderFilterTree(el, configEnabled);
+        this.renderDeviceOnlyKeys(el);
 
         new Setting(el)
             .setName("Push")
@@ -611,6 +612,42 @@ export class ConfigSyncTab {
         }
         treeEl.createEl("p", { text: "Loading config tree…", cls: "setting-item-description" });
         void this.populateFilterTree(treeEl);
+    }
+
+    /** The keys a Push left out, each with a button that shares it again.
+     *  Shown only when there are some. */
+    private renderDeviceOnlyKeys(el: HTMLElement): void {
+        const policy = this.deps.getSettings().configSyncPolicy;
+        const paths = Object.keys(policy.deviceOnlyKeys)
+            .filter((p) => policy.deviceOnlyKeys[p].length > 0)
+            .sort();
+        if (paths.length === 0) return;
+        el.createEl("h4", { text: "Kept on this device" });
+        el.createEl("p", {
+            text: "Keys left out of a Push. Push does not send them and Pull does not " +
+                "change them. \"Share again\" makes a key sync as usual: if this " +
+                "device's value differs from the shared one, the next Push lists it.",
+            cls: "setting-item-description",
+        });
+        const box = el.createDiv({ cls: "cs-config-tree" });
+        for (const path of paths) {
+            for (const pointer of policy.deviceOnlyKeys[path]) {
+                const row = box.createDiv({ cls: "cs-device-only" });
+                row.createSpan({
+                    text: `${path.replace(/^\.obsidian\//, "")}  ${pointer === "" ? "(whole value)" : pointer}`,
+                });
+                const btn = row.createEl("button", { text: "Share again" });
+                btn.addEventListener("click", async () => {
+                    const cur = this.deps.getSettings().configSyncPolicy.deviceOnlyKeys;
+                    const rest = (cur[path] ?? []).filter((p) => p !== pointer);
+                    const next = { ...cur };
+                    if (rest.length > 0) next[path] = rest;
+                    else delete next[path];
+                    await this.updatePolicy({ deviceOnlyKeys: next });
+                    this.deps.refresh();
+                });
+            }
+        }
     }
 
     private async populateFilterTree(treeEl: HTMLElement): Promise<void> {

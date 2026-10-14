@@ -188,10 +188,23 @@ current database, the step says so.
     `data.json` is neither sent nor written where the plugin is not
     installed, and a desktop-only plugin's files are neither sent nor
     written on mobile.
-- **Push** (**Push ↑**) — sends the selected files this device changed since
-  it last pushed or pulled them; JSON settings send only the changed keys.
-  A file the server changed since this device's last Pull is held: the
-  notice asks to run Pull & Reload, then Push again.
+- **Push** (**Push ↑**) — lists the changes this device made to the
+  selected files since it last pushed or pulled them, one row per JSON key
+  (per plugin in `community-plugins.json`) or per file, all checked; the
+  push button sends the checked ones. Each key shows the shared value and
+  this device's; for a plugin's `data.json`, which may hold API keys or
+  tokens, the values appear only after **Show values**. Unchecked rows stay
+  this device's own: an unchecked key is not sent and later Pulls do not
+  change it (it is listed under **Kept on this device**, and in later Push
+  lists it is unchecked and marked `kept on this device`; checking it sends
+  it and shares it again); an unchecked file stops syncing on this device
+  (an override in the tree above, where it can be turned back on). Cancel
+  sends nothing. A file the server changed since this device's last Pull is
+  held: the notice asks to run Pull & Reload, then Push again.
+- **Kept on this device** (`configSyncPolicy.deviceOnlyKeys`, shown when
+  there are any) — the keys left out of a Push, per file. **Share again**
+  removes one; if this device's value differs from the shared one, the
+  next Push lists it.
 - **Pull & Reload** (**Pull & Reload ↓**) — pulls, merges the selected files
   with this device's changes (JSON settings key by key), backs up the files
   it overwrites to `backups/config/` in the plugin's folder, then reloads

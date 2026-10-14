@@ -35,6 +35,9 @@ import {
     mergeJson,
     orderLike,
     parseJsonBytes,
+    pinPointers,
+    pointerCovers,
+    sameAtPointer,
     serializeJson,
     type JsonChange,
     type NoBaseRule,
@@ -83,6 +86,9 @@ export interface PullDecision {
     /** JSON Pointers where both sides changed and the local value was
      *  kept. "" is the whole file (compared as a file). */
     conflicts: string[];
+    /** This device's own keys whose shared value changed and was not
+     *  taken in. */
+    deviceOnlyKept: number;
 }
 
 /**
@@ -91,6 +97,10 @@ export interface PullDecision {
  * `base` is null when no base is at hand; `noBase` then decides. A missing
  * local file takes the shared content: deleting a config file is not a
  * change that is shared.
+ *
+ * `deviceOnly` are the JSON Pointers declared this device's own in this
+ * file: they keep the disk's value (or stay absent), whatever the merge
+ * says, and are never reported as conflicts.
  */
 export function decidePull(
     path: string,
@@ -98,35 +108,45 @@ export function decidePull(
     local: Uint8Array | null,
     shared: Uint8Array,
     noBase: NoBaseRule,
+    deviceOnly: readonly string[] = [],
 ): PullDecision {
-    if (!local) return { write: shared, conflicts: [] };
-    if (bytesEqual(local, shared)) return { write: null, conflicts: [] };
+    if (!local) return { write: shared, conflicts: [], deviceOnlyKept: 0 };
+    if (bytesEqual(local, shared)) return { write: null, conflicts: [], deviceOnlyKept: 0 };
 
     if (isKeyedJsonPath(path)) {
         const l = parseJsonBytes(local);
         const r = parseJsonBytes(shared);
         const b = base ? parseJsonBytes(base) : undefined;
         if (l && r && b !== null) {
-            const { value, conflicts } = mergeJson(b?.value, l.value, r.value, {
-                set: path === SET_FILE, noBase,
-            });
-            if (jsonEqual(value, l.value)) return { write: null, conflicts };
+            const set = path === SET_FILE;
+            const merged = mergeJson(b?.value, l.value, r.value, { set, noBase });
+            // Declared keys the shared version changed to a value the disk
+            // does not have.
+            const deviceOnlyKept = deviceOnly.filter((p) =>
+                !sameAtPointer(r.value, l.value, p, { set })
+                && (!b || !sameAtPointer(r.value, b.value, p, { set }))).length;
+            const value = orderLike(pinPointers(merged.value, l.value, deviceOnly, { set }), l.value);
+            const conflicts = merged.conflicts.filter(
+                (c) => !deviceOnly.some((d) => pointerCovers(d, c)),
+            );
+            if (jsonEqual(value, l.value)) return { write: null, conflicts, deviceOnlyKept };
             return {
                 write: encoder.encode(serializeJson(value, detectJsonFormat(l.text))),
                 conflicts,
+                deviceOnlyKept,
             };
         }
         // One of the versions is not JSON: compared as a file below.
     }
 
+    const file = (write: Uint8Array | null, conflict: boolean): PullDecision =>
+        ({ write, conflicts: conflict ? [""] : [], deviceOnlyKept: 0 });
     if (base) {
-        if (bytesEqual(local, base)) return { write: shared, conflicts: [] };
-        if (bytesEqual(shared, base)) return { write: null, conflicts: [] };
-        return { write: null, conflicts: [""] };
+        if (bytesEqual(local, base)) return file(shared, false);
+        if (bytesEqual(shared, base)) return file(null, false);
+        return file(null, true);
     }
-    return noBase === "local-first"
-        ? { write: null, conflicts: [""] }
-        : { write: shared, conflicts: [] };
+    return noBase === "local-first" ? file(null, true) : file(shared, false);
 }
 
 // ── Push difference ──────────────────────────────────────
@@ -157,16 +177,26 @@ export function diffForPush(path: string, base: Uint8Array | null, local: Uint8A
 
 /**
  * Content to send: the base with the `selected` changes applied, written in
- * the disk's format. With every change selected (or a whole-file diff) that
- * is the disk itself, sent byte for byte.
+ * the disk's format. Positions in `deviceOnly` (this device's own keys)
+ * keep the base's value even where a selected change covers them, so they
+ * never reach the shared state. With every change selected (or a
+ * whole-file diff) and nothing held back, that is the disk itself, sent
+ * byte for byte.
  */
 export function pushContent(
+    path: string,
     diff: PushDiff,
     local: Uint8Array,
-    selected?: readonly JsonChange[],
+    selected: readonly JsonChange[] | "all" = "all",
+    deviceOnly: readonly string[] = [],
 ): Uint8Array {
-    if (diff.kind !== "json" || !selected || selected.length === diff.changes.length) return local;
-    const value = orderLike(applyJsonChanges(diff.base.value, selected), diff.local.value);
+    if (diff.kind !== "json") return local;
+    const changes = selected === "all" ? diff.changes : selected;
+    if (changes.length === diff.changes.length && deviceOnly.length === 0) return local;
+    const set = path === SET_FILE;
+    const applied = pinPointers(applyJsonChanges(diff.base.value, changes), diff.base.value, deviceOnly, { set });
+    if (jsonEqual(applied, diff.local.value)) return local;
+    const value = orderLike(applied, diff.local.value);
     return encoder.encode(serializeJson(value, detectJsonFormat(diff.local.text)));
 }
 
@@ -186,6 +216,9 @@ export interface ReconcileDeps {
     fetchChunks?: (doc: ConfigDoc) => Promise<void>;
     /** Paths whose missing base is settled keeping the local value. */
     localFirst: ReadonlySet<string>;
+    /** JSON Pointers declared this device's own in `path`: not sent, not
+     *  taken in. Omitted: none. */
+    deviceOnly?: (path: string) => readonly string[];
 }
 
 export interface PullPlanEntry {
@@ -292,7 +325,10 @@ export async function planPull(
             const noBase: NoBaseRule = deps.localFirst.has(path) ? "local-first" : "remote-first";
             entries.push({
                 path, shared, local,
-                decision: decidePull(path, base?.bytes ?? null, local, sharedBytes, noBase),
+                decision: decidePull(
+                    path, base?.bytes ?? null, local, sharedBytes, noBase,
+                    deps.deviceOnly?.(path) ?? [],
+                ),
             });
         } catch (e: any) {
             logWarn(`Failed to compare config ${path}: ${e?.message ?? e}`);

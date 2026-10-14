@@ -13,6 +13,8 @@
  *   - a file this device would not write is not sent either
  *   - community-plugins.json merges as a set
  *   - a Pull that writes nothing does not reload and shows one Notice
+ *   - the Push list: what it selects is sent, what it leaves out is kept
+ *     on this device (not sent, not taken in) until selected again
  *   - the one-time migration of a store written by older builds
  */
 import "fake-indexeddb/auto";
@@ -58,6 +60,7 @@ interface Device {
     vault: FakeVaultIO;
     store: ConfigLocalDB;
     settings: CouchSyncSettings;
+    modal: FakeModalPresenter;
     reloads: number;
 }
 
@@ -102,9 +105,9 @@ describe("config three-way merge across devices", () => {
             compressionEnabled: false,
             configCompressionEnabled: false,
         });
-        const dev = { id, vault, store, settings, reloads: 0 } as Device;
+        const dev = { id, vault, store, settings, modal: new FakeModalPresenter(), reloads: 0 } as Device;
         dev.cs = new ConfigSync(
-            vault, new FakeModalPresenter(), `vault-${id}`, new AuthGate(), ALWAYS_VISIBLE,
+            vault, dev.modal, `vault-${id}`, new AuthGate(), ALWAYS_VISIBLE,
             NoopReconnectBridge, () => settings,
             {
                 storeFactory: () => store,
@@ -410,6 +413,149 @@ describe("config three-way merge across devices", () => {
         // Backups are never pushed.
         const paths = (await b.cs.listLocalConfigPaths());
         expect(paths.some((p) => p.includes("/backups/"))).toBe(false);
+    });
+
+    // ── The Push list and this device's own keys ────────
+
+    const leaveOut = (...ids: string[]) => (review: { items: Array<{ id: string; deviceOnly: boolean }> }) =>
+        review.items.filter((i) => !i.deviceOnly && !ids.includes(i.id)).map((i) => i.id);
+    const serverJson = async (path = APP) => JSON.parse(new TextDecoder().decode(await serverBytes(path)));
+
+    it("sends what the list selects; a key left out is not sent", async () => {
+        const a = await device("dev-A");
+        const b = await device("dev-B");
+        put(a, { k: 0, mine: 0 });
+        await a.cs.push();
+        await b.cs.pull();
+
+        put(b, { k: 1, mine: 1 });
+        b.modal.pushResponder = leaveOut(`${APP}#/mine`);
+        expect(await b.cs.push()).toBe(1);
+
+        expect(b.modal.pushCalls).toHaveLength(1);
+        expect(b.modal.pushCalls[0].items.map((i) => i.pointer)).toEqual(["/k", "/mine"]);
+        expect(await serverJson()).toEqual({ k: 1, mine: 0 });
+        expect(b.settings.configSyncPolicy.deviceOnlyKeys).toEqual({ [APP]: ["/mine"] });
+        // The disk keeps this device's value.
+        expect(json(b)).toEqual({ k: 1, mine: 1 });
+    });
+
+    it("a key left out stays left out on the next Push and does not take in remote changes", async () => {
+        const a = await device("dev-A");
+        const b = await device("dev-B");
+        put(a, { k: 0, mine: 0 });
+        await a.cs.push();
+        await b.cs.pull();
+        put(b, { k: 0, mine: 1 });
+        b.modal.pushResponder = leaveOut(`${APP}#/mine`);
+        expect(await b.cs.push()).toBe(0);
+        b.modal.pushResponder = (r) => r.items.filter((i) => !i.deviceOnly).map((i) => i.id);
+
+        // A changes both keys; B takes k, keeps its own mine, and reports
+        // no conflict.
+        put(a, { k: 2, mine: 2 });
+        await a.cs.push();
+        clearLog();
+        expect(await b.cs.pull()).toBe(1);
+        expect(json(b)).toEqual({ k: 2, mine: 1 });
+        expect(warnings().some((w) => w.includes("both sides changed"))).toBe(false);
+        expect(getLogEntries().some((e) => /1 key\(s\) kept on this device were not taken in/.test(e.message)))
+            .toBe(true);
+
+        // Only the declared key differs: Push shows no list and sends nothing.
+        shown.length = 0;
+        const calls = b.modal.pushCalls.length;
+        expect(await b.cs.push()).toBe(0);
+        expect(b.modal.pushCalls).toHaveLength(calls);
+        expect(shown.filter((t) => t.startsWith("CouchSync: Config Push")))
+            .toEqual([expect.stringMatching(/No local changes to push\. 1 file\(s\) differ only in keys kept on this device/)]);
+
+        // With another change, the list shows the declared key left out.
+        put(b, { k: 3, mine: 1 });
+        expect(await b.cs.push()).toBe(1);
+        const last = b.modal.pushCalls[b.modal.pushCalls.length - 1];
+        expect(last.items.map((i) => [i.pointer, i.deviceOnly])).toEqual([["/k", false], ["/mine", true]]);
+        expect(await serverJson()).toEqual({ k: 3, mine: 2 });
+    });
+
+    it("selecting a declared key again sends it and shares it again", async () => {
+        const a = await device("dev-A");
+        const b = await device("dev-B");
+        put(a, { k: 0, mine: 0 });
+        await a.cs.push();
+        await b.cs.pull();
+        put(b, { k: 1, mine: 1 });
+        b.modal.pushResponder = leaveOut(`${APP}#/mine`);
+        await b.cs.push();
+
+        // With another change the list shows the declared key; B selects
+        // everything.
+        put(b, { k: 2, mine: 1 });
+        b.modal.pushResponder = (r) => r.items.map((i) => i.id);
+        expect(await b.cs.push()).toBe(1);
+        expect(await serverJson()).toEqual({ k: 2, mine: 1 });
+        expect(b.settings.configSyncPolicy.deviceOnlyKeys).toEqual({});
+
+        // Shared again: A's next change of the key reaches B.
+        await a.cs.pull();
+        put(a, { k: 2, mine: 5 });
+        await a.cs.push();
+        await b.cs.pull();
+        expect(json(b)).toEqual({ k: 2, mine: 5 });
+    });
+
+    it("a plugin left out of community-plugins.json stays this device's own", async () => {
+        const PLUGINS = ".obsidian/community-plugins.json";
+        const enableList = (d: Device) => { d.settings.configSyncPolicy.unitDefaults["enabled-list"] = true; };
+        const desktop = await device("desktop");
+        const mobile = await device("mobile", { mobile: true });
+        enableList(desktop);
+        enableList(mobile);
+        put(desktop, ["a", "heavy"], PLUGINS);
+        await desktop.cs.push();
+        await mobile.cs.pull();
+
+        // Mobile disables "heavy" and keeps that to itself.
+        put(mobile, ["a"], PLUGINS);
+        mobile.modal.pushResponder = leaveOut(`${PLUGINS}#/heavy`);
+        expect(await mobile.cs.push()).toBe(0);
+        expect(mobile.settings.configSyncPolicy.deviceOnlyKeys).toEqual({ [PLUGINS]: ["/heavy"] });
+        expect(await serverJson(PLUGINS)).toEqual(["a", "heavy"]);
+
+        // Desktop enables "b": mobile takes it, "heavy" stays off there.
+        await desktop.cs.pull();
+        put(desktop, ["a", "heavy", "b"], PLUGINS);
+        await desktop.cs.push();
+        expect(await mobile.cs.pull()).toBe(1);
+        expect(json(mobile, PLUGINS)).toEqual(["a", "b"]);
+        // Mobile's next Push does not disable "heavy" for everyone.
+        mobile.modal.pushResponder = (r) => r.items.filter((i) => !i.deviceOnly).map((i) => i.id);
+        expect(await mobile.cs.push()).toBe(0);
+        expect(await serverJson(PLUGINS)).toEqual(["a", "heavy", "b"]);
+    });
+
+    it("a whole file left out stops syncing on this device", async () => {
+        const CSS = ".obsidian/snippets/x.css";
+        const a = await device("dev-A");
+        a.vault.addFile(CSS, "a {}");
+        a.modal.pushResponder = leaveOut(CSS);
+        expect(await a.cs.push()).toBe(0);
+        expect(a.settings.configSyncPolicy.overrides).toEqual({ [CSS]: false });
+        expect(await serverDoc(CSS)).toBeNull();
+        // Not offered again.
+        a.modal.pushResponder = (r) => r.items.map((i) => i.id);
+        expect(await a.cs.push()).toBe(0);
+        expect(a.modal.pushCalls).toHaveLength(1);
+    });
+
+    it("cancelling the list sends nothing and declares nothing", async () => {
+        const a = await device("dev-A");
+        put(a, { k: 1 });
+        a.modal.pushResponder = () => null;
+        await expect(a.cs.push()).rejects.toThrow();
+        expect(await serverDoc()).toBeNull();
+        expect(a.settings.configSyncPolicy.deviceOnlyKeys).toEqual({});
+        expect(warnings()).toContain("Config Push cancelled — Nothing was pushed.");
     });
 
     // ── Migration of an older store ─────────────────────

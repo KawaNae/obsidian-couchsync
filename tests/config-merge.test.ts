@@ -6,6 +6,11 @@ import {
     jsonEqual,
     mergeJson,
     orderLike,
+    changePointer,
+    pinPointers,
+    pointerCovers,
+    sameAtPointer,
+    valueAt,
     parseJsonBytes,
     serializeJson,
 } from "../src/sync/config-merge.ts";
@@ -199,5 +204,45 @@ describe("text", () => {
         ["one line", `{"a":1}`],
     ])("writes back in the detected format (%s)", (_label, text) => {
         expect(serializeJson({ a: 1 }, detectJsonFormat(text))).toBe(text);
+    });
+});
+
+describe("positions declared this device's own", () => {
+    it("names a key by its pointer and a set member by /<element>", () => {
+        expect(changePointer({ kind: "set", pointer: "/a/b", value: 1, added: false })).toBe("/a/b");
+        expect(changePointer({ kind: "set-add", element: "x/y" })).toBe("/x~1y");
+    });
+
+    it("a declared pointer covers itself and what is under it, not its siblings", () => {
+        expect(pointerCovers("/a", "/a")).toBe(true);
+        expect(pointerCovers("/a", "/a/b")).toBe(true);
+        expect(pointerCovers("/a", "/ab")).toBe(false);
+        expect(pointerCovers("/a/b", "/a")).toBe(false);
+    });
+
+    it("pins keys to the source: set where it has them, removed where it has not", () => {
+        const v = pinPointers({ a: 1, n: { x: 1 }, gone: 1 }, { a: 0, n: { y: 2 } }, ["/a", "/n/y", "/n/x", "/gone"]);
+        expect(v).toEqual({ a: 0, n: { y: 2 } });
+    });
+
+    it("removing a key whose parent is absent creates nothing", () => {
+        expect(pinPointers({ a: 1 }, {}, ["/n/x"])).toEqual({ a: 1 });
+    });
+
+    it("pins set members to the source's membership", () => {
+        expect(pinPointers(["a", "b"], ["b", "c"], ["/a", "/c"], { set: true })).toEqual(["b", "c"]);
+    });
+
+    it("compares a position by value, or by membership in a set", () => {
+        expect(sameAtPointer({ a: 1 }, { a: 1, b: 2 }, "/a")).toBe(true);
+        expect(sameAtPointer({ a: 1 }, { b: 2 }, "/a")).toBe(false);
+        expect(sameAtPointer({}, { b: 2 }, "/a")).toBe(true);
+        expect(sameAtPointer(["a"], ["a", "b"], "/a", { set: true })).toBe(true);
+        expect(sameAtPointer(["a"], ["a", "b"], "/b", { set: true })).toBe(false);
+    });
+
+    it("reads the value at a pointer", () => {
+        expect(valueAt({ a: { b: [1] } }, "/a/b")).toEqual([1]);
+        expect(valueAt({ a: 1 }, "/x")).toBeUndefined();
     });
 });
