@@ -74,14 +74,9 @@ export class VaultRemoteOps {
         return remoteCouch.pullAll(this.localDb, this.makeDataClient(), this.chunkHasher, onProgress);
     }
 
-    /** Destroy the vault remote database (auto-recreated on next push). */
-    async destroyRemote(): Promise<void> {
-        await remoteCouch.destroyRemote(this.makeClient());
-    }
-
-    /** Create the vault remote database if it doesn't exist. */
-    async ensureRemoteDb(): Promise<void> {
-        await this.makeClient().ensureDb();
+    /** Destroy the vault remote database and create it empty. */
+    async recreateRemote(): Promise<void> {
+        await remoteCouch.recreateRemote(this.makeClient());
     }
 
     /**

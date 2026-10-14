@@ -26,6 +26,9 @@ import { makeFileId } from "../../src/types/doc-id.ts";
 import type { FileDoc, CouchSyncDoc } from "../../src/types.ts";
 import { ALWAYS_VISIBLE } from "../../src/db/visibility-gate.ts";
 import { EncryptionError } from "../../src/db/codec-errors.ts";
+import { makePendingApply } from "../helpers/pending-apply.ts";
+import { buildInitialVaultMeta, pushVaultMeta, type VaultMetaDoc } from "../../src/db/vault-meta.ts";
+import { VaultEncryptionPausedError } from "../../src/sync/vault-binding.ts";
 
 interface PipelineRig {
     pipeline: PullPipeline;
@@ -39,11 +42,15 @@ interface PipelineRig {
     dbErrorCalls: Array<{ err: unknown; ctx: string }>;
     /** Errors routed to onTransientError. */
     transientErrors: unknown[];
+    /** Arguments of every `recheckRoot` call (`"read"`: none passed). */
+    rechecks: Array<VaultMetaDoc | null | "read">;
 }
 
 function attachPullPipeline(opts: {
     device: DeviceHarness;
     couch: SyncHarness["couch"];
+    /** Stand-in for the vault setup's verdict; passes by default. */
+    recheckRoot?: (observed?: VaultMetaDoc | null) => Promise<void>;
 }): PipelineRig {
     const events = new SyncEvents();
     const echoes = new EchoTracker();
@@ -51,6 +58,7 @@ function attachPullPipeline(opts: {
     const pausedCount = { value: 0 };
     events.on("paused", () => { pausedCount.value++; });
 
+    const pendingApply = makePendingApply(opts.device.db);
     const pullWriter = new PullWriter({
         localDb: opts.device.db,
         events,
@@ -58,16 +66,19 @@ function attachPullPipeline(opts: {
         checkpoints,
         getConflictResolver: () => opts.device.resolver,
         ensureChunks: async () => {},
+        pendingApply,
     });
 
     let cancelled = false;
     const controller = new AbortController();
     const dbErrorCalls: Array<{ err: unknown; ctx: string }> = [];
     const transientErrors: unknown[] = [];
+    const rechecks: Array<VaultMetaDoc | null | "read"> = [];
 
     const pipeline = new PullPipeline({
         client: opts.couch,
         pullWriter,
+        pendingApply,
         checkpoints,
         events,
         sessionEpoch: 1,
@@ -76,6 +87,10 @@ function attachPullPipeline(opts: {
         signal: controller.signal,
         handleLocalDbError: (err, ctx) => { dbErrorCalls.push({ err, ctx }); },
         onTransientError: (e) => { transientErrors.push(e); },
+        recheckRoot: async (observed) => {
+            rechecks.push(observed === undefined ? "read" : observed);
+            await opts.recheckRoot?.(observed);
+        },
         delay: async () => {},
     });
 
@@ -89,6 +104,7 @@ function attachPullPipeline(opts: {
         signal: controller.signal,
         dbErrorCalls,
         transientErrors,
+        rechecks,
     };
 }
 
@@ -445,6 +461,121 @@ describe("PullPipeline integration", () => {
             // Does NOT throw — backs off and exits cleanly when cancelled.
             await rig.pipeline.runCatchup();
             expect(calls).toBeGreaterThan(1);
+            spy.mockRestore();
+        });
+    });
+    // ── Re-created remote DB ────────────────────
+    describe("a sign that the remote DB was re-created is re-checked before anything is applied", () => {
+        const recreated = async () => { throw new VaultEncryptionPausedError("root-changed"); };
+
+        it("catchup: a batch carrying vault:meta is re-checked with the pulled meta", async () => {
+            h = createSyncHarness();
+            const a = h.addDevice("dev-A");
+            const b = h.addDevice("dev-B");
+            const rig = attachPullPipeline({ device: b, couch: h.couch });
+            const { meta } = await buildInitialVaultMeta({ encryption: false, compression: false });
+            await pushVaultMeta(h.couch, meta);
+            await seedRemote(h, a, "notes/one.md", "one");
+
+            await rig.pipeline.runCatchup();
+
+            expect(rig.rechecks).toHaveLength(1);
+            expect(rig.rechecks[0]).toMatchObject({ _id: "vault:meta", generationId: meta.generationId });
+            await expectDb(b.db).toHaveFileDoc("notes/one.md");
+        });
+
+        it("catchup: a re-created DB throws the pause and applies nothing", async () => {
+            h = createSyncHarness();
+            const a = h.addDevice("dev-A");
+            const b = h.addDevice("dev-B");
+            const rig = attachPullPipeline({ device: b, couch: h.couch, recheckRoot: recreated });
+            const { meta } = await buildInitialVaultMeta({ encryption: false, compression: false });
+            await pushVaultMeta(h.couch, meta);
+            await seedRemote(h, a, "notes/one.md", "one");
+
+            await expect(rig.pipeline.runCatchup()).rejects.toMatchObject({ reason: "root-changed" });
+            await expectDb(b.db).toNotHaveFileDoc("notes/one.md");
+            expect(rig.checkpoints.getRemoteSeq()).toBe(0);
+        });
+
+        it("longpoll: a re-created DB halts the loop with the pause and applies nothing", async () => {
+            h = createSyncHarness();
+            const a = h.addDevice("dev-A");
+            const b = h.addDevice("dev-B");
+            const rig = attachPullPipeline({ device: b, couch: h.couch, recheckRoot: recreated });
+            const { meta } = await buildInitialVaultMeta({ encryption: false, compression: false });
+            await pushVaultMeta(h.couch, meta);
+            await seedRemote(h, a, "notes/one.md", "one");
+
+            await rig.pipeline.runLongpoll();
+
+            expect(rig.transientErrors).toHaveLength(1);
+            expect(rig.transientErrors[0]).toBeInstanceOf(VaultEncryptionPausedError);
+            await expectDb(b.db).toNotHaveFileDoc("notes/one.md");
+        });
+
+        it("a batch without vault:meta is not re-checked", async () => {
+            h = createSyncHarness();
+            const a = h.addDevice("dev-A");
+            const b = h.addDevice("dev-B");
+            const rig = attachPullPipeline({ device: b, couch: h.couch, recheckRoot: recreated });
+            await seedRemote(h, a, "notes/one.md", "one");
+
+            await rig.pipeline.runCatchup();
+
+            expect(rig.rechecks).toEqual([]);
+            await expectDb(b.db).toHaveFileDoc("notes/one.md");
+        });
+
+        it("a body that does not decrypt reads the server's meta; a re-created DB halts", async () => {
+            h = createSyncHarness();
+            const b = h.addDevice("dev-B");
+            const rig = attachPullPipeline({ device: b, couch: h.couch, recheckRoot: recreated });
+            let calls = 0;
+            const spy = vi.spyOn(h.couch, "changesLongpoll").mockImplementation(async () => {
+                calls++;
+                throw new EncryptionError("Failed to decrypt doc x");
+            });
+
+            await rig.pipeline.runLongpoll();
+
+            expect(calls).toBe(1);
+            expect(rig.rechecks).toEqual(["read"]);
+            expect(rig.transientErrors).toEqual([expect.any(VaultEncryptionPausedError)]);
+            spy.mockRestore();
+        });
+
+        it("catchup: a body that does not decrypt in a re-created DB throws the pause", async () => {
+            h = createSyncHarness();
+            const b = h.addDevice("dev-B");
+            const rig = attachPullPipeline({ device: b, couch: h.couch, recheckRoot: recreated });
+            const spy = vi.spyOn(h.couch, "changes").mockImplementation(async () => {
+                throw new EncryptionError("Failed to decrypt doc x");
+            });
+
+            await expect(rig.pipeline.runCatchup()).rejects.toMatchObject({ reason: "root-changed" });
+            expect(rig.rechecks).toEqual(["read"]);
+            spy.mockRestore();
+        });
+
+        it("a re-check that fails for another reason is not a verdict: the loop goes on", async () => {
+            h = createSyncHarness();
+            const b = h.addDevice("dev-B");
+            const rig = attachPullPipeline({
+                device: b, couch: h.couch,
+                recheckRoot: async () => { throw new TypeError("Failed to fetch"); },
+            });
+            let calls = 0;
+            const spy = vi.spyOn(h.couch, "changesLongpoll").mockImplementation(async () => {
+                calls++;
+                if (calls > 2) rig.cancel();
+                throw new EncryptionError("Failed to decrypt doc x");
+            });
+
+            await rig.pipeline.runLongpoll();
+
+            expect(calls).toBeGreaterThan(1);
+            expect(rig.transientErrors.every((e) => e instanceof EncryptionError)).toBe(true);
             spy.mockRestore();
         });
     });

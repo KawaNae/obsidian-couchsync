@@ -9,11 +9,13 @@
  */
 import { describe, it, expect, beforeEach } from "vitest";
 import {
-    VaultBinding, VaultEncryptionPausedError, type VaultBindingHost, type AskVaultPassphrase,
+    VaultBinding, VaultEncryptionPausedError, vaultTarget, type VaultBindingHost, type AskVaultPassphrase,
 } from "../src/sync/vault-binding.ts";
 import { classifyError } from "../src/db/sync/errors.ts";
 import { AuthGate } from "../src/db/sync/auth-gate.ts";
-import { buildInitialVaultMeta, fetchVaultMeta, pushVaultMeta } from "../src/db/vault-meta.ts";
+import {
+    buildInitialVaultMeta, fetchVaultMeta, metaFingerprint, pushVaultMeta, unlockVaultMeta,
+} from "../src/db/vault-meta.ts";
 import { FakeCouchClient } from "./helpers/fake-couch-client.ts";
 import { makeSettings } from "./helpers/settings-factory.ts";
 import type { CouchSyncSettings } from "../src/settings.ts";
@@ -65,9 +67,10 @@ function rig(opts: {
         auth: r.auth,
         makeRawClient: () => (opts.client ? opts.client(remote) : remote),
         setup: () => ({
-            init: async () => {
+            init: async (_progress, publishMeta) => {
                 r.stateAtSetup = settings.connectionState;
                 r.onSetup();
+                await publishMeta();
                 await r.setupGate;
                 if (r.setupError) throw r.setupError;
                 return result;
@@ -213,6 +216,40 @@ describe("VaultBinding.init", () => {
         await first;
         expect(r.binding.relation().lastOp).toMatchObject({ op: "init", error: null });
     });
+
+    it("builds the vault from the Step 1 passphrase even when a key is unlocked in this session", async () => {
+        const r = rig({ settings: { encryptionEnabled: true, encryptionPassphrase: "old" } });
+        await encryptedRemote(r.remote, "old");
+        await r.binding.clone();
+        const before = await fetchVaultMeta(r.remote);
+
+        r.settings.encryptionPassphrase = "new";
+        await r.binding.init();
+
+        const after = await fetchVaultMeta(r.remote);
+        expect(after?.encryption.enabled).toBe(true);
+        if (!before?.encryption.enabled || !after?.encryption.enabled) throw new Error("unreachable");
+        expect(after.encryption.salt).not.toBe(before.encryption.salt);
+        expect(after.encryption.keyCheck).not.toBe(before.encryption.keyCheck);
+        expect(await unlockVaultMeta(after, "old")).toBeNull();
+        const unlocked = await unlockVaultMeta(after, "new");
+        expect(unlocked).not.toBeNull();
+
+        // The chunk hasher of every vault client uses the new key.
+        const data = new TextEncoder().encode("chunk body");
+        expect(await r.binding.chunkHasher.hash(data)).toBe(await unlocked!.crypto.hmacHash(data));
+    });
+
+    it("mints a fresh salt on each Init with the same passphrase", async () => {
+        const r = rig({ settings: { encryptionEnabled: true, encryptionPassphrase: "pw" } });
+        await r.binding.init();
+        const first = await fetchVaultMeta(r.remote);
+        await r.binding.init();
+        const second = await fetchVaultMeta(r.remote);
+        if (!first?.encryption.enabled || !second?.encryption.enabled) throw new Error("not encrypted");
+        expect(second.encryption.salt).not.toBe(first.encryption.salt);
+        expect(await unlockVaultMeta(second, "pw")).not.toBeNull();
+    });
 });
 
 describe("VaultBinding.clone", () => {
@@ -280,6 +317,31 @@ describe("VaultBinding.clone", () => {
             encryptionEnabled: false, compressionEnabled: false, connectionState: "settingUp",
         });
         expect(r.settings.vaultCipherVersion).toBeUndefined();
+    });
+
+    it("records what the DB holds from its own read; no Check is needed before it", async () => {
+        const r = rig({ settings: { encryptionPassphrase: "pw" } });
+        await encryptedRemote(r.remote, "pw");
+        expect(r.binding.relation().dbCheck).toBeNull();
+        await r.binding.clone();
+        expect(r.binding.relation().dbCheck?.result).toEqual({ status: "exists", docCount: 1 });
+    });
+
+    it("a Check made before is replaced by what Clone read", async () => {
+        const r = rig({ settings: { encryptionPassphrase: "pw" } });
+        r.dbCheckResult = { status: "exists", docCount: 0 };
+        await r.binding.checkDatabase("vault");
+        await encryptedRemote(r.remote, "pw");
+        await r.binding.clone();
+        expect(r.binding.relation().dbCheck?.result).toEqual({ status: "exists", docCount: 1 });
+    });
+
+    it("an empty DB is refused in the preparation: nothing is stopped or changed", async () => {
+        const r = rig();
+        await expect(r.binding.clone()).rejects.toThrow(/empty — use Init/);
+        expect(r.stops).toBe(0);
+        expect(r.settings.connectionState).toBe("setupDone");
+        expect(r.binding.relation().dbCheck?.result).toEqual({ status: "exists", docCount: 0 });
     });
 
     it("an outcome about another vault DB is not shown", async () => {
@@ -382,6 +444,174 @@ describe("VaultBinding.checkAgreement", () => {
         r.setupError = new Error("disk full");
         await r.binding.init().catch(() => {});
         expect(r.binding.relation().pause).not.toBeNull();
+    });
+});
+
+describe("VaultBinding: the incarnation of the vault DB a device is set up against", () => {
+    const signal = new AbortController().signal;
+
+    /** Another device's Init: the DB is re-created with a new vault:meta. */
+    async function initElsewhere(remote: FakeCouchClient, compression = false): Promise<void> {
+        await remote.destroy();
+        const built = await buildInitialVaultMeta({ encryption: false, compression });
+        await pushVaultMeta(remote, built.meta);
+    }
+
+    it("Init writes a meta with a fresh generation id and binds the device to it", async () => {
+        const r = rig();
+        await r.binding.init();
+        const meta = await fetchVaultMeta(r.remote);
+        expect(meta?.generationId).toMatch(/^[0-9a-f]{32}$/);
+        expect(r.settings.vaultRoot).toEqual({
+            fingerprint: await metaFingerprint(meta!), against: vaultTarget(r.settings),
+        });
+    });
+
+    it("Clone binds the device to the meta it cloned, or to no meta", async () => {
+        const r = rig({ settings: { connectionState: "tested" } });
+        await initElsewhere(r.remote);
+        await r.binding.clone();
+        expect(r.settings.vaultRoot?.fingerprint).toBe(await metaFingerprint((await fetchVaultMeta(r.remote))!));
+
+        // A vault set up before vault:meta existed: documents, no meta.
+        const bare = rig({ settings: { connectionState: "tested" } });
+        await bare.remote.bulkDocs([{ _id: "file:a.md", type: "file", chunks: [] } as never]);
+        await bare.binding.clone();
+        expect(bare.settings.vaultRoot).toEqual({ fingerprint: null, against: vaultTarget(bare.settings) });
+    });
+
+    it("another device's Init pauses this device until it clones the new DB", async () => {
+        const r = rig({ settings: { connectionState: "tested" } });
+        await initElsewhere(r.remote);
+        await r.binding.clone();
+        r.settings.connectionState = "syncing";
+        await r.binding.checkAgreement(signal);
+
+        await initElsewhere(r.remote);
+        const err = await r.binding.checkAgreement(signal).catch((e) => e);
+        expect(err).toBeInstanceOf(VaultEncryptionPausedError);
+        expect(err).toMatchObject({ reason: "root-changed" });
+        expect(classifyError(err).kind).toBe("encryption-paused");
+        expect(r.settings.connectionState).toBe("tested");
+        expect(r.settings.vaultPause).toMatchObject({ reason: "root-changed" });
+        expect(r.binding.relation().pause?.error.userMessage).toMatch(/Run Clone/);
+
+        // Clone recovers: bound to the new DB, the pause is gone.
+        await r.binding.clone();
+        r.settings.connectionState = "syncing";
+        await r.binding.checkAgreement(signal);
+        expect(r.settings.vaultPause).toBeUndefined();
+        expect(r.settings.connectionState).toBe("syncing");
+    });
+
+    it("a re-creation keeps the same plaintext codec and is still told apart", async () => {
+        const r = rig({ settings: { connectionState: "tested" } });
+        await initElsewhere(r.remote, true);
+        await r.binding.clone();
+        r.settings.connectionState = "syncing";
+        await initElsewhere(r.remote, true);
+        await expect(r.binding.checkAgreement(signal)).rejects.toMatchObject({ reason: "root-changed" });
+    });
+
+    it("a DB whose vault:meta is gone (deleted, or Init has not written it yet) pauses", async () => {
+        const r = rig({ settings: { connectionState: "tested" } });
+        await initElsewhere(r.remote);
+        await r.binding.clone();
+        r.settings.connectionState = "syncing";
+        await r.remote.destroy();
+        await expect(r.binding.checkAgreement(signal)).rejects.toMatchObject({ reason: "root-changed" });
+    });
+
+    it("a device set up before the record existed adopts the server's meta, then detects a re-creation", async () => {
+        const r = rig({ settings: { connectionState: "syncing" } });
+        await initElsewhere(r.remote);
+        expect(r.settings.vaultRoot).toBeUndefined();
+        await r.binding.checkAgreement(signal);
+        expect(r.settings.vaultRoot?.fingerprint).toBe(await metaFingerprint((await fetchVaultMeta(r.remote))!));
+        expect(r.settings.connectionState).toBe("syncing");
+
+        await initElsewhere(r.remote);
+        await expect(r.binding.checkAgreement(signal)).rejects.toMatchObject({ reason: "root-changed" });
+    });
+
+    it("a meta written by an older build (no generation id) is compared by its codec and salt", async () => {
+        const r = rig({ settings: { connectionState: "syncing", encryptionEnabled: true, encryptionPassphrase: "pw" } });
+        const old = await buildInitialVaultMeta({ encryption: true, passphrase: "pw", compression: false });
+        delete old.meta.generationId;
+        await pushVaultMeta(r.remote, old.meta);
+        await r.binding.checkAgreement(signal);
+        // Checked again with the same meta: still the same DB.
+        await r.binding.checkAgreement(signal);
+        expect(r.settings.connectionState).toBe("syncing");
+
+        const reInit = await buildInitialVaultMeta({ encryption: true, passphrase: "pw", compression: false });
+        delete reInit.meta.generationId;
+        await r.remote.destroy();
+        await pushVaultMeta(r.remote, reInit.meta);
+        await expect(r.binding.checkAgreement(signal)).rejects.toMatchObject({ reason: "root-changed" });
+    });
+
+    it("a record about another vault DB is not compared, and is replaced", async () => {
+        const r = rig({ settings: { connectionState: "syncing", vaultRoot: { fingerprint: "sha256:x", against: "elsewhere" } } });
+        await initElsewhere(r.remote);
+        await r.binding.checkAgreement(signal);
+        expect(r.settings.vaultRoot?.against).toBe(vaultTarget(r.settings));
+    });
+
+    describe("recheckRoot (during a live session)", () => {
+        async function bound(): Promise<Rig> {
+            const r = rig({ settings: { connectionState: "tested" } });
+            await initElsewhere(r.remote);
+            await r.binding.clone();
+            r.settings.connectionState = "syncing";
+            return r;
+        }
+
+        it("a pulled meta of the same DB passes; of a re-created DB pauses", async () => {
+            const r = await bound();
+            const same = await fetchVaultMeta(r.remote);
+            await r.binding.recheckRoot(same);
+            expect(r.settings.connectionState).toBe("syncing");
+
+            const other = await buildInitialVaultMeta({ encryption: false, compression: false });
+            await expect(r.binding.recheckRoot(other.meta)).rejects.toMatchObject({ reason: "root-changed" });
+            expect(r.settings.connectionState).toBe("tested");
+        });
+
+        it("a deleted meta pauses", async () => {
+            const r = await bound();
+            await expect(r.binding.recheckRoot(null)).rejects.toMatchObject({ reason: "root-changed" });
+        });
+
+        it("without a pulled meta, reads the server's", async () => {
+            const r = await bound();
+            await r.binding.recheckRoot();
+            await initElsewhere(r.remote);
+            await expect(r.binding.recheckRoot()).rejects.toMatchObject({ reason: "root-changed" });
+        });
+
+        it("a failed read is not a verdict: nothing changes", async () => {
+            const r = await bound();
+            const failing = rig({
+                settings: JSON.parse(JSON.stringify(r.settings)),
+                client: (remote) => new Proxy(remote, {
+                    get(target, prop, recv) {
+                        if (prop === "getDoc") return async () => { throw new TypeError("Failed to fetch"); };
+                        return Reflect.get(target, prop, recv);
+                    },
+                }),
+            });
+            await failing.binding.recheckRoot();
+            expect(failing.settings.connectionState).toBe("syncing");
+            expect(failing.settings.vaultPause).toBeUndefined();
+        });
+
+        it("without a record there is nothing to compare", async () => {
+            const r = rig({ settings: { connectionState: "syncing" } });
+            const other = await buildInitialVaultMeta({ encryption: false, compression: false });
+            await r.binding.recheckRoot(other.meta);
+            expect(r.settings.connectionState).toBe("syncing");
+        });
     });
 });
 

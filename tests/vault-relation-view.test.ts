@@ -40,7 +40,7 @@ describe("vaultRelationView", () => {
         const pause = new VaultEncryptionPausedError("encryption-changed", { remoteEncrypted: true });
         const v = vaultRelationView(rel({ pause: { at: 1, error: pause } }), null);
         expect(v.tone).toBe("error");
-        expect(v.text).toBe(`Last encryption check: ${pause.userMessage}`);
+        expect(v.text).toBe(`Last server check: ${pause.userMessage}`);
     });
 
     it("a failed Clone in its preparation is shown with the unchanged state", () => {
@@ -64,7 +64,7 @@ describe("vaultRelationView", () => {
             lastOp: outcome({ at: 5, error: new UserFacingError("op") }),
             pause: { at: 9, error: pause },
         }), null);
-        expect(newerPause.text).toBe(`Last encryption check: ${pause.userMessage}`);
+        expect(newerPause.text).toBe(`Last server check: ${pause.userMessage}`);
         const newerOp = vaultRelationView(rel({
             lastOp: outcome({ at: 9, error: new UserFacingError("op") }),
             pause: { at: 5, error: pause },
@@ -83,17 +83,19 @@ describe("vaultRelationView", () => {
 describe("cloneAvailability", () => {
     const check = (result: any) => ({ at: 1, against: "t", result });
 
-    it("without a check, asks for one instead of calling the DB empty", () => {
-        const c = cloneAvailability(null, true);
-        expect(c.enabled).toBe(false);
-        expect(c.desc).toMatch(/Press Check in Step 2/);
-        expect(c.desc).not.toMatch(/empty/);
+    it("without a finding, or after a failed check, offers Clone: its preparation reads the DB", () => {
+        expect(cloneAvailability(null, true)).toEqual({
+            enabled: true, desc: "Pull remote database to local vault (2nd+ device)",
+        });
+        expect(cloneAvailability(check({ status: "error", error: new Error("x") }), true).enabled).toBe(true);
     });
 
-    it("an empty or new DB points to Init; a failed check to Step 2", () => {
-        expect(cloneAvailability(check({ status: "exists", docCount: 0 }), true).desc).toMatch(/empty/);
-        expect(cloneAvailability(check({ status: "created" }), true).desc).toMatch(/empty/);
-        expect(cloneAvailability(check({ status: "error", error: new Error("x") }), true).desc).toMatch(/check failed/);
+    it("an empty or new DB points to Init", () => {
+        for (const result of [{ status: "exists", docCount: 0 }, { status: "created" }]) {
+            const c = cloneAvailability(check(result), true);
+            expect(c.enabled).toBe(false);
+            expect(c.desc).toMatch(/empty/);
+        }
     });
 
     it("a DB with documents enables Clone when the setup state allows it", () => {

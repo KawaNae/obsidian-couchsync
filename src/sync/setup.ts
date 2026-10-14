@@ -23,6 +23,8 @@ function formatDocIdForProgress(id: string): string {
 }
 
 export interface SetupResult {
+    /** Init: vault files scanned into the local DB. Clone: vault files
+     *  written from the remote (deletions and declined docs excluded). */
     vaultFiles: number;
     totalDocs: number;
 }
@@ -36,8 +38,20 @@ export class SetupService {
         private reconciler: Reconciler,
     ) {}
 
-    /** Init: clean slate (local + remote) → scan vault → push */
-    async init(onProgress: (msg: string) => void): Promise<SetupResult> {
+    /**
+     * Init: clean slate (local + remote) → publish the new vault:meta → scan
+     * vault → push.
+     *
+     * `publishMeta` writes the new `vault:meta` into the re-created remote
+     * DB before anything else. A device still live-syncing with the DB this
+     * Init replaced tells the replacement by that meta (the pull wakes on
+     * it; the agreement check compares it), so the sooner it is there, the
+     * shorter the time that device can push into the new DB unnoticed.
+     */
+    async init(
+        onProgress: (msg: string) => void,
+        publishMeta: () => Promise<void>,
+    ): Promise<SetupResult> {
         return this.withWakeLock(async () => {
             onProgress("Initializing local database...");
             await this.localDb.destroy();
@@ -45,8 +59,9 @@ export class SetupService {
             await this.localDb.ensureSchemaVersion();
 
             onProgress("Initializing remote database...");
-            await this.remoteOps.destroyRemote();
-            await this.remoteOps.ensureRemoteDb();
+            await this.remoteOps.recreateRemote();
+            onProgress("Writing vault metadata...");
+            await publishMeta();
 
             onProgress("Scanning vault files...");
             const vaultFiles = await this.scanVaultToDb(onProgress);
@@ -77,15 +92,24 @@ export class SetupService {
                 onProgress(`Pulling: ${formatDocIdForProgress(docId)} (${n})`);
             });
 
+            // Every FileDoc goes through dbToFile, tombstones included (they
+            // establish the deleted baseline). Only an alive doc that landed
+            // in the vault counts as a file written: a tombstone is a file
+            // deleted elsewhere, and a doc dbToFile declines (filtered,
+            // unsafe path, collision) or fails on is not in the vault.
             const allFiles = await this.localDb.allFileDocs();
-            onProgress(`Writing ${allFiles.length} vault files...`);
+            const alive = allFiles.filter((d) => !d.deleted).length;
+            onProgress(`Writing ${alive} vault files...`);
             let vaultFiles = 0;
+            let done = 0;
             for (const fileDoc of allFiles) {
                 const vaultPath = filePathFromId(fileDoc._id);
                 try {
-                    onProgress(`Writing: ${vaultPath} (${vaultFiles + 1}/${allFiles.length})`);
-                    await this.vaultSync.dbToFile(fileDoc);
-                    vaultFiles++;
+                    if (!fileDoc.deleted) {
+                        onProgress(`Writing: ${vaultPath} (${++done}/${alive})`);
+                    }
+                    const result = await this.vaultSync.dbToFile(fileDoc);
+                    if (!fileDoc.deleted && result.applied) vaultFiles++;
                 } catch (e) {
                     logError(`Failed to write ${vaultPath}: ${e?.message ?? e}`);
                 }

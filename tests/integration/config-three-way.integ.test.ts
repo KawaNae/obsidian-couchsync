@@ -24,11 +24,8 @@ import { NoopReconnectBridge } from "../../src/sync/reconnect-bridge.ts";
 import { makeConfigId } from "../../src/types/doc-id.ts";
 import type { ConfigDoc, CouchSyncDoc } from "../../src/types.ts";
 import type { CouchSyncSettings } from "../../src/settings.ts";
-import type { ConfigMetaDoc } from "../../src/db/vault-meta.ts";
-import {
-    configMetaFingerprint,
-    metaCodec,
-} from "../../src/sync/config-binding-record.ts";
+import { metaFingerprint, type ConfigMetaDoc } from "../../src/db/vault-meta.ts";
+import { metaCodec } from "../../src/sync/config-binding-record.ts";
 import { configLastSyncedKey } from "../../src/db/sync/config-last-synced.ts";
 import {
     configLocalFirstKey,
@@ -121,7 +118,7 @@ describe("config three-way merge across devices", () => {
         } else {
             await putAttachment(store, {
                 codec: metaCodec(meta),
-                metaFingerprint: await configMetaFingerprint(meta),
+                metaFingerprint: await metaFingerprint(meta),
             });
         }
         // The binding read its attachment when it opened: re-open it.

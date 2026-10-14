@@ -1,13 +1,13 @@
 /**
- * `configMetaFingerprint` — the root identity a device records on Create /
- * Join. With a generation id it tells re-created plaintext roots apart;
+ * `metaFingerprint` — the root identity a device records on config Create /
+ * Join and vault Init / Clone. With a generation id it tells re-created
+ * plaintext roots apart;
  * without one (a meta written by an older build) it must equal the
  * pre-generation fingerprint bit for bit, or every record anchored before
  * the upgrade would read as `root-changed`.
  */
 import { describe, it, expect } from "vitest";
 import {
-    configMetaFingerprint,
     configBindingKey,
     configStoreName,
     describeCodec,
@@ -17,7 +17,9 @@ import {
 } from "../src/sync/config-binding-record.ts";
 import {
     buildInitialConfigMeta,
+    buildInitialVaultMeta,
     CONFIG_META_DOC_ID,
+    metaFingerprint,
     type ConfigMetaDoc,
 } from "../src/db/vault-meta.ts";
 
@@ -47,25 +49,25 @@ function plainMeta(extra: Partial<ConfigMetaDoc> = {}): ConfigMetaDoc {
     };
 }
 
-describe("configMetaFingerprint", () => {
+describe("metaFingerprint", () => {
     it("without a generation id: identical to the pre-generation fingerprint", async () => {
         const plain = plainMeta();
-        expect(await configMetaFingerprint(plain)).toBe(await legacyFingerprint(plain));
+        expect(await metaFingerprint(plain)).toBe(await legacyFingerprint(plain));
 
         const { meta } = await buildInitialConfigMeta({
             encryption: true, passphrase: "pw", compression: true,
         });
         const { generationId, ...old } = meta;
         expect(generationId).toBeDefined();
-        expect(await configMetaFingerprint(old)).toBe(await legacyFingerprint(old));
+        expect(await metaFingerprint(old)).toBe(await legacyFingerprint(old));
     });
 
     it("plaintext: two roots with the same codec differ only by generation id", async () => {
         const a = plainMeta({ generationId: "a".repeat(32) });
         const b = plainMeta({ generationId: "b".repeat(32) });
-        expect(await configMetaFingerprint(a)).not.toBe(await configMetaFingerprint(b));
+        expect(await metaFingerprint(a)).not.toBe(await metaFingerprint(b));
         // …and a generation id is never confused with its absence.
-        expect(await configMetaFingerprint(a)).not.toBe(await configMetaFingerprint(plainMeta()));
+        expect(await metaFingerprint(a)).not.toBe(await metaFingerprint(plainMeta()));
     });
 
     it("every Create mints a fresh generation id, encrypted or not", async () => {
@@ -73,6 +75,14 @@ describe("configMetaFingerprint", () => {
         const two = await buildInitialConfigMeta({ encryption: false, compression: false });
         expect(one.meta.generationId).toMatch(/^[0-9a-f]{32}$/);
         expect(one.meta.generationId).not.toBe(two.meta.generationId);
+    });
+
+    it("every vault Init mints a fresh generation id, so two plaintext vaults differ", async () => {
+        const one = await buildInitialVaultMeta({ encryption: false, compression: true });
+        const two = await buildInitialVaultMeta({ encryption: false, compression: true });
+        expect(one.meta.generationId).toMatch(/^[0-9a-f]{32}$/);
+        expect(one.meta.generationId).not.toBe(two.meta.generationId);
+        expect(await metaFingerprint(one.meta)).not.toBe(await metaFingerprint(two.meta));
     });
 
     it("ignores cipherVersion (a lowered one is cipher-downgrade, not a reset)", async () => {
@@ -83,7 +93,7 @@ describe("configMetaFingerprint", () => {
         const lowered: ConfigMetaDoc = {
             ...meta, encryption: { ...meta.encryption, cipherVersion: 2 },
         };
-        expect(await configMetaFingerprint(lowered)).toBe(await configMetaFingerprint(meta));
+        expect(await metaFingerprint(lowered)).toBe(await metaFingerprint(meta));
     });
 });
 

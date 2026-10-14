@@ -38,7 +38,7 @@ import { logDebug, logError, logInfo } from "../../ui/log.ts";
 import type { EchoTracker } from "./echo-tracker.ts";
 import type { SyncEvents } from "./sync-events.ts";
 import type { Checkpoints } from "./checkpoints.ts";
-import { loadAllPendingApply, type PendingApplyReason } from "./pending-apply.ts";
+import type { PendingApply, PendingApplyReason } from "./pending-apply.ts";
 import {
     loadAllPendingConflict, clearPendingConflict, type PendingConflictKind,
 } from "./pending-conflict.ts";
@@ -63,6 +63,10 @@ export interface PullWriterDeps {
     checkpoints: Checkpoints;
     getConflictResolver: () => ConflictResolver | undefined;
     ensureChunks: (doc: FileDoc) => Promise<void>;
+    /** The record of docs not yet reflected in the vault. The pull pre-records
+     *  docs whose chunks are not local in the same tx as the cursor advance,
+     *  and drops the ones that apply cleanly. */
+    pendingApply: PendingApply;
     /** Fetch the current remote FileDoc by id (decoded through the codec
      *  stack), or null if absent. Used by `drainPendingConflict` to re-present
      *  a persisted local-delete-vs-remote-edit conflict: the surviving
@@ -164,11 +168,6 @@ export class PullWriter {
             this.emittedConflicts.delete(makeFileId(filePath));
         });
     }
-
-    /** In-memory count of the pending-apply set. -1 = not
-     *  yet loaded this session; a non-negative value lets `drainPendingApply`
-     *  short-circuit the common empty case without a meta scan. */
-    private pendingApplyCount = -1;
 
     /** File-doc ids whose deletion conflict has already been surfaced (emitted
      *  to the orchestrator) during THIS session — either live in
@@ -417,7 +416,7 @@ export class PullWriter {
         // No unpushed local edit: the deletion is safe to apply. Route it
         // through the SAME durable `accepted → pending-deletion → drain` path
         // as a soft-delete — committed atomically with the
-        // cursor advance and retried by drainPendingApply on apply failure —
+        // cursor advance and retried by the PendingApply drain on apply failure —
         // instead of the former tx-external immediate applyRemoteDeletion that
         // could lose the file on a mid-delete crash.
         accepted.push(buildAcceptedTombstone(docId, localDoc));
@@ -444,7 +443,7 @@ export class PullWriter {
      * is a restart: the in-memory modal queue is gone but the `pending-conflict`
      * entry survived, so the deletion intent is re-shown instead of being
      * silently un-deleted by the surviving local edit. Called every pull cycle
-     * like `drainPendingApply`; `emittedConflicts` makes it a no-op for
+     * like the PendingApply drain; `emittedConflicts` makes it a no-op for
      * conflicts already shown this session.
      */
     async drainPendingConflict(): Promise<void> {
@@ -547,7 +546,7 @@ export class PullWriter {
         // durably commits, so its outcome can't ride the tx). Record those
         // ids in the SAME tx as the remoteSeq advance, then drop the ones
         // that apply cleanly. What remains is exactly the genuine misses,
-        // retried by `drainPendingApply`.
+        // retried by the PendingApply drain.
         const pendingApplyAdd = await this.computePendingApplyAdd(accepted);
         const pendingSet = new Set(pendingApplyAdd.map((p) => p.id));
         const resolved: string[] = [];
@@ -558,6 +557,7 @@ export class PullWriter {
             pendingApplyAdd,
             pendingConflictAdd,
             onCommit: async () => {
+                this.deps.pendingApply.noteRecorded(pendingApplyAdd);
                 const { updateSeq } = await this.deps.localDb.info();
                 const seq = typeof updateSeq === "number"
                     ? updateSeq
@@ -605,12 +605,7 @@ export class PullWriter {
             },
         });
 
-        if (resolved.length > 0) {
-            await this.deps.checkpoints.commitPendingApply({ remove: resolved });
-        }
-        if (this.pendingApplyCount >= 0) {
-            this.pendingApplyCount += pendingApplyAdd.length - resolved.length;
-        }
+        await this.deps.pendingApply.resolve(resolved);
     }
 
     /** Probe which accepted file docs reference chunks not yet on disk.
@@ -640,79 +635,6 @@ export class PullWriter {
             if (have.length < doc.chunks.length) out.push({ id: doc._id, reason: "missing-chunks" });
         }
         return out;
-    }
-
-    /**
-     * Drain the pending-apply set. For each id whose
-     * file still exists, re-fetch its chunks and re-apply to the vault; on
-     * success (or a deliberate skip) the id leaves the set, otherwise its
-     * attempt count is bumped and it stays for the next cycle. Called every
-     * pull cycle — including the empty-longpoll branch, since a freshly-
-     * durable chunk does not flow through `_changes` to wake the loop.
-     */
-    async drainPendingApply(): Promise<void> {
-        if (this.pendingApplyCount === 0) return;
-        const rows = await loadAllPendingApply(this.deps.localDb);
-        if (rows.length === 0) { this.pendingApplyCount = 0; return; }
-
-        const remove: string[] = [];
-        const reAdd: Array<{ id: string; reason: PendingApplyReason; attempts: number }> = [];
-        for (const { id, entry } of rows) {
-            const doc = await this.deps.localDb.get<FileDoc>(id);
-            const path = filePathFromId(id);
-
-            if (entry.reason === "pending-deletion") {
-                // Deletion recovery: the durable tombstone must still be a deletion.
-                // If the local doc is gone or superseded by a live (non-deleted)
-                // edit, the deletion is moot — drop it. `doc.deleted` is the
-                // EXPECTED state here, NOT a moot signal. Re-apply the vault
-                // deletion (dbToFile dispatches `applyRemoteDeletion`); no
-                // ensureChunks since a tombstone references none.
-                if (!doc || !isFileDoc(doc) || !doc.deleted) {
-                    remove.push(id);
-                    continue;
-                }
-                try {
-                    const result = await this.deps.applyPullWrite(doc);
-                    remove.push(id);
-                    if (result.applied === true) {
-                        logDebug(`  ← ${path} (pending-deletion recovered)`);
-                    } else {
-                        logDebug(`  ← ${path} (pending-deletion skipped: ${result.reason})`);
-                    }
-                } catch (e: any) {
-                    logDebug(`pending-deletion: ${path} re-apply failed (attempt ${entry.attempts + 1})`);
-                    reAdd.push({ id, reason: "pending-deletion", attempts: entry.attempts + 1 });
-                }
-                continue;
-            }
-
-            // "missing-chunks": the file must still be a live (non-deleted) doc.
-            if (!doc || !isFileDoc(doc) || doc.deleted) {
-                // File no longer present locally (deleted / superseded) —
-                // nothing left to apply.
-                remove.push(id);
-                continue;
-            }
-            try {
-                await this.deps.ensureChunks(doc);
-                const result = await this.deps.applyPullWrite(doc);
-                remove.push(id);
-                if (result.applied === true) {
-                    logDebug(`  ← ${path} (pending-apply recovered)`);
-                    this.deps.events.emit("auto-resolve", { filePath: path });
-                } else {
-                    logDebug(`  ← ${path} (pending-apply skipped: ${result.reason})`);
-                }
-            } catch (e: any) {
-                logDebug(
-                    `pending-apply: ${path} still missing chunks (attempt ${entry.attempts + 1})`,
-                );
-                reAdd.push({ id, reason: "missing-chunks", attempts: entry.attempts + 1 });
-            }
-        }
-        await this.deps.checkpoints.commitPendingApply({ add: reAdd, remove });
-        this.pendingApplyCount = reAdd.length;
     }
 
     // ── Phase 3: dispatch ───────────────────────────────

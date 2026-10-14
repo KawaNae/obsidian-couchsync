@@ -262,7 +262,8 @@ shipped is something every future version has to be able to decode.
 ## Local-only schema versioning
 
 Each local Dexie database (`couchsync-<vault>`,
-`couchsync-<vault>-meta`, the per-config-pool variants,
+`couchsync-<vault>-meta`, one config store per server and config DB
+(`couchsync-<vault>-config-<db>-<hash16>`),
 `couchsync-history-<vault>`, `couchsync-logs-<vault>`) carries a
 `_meta.schemaVersion = 1` row stamped on first open. A future build
 that bumps the local row layout will increment the value and migrate

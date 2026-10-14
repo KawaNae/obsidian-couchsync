@@ -13,6 +13,7 @@ import {
     pullByPrefix,
     listRemoteByPrefix,
     destroyRemote,
+    recreateRemote,
     pushAll,
     pullAll,
 } from "../src/db/remote-couch.ts";
@@ -360,6 +361,40 @@ describe("remote-couch (IDocStore + ICouchClient)", () => {
             await destroyRemote(remote);
             expect(remote._destroyed).toBe(true);
             expect(remote._docs.size).toBe(0);
+        });
+    });
+
+    describe("recreateRemote", () => {
+        it("creates the DB again while CouchDB still releases the deleted one", async () => {
+            remote._docs.set(makeFileId("doomed.md"), { _id: makeFileId("doomed.md") });
+            // The first two PUTs land while the old shards are released:
+            // CouchDB answers 412 (taken for "exists") and the DB is gone.
+            let creates = 0;
+            remote.ensureDb = async () => { creates++; };
+            remote.info = async () => {
+                if (creates < 3) throw Object.assign(new Error("Database does not exist."), { status: 404 });
+                return { db_name: "fake-remote", doc_count: 0, update_seq: 0 };
+            };
+            const waits: number[] = [];
+            await recreateRemote(remote, undefined, async (ms) => { waits.push(ms); });
+            expect(remote._destroyed).toBe(true);
+            expect(remote._docs.size).toBe(0);
+            expect(creates).toBe(3);
+            expect(waits).toEqual([100, 200]);
+        });
+
+        it("gives up with the last answer when the DB never answers", async () => {
+            remote.ensureDb = async () => {};
+            remote.info = async () => { throw Object.assign(new Error("No DB shards could be opened."), { status: 500 }); };
+            await expect(recreateRemote(remote, undefined, async () => {})).rejects.toThrow(/shards/);
+        });
+
+        it("does not retry an answer that is not about the DB settling", async () => {
+            let creates = 0;
+            remote.ensureDb = async () => { creates++; };
+            remote.info = async () => { throw Object.assign(new Error("forbidden"), { status: 403 }); };
+            await expect(recreateRemote(remote, undefined, async () => {})).rejects.toThrow(/forbidden/);
+            expect(creates).toBe(1);
         });
     });
 

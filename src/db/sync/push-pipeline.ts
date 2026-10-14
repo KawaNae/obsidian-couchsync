@@ -639,6 +639,13 @@ export class PushPipeline {
      * thread) and submits via bulkDocs. Returns a per-id result summary
      * so the caller can route conflicts / pushed ids appropriately.
      *
+     * A chunk the remote already holds (alive) is not sent: chunks are
+     * content-addressed, so the remote body is the same content, and a new
+     * revision of it would only advance the remote sequence and wake every
+     * other device's pull. It counts as durable and pushed. This is the
+     * common case after Init or Clone, whose local docs all re-enter the
+     * first live session's push cycle.
+     *
      * Pre-threaded `_rev`s on the input are preserved — `run()` uses this
      * to avoid re-fetching file revs that `classifyFiles()` already pulled.
      *
@@ -666,6 +673,7 @@ export class PushPipeline {
 
         // Fill in _rev for any doc that didn't arrive pre-threaded.
         const needRev = prepared.filter((d) => !d._rev).map((d) => d._id);
+        const onRemote = new Set<string>();
         if (needRev.length > 0) {
             const remoteResult = await this.deps.client.allDocs<CouchSyncDoc>(
                 { keys: needRev },
@@ -680,7 +688,9 @@ export class PushPipeline {
             for (const doc of prepared) {
                 if (doc._rev) continue;
                 const rev = remoteRevMap.get(doc._id);
-                if (rev) doc._rev = rev;
+                if (!rev) continue;
+                if (isChunkDocId(doc._id)) onRemote.add(doc._id);
+                else doc._rev = rev;
             }
         }
 
@@ -698,13 +708,16 @@ export class PushPipeline {
         // Results are zipped back into the original prepared[] order —
         // callers (run, tests) rely on positional alignment between input
         // docs and result rows.
+        const results: BulkDocsResult[] = new Array(prepared.length);
         const chunkPositions: number[] = [];
         const filePositions: number[] = [];
         const chunkItems: DocWithAttachments[] = [];
         const fileDocs: Array<CouchSyncDoc & { _rev?: string }> = [];
         for (let i = 0; i < prepared.length; i++) {
             const doc = prepared[i];
-            if (isChunkDocId(doc._id)) {
+            if (onRemote.has(doc._id)) {
+                results[i] = { id: doc._id, ok: true };
+            } else if (isChunkDocId(doc._id)) {
                 const chunk = doc as unknown as ChunkDoc & { _rev?: string };
                 chunkPositions.push(i);
                 chunkItems.push(buildChunkAttachment(chunk));
@@ -713,8 +726,6 @@ export class PushPipeline {
                 fileDocs.push(doc);
             }
         }
-
-        const results: BulkDocsResult[] = new Array(prepared.length);
 
         // ── Phase 1: chunks ────────────────────────────────────
         // Throwing here (network/abort) propagates and aborts the whole
@@ -809,7 +820,7 @@ export class PushPipeline {
                 if (isFile) {
                     logDebug(`  → ${filePathFromId(doc._id)}`);
                     fileCount++;
-                } else if (isChunk) {
+                } else if (isChunk && !onRemote.has(doc._id)) {
                     chunkCount++;
                 }
                 pushed.push(doc._id);

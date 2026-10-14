@@ -1,5 +1,5 @@
 import "fake-indexeddb/auto";
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { VaultSync } from "../../src/sync/vault-sync.ts";
 import { FilesystemVaultWriter } from "../../src/sync/vault-writer.ts";
 import { LocalDB } from "../../src/db/local-db.ts";
@@ -7,6 +7,7 @@ import { FakeVaultIO } from "../helpers/fake-vault-io.ts";
 import { makeSettings } from "../helpers/settings-factory.ts";
 import { makeFileId } from "../../src/types/doc-id.ts";
 import type { FileDoc } from "../../src/types.ts";
+import { RACY_MTIME_WINDOW_MS } from "../../src/sync/last-synced.ts";
 
 let counter = 0;
 function uniqueDbName() { return `vault-sync-test-${Date.now()}-${counter++}`; }
@@ -151,15 +152,18 @@ describe("VaultSync", () => {
         });
 
         it("overwrites existing file", async () => {
-            vault.addFile("a.md", "v1");
+            // Explicit mtimes: dbToFile trusts the integration baseline's
+            // chunks when mtime and size are unchanged, and "v1"/"v2" have
+            // the same size, so the reset below must carry its own mtime.
+            vault.addFile("a.md", "v1", { mtime: 1000 });
             await vs.fileToDb("a.md");
 
             // Change DB content
-            vault.addFile("a.md", "v2");
+            vault.addFile("a.md", "v2", { mtime: 2000 });
             await vs.fileToDb("a.md");
 
             // Reset vault to v1
-            vault.addFile("a.md", "v1");
+            vault.addFile("a.md", "v1", { mtime: 3000 });
             const doc = await db.get(makeFileId("a.md")) as FileDoc;
 
             await vs.dbToFile(doc);
@@ -373,7 +377,44 @@ describe("VaultSync", () => {
             expect(vs.getLastSynced("c.md")?.mtime).toBeUndefined();
         });
 
-        it("dbToFile stamps the post-write disk mtime", async () => {
+        it("a stamp too recent to trust is not kept: a same-size rewrite with the same mtime is seen", async () => {
+            const t = Date.now();
+            vault.addFile("r.md", "aa", { mtime: t });
+            await vs.fileToDb("r.md");
+            expect(vs.getLastSynced("r.md")?.mtime).toBeUndefined();
+            await vs.loadLastSyncedVclocks();
+            expect(vs.getLastSynced("r.md")?.mtime).toBeUndefined();
+
+            // Rewritten within the mtime resolution: same mtime, same size.
+            vault.addFile("r.md", "bb", { mtime: t });
+            const doc = await db.get(makeFileId("r.md")) as FileDoc;
+            const reads = countReads();
+            const result = await vs.classifyFileVsDoc(doc, "r.md", { mtime: t, size: 2 });
+            expect(reads()).toBe(1);
+            expect(result).not.toBe("identical");
+
+            // The startup drift scan hashes it too and records the rewrite.
+            expect(await vs.stampVaultDrift()).toBe(1);
+            const after = await db.get(makeFileId("r.md")) as FileDoc;
+            expect(after.chunks).not.toEqual(doc.chunks);
+        });
+
+        it("a stamp old enough is kept, and a later check is served from it", async () => {
+            const old = Date.now() - RACY_MTIME_WINDOW_MS - 1;
+            vault.addFile("o.md", "aa", { mtime: old });
+            await vs.fileToDb("o.md");
+            expect(vs.getLastSynced("o.md")?.mtime).toBe(old);
+            await vs.loadLastSyncedVclocks();
+            expect(vs.getLastSynced("o.md")?.mtime).toBe(old);
+
+            const doc = await db.get(makeFileId("o.md")) as FileDoc;
+            const reads = countReads();
+            expect(await vs.classifyFileVsDoc(doc, "o.md", { mtime: old, size: 2 })).toBe("identical");
+            expect(reads()).toBe(0);
+            expect(await vs.stampVaultDrift()).toBe(0);
+        });
+
+        it("dbToFile stamps the post-write disk mtime once it is old enough", async () => {
             const remote: FileDoc = {
                 _id: makeFileId("pulled.md"),
                 type: "file",
@@ -393,7 +434,17 @@ describe("VaultSync", () => {
             const res = await vs.dbToFile(pulled);
             expect(res.applied).toBe(true);
 
+            // Just written: too recent to stamp.
             const stat = (await vault.stat("pulled.md"))!;
+            expect(vs.getLastSynced("pulled.md")!.mtime).toBeUndefined();
+
+            // A later reconcile align stamps the disk mtime (never the sender's).
+            const now = vi.spyOn(Date, "now").mockReturnValue(stat.mtime + RACY_MTIME_WINDOW_MS);
+            try {
+                expect(await vs.alignLastSyncedToDoc("pulled.md", pulled, stat)).toBe("stamped-mtime");
+            } finally {
+                now.mockRestore();
+            }
             const ls = vs.getLastSynced("pulled.md")!;
             expect(ls.mtime).toBe(stat.mtime);
             expect(ls.mtime).not.toBe(123);

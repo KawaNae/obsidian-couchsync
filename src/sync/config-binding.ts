@@ -56,6 +56,7 @@ import {
 } from "./config-errors.ts";
 import {
     fetchConfigMeta,
+    metaFingerprint,
     unlockConfigMeta,
     type ConfigMetaDoc,
 } from "../db/vault-meta.ts";
@@ -63,7 +64,6 @@ import { classifyError } from "../db/sync/errors.ts";
 import {
     CONFIG_ATTACHMENT_KEY,
     configBindingKey,
-    configMetaFingerprint,
     configStoreName,
     describeCodec,
     metaCodec,
@@ -405,7 +405,7 @@ export class ConfigBinding {
         if (att.codec.encryption && !meta.encryption.enabled) {
             throw configNotReady("encryption-removed", this.ctx());
         }
-        const metaFp = await configMetaFingerprint(meta);
+        const metaFp = await metaFingerprint(meta);
         if (att.metaFingerprint !== metaFp) {
             throw configNotReady("root-changed", this.ctx());
         }
@@ -523,7 +523,7 @@ export class ConfigBinding {
         if (meta.schemaVersion !== 2) {
             throw configNotReady("legacy-meta", this.ctx({ schemaVersion: meta.schemaVersion }));
         }
-        const metaFp = await configMetaFingerprint(meta);
+        const metaFp = await metaFingerprint(meta);
         const codec = metaCodec(meta);
 
         // 2. Weaker than trusted?
@@ -668,7 +668,7 @@ export class ConfigBinding {
         crypto: CryptoProvider | null,
         passphrase: string,
     ): Promise<void> {
-        const metaFp = await configMetaFingerprint(meta);
+        const metaFp = await metaFingerprint(meta);
         await this.putEntry({
             ...(meta.encryption.enabled
                 ? { cipherFloor: meta.encryption.cipherVersion, passphrase } : {}),

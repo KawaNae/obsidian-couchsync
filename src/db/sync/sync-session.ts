@@ -26,10 +26,12 @@ import { EchoTracker } from "./echo-tracker.ts";
 import type { SyncEvents } from "./sync-events.ts";
 import type { Checkpoints } from "./checkpoints.ts";
 import { PullWriter } from "./pull-writer.ts";
+import type { PendingApply } from "./pending-apply.ts";
 import { PullPipeline } from "./pull-pipeline.ts";
 import { PushPipeline } from "./push-pipeline.ts";
 import { logDebug, logError } from "../../ui/log.ts";
 import { ALWAYS_VISIBLE, type VisibilityGate } from "../visibility-gate.ts";
+import type { VaultMetaDoc } from "../vault-meta.ts";
 
 export interface SyncSessionDeps {
     /** Monotonic identifier supplied by SyncEngine. Shows up in pipeline
@@ -41,6 +43,8 @@ export interface SyncSessionDeps {
     checkpoints: Checkpoints;
     getConflictResolver: () => ConflictResolver | undefined;
     ensureChunks: (doc: FileDoc) => Promise<void>;
+    /** The engine's record of docs not yet reflected in the vault. */
+    pendingApply: PendingApply;
     /** Apply a pulled FileDoc to the vault. Called from PullWriter.commit
      *  inside its commit closure. Returns `WriteResult` so PullWriter can
      *  account skips separately and emit `pull-skipped` for the supervisor
@@ -51,6 +55,9 @@ export interface SyncSessionDeps {
     /** Invoked from pipelines when a transient upstream error (auth /
      *  5xx) occurs. The supervisor (SyncEngine) decides escalation. */
     onTransientError: (err: unknown) => void;
+    /** Re-check that the remote DB is still the one this device set up
+     *  against (`RemoteAgreement.recheckRoot`). Throws only the pause. */
+    recheckRoot?: (observed?: VaultMetaDoc | null) => Promise<void>;
     /** Optional: gate that pauses live loops while the page is hidden.
      *  Defaults to ALWAYS_VISIBLE for tests / non-browser hosts. */
     visibility?: VisibilityGate;
@@ -94,6 +101,7 @@ export class SyncSession {
             checkpoints: deps.checkpoints,
             getConflictResolver: deps.getConflictResolver,
             ensureChunks: deps.ensureChunks,
+            pendingApply: deps.pendingApply,
             // Re-fetch a remote FileDoc (codec-decoded, _rev stripped) for the
             // local-delete-vs-remote-edit conflict re-presentation. This
             // session already owns the client, so no new engine-level dep.
@@ -110,6 +118,7 @@ export class SyncSession {
         this.pullPipeline = new PullPipeline({
             client: deps.client,
             pullWriter: this.pullWriter,
+            pendingApply: deps.pendingApply,
             checkpoints: deps.checkpoints,
             events: deps.events,
             sessionEpoch: deps.epoch,
@@ -118,6 +127,7 @@ export class SyncSession {
             signal: this.signal,
             handleLocalDbError: deps.handleLocalDbError,
             onTransientError: deps.onTransientError,
+            recheckRoot: deps.recheckRoot ?? (async () => {}),
             delay,
         });
         this.pushPipeline = new PushPipeline({

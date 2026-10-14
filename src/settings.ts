@@ -37,6 +37,25 @@ export interface VaultPauseRecord {
     against: string;
 }
 
+/**
+ * The incarnation of the vault DB this device was set up against: the
+ * `metaFingerprint` of the `vault:meta` its last Init wrote or its last
+ * Clone read. Another device's Init re-creates the DB with a new
+ * `vault:meta`; the agreement check compares the server's meta against
+ * this record and pauses on a difference, so this device stops syncing
+ * with a DB it never cloned.
+ *
+ * Absent: set up before the record existed. The first agreement check that
+ * passes adopts the server's meta, so an existing setup moves over without
+ * any action.
+ */
+export interface VaultRootRecord {
+    /** `metaFingerprint`, or null when the DB had no `vault:meta`. */
+    fingerprint: string | null;
+    /** `vaultTarget` of the vault DB the record is about. */
+    against: string;
+}
+
 export interface MobileStatusPosition {
     align: "left" | "right";
     bottom: number;
@@ -175,6 +194,7 @@ export interface CouchSyncSettings {
     serverTested: boolean;
     connectionState: ConnectionState;
     vaultPause?: VaultPauseRecord;
+    vaultRoot?: VaultRootRecord;
     /** Human-readable device name used as the vclock key (e.g. "desktop", "iphone"). */
     deviceId: string;
     /** Old deviceIds this device has used (UUIDs from pre-v0.12, renamed names).

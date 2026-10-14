@@ -30,7 +30,7 @@ const __noopEvt = () => {};
 };
 
 import { LocalDB } from "../../src/db/local-db.ts";
-import { SyncEngine } from "../../src/db/sync-engine.ts";
+import { SyncEngine, type RemoteAgreement } from "../../src/db/sync-engine.ts";
 import { AuthGate } from "../../src/db/sync/auth-gate.ts";
 import { VaultSync } from "../../src/sync/vault-sync.ts";
 import { ChangeTracker } from "../../src/sync/change-tracker.ts";
@@ -157,16 +157,17 @@ export interface E2EDeviceHarness {
      * `VaultBinding.init`: build vault:meta (deriving the key when
      * encryption is on), wipe + push the whole local vault through the real
      * codec stack, then publish the meta. Leaves the device live-syncable.
+     * Resolves with the summary the notice shows.
      */
-    runInit(opts: { encryption: boolean; passphrase?: string; compression: boolean }): Promise<void>;
+    runInit(opts: { encryption: boolean; passphrase?: string; compression: boolean }): Promise<string>;
     /**
      * Clone this device from the remote through the production
      * `VaultBinding.clone`: fetch vault:meta, unlock the key with the
      * passphrase, pull everything and write the vault. A wrong or missing
      * passphrase for an encrypted remote ends as a cancelled prompt — the
-     * harness answers no prompt.
+     * harness answers no prompt. Resolves with the summary the notice shows.
      */
-    runClone(opts?: { passphrase?: string }): Promise<void>;
+    runClone(opts?: { passphrase?: string }): Promise<string>;
     destroy(): Promise<void>;
 }
 
@@ -276,6 +277,7 @@ export async function createE2EHarness(opts: CreateE2EHarnessOpts = {}): Promise
         // (`seeded`), standing in for a device that is already set up; the
         // first runInit / runClone hands the codec over to the binding.
         let setupService!: SetupService;
+        let summary = "";
         const binding = new VaultBinding({
             getSettings,
             saveSettings: async () => {},
@@ -285,7 +287,7 @@ export async function createE2EHarness(opts: CreateE2EHarnessOpts = {}): Promise
             stopLive: () => { engine.stop(); ct.stop(); },
             startLive: async () => {},
             checkDatabase: (db) => remoteOps.checkDatabaseWith(cfg.couchUrl, cfg.user, cfg.password, db),
-            openProgress: () => ({ update: () => {}, done: () => {}, fail: () => {} }),
+            openProgress: () => ({ update: () => {}, done: (s) => { summary = s; }, fail: () => {} }),
             askPassphrase: async (reason) => {
                 throw new Error(`the harness answers no passphrase prompt (${reason} passphrase)`);
             },
@@ -309,6 +311,14 @@ export async function createE2EHarness(opts: CreateE2EHarnessOpts = {}): Promise
         const ct = new ChangeTracker(vaultEvents, vs, getSettings);
         const remoteOps = new VaultRemoteOps(db, getSettings, auth, wrapVaultClient, hasher);
 
+        // The live session's agreement check, as production wires it. A codec
+        // harness device holds a shared key the binding knows nothing about
+        // (no vault:meta on the remote), so it is checked only once a
+        // runInit / runClone handed the codec over to the binding.
+        const agreement: RemoteAgreement = {
+            check: async (signal) => { if (!seeded) await binding.checkAgreement(signal); },
+            recheckRoot: async (observed) => { if (!seeded) await binding.recheckRoot(observed); },
+        };
         const engine = new SyncEngine(
             db,
             getSettings,
@@ -317,19 +327,21 @@ export async function createE2EHarness(opts: CreateE2EHarnessOpts = {}): Promise
             /* isMobile */ false,
             auth,
             clientFactory,
+            agreement,
         );
         engine.setChunkHasher(hasher);
 
-        // Reconciler wired to the real engine's ensureFileChunks so e2e tests
-        // can exercise the onload/manual reconcile path (broken-chunk
-        // quarantine, restore) against real CouchDB.
+        // Reconciler wired to the real engine's PendingApply (chunk fetch
+        // through the live session) so e2e tests can exercise the
+        // onload/manual reconcile path (broken-chunk quarantine, restore)
+        // against real CouchDB.
         const reconciler = new Reconciler(
             vault,
             db,
             vs,
             getSettings,
             () => {},
-            (doc) => engine.ensureFileChunks(doc),
+            engine.pendingApply,
         );
 
         const resolver = new ConflictResolver();
@@ -339,7 +351,7 @@ export async function createE2EHarness(opts: CreateE2EHarnessOpts = {}): Promise
         // scan/pull → push/write → reconcile), through the real codec stack.
         setupService = new SetupService(vault, db, remoteOps, vs, reconciler);
 
-        async function runInit(o: { encryption: boolean; passphrase?: string; compression: boolean }): Promise<void> {
+        async function runInit(o: { encryption: boolean; passphrase?: string; compression: boolean }): Promise<string> {
             seeded = undefined;
             settingsRef.current.encryptionEnabled = o.encryption;
             settingsRef.current.compressionEnabled = o.compression;
@@ -347,14 +359,16 @@ export async function createE2EHarness(opts: CreateE2EHarnessOpts = {}): Promise
             settingsRef.current.connectionState = "tested";
             await binding.init();
             settingsRef.current.connectionState = "syncing";
+            return summary;
         }
 
-        async function runClone(o: { passphrase?: string } = {}): Promise<void> {
+        async function runClone(o: { passphrase?: string } = {}): Promise<string> {
             seeded = undefined;
             settingsRef.current.encryptionPassphrase = o.passphrase ?? "";
             settingsRef.current.connectionState = "tested";
             await binding.clone();
             settingsRef.current.connectionState = "syncing";
+            return summary;
         }
 
         const device: E2EDeviceHarness = {

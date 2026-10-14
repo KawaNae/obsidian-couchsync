@@ -9,6 +9,14 @@
  *     errors with exponential backoff, routes hard errors through the
  *     shared ErrorRecovery, and exits cleanly on `isCancelled()`.
  *
+ * Before applying a batch, the pipeline asks the vault setup to re-check
+ * that the remote DB is still the one this device set up against
+ * (`recheckRoot`) when the batch carries a sign that it was re-created by
+ * another device's Init: a change of `vault:meta` (Init writes a new one
+ * right after re-creating the DB, so the longpoll wakes on it), a body that
+ * does not decrypt (the new DB's key), or a sequence that went backwards.
+ * A re-created DB pauses the session before anything of it is applied.
+ *
  * The pipeline is stateless w.r.t. durable data: it delegates all doc
  * writes to `PullWriter` / `Checkpoints` (which together own the atomic
  * runWriteTx boundary) and reads the feed cursor from Checkpoints. The
@@ -21,6 +29,7 @@ import type { ICouchClient, ChangesResult } from "../interfaces.ts";
 import { DbError } from "../write-transaction.ts";
 import { logDebug, logInfo } from "../../ui/log.ts";
 import type { PullWriter } from "./pull-writer.ts";
+import type { PendingApply } from "./pending-apply.ts";
 import type { SyncEvents } from "./sync-events.ts";
 import type { Checkpoints } from "./checkpoints.ts";
 import { classifyError } from "./errors.ts";
@@ -28,6 +37,7 @@ import { classifyError } from "./errors.ts";
 // not compile-depend on the EncryptingCouchClient decorator.
 import { EncryptionError } from "../codec-errors.ts";
 import type { VisibilityGate } from "../visibility-gate.ts";
+import { VAULT_META_DOC_ID, type VaultMetaDoc } from "../vault-meta.ts";
 
 function seqNumeric(seq: number | string): number {
     if (typeof seq === "number") return seq;
@@ -47,6 +57,8 @@ const PULL_RETRY_MAX_MS = 30_000;
 export interface PullPipelineDeps {
     client: ICouchClient;
     pullWriter: PullWriter;
+    /** Retried every cycle: docs committed but not yet in the vault. */
+    pendingApply: PendingApply;
     checkpoints: Checkpoints;
     events: SyncEvents;
     /** Session epoch, used as `[sess#N]` prefix on diagnostic logs so
@@ -67,6 +79,11 @@ export interface PullPipelineDeps {
      *  decides whether to escalate to hard error or keep the pipeline
      *  alive with backoff. */
     onTransientError: (err: unknown) => void;
+    /** Re-check that the remote DB is still the one this device set up
+     *  against. `observed`: the pulled `vault:meta` (null: the change
+     *  deleted it); omitted: read it from the server. Throws only the
+     *  terminal pause (`encryption-paused`). */
+    recheckRoot: (observed?: VaultMetaDoc | null) => Promise<void>;
     delay: (ms: number) => Promise<void>;
 }
 
@@ -109,7 +126,11 @@ export class PullPipeline {
                     // timeout halt catchup if it never clears, instead of
                     // tearing the whole session down. A non-retriable
                     // EncryptionError (downgrade gate) falls through to throw →
-                    // classifyError → schema-mismatch → terminal.
+                    // classifyError → schema-mismatch → terminal. A body
+                    // sealed under another key is also what a DB re-created
+                    // by another device's Init looks like.
+                    const paused = await this.rootPause();
+                    if (paused) throw paused;
                     await this.deps.delay(this.retryMs);
                     this.retryMs = Math.min(this.retryMs * 2, PULL_RETRY_MAX_MS);
                     continue;
@@ -120,8 +141,12 @@ export class PullPipeline {
             if (this.deps.isCancelled()) return;
 
             if (result.results.length > 0) {
+                const paused = await this.batchRootPause(result);
+                if (paused) throw paused;
                 const storedSeq = this.deps.checkpoints.getRemoteSeq();
                 if (seqNumeric(result.last_seq) < seqNumeric(storedSeq)) {
+                    const recreated = await this.rootPause();
+                    if (recreated) throw recreated;
                     throw new Error("Remote database was recreated (seq regression)");
                 }
                 lastProgressAt = Date.now();
@@ -141,7 +166,7 @@ export class PullPipeline {
                 }
                 // One drain at catchup end: chunks for files pulled earlier
                 // in this catchup may now all be durable.
-                await this.deps.pullWriter.drainPendingApply();
+                await this.deps.pendingApply.drain();
                 // And re-present any deletion conflicts parked by a prior
                 // session — this is the load-bearing restart recovery: it runs
                 // even when catchup found no new changes.
@@ -177,6 +202,15 @@ export class PullPipeline {
                     if (this.deps.isCancelled()) return;
 
                     if (result.results.length > 0) {
+                        const paused = await this.batchRootPause(result)
+                            ?? (seqNumeric(result.last_seq) < seqNumeric(this.deps.checkpoints.getRemoteSeq())
+                                ? await this.rootPause()
+                                : null);
+                        if (paused) {
+                            this.deps.onTransientError(paused);
+                            exitReason = "halted";
+                            return;
+                        }
                         const storedSeq = this.deps.checkpoints.getRemoteSeq();
                         if (seqNumeric(result.last_seq) < seqNumeric(storedSeq)) {
                             this.deps.onTransientError(
@@ -201,7 +235,7 @@ export class PullPipeline {
                         // chunk landing never wakes this loop on its own
                         // (chunks don't flow through _changes). Cheap no-op
                         // when the set is empty.
-                        await this.deps.pullWriter.drainPendingApply();
+                        await this.deps.pendingApply.drain();
                         await this.deps.pullWriter.drainPendingConflict();
                     }
                 } catch (e: any) {
@@ -244,7 +278,14 @@ export class PullPipeline {
                             return;
                         }
                         // Retriable decrypt failure (key not yet distributed,
-                        // partial write) — transient, keep the loop alive.
+                        // partial write) — transient, keep the loop alive —
+                        // unless the remote DB was re-created under a new key.
+                        const paused = await this.rootPause();
+                        if (paused) {
+                            this.deps.onTransientError(paused);
+                            exitReason = "halted";
+                            return;
+                        }
                         this.deps.onTransientError(e);
                         await this.deps.delay(this.retryMs);
                         this.retryMs = Math.min(this.retryMs * 2, PULL_RETRY_MAX_MS);
@@ -278,6 +319,30 @@ export class PullPipeline {
 
     // ── Internal ────────────────────────────────────────
 
+    /** The pause when `result` changes `vault:meta` and the DB it now
+     *  describes is not the one this device set up against; null otherwise
+     *  (a batch that does not touch the meta is not re-checked). */
+    private async batchRootPause(result: ChangesResult<CouchSyncDoc>): Promise<unknown | null> {
+        const row = result.results.find((r) => r.id === VAULT_META_DOC_ID);
+        if (!row) return null;
+        if (row.deleted) return this.rootPause(null);
+        // Without the doc (never with include_docs), read it from the server.
+        return this.rootPause(row.doc as unknown as VaultMetaDoc | undefined);
+    }
+
+    /** `recheckRoot`, with its pause returned instead of thrown (null: the
+     *  DB is the one this device set up against, or it cannot be told now). */
+    private async rootPause(observed?: VaultMetaDoc | null): Promise<unknown | null> {
+        try {
+            await this.deps.recheckRoot(observed);
+            return null;
+        } catch (e) {
+            if (classifyError(e).kind === "encryption-paused") return e;
+            logDebug(`[sess#${this.deps.sessionEpoch}] root re-check failed: ${classifyError(e).message}`);
+            return null;
+        }
+    }
+
     private async applyBatch(result: ChangesResult<CouchSyncDoc>): Promise<void> {
         const applied = await this.deps.pullWriter.apply(result);
         // When the batch had no accepted docs, PullWriter didn't run a
@@ -296,7 +361,7 @@ export class PullPipeline {
         }
         // Pull durability: retry any files checkpointed-past without a vault
         // write (chunks landed late). Short-circuits when the set is empty.
-        await this.deps.pullWriter.drainPendingApply();
+        await this.deps.pendingApply.drain();
         // Same for the deletion-conflict class: re-present any persisted
         // remote-deletion-vs-local-edit conflicts not yet shown this session
         // (e.g. parked by a prior session before a restart).
