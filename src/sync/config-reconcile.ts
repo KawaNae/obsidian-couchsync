@@ -456,7 +456,7 @@ export async function planOverwrite(
     return { entries, deletes, unavailable };
 }
 
-/** The shared value at one position, as the config DB has it now. */
+/** The shared value at one position, as the config DB has it. */
 export type SharedAtPointer =
     | { kind: "value"; value: JsonValue }
     /** The shared version has the file but not the key (for
@@ -466,15 +466,25 @@ export type SharedAtPointer =
     | { kind: "member" }
     /** The shared state has no such file. */
     | { kind: "no-file" }
-    /** The content is not here yet (chunks missing) or is not JSON. */
+    /** The content is not available (chunks missing) or is not JSON. */
     | { kind: "unknown" };
 
-/** The shared value of `pointer` in `path` from the config DB, without
- *  fetching anything: what is known before a Pull takes in the server. */
-export async function readSharedAt(store: ConfigLocalDB, path: string, pointer: string): Promise<SharedAtPointer> {
+/** The shared value of `pointer` in `path` from the config DB, reading
+ *  the content as `planPull` does: chunks the store lacks are fetched with
+ *  `fetchChunks` when given. */
+export async function readSharedAt(
+    store: ConfigLocalDB,
+    path: string,
+    pointer: string,
+    fetchChunks?: (doc: ConfigDoc) => Promise<void>,
+): Promise<SharedAtPointer> {
     const doc = await store.get(makeConfigId(path));
     if (!doc || doc.deleted) return { kind: "no-file" };
-    const bytes = await readChunks(store, doc.chunks);
+    let bytes = await readChunks(store, doc.chunks);
+    if (!bytes && fetchChunks) {
+        await fetchChunks(doc);
+        bytes = await readChunks(store, doc.chunks);
+    }
     const parsed = bytes ? parseJsonBytes(bytes) : null;
     if (!parsed) return { kind: "unknown" };
     if (path === SET_FILE) {

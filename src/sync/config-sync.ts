@@ -860,9 +860,9 @@ export class ConfigSync {
      * Share again: the key `pointer` of `path`, kept on this device
      * (`deviceOnlyKeys`), takes the shared value and is shared from now on.
      *
-     * A confirmation shows the shared value the config DB has before
-     * anything is taken in; Cancel changes nothing and the key stays kept.
-     * Then it is Pull & Reload, with that one key taken from the shared
+     * It is Pull & Reload: after the copy, a confirmation shows the shared
+     * value the Pull is about to write; Cancel leaves the disk, the bases
+     * and the declaration as they were. That one key is taken from the shared
      * version (removed where the shared version has none) instead of kept
      * as a change of this device. Every other key and file is pulled as
      * usual. The declaration is dropped once the file holds the shared
@@ -876,16 +876,6 @@ export class ConfigSync {
     private async pullAndReload(take: { path: string; pointer: string } | null): Promise<number> {
         const outcome = await this.runOperation("pull", async (ctx, progress, binding, keys) => {
             await binding.ensureCheckpointsLoaded();
-            if (take) {
-                progress.update("Confirm the shared value to take...");
-                const go = await this.modal.showConfigShareAgainModal({
-                    path: take.path,
-                    pointer: take.pointer,
-                    shared: await readSharedAt(binding.store, take.path, take.pointer),
-                    hideValue: hidesValues(take.path),
-                });
-                if (!go) throw abortError("Nothing was changed.");
-            }
             const writer = this.makePullWriter(binding, ctx, keys!);
             const deps = await this.prepare(binding, ctx, keys!, writer);
 
@@ -894,6 +884,20 @@ export class ConfigSync {
             // migration (Create, then Join on the other devices); it reaches
             // progress.fail as is.
             const received = await writer.run((msg) => progress.update(msg));
+
+            // Confirmed after the copy, so the value shown is the one the
+            // plan writes. The copy writes only the config DB: Cancel leaves
+            // the disk, the bases and the declaration as they were.
+            if (take) {
+                progress.update("Confirm the shared value to take...");
+                const go = await this.modal.showConfigShareAgainModal({
+                    path: take.path,
+                    pointer: take.pointer,
+                    shared: await readSharedAt(binding.store, take.path, take.pointer, deps.fetchChunks),
+                    hideValue: hidesValues(take.path),
+                });
+                if (!go) throw abortError("Nothing was changed.");
+            }
 
             const plan = await planPull(
                 take ? { ...deps, takeShared: (p) => (p === take.path ? [take.pointer] : []) } : deps,

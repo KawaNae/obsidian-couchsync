@@ -600,10 +600,10 @@ describe("config three-way merge across devices", () => {
             b.modal.shareAgainResponses.push(true);
             expect(await b.cs.shareAgain(APP, "/mine")).toBe(1);
 
-            // The confirmation shows what the config DB had before the Pull;
-            // the Pull then writes the newest shared value.
+            // The confirmation comes after the copy: it shows the newest
+            // shared value, the one the Pull writes.
             expect(b.modal.shareAgainCalls).toEqual([
-                { path: APP, pointer: "/mine", shared: { kind: "value", value: 0 }, hideValue: false },
+                { path: APP, pointer: "/mine", shared: { kind: "value", value: 2 }, hideValue: false },
             ]);
             expect(json(b)).toEqual({ k: 5, mine: 2 });
             expect(b.settings.configSyncPolicy.deviceOnlyKeys).toEqual({});
@@ -699,6 +699,21 @@ describe("config three-way merge across devices", () => {
             expect((await b.vault.list(BACKUPS)).folders).toHaveLength(generations);
             expect(b.reloads).toBe(reloads);
             expect(warnings()).toContain("Config Share again cancelled — Nothing was changed.");
+        });
+
+        it("a copy that fails shows no confirmation and changes nothing", async () => {
+            const { b } = await keptPair();
+            const reloads = b.reloads;
+            shown.length = 0;
+            vi.spyOn(remote, "changes").mockRejectedValue(new TypeError("Failed to fetch"));
+
+            await expect(b.cs.shareAgain(APP, "/mine")).rejects.toThrow();
+
+            expect(b.modal.shareAgainCalls).toHaveLength(0);
+            expect(json(b)).toEqual({ k: 0, mine: 1 });
+            expect(b.settings.configSyncPolicy.deviceOnlyKeys).toEqual({ [APP]: ["/mine"] });
+            expect(b.reloads).toBe(reloads);
+            expect(shown.filter((t) => t.startsWith("CouchSync: Config Share again"))).toHaveLength(1);
         });
 
         it("drops the declaration without a reload when the disk already has the shared value", async () => {

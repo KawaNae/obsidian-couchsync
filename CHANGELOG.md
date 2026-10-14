@@ -278,7 +278,8 @@ All notable changes to obsidian-couchsync.
   are not synced. A key is shared again in one of two ways. Checking it in
   a later Push list sends this device's value. "Share again" under "Kept on
   this device" in the Config Sync tab takes the shared value instead: it
-  shows the shared value, then runs Pull & Reload, which writes that value
+  runs Pull & Reload, shows the shared value once the server is taken in,
+  and on confirmation writes that value
   for the key (removes the key, or disables the plugin, where the shared
   config has none) while every other key and file is pulled as usual. When
   the disk already has the shared value, it only stops keeping the key and

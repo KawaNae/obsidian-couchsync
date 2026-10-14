@@ -72,7 +72,7 @@ export interface ConfigShareAgainPreview {
     path: string;
     /** JSON Pointer of the key (`/<plugin id>` in community-plugins.json). */
     pointer: string;
-    /** The shared value as the config DB has it before the Pull. */
+    /** The shared value the Pull writes (read after its copy). */
     shared: SharedAtPointer;
     /** The value comes from a plugin's data.json: shown only on request. */
     hideValue: boolean;

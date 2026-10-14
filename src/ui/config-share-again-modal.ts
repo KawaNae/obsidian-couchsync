@@ -5,9 +5,9 @@ import type { ConfigShareAgainPreview } from "../types/modal-presenter.ts";
 
 /**
  * Confirmation of Share again: the key kept on this device takes the
- * shared value through a Pull & Reload. Shows the key, its shared value as
- * known before the Pull, and that Obsidian reloads. Closing the dialog
- * changes nothing.
+ * shared value through a Pull & Reload. Shows the key, the shared value
+ * the Pull writes, and that Obsidian reloads. Closing the dialog leaves
+ * the disk and the key's declaration as they were.
  */
 export class ConfigShareAgainModal extends ConfirmationModal {
     constructor(app: App, private preview: ConfigShareAgainPreview) {
@@ -56,7 +56,7 @@ export class ConfigShareAgainModal extends ConfirmationModal {
                 ? "not enabled (the plugin is disabled here)"
                 : "(none; the key is removed here)";
             case "no-file": return "(the shared config has no such file; nothing is written to it)";
-            case "unknown": return "(not known before the Pull; the Pull reads it)";
+            case "unknown": return "(cannot be read as a JSON key; see log)";
         }
     }
 }
