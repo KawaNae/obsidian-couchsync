@@ -176,6 +176,14 @@ export class ConfigSyncTab {
         return this.deps.configSync.bindingChangeBlocker() === null;
     }
 
+    /** No operation outside config sync keeps `op` from starting: a vault
+     *  Init or Clone keeps out Pull (it reloads Obsidian) and a reload about
+     *  to happen keeps out Create and Join (`ConfigSync.reloadConflict`). The
+     *  settings tab redraws when this changes (`ReloadGuard.onChange`). */
+    private reloadFree(op: "pull" | "create" | "join"): boolean {
+        return this.deps.configSync.reloadConflict(op) === null;
+    }
+
     private applyDescText(): string {
         const blocked = this.deps.configSync.bindingChangeBlocker();
         if (blocked) return blocked;
@@ -377,7 +385,7 @@ export class ConfigSyncTab {
             )
             .addButton((btn) =>
                 btn.setButtonText("Create").setWarning()
-                    .setDisabled(!canRun)
+                    .setDisabled(!canRun || !this.reloadFree("create"))
                     .onClick(async () => this.handleCreate(btn))
             );
 
@@ -390,7 +398,7 @@ export class ConfigSyncTab {
             )
             .addButton((btn) =>
                 btn.setButtonText("Join")
-                    .setDisabled(!canRun)
+                    .setDisabled(!canRun || !this.reloadFree("join"))
                     .onClick(async () => {
                         btn.setButtonText("Joining...");
                         btn.setDisabled(true);
@@ -457,7 +465,7 @@ export class ConfigSyncTab {
             )
             .addButton((btn) =>
                 btn.setButtonText("Pull & Reload ↓")
-                    .setDisabled(!canRun)
+                    .setDisabled(!canRun || !this.reloadFree("pull"))
                     .onClick(async () => {
                         btn.setButtonText("Pulling...");
                         btn.setDisabled(true);
@@ -486,7 +494,7 @@ export class ConfigSyncTab {
             .addButton((btn) =>
                 btn.setButtonText("Overwrite ↓")
                     .setWarning()
-                    .setDisabled(!canRun)
+                    .setDisabled(!canRun || !this.reloadFree("pull"))
                     .onClick(async () => {
                         btn.setButtonText("Overwriting...");
                         btn.setDisabled(true);
@@ -634,7 +642,7 @@ export class ConfigSyncTab {
                     text: `${path.replace(/^\.obsidian\//, "")}  ${pointer === "" ? "(whole value)" : pointer}`,
                 });
                 const btn = row.createEl("button", { text: "Share again" });
-                btn.disabled = !configEnabled || !this.idle();
+                btn.disabled = !configEnabled || !this.idle() || !this.reloadFree("pull");
                 btn.addEventListener("click", async () => {
                     btn.disabled = true;
                     try {

@@ -87,6 +87,9 @@ export class VaultSyncTab {
             setupGating(state, settings.serverTested);
         const relation = this.deps.vault.relation();
         const idle = relation.busy === null;
+        // A config Pull reloads Obsidian when it writes files, which would
+        // stop an Init or Clone half-way.
+        const reloadFree = this.deps.vault.reloadConflict() === null;
 
         this.pencils.clear();
         this.applyBtn = null;
@@ -166,7 +169,7 @@ export class VaultSyncTab {
             .addButton((btn) =>
                 btn
                     .setButtonText("Init")
-                    .setDisabled(!initEnabled || !idle)
+                    .setDisabled(!initEnabled || !idle || !reloadFree)
                     .onClick(async () => {
                         btn.setButtonText("Pushing...");
                         btn.setDisabled(true);
@@ -182,7 +185,7 @@ export class VaultSyncTab {
             .addButton((btn) =>
                 btn
                     .setButtonText("Clone")
-                    .setDisabled(!cloneEnabled || !idle)
+                    .setDisabled(!cloneEnabled || !idle || !reloadFree)
                     .onClick(async () => {
                         btn.setButtonText("Pulling...");
                         btn.setDisabled(true);

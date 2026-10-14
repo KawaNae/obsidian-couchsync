@@ -223,6 +223,15 @@ All notable changes to obsidian-couchsync.
 - **Clearing the config passphrase is no longer a codec change.** It used to
   be reported as a codec change that recommended Create; it is now reported
   as a missing passphrase.
+- **A config Pull no longer stops a vault Init or Clone half-way.** A Pull
+  that writes files reloads Obsidian, which stopped an Init or Clone running
+  at the time: an Init left the server's vault database sent only in part,
+  and every other device stopped on it. Pull & Reload, Pull & Overwrite and
+  Share again are now refused while an Init or Clone runs, and Init and
+  Clone while one of them runs; the notice says which one to wait for, and
+  the buttons are disabled until it ends. After a Pull that reloads, Init,
+  Clone, Config Create and Join stay refused until Obsidian has restarted. Push
+  and Join still run beside an Init or Clone.
 
 ### Changed
 

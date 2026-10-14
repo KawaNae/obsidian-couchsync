@@ -58,6 +58,7 @@ import { classifyError } from "../db/sync/errors.ts";
 import { describeError, rawErrorMessage, UserFacingError } from "../ui/describe-error.ts";
 import { logWarn } from "../ui/log.ts";
 import { OutcomeLedger, type OpOutcome } from "./op-outcome.ts";
+import { ReloadGuard } from "./reload-guard.ts";
 import type { SetupResult } from "./setup.ts";
 import { describeDbFound, type DbCheckResult } from "../db/sync/vault-remote-ops.ts";
 import type { VaultSetupPlan } from "./vault-setup-confirm.ts";
@@ -111,6 +112,12 @@ export interface VaultBindingHost {
     /** Ask the user to confirm the destructive half of Init or Clone, as
      *  `plan` describes it. Resolves false when the user declined. */
     confirmSetup(plan: VaultSetupPlan): Promise<boolean>;
+    /** The plugin-wide guard that keeps a reload away from the operations
+     *  it would break; config sync enters the same one. Init and Clone
+     *  enter it as `uninterruptible`: stopped half-way, they leave a vault
+     *  DB sent in part or an emptied local DB. Omitted → a guard of its
+     *  own. */
+    reloadGuard?: ReloadGuard;
 }
 
 /** The user's operations on the vault setup. */
@@ -186,6 +193,7 @@ export class VaultBinding {
     /** What each vault DB was found to hold, keyed by `vaultTarget`. */
     private readonly dbChecks = new Map<string, VaultDbCheck>();
     private readonly listeners = new Set<() => void>();
+    private readonly reloadGuard: ReloadGuard;
 
     /** The vault chunk hasher: HMAC under the key when the vault is
      *  encrypted and unlocked, xxhash64 otherwise. Reads the key on every
@@ -193,6 +201,7 @@ export class VaultBinding {
     readonly chunkHasher: ChunkHasher;
 
     constructor(private readonly host: VaultBindingHost) {
+        this.reloadGuard = host.reloadGuard ?? new ReloadGuard();
         const binding = this;
         this.chunkHasher = {
             get alg(): ChunkHashAlg {
@@ -312,6 +321,14 @@ export class VaultBinding {
         return this.inflight
             ? `${OP_LABELS[this.inflight]} is running — wait for it to finish.`
             : null;
+    }
+
+    /** Why Init and Clone cannot start now because of an operation outside
+     *  the vault setup (a config Pull, or the reload after it), or null.
+     *  The run is refused with this text; the tab disables the buttons.
+     *  Redraw on the guard's `onChange`. */
+    reloadConflict(): string | null {
+        return this.reloadGuard.blocker("uninterruptible");
     }
 
     private assertIdle(): void {
@@ -449,7 +466,8 @@ export class VaultBinding {
     /**
      * Run Init or Clone. The notice is opened first, so no failure goes
      * unreported. A second run while one is in flight is refused; so is a
-     * run while the auth latch is raised. Neither refusal is recorded:
+     * run while an operation that reloads Obsidian runs (`ReloadGuard`),
+     * and a run while the auth latch is raised. Neither refusal is recorded:
      * nothing was attempted. `body` prepares (reads, derives, asks —
      * nothing is changed, and a failure leaves the setup state and live
      * sync as they were), then calls `beginDestructive`, which asks the
@@ -471,7 +489,7 @@ export class VaultBinding {
         body: (progress: VaultProgress, at: number) => Promise<string>,
     ): Promise<void> {
         const progress = this.host.openProgress(OP_LABELS[op]);
-        const busy = this.changeBlocker();
+        const busy = this.changeBlocker() ?? this.reloadConflict();
         const refusal = busy !== null
             ? new UserFacingError(busy)
             : this.host.auth.isBlocked() ? this.host.auth.blockedError() : null;
@@ -480,6 +498,7 @@ export class VaultBinding {
             throw refusal;
         }
         this.inflight = op;
+        const lease = this.reloadGuard.enter(`Vault ${OP_LABELS[op]}`, "uninterruptible");
         this.changed();
         const at = Date.now();
         const against = vaultTarget(this.settings());
@@ -501,6 +520,7 @@ export class VaultBinding {
             throw e;
         } finally {
             this.inflight = null;
+            lease.release();
             this.changed();
         }
     }

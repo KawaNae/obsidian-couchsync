@@ -26,6 +26,12 @@ accordingly:
 
 Vault sync is **continuous** once Live Sync is on. **Init**, **Clone**, and
 config-sync operations are the manual, full-DB actions.
+A config **Pull & Reload**, **Pull & Overwrite** or **Share again** that
+writes files reloads Obsidian, which would stop an Init or Clone half-way.
+So these three and Init / Clone never run together: while one side runs,
+the other's buttons are disabled and a start is refused with a notice
+naming what to wait for. After a Pull that reloads, Init, Clone and Config
+**Create** and **Join** stay refused until Obsidian has restarted.
 
 ---
 

@@ -69,6 +69,7 @@ import { CURRENT_CIPHER_VERSION, fetchConfigMeta } from "../db/vault-meta.ts";
 import { classifyError } from "../db/sync/errors.ts";
 import { resolveConfigCodec } from "./config-codec-policy.ts";
 import { configNotReady } from "./config-errors.ts";
+import { ReloadGuard, type ReloadLease, type ReloadRole } from "./reload-guard.ts";
 
 /**
  * ConfigSync — replication of `.obsidian/` configuration files against a
@@ -136,9 +137,14 @@ export interface ConfigSyncOptions {
      *  its backups there. Falls back to the default folder name when
      *  omitted. */
     pluginDir?: string;
-    /** Reload the app. Pull calls it after writing files; omitted in
-     *  tests. */
+    /** Reload the app. Pull calls it after writing files. Omitted in
+     *  tests: nothing reloads, so the guard's lease is released as after a
+     *  Pull that wrote nothing. */
     reload?: () => void;
+    /** The plugin-wide guard that keeps a reload away from the operations
+     *  it would break; the vault setup enters the same one. Omitted → a
+     *  guard of its own (nothing outside config sync to keep apart). */
+    reloadGuard?: ReloadGuard;
     /** Unload the community plugins installed in these folders
      *  (`.obsidian/plugins/<folder>`), without changing which plugins are
      *  enabled. Pull calls it before it writes or deletes a plugin's files,
@@ -199,6 +205,18 @@ const HOLD_REASONS: Record<ConfigPushHoldReason, string> = {
     "not-merged": "this device has not taken in the shared version yet",
 };
 
+/** The ops that enter the `ReloadGuard`: Pull (Pull & Reload, Pull &
+ *  Overwrite, Share again) reloads Obsidian after writing files; Create
+ *  empties the server's config DB and Join this device's local store
+ *  before each attaches to the new state. Push and the local exclusive
+ *  tasks neither reload nor leave a half-built state: what a stopped Push
+ *  did not send, the next one sends. */
+const RELOAD_ROLES: Partial<Record<LockedConfigOp, ReloadRole>> = {
+    pull: "reloads",
+    create: "uninterruptible",
+    join: "uninterruptible",
+};
+
 const OP_LABELS: Record<LockedConfigOp, string> = {
     push: "Config Push",
     pull: "Config Pull",
@@ -226,7 +244,8 @@ export class ConfigSync {
     private readonly backupsDir: string;
     /** Where Pull keeps copies of the files it overwrites. */
     private readonly backupRoot: string;
-    private readonly reload: () => void;
+    private readonly reload: (() => void) | null;
+    private readonly reloadGuard: ReloadGuard;
     private readonly stopPlugins: (pluginDirs: string[]) => Promise<string[]>;
     /** This plugin's folder: an overwriting Pull deletes nothing in it,
      *  and Pull never stops this plugin. */
@@ -288,7 +307,8 @@ export class ConfigSync {
         this.ownDataPath = `${pluginDir}/data.json`;
         this.backupsDir = `${pluginDir}/backups`;
         this.backupRoot = `${this.backupsDir}/config`;
-        this.reload = opts.reload ?? (() => {});
+        this.reload = opts.reload ?? null;
+        this.reloadGuard = opts.reloadGuard ?? new ReloadGuard();
         this.stopPlugins = opts.stopPlugins ?? (async () => []);
     }
 
@@ -362,6 +382,15 @@ export class ConfigSync {
             return "A config operation is running — Apply is available when it finishes.";
         }
         return null;
+    }
+
+    /** Why `op` cannot start now because of an operation outside config
+     *  sync (a vault Init or Clone, or a reload about to happen), or null.
+     *  The op is refused as `busy` with this text; the tab disables its
+     *  button. Redraw on the guard's `onChange`. */
+    reloadConflict(op: LockedConfigOp): string | null {
+        const role = RELOAD_ROLES[op];
+        return role ? this.reloadGuard.blocker(role) : null;
     }
 
     /** Subscribe to changes of `bindingChangeBlocker()`: an op or a rebind
@@ -468,7 +497,9 @@ export class ConfigSync {
      * epoch. Order is fixed so NO failure escapes unreported:
      *
      *   1. ProgressNotice — created first, before any check can throw.
-     *   2. Busy check (another op in flight); the op lock is taken.
+     *   2. Busy check (another op in flight, or an operation the
+     *      `ReloadGuard` keeps apart from this one); the op lock and the
+     *      guard's lease are taken.
      *   3. The binding (it always matches the settings — see `rebind`) and
      *      the caller's synchronous `gate` (e.g. Push's device name).
      *   4. ConfigOperation — auth, visibility, raw client, reachability
@@ -482,6 +513,10 @@ export class ConfigSync {
      * to restore its button. A success is recorded too. Neither a busy
      * refusal (nothing ran) nor a cancellation (the user chose it) is an
      * outcome of the relation, so neither is recorded.
+     *
+     * `reloadAfter` says from the op's result whether Obsidian must reload.
+     * The reload is asked for here, after the lock is released, and the
+     * guard's lease is held until the app goes down.
      *
      * Per op:
      *   - push / pull: preflight + wrapped client; the body gets the frozen
@@ -497,12 +532,19 @@ export class ConfigSync {
             binding: ConfigBinding,
             keys: ConfigOpKeys | undefined,
         ) => Promise<T>,
-        opts: { gate?: (binding: ConfigBinding) => void; label?: string } = {},
+        opts: {
+            gate?: (binding: ConfigBinding) => void;
+            label?: string;
+            reloadAfter?: (result: T) => boolean;
+        } = {},
     ): Promise<T> {
-        const progress = new ProgressNotice(opts.label ?? OP_LABELS[opName]);
-        if (this.inflight !== null || this.rebinding !== null) {
+        const label = opts.label ?? OP_LABELS[opName];
+        const progress = new ProgressNotice(label);
+        const role = RELOAD_ROLES[opName];
+        const conflict = role ? this.reloadGuard.blocker(role) : null;
+        if (this.inflight !== null || this.rebinding !== null || conflict !== null) {
             // Nothing was started — the running op (if any) keeps its lock.
-            const e = configNotReady("busy");
+            const e = configNotReady("busy", conflict ? { blocker: conflict } : {});
             progress.fail(e);
             throw e;
         }
@@ -510,6 +552,8 @@ export class ConfigSync {
         let op: ConfigOperation | null = null;
         let cancelled = false;
         let binding: ConfigBinding | null = null;
+        const lease: ReloadLease | null = role ? this.reloadGuard.enter(label, role) : null;
+        let reload = false;
         this.setInflight({ cancel: () => { cancelled = true; op?.cancel(); } });
         try {
             const b = this.requireBinding();
@@ -534,6 +578,7 @@ export class ConfigSync {
             });
             const result = await op.run((ctx) => body(ctx, progress, b, keys));
             b.record({ op: opName, at, against: b.attachment?.metaFingerprint ?? null, error: null });
+            reload = opts.reloadAfter?.(result) ?? false;
             return result;
         } catch (e) {
             if (binding && !describeError(e).cancelled) {
@@ -545,6 +590,12 @@ export class ConfigSync {
             throw e;
         } finally {
             this.setInflight(null);
+            if (reload && this.reload) {
+                lease?.holdForReload();
+                this.reload();
+            } else {
+                lease?.release();
+            }
         }
     }
 
@@ -940,8 +991,10 @@ export class ConfigSync {
                     : "No config files changed; no reload needed.");
             progress.done(parts.join(" "));
             return applied;
-        }, take ? { label: "Config Share again" } : {});
-        if (outcome.reload) this.reload();
+        }, {
+            ...(take ? { label: "Config Share again" } : {}),
+            reloadAfter: (applied) => applied.reload,
+        });
         return outcome.written;
     }
 
@@ -1046,8 +1099,7 @@ export class ConfigSync {
             if (applied.reload) parts.push("Reloading Obsidian...");
             progress.done(parts.join(" "));
             return applied;
-        }, { label: "Config Pull & Overwrite" });
-        if (outcome.reload) this.reload();
+        }, { label: "Config Pull & Overwrite", reloadAfter: (applied) => applied.reload });
         return outcome.written + outcome.deleted;
     }
 

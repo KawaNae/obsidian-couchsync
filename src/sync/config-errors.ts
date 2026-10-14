@@ -21,7 +21,8 @@
 export type ConfigNotReadyKind =
     /** No config DB name, or the local config store is not open. */
     | "not-configured"
-    /** Another config op is in flight. */
+    /** Another config op is in flight, or an operation that cannot run
+     *  beside this one (`ReloadGuard`). */
     | "busy"
     /** The remote config DB does not exist (404). */
     | "db-missing"
@@ -82,6 +83,9 @@ export interface ConfigNotReadyContext {
     /** Remote cipherVersion and local floor (`cipher-downgrade`). */
     remoteCipherVersion?: number;
     localFloor?: number;
+    /** What runs and keeps the op from starting, worded by `ReloadGuard`
+     *  (`busy` for an operation outside config sync). */
+    blocker?: string;
 }
 
 /**
@@ -111,6 +115,7 @@ export function configNotReady(
                         "store could not be opened (see the log). Apply the name again in Step 2."
                     : "Config sync is not configured — apply a config database name in Step 2.";
             case "busy":
+                if (ctx.blocker) return ctx.blocker;
                 return "Another config operation is already in progress. " +
                     "Wait for it to finish or cancel it first.";
             case "db-missing":
