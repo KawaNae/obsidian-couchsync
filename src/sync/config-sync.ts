@@ -733,7 +733,12 @@ export class ConfigSync {
                 progress.update("Choose what to push...");
                 const chosen = await this.modal.showConfigPushModal(review);
                 if (chosen === null) throw abortError("Nothing was pushed.");
-                const applied = applyPushSelection(entries, policy, new Set(chosen));
+                // Applied to the policy as it is now, as Share again and
+                // Pull & Overwrite do, so saving the declarations keeps a
+                // Filter change made since `policy` was read.
+                const applied = applyPushSelection(
+                    entries, this.getSettings().configSyncPolicy, new Set(chosen),
+                );
                 await this.saveDeclarations(applied);
                 leftOut = applied.declared.length + applied.filesLeftOut.length;
                 const byPath = new Map(check.ready.map((r) => [r.entry.path, r]));

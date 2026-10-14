@@ -125,6 +125,22 @@ describe("config ops never overlap, their confirmation dialogs included", () => 
         expect(await remote.getDoc(`${DOC_ID.CONFIG}.obsidian/app.json`)).not.toBeNull();
     });
 
+    it("saving what a Push left out keeps a Filter change made during the Push", async () => {
+        await attachPlain(settings, remote, db);
+        vault.addFile(".obsidian/app.json", `{"theme":"dark"}`);
+        const pushing = cs.push();
+        await vi.waitFor(() => expect(modal.push.open).toBe(true));
+        const policy = settings.configSyncPolicy;
+        settings.configSyncPolicy = {
+            ...policy, unitDefaults: { ...policy.unitDefaults, snippets: false },
+        };
+        // Leave the file out: the Push saves it as an override.
+        modal.push.close([]);
+        await pushing;
+        expect(settings.configSyncPolicy.overrides[".obsidian/app.json"]).toBe(false);
+        expect(settings.configSyncPolicy.unitDefaults.snippets).toBe(false);
+    });
+
     it("Create's confirmation is shown inside the op: nothing else runs while it is open, and Cancel changes nothing", async () => {
         await attachPlain(settings, remote, db);
         const before = (await remote.info()).doc_count;
