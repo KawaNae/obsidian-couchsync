@@ -276,7 +276,9 @@ the cause and the fix, e.g. `CouchSync: Config Pull failed — …`.
 ## Maintenance tab
 
 - **Status Indicator** — on mobile only: **Align**, **Bottom (px)**,
-  **Horizontal offset (px)** (`mobileStatus`).
+  **Horizontal offset (px)** (`mobileStatus`). While the on-screen keyboard
+  is open, Bottom counts from the keyboard's top, and the indicator stays
+  above Obsidian's editing toolbar.
 - **Logging**
   - **Verbose notice** (`verboseNotice`, default off) — also show
     debug/info-level logs in the console and as notices.
