@@ -1,8 +1,8 @@
 /**
  * Pure classification of a `.obsidian/` config path into a *meaning unit*.
  *
- * This is the single source of truth that the SEND projection
- * (`sendDecision`), the RECEIVE projection (`receiveDecision`), and the
+ * This is the single source of truth that the policy's selection
+ * (`policySelects`), the participation decision (`participates`) and the
  * settings-tab tree UI all consult. Because all three derive their
  * behaviour from this one function, they cannot drift apart: what the user
  * sees in the tree is exactly what is sent and received.

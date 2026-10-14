@@ -40,7 +40,7 @@ import {
     type ConfigUnit,
 } from "../sync/config-policy/classify.ts";
 import {
-    sendDecision,
+    policySelects,
     type ConfigSyncPolicy,
 } from "../sync/config-policy/policy.ts";
 
@@ -730,7 +730,7 @@ export class ConfigSyncTab {
         const groupCb = summary.createEl("input", { cls: "cs-unit-group" }) as HTMLInputElement;
         groupCb.type = "checkbox";
 
-        const effs = items.map((it) => sendDecision(policy, it.c));
+        const effs = items.map((it) => policySelects(policy, it.c));
         const allOn = effs.length > 0 && effs.every(Boolean);
         const anyOn = effs.some(Boolean);
         groupCb.checked = items.length > 0 ? allOn : (policy.unitDefaults[unit] ?? false);
@@ -764,7 +764,7 @@ export class ConfigSyncTab {
             const row = list.createDiv({ cls: "cs-unit-child" });
             const cb = row.createEl("input") as HTMLInputElement;
             cb.type = "checkbox";
-            cb.checked = sendDecision(policy, c);
+            cb.checked = policySelects(policy, c);
             cb.disabled = locked;
             row.createSpan({
                 text: ` ${c.path.replace(".obsidian/", "")}${c.isPluginCode ? " ⚠️" : ""}`,

@@ -901,6 +901,53 @@ describe("config binding lifecycle", () => {
         });
     });
 
+    describe("coming back to a config DB after another DB's Pull wrote the disk", () => {
+        const APP = ".obsidian/app.json";
+        const serverApp = async (db: string) =>
+            (await remote(db).getDoc<{ vclock: Record<string, number> }>(makeConfigId(APP)))!.vclock;
+
+        it("merges as after a Join: the other DB's values are not pushed, and the shared values come back", async () => {
+            await seed("cfg-one", { [APP]: `{"k":1,"x":1}` });
+            await seed("cfg-two", { [APP]: `{"k":2,"x":1}` });
+            const dev = makeDevice("dev-X", { configCompressionEnabled: false });
+            await apply(dev, "cfg-one");
+            await dev.cs.join();
+            expect(await dev.cs.pull()).toBe(1);
+            await apply(dev, "cfg-two");
+            await dev.cs.join();
+            expect(await dev.cs.pull()).toBe(1);
+            // A key added while on two is this device's own.
+            dev.vault.addFile(APP, `{"k":2,"x":1,"mine":true}`);
+
+            await apply(dev, "cfg-one");
+            const before = await serverApp("cfg-one");
+            // Two's value of k is not a change made against one.
+            expect(await dev.cs.push()).toBe(0);
+            expect(await serverApp("cfg-one")).toEqual(before);
+
+            expect(await dev.cs.pull()).toBe(1);
+            expect(JSON.parse(dev.vault.readText(APP))).toEqual({ k: 1, x: 1, mine: true });
+        });
+
+        it("a DB that only pushed meanwhile leaves the bases alone", async () => {
+            await seed("cfg-one", { [APP]: `{"k":1}` });
+            await seed("cfg-two", { ".obsidian/hotkeys.json": `{}` });
+            const dev = makeDevice("dev-X", { configCompressionEnabled: false });
+            await apply(dev, "cfg-one");
+            await dev.cs.join();
+            expect(await dev.cs.pull()).toBe(1);
+            // On two, only a Push: it writes no file.
+            await apply(dev, "cfg-two");
+            await dev.cs.join();
+            expect(await dev.cs.push()).toBe(1);
+
+            await apply(dev, "cfg-one");
+            dev.vault.addFile(APP, `{"k":1,"y":5}`);
+            // The edit is a change against one's base, sent as such.
+            expect(await dev.cs.push()).toBe(1);
+        });
+    });
+
     describe("rebind vs a running op", () => {
         it("is refused while an op is in flight, and the op keeps its store", async () => {
             await seed("cfg-A", { ".obsidian/app.json": "{}" });
@@ -1254,7 +1301,7 @@ describe("config binding lifecycle", () => {
             await seed("cfg-one", { ".obsidian/app.json": `{"db":1}` }, {
                 configEncryptionEnabled: true, configEncryptionPassphrase: "one",
             });
-            await seed("cfg-two", { ".obsidian/hotkeys.json": `{"db":2}` }, {
+            await seed("cfg-two", { ".obsidian/app.json": `{"db":2}` }, {
                 configEncryptionEnabled: true, configEncryptionPassphrase: "two",
             });
             const answers: Record<string, string> = { "cfg-one": "one", "cfg-two": "two" };
@@ -1274,13 +1321,13 @@ describe("config binding lifecycle", () => {
             expect(getEntry(d.settings, "cfg-two")).toMatchObject({ passphrase: "two" });
 
             // Back and forth: each DB still unlocks with its own passphrase,
-            // with no prompt.
-            for (const [db, written] of [["cfg-one", 1], ["cfg-two", 1], ["cfg-one", 0]] as const) {
+            // with no prompt. Coming back to a DB merges as after a Join, so
+            // each Pull puts that DB's values on the disk.
+            for (const db of ["cfg-one", "cfg-two", "cfg-one"]) {
                 await apply(d, db);
-                expect(await d.cs.pull()).toBe(written);
+                expect(await d.cs.pull()).toBe(1);
+                expect(d.vault.readText(".obsidian/app.json")).toBe(`{"db":${db === "cfg-one" ? 1 : 2}}`);
             }
-            expect(d.vault.readText(".obsidian/app.json")).toBe(`{"db":1}`);
-            expect(d.vault.readText(".obsidian/hotkeys.json")).toBe(`{"db":2}`);
             expect(asked).toEqual(["cfg-one", "cfg-two"]);
         });
     });

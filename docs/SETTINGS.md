@@ -184,13 +184,22 @@ current database, the step says so.
   - The tree lists config on this device and on the server. When it cannot
     list the server, it says `Showing this device's config only — see Step
     3.`
-- **Push** (**Push ↑**) — scans `.obsidian/` and pushes the selected units.
-  If remote copies have diverged, it asks before overwriting them.
-- **Pull & Reload** (**Pull & Reload ↓**) — pulls, writes the selected units
-  to this device, then reloads Obsidian. Only files whose content differs
-  from the pulled config are written. When none differ, it shows `No config
-  files changed. Skipping reload.` and does not reload. A failed Pull does
-  not reload.
+  - A file takes part only where this device also writes it: a plugin's
+    `data.json` is neither sent nor written where the plugin is not
+    installed, and a desktop-only plugin's files are neither sent nor
+    written on mobile.
+- **Push** (**Push ↑**) — sends the selected files this device changed since
+  it last pushed or pulled them; JSON settings send only the changed keys.
+  A file the server changed since this device's last Pull is held: the
+  notice asks to run Pull & Reload, then Push again.
+- **Pull & Reload** (**Pull & Reload ↓**) — pulls, merges the selected files
+  with this device's changes (JSON settings key by key), backs up the files
+  it overwrites to `backups/config/` in the plugin's folder, then reloads
+  Obsidian. When no file changes, it shows `No config files changed; no
+  reload needed.` and does not reload. A failed Pull does not reload.
+- After another config database's Pull wrote this vault's config, Push and
+  Pull on this database merge as after a Join: the shared values win, keys
+  only this device has stay.
 - Push and Pull on a device that has not joined stop and ask it to Join.
   When another device ran Create, they stop and ask this device to Join
   again.

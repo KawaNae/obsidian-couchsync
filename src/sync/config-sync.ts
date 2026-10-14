@@ -24,11 +24,7 @@ import { makeCouchClient } from "../db/couch-client.ts";
 import { logError, logInfo, logWarn } from "../ui/log.ts";
 import { describeError } from "../ui/describe-error.ts";
 import { classifyConfigPath } from "./config-policy/classify.ts";
-import {
-    sendDecision,
-    receiveDecision,
-    type ReceiveContext,
-} from "./config-policy/policy.ts";
+import { participates, type DeviceContext } from "./config-policy/policy.ts";
 import { readLocalIsDesktopOnly } from "./config-policy/manifest.ts";
 import * as remoteCouch from "../db/remote-couch.ts";
 import {
@@ -663,8 +659,8 @@ export class ConfigSync {
     /**
      * Push: send the disk's changes against the base.
      *
-     *   1. plan: every file the send policy lets out, compared with its base
-     *      (`planPush`); unchanged files are not sent
+     *   1. plan: every file that takes part in sharing here, compared with
+     *      its base (`planPush`); unchanged files are not sent
      *   2. send (`ConfigPushPipeline`): a path whose server doc is not the
      *      shared version held here, or whose disk has not taken that
      *      version in, is held — Pull & Reload merges it first
@@ -676,9 +672,8 @@ export class ConfigSync {
     async push(): Promise<number> {
         return this.runOperation("push", async (ctx, progress, binding, keys) => {
             await binding.ensureCheckpointsLoaded();
-            const receiveCtx = await this.buildReceiveContext();
             const writer = this.makePullWriter(binding, ctx, keys!);
-            const deps = await this.prepare(binding, ctx, keys!, receiveCtx, writer);
+            const deps = await this.prepare(binding, ctx, keys!, writer);
 
             const files: string[] = [];
             await this.listFilesRecursive(".obsidian", files);
@@ -754,9 +749,8 @@ export class ConfigSync {
     async pull(): Promise<number> {
         const written = await this.runOperation("pull", async (ctx, progress, binding, keys) => {
             await binding.ensureCheckpointsLoaded();
-            const receiveCtx = await this.buildReceiveContext();
             const writer = this.makePullWriter(binding, ctx, keys!);
-            const deps = await this.prepare(binding, ctx, keys!, receiveCtx, writer);
+            const deps = await this.prepare(binding, ctx, keys!, writer);
 
             // A remote ConfigDoc shape this build cannot read throws
             // SchemaVersionMismatchError, whose `userMessage` names the
@@ -814,6 +808,7 @@ export class ConfigSync {
             progress.update(`Backing up ${backups.length} file(s)...`);
             await backupConfigFiles(this.vault, this.backupRoot, backups);
         }
+        if (writes.length > 0) await binding.recordDiskWrite();
 
         let count = 0;
         for (let i = 0; i < writes.length; i++) {
@@ -868,8 +863,11 @@ export class ConfigSync {
     }
 
     /**
-     * Shared start of Push and Pull: bring an old store to the shared / base
-     * meaning once (`migrateConfigBase`), and build the planner's inputs.
+     * Shared start of Push and Pull: drop the bases when another config
+     * DB's Pull wrote the disk since this one was used
+     * (`ConfigBinding.alignBasesWithDisk`), bring an old store to the
+     * shared / base meaning once (`migrateConfigBase`), and build the
+     * planner's inputs.
      * Right after that migration, the files whose disk differs from their
      * base are logged: the next Push sends them.
      */
@@ -877,18 +875,23 @@ export class ConfigSync {
         binding: ConfigBinding,
         ctx: ConfigOpContext,
         keys: ConfigOpKeys,
-        receiveCtx: ReceiveContext,
         writer: ConfigPullWriter,
     ): Promise<ReconcileDeps> {
-        const policy = () => this.getSettings().configSyncPolicy;
-        const receives = (path: string) =>
-            !this.isExcluded(path) && receiveDecision(policy(), classifyConfigPath(path), receiveCtx);
+        const participating = await this.participation();
+        const dropped = await binding.alignBasesWithDisk();
+        if (dropped > 0) {
+            logInfo(
+                `Config: another config database's Pull wrote this vault's config since ` +
+                `"${binding.dbName}" was last used; ${dropped} file(s) are merged as after ` +
+                `a Join (the shared values win, keys only this device has stay).`,
+            );
+        }
         const migration = await migrateConfigBase({
             store: binding.store,
             lastSynced: binding.lastSynced,
             client: ctx.client,
             signal: ctx.signal,
-            receives,
+            participates: participating,
             ensureChunks: (doc) => writer.ensureChunks(doc).catch((e: any) => {
                 logWarn(`config migration: chunks of ${doc._id}: ${e?.message ?? e}`);
             }),
@@ -899,9 +902,7 @@ export class ConfigSync {
             lastSynced: binding.lastSynced,
             hasher: keys.hasher,
             maxSize: ConfigSync.MAX_CONFIG_SIZE,
-            isExcluded: (path) => this.isExcluded(path),
-            sends: (path) => sendDecision(policy(), classifyConfigPath(path)),
-            receives,
+            participates: participating,
             fetchChunks: (doc) => writer.ensureChunks(doc),
             localFirst: await loadLocalFirst(binding.store),
         };
@@ -932,11 +933,24 @@ export class ConfigSync {
         return path === this.backupsDir || path.startsWith(this.backupsDir + "/");
     }
 
-    /** Build the per-write receive context: this device's platform + the set
+    /**
+     * The one decision of which paths take part in sharing on this device,
+     * for the op about to run: not physically excluded, and `participates`
+     * under the policy and this device's state. Push and Pull both use it,
+     * so a file is sent exactly when it would also be written here.
+     */
+    private async participation(): Promise<(path: string) => boolean> {
+        const device = await this.buildDeviceContext();
+        const policy = () => this.getSettings().configSyncPolicy;
+        return (path) =>
+            !this.isExcluded(path) && participates(policy(), classifyConfigPath(path), device);
+    }
+
+    /** Build the per-op device context: this device's platform + the set
      *  of locally-installed plugin folders + their local desktop-only flags.
      *  The plugins folder is listed once; each present plugin's local manifest
      *  is read only on mobile, where the desktop-only gate can fire. */
-    private async buildReceiveContext(): Promise<ReceiveContext> {
+    private async buildDeviceContext(): Promise<DeviceContext> {
         const isMobile = this.getIsMobile();
         const present = new Set<string>();
         try {

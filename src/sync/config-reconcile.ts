@@ -179,12 +179,9 @@ export interface ReconcileDeps {
     /** Chunk hasher of the op (the key space the config DB uses). */
     hasher: ChunkHasher;
     maxSize: number;
-    /** Physically excluded paths (own data.json, backups, layout files). */
-    isExcluded: (path: string) => boolean;
-    /** Policy SEND projection. */
-    sends: (path: string) => boolean;
-    /** Policy RECEIVE projection. */
-    receives: (path: string) => boolean;
+    /** Does `path` take part in sharing on this device? Push sends and
+     *  Pull writes only such paths; the others are this device's own. */
+    participates: (path: string) => boolean;
     /** Fetch chunks of `doc` the store lacks. */
     fetchChunks?: (doc: ConfigDoc) => Promise<void>;
     /** Paths whose missing base is settled keeping the local value. */
@@ -239,7 +236,7 @@ async function readBase(deps: ReconcileDeps, path: string): Promise<{ value: Con
 }
 
 /**
- * Plan a Pull: for every shared doc the policy lets this device receive and
+ * Plan a Pull: for every shared doc that takes part in sharing here and
  * whose version the disk has not taken in yet, decide what the disk
  * becomes. Paths whose base already is the shared version are not read.
  */
@@ -257,7 +254,7 @@ export async function planPull(
             logWarn(`rejecting unsafe remote config path "${path}" — ${violation}`);
             continue;
         }
-        if (deps.isExcluded(path) || !deps.receives(path)) continue;
+        if (!deps.participates(path)) continue;
         const base = deps.lastSynced.get(path);
         if (base && sameVersion(base, doc)) continue;
         candidates.push(doc);
@@ -318,7 +315,7 @@ export interface PushPlanEntry {
 }
 
 /**
- * Plan a Push: every file the policy lets this device send whose disk
+ * Plan a Push: every file that takes part in sharing here whose disk
  * content differs from its base. Files whose chunks equal the base are not
  * parsed. A file missing on disk is not a change (deletions are not
  * shared).
@@ -332,7 +329,7 @@ export async function planPush(
     const out: PushPlanEntry[] = [];
     for (let i = 0; i < files.length; i++) {
         const path = files[i];
-        if (deps.isExcluded(path) || !deps.sends(path)) continue;
+        if (!deps.participates(path)) continue;
         onProgress?.(path, i + 1, files.length);
         try {
             const stat = await deps.vault.stat(path);

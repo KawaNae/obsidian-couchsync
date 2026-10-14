@@ -240,7 +240,17 @@ All notable changes to obsidian-couchsync.
   whose server copy changed since this device last pulled is not sent: the
   notice counts it and asks to run Pull & Reload, then Push again (the log
   names the files). The confirmation that offered to overwrite the server
-  copy is gone.
+  copy is gone. A file this device's Pull would not write is not sent
+  either: a plugin's `data.json` on a device where the plugin is not
+  installed, or a desktop-only plugin's files on mobile, stay this device's
+  own.
+- **Coming back to a config database merges as after a Join.** When another
+  config database's Pull wrote this vault's config since this database was
+  last used, the next Push or Pull here no longer treats those values as
+  this device's changes, which Push would have sent. Pull takes this
+  database's values (keys only this device has stay, and the files are
+  backed up first); Push holds the files until that Pull. Switching to
+  another database and back without a Pull there changes nothing.
 - **Config Init is renamed Create, and Join is new.** Config Sync's Step 3
   now has Create (first device: reset the config database with a new root,
   then Push) and Join (every other device: sync with the existing

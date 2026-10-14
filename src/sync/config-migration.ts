@@ -12,7 +12,7 @@
  *
  * Old lastSynced always named the same chunks as the config DB doc (scan
  * and Pull wrote both in one tx), and an old Pull wrote every received doc
- * that passed the receive policy to the disk. Whether a doc was ever sent
+ * that passed the receive gates to the disk. Whether a doc was ever sent
  * is told by comparing it with the server doc:
  *
  *   | config DB doc vs server        | base                               |
@@ -25,8 +25,8 @@
  *   |                                | are reported as conflicts          |
  *   | no server doc                  | none (a new file on this device)   |
  *
- * A path the receive policy does not let in loses its lastSynced: an old
- * Pull did not write it, so it is not on the disk. Every config DB doc is
+ * A path that does not take part in sharing on this device loses its
+ * lastSynced: an old Pull did not write it, so it is not on the disk. Every config DB doc is
  * replaced by the server doc (or removed when there is none), so the store
  * holds only shared versions afterwards. The push cursor goes away.
  */
@@ -71,8 +71,8 @@ export interface ConfigMigrationDeps {
     lastSynced: ConfigLastSynced;
     client: ICouchClient;
     signal: AbortSignal;
-    /** Would the receive policy let `path` onto this device's disk? */
-    receives: (path: string) => boolean;
+    /** Does `path` take part in sharing on this device? */
+    participates: (path: string) => boolean;
     /** Fetch the chunks of a doc the store just took from the server. */
     ensureChunks: (doc: ConfigDoc) => Promise<void>;
 }
@@ -135,7 +135,7 @@ export async function migrateConfigBase(deps: ConfigMigrationDeps): Promise<Conf
             baseDropped.push(path);
             meta.push({ op: "delete", key: configLastSyncedKey(path) });
         };
-        if (!deps.receives(path) || !server) {
+        if (!deps.participates(path) || !server) {
             dropBase();
             continue;
         }

@@ -1,23 +1,22 @@
 /**
- * Config sync policy — ONE user-facing selection, enforced at TWO points.
+ * Config sync policy — ONE user-facing selection, and the one decision of
+ * which files take part in sharing on this device.
  *
- * First principles (see plan / [[feedback_threat_model_triage]]):
+ *   - **Selection** (`policySelects`) = the policy alone: a function
+ *     `unit → bool` over meaning units, plus per-path overrides and the JS
+ *     safety interlock. It is what the user picks in the filter tree, and
+ *     needs no knowledge of this device's state.
+ *   - **Participation** (`participates`) = the selection AND this device's
+ *     gates (its platform; whether the plugin is installed here). Push
+ *     sends and Pull writes exactly the participating files.
  *
- *   - The policy is a single function `unit → bool` over meaning units,
- *     plus per-path overrides and the JS safety interlock. It is the same
- *     truth applied to both directions.
- *   - **Send projection** = policy alone. Exposure / bandwidth / not
- *     leaking code is decidable by the sending device with no knowledge of
- *     any receiver.
- *   - **Receive projection** = policy AND receiver-only gates (this
- *     device's platform; whether the plugin is installed here). These
- *     depend on information the sender cannot have, so the asymmetry is a
- *     structural necessity of *where the information lives*, not an
- *     implementation accident.
+ * Sending is what makes a value shared, and a shared value is merged
+ * against the version this device last took in. A file this device would
+ * send but never takes in (a plugin's data.json where the plugin is not
+ * installed) has no such version, so it is not sent either: it stays this
+ * device's own. That is why there is no separate send decision.
  *
- * This is expressed in code by `receiveDecision` calling `sendDecision`
- * first and only ever narrowing it (receive ⊆ send). That invariant is the
- * regression guard for the whole design.
+ * `participates` calls `policySelects` first and only ever narrows it.
  */
 
 import type { ClassifiedPath, ConfigUnit } from "./classify.ts";
@@ -42,9 +41,9 @@ export interface ConfigSyncPolicy {
     blockPluginCode: boolean;
 }
 
-/** Receiver-only context for the receive projection. Built once per write
- *  (not per doc) by the host — see `ConfigSync.buildReceiveContext`. */
-export interface ReceiveContext {
+/** This device's state the gates of `participates` read. Built once per
+ *  op (not per doc) by the host — see `ConfigSync.buildDeviceContext`. */
+export interface DeviceContext {
     isMobile: boolean;
     /** Is the plugin folder present on THIS device's filesystem? */
     pluginPresent: (pluginDir: string) => boolean;
@@ -54,10 +53,10 @@ export interface ReceiveContext {
 }
 
 /**
- * SEND projection: should this device upload `c` to the config server?
- * Depends only on the policy — no receiver state.
+ * Does the user's selection include `c`? Depends only on the policy — no
+ * device state. The filter tree shows this.
  */
-export function sendDecision(p: ConfigSyncPolicy, c: ClassifiedPath): boolean {
+export function policySelects(p: ConfigSyncPolicy, c: ClassifiedPath): boolean {
     // JS safety interlock wins over everything (incl. overrides).
     if (p.blockPluginCode && c.unit === "install-state") return false;
     // Workspace layout is device-local; never synced regardless of policy.
@@ -68,15 +67,15 @@ export function sendDecision(p: ConfigSyncPolicy, c: ClassifiedPath): boolean {
 }
 
 /**
- * RECEIVE projection: should this device materialise `c` to the filesystem?
- * = send projection, narrowed by receiver-only gates. receive ⊆ send.
+ * Does `c` take part in sharing on this device — sent by Push, written by
+ * Pull? = the selection, narrowed by this device's gates.
  */
-export function receiveDecision(
+export function participates(
     p: ConfigSyncPolicy,
     c: ClassifiedPath,
-    ctx: ReceiveContext,
+    ctx: DeviceContext,
 ): boolean {
-    if (!sendDecision(p, c)) return false;
+    if (!policySelects(p, c)) return false;
 
     // Gate ①presence: a plugin's data.json only makes sense where the
     // plugin is installed. Writing it into a non-existent plugin folder

@@ -10,6 +10,7 @@
  *   - a key both devices changed keeps the local value and is reported
  *   - without a base the shared value wins, keys only local has stay, and
  *     the overwritten file is backed up first
+ *   - a file this device would not write is not sent either
  *   - community-plugins.json merges as a set
  *   - a Pull that writes nothing does not reload and shows one Notice
  *   - the one-time migration of a store written by older builds
@@ -185,6 +186,32 @@ describe("config three-way merge across devices", () => {
         expect(json(desktop)).toEqual({ a: 2, mobileOnly: true });
         expect(await desktop.cs.push()).toBe(1);
         expect(JSON.parse(new TextDecoder().decode(await serverBytes()))).toEqual({ a: 2, mobileOnly: true });
+    });
+
+    it("a file this device would not write is not sent either: it stays this device's own", async () => {
+        const PLUGIN = ".obsidian/plugins/dt";
+        const DATA = `${PLUGIN}/data.json`;
+        const withPlugin = (value: unknown) => {
+            const vault = new FakeVaultIO();
+            vault.addFile(`${PLUGIN}/manifest.json`, JSON.stringify({ id: "dt", isDesktopOnly: true }));
+            vault.addFile(DATA, JSON.stringify(value));
+            return vault;
+        };
+        const desktop = await device("desktop", { vault: withPlugin({ v: "desktop" }) });
+        expect(await desktop.cs.push()).toBe(1);
+
+        // On mobile the desktop-only plugin's data.json is never written, so
+        // its own copy is not sent and not held either.
+        const mobile = await device("mobile", { vault: withPlugin({ v: "mobile" }), mobile: true });
+        expect(await mobile.cs.pull()).toBe(0);
+        shown.length = 0;
+        expect(await mobile.cs.push()).toBe(0);
+
+        expect(json(mobile, DATA)).toEqual({ v: "mobile" });
+        expect(JSON.parse(new TextDecoder().decode(await serverBytes(DATA)))).toEqual({ v: "desktop" });
+        expect(warnings().some((w) => /held/.test(w))).toBe(false);
+        expect(shown.filter((t) => t.startsWith("CouchSync: Config Push")))
+            .toEqual([expect.stringMatching(/No local changes to push\./)]);
     });
 
     async function serverBytes(path = APP): Promise<Uint8Array> {
@@ -473,7 +500,7 @@ describe("config three-way merge across devices", () => {
             expect((await serverDoc())!.vclock).toEqual({ "dev-B": 1 });
         });
 
-        it("outside the receive policy: the base is dropped, so the shared value arrives later", async () => {
+        it("not taking part in sharing here: the base is dropped, so the shared value arrives later", async () => {
             const DATA = ".obsidian/plugins/foo/data.json";
             const v1 = await fx(DATA, { s: 1 }, { "dev-A": 1 });
             await seedRemoteConfig(remote, [v1]);
