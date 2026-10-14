@@ -216,7 +216,9 @@ export function mergeJson(
     const value = base === undefined
         ? merge2(local, remote, opts.noBase ?? "remote-first", "", conflicts)
         : merge3(base, local, remote, "", conflicts);
-    return { value: value as JsonValue, conflicts };
+    // merge3 takes a whole remote subtree where only remote changed it; the
+    // order is set here so it does not depend on which side changed.
+    return { value: orderLike(value as JsonValue, local), conflicts };
 }
 
 // ── Diff and patch ───────────────────────────────────────

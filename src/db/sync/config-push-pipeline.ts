@@ -172,7 +172,10 @@ export class ConfigPushPipeline {
         }
 
         if (result.pushed.length > 0) {
-            logInfo(`Config Push: ${result.pushed.length} pushed`);
+            logInfo(
+                `Config Push: ${result.pushed.length} pushed:\n` +
+                result.pushed.map((p) => `  • ${p}`).join("\n"),
+            );
         }
         return result;
     }

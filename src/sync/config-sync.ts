@@ -175,6 +175,7 @@ export interface ConfigRebindOptions {
  *  tree's check). */
 type LockedConfigOp = Exclude<ConfigOpName, "check">;
 
+/** Why a path was held, worded once for both the Notice and the log. */
 const HOLD_REASONS: Record<ConfigPushHoldReason, string> = {
     "remote-changed": "the server has a newer version",
     "not-merged": "this device has not taken in the shared version yet",
@@ -708,10 +709,11 @@ export class ConfigSync {
                 ? `${result.pushed.length} file(s) pushed.`
                 : plan.length === 0 ? "No local changes to push." : "Nothing pushed.");
             if (result.held.length > 0) {
-                parts.push(
-                    `${result.held.length} held: the server has changes this device has not ` +
-                    `taken in — run Pull & Reload, then Push again.`,
-                );
+                for (const reason of Object.keys(HOLD_REASONS) as ConfigPushHoldReason[]) {
+                    const n = result.held.filter((h) => h.reason === reason).length;
+                    if (n > 0) parts.push(`${n} held (${HOLD_REASONS[reason]}).`);
+                }
+                parts.push("Run Pull & Reload, then Push again.");
             }
             if (result.failed.length > 0) {
                 parts.push(`${result.failed.length} rejected by the server (see log).`);
@@ -868,8 +870,6 @@ export class ConfigSync {
      * (`ConfigBinding.alignBasesWithDisk`), bring an old store to the
      * shared / base meaning once (`migrateConfigBase`), and build the
      * planner's inputs.
-     * Right after that migration, the files whose disk differs from their
-     * base are logged: the next Push sends them.
      */
     private async prepare(
         binding: ConfigBinding,
@@ -886,7 +886,7 @@ export class ConfigSync {
                 `a Join (the shared values win, keys only this device has stay).`,
             );
         }
-        const migration = await migrateConfigBase({
+        await migrateConfigBase({
             store: binding.store,
             lastSynced: binding.lastSynced,
             client: ctx.client,
@@ -896,7 +896,7 @@ export class ConfigSync {
                 logWarn(`config migration: chunks of ${doc._id}: ${e?.message ?? e}`);
             }),
         });
-        const deps: ReconcileDeps = {
+        return {
             vault: this.vault,
             store: binding.store,
             lastSynced: binding.lastSynced,
@@ -906,19 +906,6 @@ export class ConfigSync {
             fetchChunks: (doc) => writer.ensureChunks(doc),
             localFirst: await loadLocalFirst(binding.store),
         };
-        if (migration.ran) {
-            const files: string[] = [];
-            await this.listFilesRecursive(".obsidian", files);
-            const changed = await planPush(deps, files);
-            if (changed.length > 0) {
-                logInfo(
-                    `Config: ${changed.length} file(s) differ from what this device last ` +
-                    `took from the server; the next Push sends them:\n` +
-                    changed.map((e) => `  • ${e.path}`).join("\n"),
-                );
-            }
-        }
-        return deps;
     }
 
     // ── Low-level operations ───────────────────────────

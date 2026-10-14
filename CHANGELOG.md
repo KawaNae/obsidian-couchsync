@@ -234,12 +234,15 @@ All notable changes to obsidian-couchsync.
   to `backups/config/<date_time>/` in the plugin's folder and keeps the
   newest 10 of these backups; they are never pushed. Written files keep
   their indentation and key order. Pull & Reload shows one notice and
-  reloads Obsidian only when it wrote a file.
+  reloads Obsidian only when it wrote a file. The notice's "Received" counts
+  the changes this device did not have yet; its own pushed files are not
+  counted.
 - **Config Push sends this device's changes.** Push sends the config files
   that changed on this device since it last pushed or pulled them. A file
-  whose server copy changed since this device last pulled is not sent: the
-  notice counts it and asks to run Pull & Reload, then Push again (the log
-  names the files). The confirmation that offered to overwrite the server
+  whose server copy changed since this device last pulled, or whose server
+  copy this device has not taken in, is not sent: the notice counts such
+  files by that reason and asks to run Pull & Reload, then Push again (the
+  log names each file with the same reason). The confirmation that offered to overwrite the server
   copy is gone. A file this device's Pull would not write is not sent
   either: a plugin's `data.json` on a device where the plugin is not
   installed, or a desktop-only plugin's files on mobile, stay this device's
@@ -289,9 +292,9 @@ All notable changes to obsidian-couchsync.
   Push or Pull after updating compares each file this device knows with the
   server copy once. Edits that were never pushed are kept as this device's
   changes: where the server also changed the same file since, the keys that
-  differ keep this device's value and are reported like a conflict. The log
-  then lists the files the next Push will send; check them if a plugin was
-  installed after the last Pull, since its default settings would be sent.
+  differ keep this device's value and are reported like a conflict. If a
+  plugin was installed after the last Pull, its default settings look like
+  this device's changes; the log of each Push names the files it sent.
 - **Existing devices Join once.** Whether a device has joined a config
   database, and with which codec, is now recorded inside that database's
   local store, which is also renamed to include the server. The previous

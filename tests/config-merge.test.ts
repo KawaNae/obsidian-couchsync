@@ -93,6 +93,16 @@ describe("mergeJson with a base", () => {
         const r = mergeJson({ a: 1, b: 1 }, { b: 1, a: 1, l: 1 }, { a: 1, b: 1, r: 1 });
         expect(Object.keys(r.value as object)).toEqual(["b", "a", "l", "r"]);
     });
+
+    it("keeps the local key order also where only remote changed, at every depth", () => {
+        const base = { a: 0, n: { x: 0, y: 0 } };
+        const local = { n: { y: 0, x: 0 }, a: 0 };
+        const remote = { a: 0, n: { x: 1, y: 0, z: 1 } };
+        const r = mergeJson(base, local, remote);
+        expect(r.value).toEqual({ a: 0, n: { x: 1, y: 0, z: 1 } });
+        expect(Object.keys(r.value as object)).toEqual(["n", "a"]);
+        expect(Object.keys((r.value as any).n)).toEqual(["y", "x", "z"]);
+    });
 });
 
 describe("mergeJson without a base", () => {

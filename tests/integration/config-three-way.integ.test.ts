@@ -365,6 +365,36 @@ describe("config three-way merge across devices", () => {
         expect(pullNotices()).toEqual([expect.stringMatching(/Wrote 1 file\(s\)\. Reloading Obsidian/)]);
     });
 
+    it("Received counts the changes this device did not have, not its own Push", async () => {
+        const a = await device("dev-A");
+        const b = await device("dev-B");
+        put(a, { a: 1 });
+        await a.cs.push();
+        shown.length = 0;
+
+        expect(await a.cs.pull()).toBe(0);
+        expect(pullNotices()).toEqual([expect.not.stringMatching(/Received/)]);
+
+        shown.length = 0;
+        await b.cs.pull();
+        expect(pullNotices()).toEqual([expect.stringMatching(/Received 1 change\(s\)/)]);
+    });
+
+    it("a held file is worded with the same reason on the Notice and in the log", async () => {
+        const a = await device("dev-A");
+        const b = await device("dev-B");
+        put(a, { a: 1 });
+        await a.cs.push();
+        put(b, { a: 2 });
+        shown.length = 0;
+
+        expect(await b.cs.push()).toBe(0);
+
+        const pushNotice = shown.find((t) => t.startsWith("CouchSync: Config Push"));
+        expect(pushNotice).toMatch(/1 held \(the server has a newer version\)\. Run Pull & Reload/);
+        expect(warnings().find((w) => w.includes("held"))).toContain(`${APP} (the server has a newer version)`);
+    });
+
     it("keeps the newest 10 backup generations", async () => {
         const a = await device("dev-A");
         const b = await device("dev-B");

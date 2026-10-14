@@ -29,6 +29,7 @@ import type { ConfigLocalDB } from "../config-local-db.ts";
 import { fetchMissingChunks } from "../chunk-attachment.ts";
 import type { ChunkHasher } from "../chunker.ts";
 import { assertSchemaVersion } from "./schema-gate.ts";
+import { sameVersion } from "../../sync/config-reconcile.ts";
 import { logInfo, logWarn } from "../../ui/log.ts";
 import {
     ConfigLastSynced,
@@ -55,9 +56,11 @@ function seqNumeric(seq: number | string): number {
 const MAX_PULL_BATCHES = 1000;
 
 export interface ConfigPullStats {
-    /** Docs copied into the local config DB. */
+    /** Docs whose shared version this Pull changed. A doc the store
+     *  already held in that version (this device's own Push) is copied
+     *  but not counted. */
     received: number;
-    /** Remote deletions applied. */
+    /** Remote deletions of docs the store held. */
     deleted: number;
 }
 
@@ -146,9 +149,10 @@ export class ConfigPullWriter {
             totalReceived += batch.results.length;
 
             const { docs, deleted } = this.collect(batch.results);
+            const news = await this.countNew(docs, deleted);
             await this.commitBatch(docs, deleted, batch.last_seq);
-            stats.received += docs.length;
-            stats.deleted += deleted.length;
+            stats.received += news.received;
+            stats.deleted += news.deleted;
 
             if (batch.last_seq === since && docs.length === 0 && deleted.length === 0) {
                 break;
@@ -192,6 +196,21 @@ export class ConfigPullWriter {
             docs.push(remoteDoc);
         }
         return { docs, deleted };
+    }
+
+    /** How many of `docs` and `deletes` change what the store holds. */
+    private async countNew(docs: readonly ConfigDoc[], deletes: readonly string[]): Promise<ConfigPullStats> {
+        let received = 0;
+        for (const doc of docs) {
+            const cur = await this.deps.db.get(doc._id);
+            if (!cur || cur.deleted || !sameVersion(cur, doc)) received++;
+        }
+        let deleted = 0;
+        for (const id of deletes) {
+            const cur = await this.deps.db.get(id);
+            if (cur && !cur.deleted) deleted++;
+        }
+        return { received, deleted };
     }
 
     /**
