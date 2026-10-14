@@ -87,13 +87,19 @@ All notable changes to obsidian-couchsync.
   empty database with "The database is empty — use Init to push your
   vault." What Check, Clone and Init last found in each database is kept
   until Obsidian restarts, so checking another name does not drop the
-  applied database's, and Clone stays disabled only for a database known to
-  be empty. Init reads its database back and Clone records what it read,
-  so the document count shown after either is current.
-- **Clone reports the files it wrote.** "Clone — N files written." counted
-  every file document in the database, including files deleted on another
-  device and files this device's filters keep out, so it could say 10 for a
-  vault that received 2. It now counts only the files written to the vault.
+  applied database's. That finding no longer disables Clone either: a device
+  that found the database empty kept Clone disabled after another device's
+  Init filled it, until Check was pressed again. For a database found empty,
+  Clone's description now points to Init, and Clone reads the database
+  again when pressed. Init reads its database back and Clone records what
+  it read, so the document count shown after either is current.
+- **Init and Clone count the files they send or write.** "Clone — N files
+  written." counted every file document in the database, including files
+  deleted on another device and files this device's filters keep out, so it
+  could say 10 for a vault that received 2. It now counts only the files
+  written to the vault, and Clone's "Writing N vault files..." only the
+  files the filters let in. Init's "N files, M docs pushed" no longer counts
+  files the filters keep out or that exceed the size limit.
 - **Live sync no longer re-sends chunks the server already holds.** The first
   live sync after an Init or Clone wrote every chunk to the server again as
   a new revision of the same content, which advanced the database's
@@ -218,6 +224,18 @@ All notable changes to obsidian-couchsync.
 
 ### Changed
 
+- **Vault Init and Clone ask before they change anything.** Init deletes the
+  vault database on the server and creates it again; Clone rebuilds this
+  device's local vault database from the server and writes the server's
+  files into the vault. Both used to start on the button press. Each now
+  first checks what it can (the server answers, the passphrase, a database
+  that is not empty), then shows what it is about to do: the database name,
+  how many documents it holds and the encryption and compression of the
+  vault. Init also says that every other device must Clone again, and that
+  a device that notices the re-created database stops its live sync until
+  then. The dialog opens with the focus on Cancel. Cancel changes nothing:
+  live sync keeps running and the setup state stays as it was. Clone asks
+  for a missing passphrase before this dialog.
 - **Config Pull merges.** Pull compares each config file the server changed
   with the version this device last took in and with the disk. In
   `app.json`, `appearance.json`, `hotkeys.json`, the other `.obsidian/*.json`

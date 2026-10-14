@@ -85,12 +85,18 @@ The main tab, organized as steps.
 
 **Step 3: Setup**
 - **Init** (first device) — ⚠️ **destructive**: recreates the remote vault
-  database from this vault and seeds it.
+  database from this vault and seeds it. Every other device has to Clone
+  again; a device that notices the re-created database stops its live sync.
 - **Clone** (subsequent devices) — pulls the whole remote into a fresh local
   DB and writes the vault files; prompts for the passphrase if the vault is
   encrypted. It reads the database before changing anything and refuses an
-  empty one; it is disabled only while the database is known to be empty
-  (from Step 2's Check or an earlier Init or Clone).
+  empty one. A database found empty (by Step 2's Check or an earlier Init or
+  Clone) does not disable it; the description then points to Init.
+- Both first check what they can without changing anything (the server
+  answers, the passphrase, for Clone a database that is not empty), then
+  ask for confirmation, naming the database, its document count and the
+  vault's encryption and compression. Cancel changes nothing: live sync
+  and the setup state stay as they were.
 
 **Step 4: Sync**
 - **Live Sync** — toggle continuous sync on/off. Enabled after Init or
