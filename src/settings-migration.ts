@@ -113,13 +113,17 @@ export function migrateSettings(data: Record<string, any>): void {
     // configSyncPaths (string[] receive-only allowlist) → configSyncPolicy
     // (meaning-unit policy, symmetric send/receive). Safe-side: plugin code
     // stops syncing (blockPluginCode forced true inside the builder). The host
-    // shows a one-time notice (configSyncPolicyMigrated) after this runs.
+    // shows a one-time notice (configSyncPolicyMigrated) after this runs,
+    // only when there was a legacy list to convert: every build that had
+    // configSyncPaths saved it with the rest of the settings, so data without
+    // it is a new install, which gets the default policy and nothing to be
+    // told of.
     if (data.configSyncPolicy === undefined) {
-        const legacy: string[] = Array.isArray(data.configSyncPaths)
-            ? data.configSyncPaths
-            : [];
-        data.configSyncPolicy = buildPolicyFromLegacyPaths(legacy);
-        data.configSyncPolicyMigrated = true;
+        const hadLegacy = Array.isArray(data.configSyncPaths);
+        data.configSyncPolicy = buildPolicyFromLegacyPaths(
+            hadLegacy ? data.configSyncPaths : [],
+        );
+        if (hadLegacy) data.configSyncPolicyMigrated = true;
         delete data.configSyncPaths;
     } else {
         // Forward-compat: backfill any unit added in a later build so an

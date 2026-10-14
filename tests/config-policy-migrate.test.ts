@@ -47,6 +47,20 @@ describe("migrateSettings: configSyncPaths → configSyncPolicy", () => {
         expect(data.configSyncPolicyMigrated).toBe(true);
     });
 
+    it("gives a new install the default policy without the migration notice", () => {
+        const data: Record<string, any> = {};
+        migrateSettings(data);
+        expect(data.configSyncPolicy).toEqual(buildPolicyFromLegacyPaths([]));
+        expect(data.configSyncPolicyMigrated).toBeUndefined();
+    });
+
+    it("notifies a legacy empty list, which did have a filter to replace", () => {
+        const data: Record<string, any> = { configSyncPaths: [] };
+        migrateSettings(data);
+        expect(data.configSyncPaths).toBeUndefined();
+        expect(data.configSyncPolicyMigrated).toBe(true);
+    });
+
     it("is idempotent — second run keeps the policy and backfills units", () => {
         const data: Record<string, any> = { configSyncPaths: [".obsidian/"] };
         migrateSettings(data);
