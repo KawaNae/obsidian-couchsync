@@ -469,6 +469,30 @@ export class ConfigSyncTab {
                         this.deps.refresh();
                     })
             );
+
+        new Setting(el)
+            .setName("Pull & Overwrite")
+            .setDesc(
+                "Make this device's selected config exactly the shared config: no merge, so changes not " +
+                "pushed are lost; selected files the server does not have are deleted, and keys kept on " +
+                "this device take the shared value. Files the Filter leaves out are not touched. Lists the " +
+                "files to delete and write first, backs them up, then reloads Obsidian.",
+            )
+            .addButton((btn) =>
+                btn.setButtonText("Overwrite ↓")
+                    .setWarning()
+                    .setDisabled(!configEnabled)
+                    .onClick(async () => {
+                        btn.setButtonText("Overwriting...");
+                        btn.setDisabled(true);
+                        try {
+                            await this.trackOp(this.deps.configSync.overwrite());
+                        } catch {
+                            // Reported by ConfigSync (ProgressNotice + log).
+                        }
+                        this.deps.refresh();
+                    })
+            );
     }
 
     /**

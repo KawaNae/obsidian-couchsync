@@ -41,6 +41,7 @@ import {
     type ConfigPushResult,
 } from "../db/sync/config-push-pipeline.ts";
 import {
+    planOverwrite,
     planPull,
     planPush,
     pushContent,
@@ -136,6 +137,12 @@ export interface ConfigSyncOptions {
     /** Reload the app. Pull calls it after writing files; omitted in
      *  tests. */
     reload?: () => void;
+    /** Unload the community plugins installed in these folders
+     *  (`.obsidian/plugins/<folder>`), without changing which plugins are
+     *  enabled. Pull calls it before it writes or deletes a plugin's files,
+     *  so a running plugin cannot save its in-memory state over them before
+     *  the reload. Omitted in tests. */
+    stopPlugins?: (pluginDirs: string[]) => Promise<void>;
     /** Persist settings. Bindings write their settings entry
      *  (`settings.configBindings`: cipher floor, setup flag, the DB's
      *  passphrase) into the live settings object, then call this. Omitted
@@ -217,6 +224,10 @@ export class ConfigSync {
     /** Where Pull keeps copies of the files it overwrites. */
     private readonly backupRoot: string;
     private readonly reload: () => void;
+    private readonly stopPlugins: (pluginDirs: string[]) => Promise<void>;
+    /** This plugin's folder: an overwriting Pull deletes nothing in it,
+     *  and Pull never stops this plugin. */
+    private readonly pluginDir: string;
     private static readonly MAX_CONFIG_SIZE = 5 * 1024 * 1024; // 5MB
 
     /** In-flight op (a ConfigOperation, or a local `runExclusive` task),
@@ -266,10 +277,12 @@ export class ConfigSync {
         this.askPassphrase = opts.askPassphrase;
         this.getIsMobile = opts.getIsMobile ?? (() => false);
         const pluginDir = opts.pluginDir ?? ConfigSync.DEFAULT_PLUGIN_DIR;
+        this.pluginDir = pluginDir;
         this.ownDataPath = `${pluginDir}/data.json`;
         this.backupsDir = `${pluginDir}/backups`;
         this.backupRoot = `${this.backupsDir}/config`;
         this.reload = opts.reload ?? (() => {});
+        this.stopPlugins = opts.stopPlugins ?? (async () => {});
     }
 
     // ── Binding lifecycle ──────────────────────────────
@@ -451,9 +464,9 @@ export class ConfigSync {
             binding: ConfigBinding,
             keys: ConfigOpKeys | undefined,
         ) => Promise<T>,
-        opts: { gate?: (binding: ConfigBinding) => void } = {},
+        opts: { gate?: (binding: ConfigBinding) => void; label?: string } = {},
     ): Promise<T> {
-        const progress = new ProgressNotice(OP_LABELS[opName]);
+        const progress = new ProgressNotice(opts.label ?? OP_LABELS[opName]);
         if (this.inflight !== null || this.rebinding !== null) {
             // Nothing was started — the running op (if any) keeps its lock.
             const e = configNotReady("busy");
@@ -825,7 +838,9 @@ export class ConfigSync {
      *      taken in is merged three-way with its base and the disk
      *      (`planPull`); nothing is written yet
      *   3. back up the files about to be written (`config-backup.ts`)
-     *   4. write them, and move each path's base to its shared version
+     *   4. stop the community plugins whose files are written
+     *      (`stopPlugins`), write the files, and move each path's base to
+     *      its shared version
      *   5. one Notice, then reload Obsidian when a file was written — the
      *      app must re-read the files, or it writes its in-memory settings
      *      back over them
@@ -835,7 +850,7 @@ export class ConfigSync {
      * of files written.
      */
     async pull(): Promise<number> {
-        const written = await this.runOperation("pull", async (ctx, progress, binding, keys) => {
+        const outcome = await this.runOperation("pull", async (ctx, progress, binding, keys) => {
             await binding.ensureCheckpointsLoaded();
             const writer = this.makePullWriter(binding, ctx, keys!);
             const deps = await this.prepare(binding, ctx, keys!, writer);
@@ -849,7 +864,8 @@ export class ConfigSync {
             const plan = await planPull(deps, (path, i, total) => {
                 progress.update(`Comparing: ${path} (${i}/${total})`);
             });
-            const count = await this.applyPullPlan(binding, plan, progress);
+            await this.backupPlan(plan, progress);
+            const applied = await this.applyPlan(binding, plan, progress);
 
             const conflicts = plan.entries.filter((e) => e.decision.conflicts.length > 0);
             if (conflicts.length > 0) {
@@ -874,35 +890,141 @@ export class ConfigSync {
             if (plan.unavailable.length > 0) {
                 parts.push(`${plan.unavailable.length} file(s) skipped (see log).`);
             }
-            parts.push(count > 0
-                ? `Wrote ${count} file(s). Reloading Obsidian...`
-                : "No config files changed; no reload needed.");
+            parts.push(applied.written > 0
+                ? `Wrote ${applied.written} file(s). Reloading Obsidian...`
+                : applied.reload
+                    ? "No config files changed. Reloading Obsidian to restart the plugins stopped for writing..."
+                    : "No config files changed; no reload needed.");
             progress.done(parts.join(" "));
-            return count;
+            return applied;
         });
-        if (written > 0) this.reload();
-        return written;
+        if (outcome.reload) this.reload();
+        return outcome.written;
     }
 
-    /** Back up, then write the planned files; move every planned path's
-     *  base to its shared version. A file that fails to write keeps its old
-     *  base, so the next Pull tries it again. */
-    private async applyPullPlan(
+    /**
+     * Pull & Overwrite: make this device's config the shared state.
+     *
+     *   1. copy, as in Pull
+     *   2. plan (`planOverwrite`): every shared file that takes part in
+     *      sharing here is written as it is where the disk differs, and every
+     *      file that takes part but is not shared is deleted. Files that do
+     *      not take part (left out by the Filter, a plugin not installed
+     *      here, a desktop-only plugin on mobile, this plugin's own folder)
+     *      are not touched
+     *   3. confirm: the files to delete and to write are listed; Cancel
+     *      changes nothing on disk, in the bases or in the declarations
+     *   4. back up every file about to change, drop the keys kept on this
+     *      device (`deviceOnlyKeys`; file overrides in the Filter stay)
+     *   5. write and delete as Pull does; every planned path's base becomes
+     *      its shared version, a deleted path loses its base
+     *   6. reload
+     *
+     * Refused when the shared state has nothing for this device: deleting
+     * every selected file is never what an overwrite means. Returns the
+     * number of files written or deleted.
+     */
+    async overwrite(): Promise<number> {
+        const outcome = await this.runOperation("pull", async (ctx, progress, binding, keys) => {
+            await binding.ensureCheckpointsLoaded();
+            const writer = this.makePullWriter(binding, ctx, keys!);
+            const deps = await this.prepare(binding, ctx, keys!, writer);
+            await writer.run((msg) => progress.update(msg));
+
+            const files: string[] = [];
+            await this.listFilesRecursive(".obsidian", files);
+            const deletable = files.filter((p) => !p.startsWith(this.pluginDir + "/"));
+            const plan = await planOverwrite(deps, deletable, (path, i, total) => {
+                progress.update(`Comparing: ${path} (${i}/${total})`);
+            });
+            if (plan.entries.length === 0) {
+                progress.done(
+                    "The server has no shared config for this device's selection " +
+                    "(or none is available). Nothing was changed.",
+                );
+                return { written: 0, deleted: 0, reload: false };
+            }
+
+            const writes = plan.entries.filter((e) => e.decision.write !== null);
+            const declared = this.getSettings().configSyncPolicy.deviceOnlyKeys;
+            const keptKeys = Object.values(declared).reduce((n, ps) => n + ps.length, 0);
+            if (writes.length === 0 && plan.deletes.length === 0 && keptKeys === 0) {
+                await this.applyPlan(binding, plan, progress);
+                progress.done("This device's config already is the shared config. Nothing was changed.");
+                return { written: 0, deleted: 0, reload: false };
+            }
+
+            progress.update("Confirm what to overwrite...");
+            const go = await this.modal.showConfigOverwriteModal({
+                writes: writes.map((e) => ({ path: e.path, created: e.local === null })),
+                deletes: plan.deletes.map((d) => d.path),
+                keptKeys,
+                skipped: plan.unavailable,
+            });
+            if (!go) throw abortError("Nothing was changed.");
+
+            await this.backupPlan(plan, progress);
+            if (keptKeys > 0) {
+                const s = this.getSettings();
+                s.configSyncPolicy = { ...s.configSyncPolicy, deviceOnlyKeys: {} };
+                await this.saveSettings();
+                logInfo(`Config Pull & Overwrite: ${keptKeys} key(s) kept on this device are shared again.`);
+            }
+            const applied = await this.applyPlan(binding, plan, progress);
+            if (applied.deleted > 0) {
+                logInfo(
+                    `Config Pull & Overwrite deleted ${applied.deleted} file(s) the shared config does not have:\n` +
+                    plan.deletes.map((d) => `  • ${d.path}`).join("\n"),
+                );
+            }
+
+            const parts: string[] = [`Wrote ${applied.written} file(s), deleted ${applied.deleted}.`];
+            if (keptKeys > 0) parts.push(`${keptKeys} key(s) kept on this device are shared again.`);
+            if (plan.unavailable.length > 0) {
+                parts.push(`${plan.unavailable.length} file(s) skipped (see log).`);
+            }
+            if (applied.reload) parts.push("Reloading Obsidian...");
+            progress.done(parts.join(" "));
+            return applied;
+        }, { label: "Config Pull & Overwrite" });
+        if (outcome.reload) this.reload();
+        return outcome.written + outcome.deleted;
+    }
+
+    /** Back up the files a plan changes: those it writes over and those it
+     *  deletes. Throws when a copy fails, so nothing is changed that could
+     *  not be backed up. */
+    private async backupPlan(plan: PullPlan, progress: ProgressNotice): Promise<void> {
+        const backups = [
+            ...plan.entries
+                .filter((e) => e.decision.write !== null && e.local !== null)
+                .map((e) => ({ path: e.path, bytes: e.local! })),
+            ...plan.deletes.map((d) => ({ path: d.path, bytes: d.local })),
+        ];
+        if (backups.length === 0) return;
+        progress.update(`Backing up ${backups.length} file(s)...`);
+        await backupConfigFiles(this.vault, this.backupRoot, backups);
+    }
+
+    /**
+     * Carry out a backed-up plan: stop the plugins whose files change,
+     * write and delete the planned files, and move every planned path's
+     * base to its shared version (a deleted path loses its base). A file
+     * that fails to write or delete keeps its old base, so the next Pull
+     * tries it again. `reload` is true when the disk changed or a plugin
+     * was stopped.
+     */
+    private async applyPlan(
         binding: ConfigBinding,
         plan: PullPlan,
         progress: ProgressNotice,
-    ): Promise<number> {
+    ): Promise<{ written: number; deleted: number; reload: boolean }> {
         const writes = plan.entries.filter((e) => e.decision.write !== null);
-        const backups = writes
-            .filter((e) => e.local !== null)
-            .map((e) => ({ path: e.path, bytes: e.local! }));
-        if (backups.length > 0) {
-            progress.update(`Backing up ${backups.length} file(s)...`);
-            await backupConfigFiles(this.vault, this.backupRoot, backups);
-        }
-        if (writes.length > 0) await binding.recordDiskWrite();
+        const changed = [...writes.map((e) => e.path), ...plan.deletes.map((d) => d.path)];
+        const stopped = await this.stopPluginsOf(changed);
+        if (changed.length > 0) await binding.recordDiskWrite();
 
-        let count = 0;
+        let written = 0;
         for (let i = 0; i < writes.length; i++) {
             const e = writes[i];
             progress.update(`Writing: ${e.path} (${i + 1}/${writes.length})`);
@@ -919,10 +1041,74 @@ export class ConfigSync {
                 continue;
             }
             await this.settleBase(binding, [e]);
-            count++;
+            written++;
         }
+
+        let deleted = 0;
+        for (let i = 0; i < plan.deletes.length; i++) {
+            const d = plan.deletes[i];
+            progress.update(`Deleting: ${d.path} (${i + 1}/${plan.deletes.length})`);
+            try {
+                await this.vault.delete(d.path);
+                await this.removeEmptyFolders(d.path);
+            } catch (err: any) {
+                logError(`Failed to delete config ${d.path}: ${err?.message ?? err}`);
+                continue;
+            }
+            await this.dropBase(binding, d.path);
+            deleted++;
+        }
+
         await this.settleBase(binding, plan.entries.filter((e) => e.decision.write === null));
-        return count;
+        return { written, deleted, reload: written + deleted > 0 || stopped };
+    }
+
+    /** Stop the community plugins (other than this one) whose files are in
+     *  `paths`. Returns whether any was asked to stop. A failure is logged:
+     *  the reload that follows unloads them anyway. */
+    private async stopPluginsOf(paths: readonly string[]): Promise<boolean> {
+        const dirs = new Set<string>();
+        for (const path of paths) {
+            const dir = classifyConfigPath(path).pluginDir;
+            if (dir && dir !== this.pluginDir) dirs.add(dir);
+        }
+        if (dirs.size === 0) return false;
+        try {
+            await this.stopPlugins([...dirs]);
+        } catch (e: any) {
+            logWarn(`Config Pull: stopping plugins before writing their files failed: ${e?.message ?? e}`);
+        }
+        return true;
+    }
+
+    /** Remove the folders a delete left empty, up to (not including) the
+     *  top folders of `.obsidian/` (`plugins`, `themes`, `snippets`): an
+     *  empty plugin folder would still count as an installed plugin. */
+    private async removeEmptyFolders(path: string): Promise<void> {
+        const segs = path.split("/");
+        for (let n = segs.length - 1; n >= 3; n--) {
+            const dir = segs.slice(0, n).join("/");
+            let listing: { files: string[]; folders: string[] };
+            try {
+                listing = await this.vault.list(dir);
+            } catch {
+                return;
+            }
+            if (listing.files.length > 0 || listing.folders.length > 0) return;
+            await this.vault.delete(dir);
+        }
+    }
+
+    /** A deleted file has no base: if the shared state gets it again, the
+     *  next Pull writes it as after a Join. */
+    private async dropBase(binding: ConfigBinding, path: string): Promise<void> {
+        await binding.store.runWriteTx({
+            meta: [
+                { op: "delete", key: configLastSyncedKey(path) },
+                { op: "delete", key: configLocalFirstKey(path) },
+            ],
+            onCommit: () => binding.lastSynced.delete(path),
+        });
     }
 
     /** The disk of `entries` has taken in their shared versions. */

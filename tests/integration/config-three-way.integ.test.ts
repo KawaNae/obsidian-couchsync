@@ -15,6 +15,9 @@
  *   - a Pull that writes nothing does not reload and shows one Notice
  *   - the Push list: what it selects is sent, what it leaves out is kept
  *     on this device (not sent, not taken in) until selected again
+ *   - Pull & Overwrite: the disk becomes the shared state, files the
+ *     shared state does not have are deleted, declarations are dropped,
+ *     files that do not take part are left alone; Cancel changes nothing
  *   - the one-time migration of a store written by older builds
  */
 import "fake-indexeddb/auto";
@@ -62,6 +65,8 @@ interface Device {
     settings: CouchSyncSettings;
     modal: FakeModalPresenter;
     reloads: number;
+    /** Plugin folders Pull asked to stop, per call. */
+    stopped: string[][];
 }
 
 describe("config three-way merge across devices", () => {
@@ -105,7 +110,7 @@ describe("config three-way merge across devices", () => {
             compressionEnabled: false,
             configCompressionEnabled: false,
         });
-        const dev = { id, vault, store, settings, modal: new FakeModalPresenter(), reloads: 0 } as Device;
+        const dev = { id, vault, store, settings, modal: new FakeModalPresenter(), reloads: 0, stopped: [] } as Device;
         dev.cs = new ConfigSync(
             vault, dev.modal, `vault-${id}`, new AuthGate(), ALWAYS_VISIBLE,
             NoopReconnectBridge, () => settings,
@@ -114,6 +119,7 @@ describe("config three-way merge across devices", () => {
                 rawClientFactory: () => remote,
                 getIsMobile: () => opts.mobile ?? false,
                 reload: () => { dev.reloads++; },
+                stopPlugins: async (dirs) => { dev.stopped.push(dirs); },
             },
         );
         await dev.cs.rebind(DB);
@@ -556,6 +562,188 @@ describe("config three-way merge across devices", () => {
         expect(await serverDoc()).toBeNull();
         expect(a.settings.configSyncPolicy.deviceOnlyKeys).toEqual({});
         expect(warnings()).toContain("Config Push cancelled — Nothing was pushed.");
+    });
+
+    // ── Pull & Overwrite ────────────────────────────────
+
+    describe("Pull & Overwrite", () => {
+        const CSS = ".obsidian/snippets/local.css";
+        const PLUGIN = ".obsidian/plugins/p";
+        const OWN = ".obsidian/plugins/obsidian-couchsync";
+
+        /** A pushes app.json and a plugin's data.json; B takes them in. */
+        async function sharedPair(): Promise<{ a: Device; b: Device }> {
+            const a = await device("dev-A");
+            a.vault.addFile(`${PLUGIN}/main.js`, "code");
+            put(a, { k: 0, mine: 0 });
+            put(a, { token: "shared" }, `${PLUGIN}/data.json`);
+            expect(await a.cs.push()).toBe(2);
+            const b = await device("dev-B");
+            b.vault.addFile(`${PLUGIN}/main.js`, "code");
+            expect(await b.cs.pull()).toBe(2);
+            return { a, b };
+        }
+
+        it("makes the disk the shared state: unpushed edits and kept keys are dropped", async () => {
+            const { b } = await sharedPair();
+            // A key kept on this device, then an edit that is not pushed.
+            put(b, { k: 0, mine: 1 });
+            b.modal.pushResponder = leaveOut(`${APP}#/mine`);
+            expect(await b.cs.push()).toBe(0);
+            put(b, { k: 5, mine: 1, extra: true });
+            put(b, { token: "mine" }, `${PLUGIN}/data.json`);
+            const before = b.vault.readText(APP);
+            const reloads = b.reloads;
+
+            b.modal.overwriteResponses.push(true);
+            expect(await b.cs.overwrite()).toBe(2);
+
+            expect(b.modal.overwriteCalls).toHaveLength(1);
+            expect(b.modal.overwriteCalls[0]).toEqual({
+                writes: [
+                    { path: APP, created: false },
+                    { path: `${PLUGIN}/data.json`, created: false },
+                ],
+                deletes: [],
+                keptKeys: 1,
+                skipped: [],
+            });
+            expect(json(b)).toEqual({ k: 0, mine: 0 });
+            expect(json(b, `${PLUGIN}/data.json`)).toEqual({ token: "shared" });
+            expect(b.settings.configSyncPolicy.deviceOnlyKeys).toEqual({});
+            expect(b.reloads).toBe(reloads + 1);
+            // The plugin was stopped before its file was written; this
+            // plugin itself never is.
+            expect(b.stopped.at(-1)).toEqual([PLUGIN]);
+            // The overwritten content is backed up.
+            const gens = (await b.vault.list(BACKUPS)).folders.sort();
+            expect(b.vault.readText(`${gens.at(-1)}/app.json`)).toBe(before);
+
+            // The bases are the shared versions: nothing to push or pull.
+            b.modal.pushResponder = (r) => r.items.map((i) => i.id);
+            expect(await b.cs.push()).toBe(0);
+            expect(b.modal.pushCalls).toHaveLength(1);
+            expect(await b.cs.pull()).toBe(0);
+        });
+
+        it("deletes the selected files the shared state does not have, and nothing else", async () => {
+            const { b } = await sharedPair();
+            const DT = ".obsidian/plugins/dt";
+            const keep: Record<string, string> = {
+                // Not taking part: plugin code (blocked), layout, this
+                // plugin's own data.json, a file left out in the Filter.
+                [`${PLUGIN}/main.js`]: "code",
+                ".obsidian/workspace.json": "{}",
+                [`${OWN}/data.json`]: "{\"secret\":1}",
+                ".obsidian/snippets/off.css": "b {}",
+            };
+            for (const [p, c] of Object.entries(keep)) b.vault.addFile(p, c);
+            b.settings.configSyncPolicy.overrides[".obsidian/snippets/off.css"] = false;
+            // Taking part, not shared: deleted.
+            b.vault.addFile(CSS, "a {}");
+            put(b, { v: 1 }, `${DT}/data.json`);
+            // The folder keeps its plugin code, so it is not removed.
+            b.vault.addFile(`${DT}/main.js`, "dt code");
+            // A folder left empty is removed, so it no longer counts as an
+            // installed plugin.
+            const GONE = ".obsidian/plugins/gone";
+            put(b, { v: 1 }, `${GONE}/data.json`);
+            const deleted: string[] = [];
+            const del = b.vault.delete.bind(b.vault);
+            b.vault.delete = async (p: string) => { deleted.push(p); await del(p); };
+
+            b.modal.overwriteResponses.push(true);
+            expect(await b.cs.overwrite()).toBe(3);
+
+            expect(b.modal.overwriteCalls[0].deletes.sort())
+                .toEqual([`${DT}/data.json`, `${GONE}/data.json`, CSS].sort());
+            expect(deleted.sort()).toEqual([`${DT}/data.json`, GONE, `${GONE}/data.json`, CSS].sort());
+            expect(b.modal.overwriteCalls[0].writes).toEqual([]);
+            expect(await b.vault.exists(CSS)).toBe(false);
+            expect(await b.vault.exists(`${DT}/data.json`)).toBe(false);
+            for (const [p, c] of Object.entries(keep)) expect(b.vault.readText(p)).toBe(c);
+            expect(b.vault.readText(`${DT}/main.js`)).toBe("dt code");
+            expect(json(b)).toEqual({ k: 0, mine: 0 });
+            expect(b.stopped.at(-1)?.sort()).toEqual([DT, GONE]);
+            // Deleted files are backed up; backups are never deleted.
+            const gens = (await b.vault.list(BACKUPS)).folders.sort();
+            expect(b.vault.readText(`${gens.at(-1)}/snippets/local.css`)).toBe("a {}");
+            expect(getLogEntries().some((e) => e.message.includes("deleted 3 file(s)") && e.message.includes(CSS)))
+                .toBe(true);
+        });
+
+        it("leaves a desktop-only plugin's files alone on mobile", async () => {
+            const DT = ".obsidian/plugins/dt";
+            const vault = new FakeVaultIO();
+            vault.addFile(`${DT}/manifest.json`, JSON.stringify({ id: "dt", isDesktopOnly: true }));
+            vault.addFile(`${DT}/data.json`, JSON.stringify({ v: "mobile" }));
+            const a = await device("dev-A");
+            put(a, { k: 0 });
+            await a.cs.push();
+            const mobile = await device("mobile", { vault, mobile: true });
+            mobile.modal.overwriteResponses.push(true);
+            expect(await mobile.cs.overwrite()).toBe(1);
+            expect(mobile.modal.overwriteCalls[0].deletes).toEqual([]);
+            expect(json(mobile, `${DT}/data.json`)).toEqual({ v: "mobile" });
+        });
+
+        it("Cancel changes nothing: disk, bases, kept keys, backups", async () => {
+            const { b } = await sharedPair();
+            put(b, { k: 0, mine: 1 });
+            b.modal.pushResponder = leaveOut(`${APP}#/mine`);
+            await b.cs.push();
+            put(b, { k: 5, mine: 1 });
+            b.vault.addFile(CSS, "a {}");
+            const binding = b.cs.currentBinding()!;
+            const bases = binding.lastSynced.paths().map((p) => [p, binding.lastSynced.get(p)]);
+            const diskWriteId = b.settings.configDiskWriteId;
+            const generations = (await b.vault.list(BACKUPS)).folders.length;
+            const reloads = b.reloads;
+
+            await expect(b.cs.overwrite()).rejects.toThrow();
+
+            expect(b.modal.overwriteCalls).toHaveLength(1);
+            expect(json(b)).toEqual({ k: 5, mine: 1 });
+            expect(b.vault.readText(CSS)).toBe("a {}");
+            expect(b.settings.configSyncPolicy.deviceOnlyKeys).toEqual({ [APP]: ["/mine"] });
+            expect(binding.lastSynced.paths().map((p) => [p, binding.lastSynced.get(p)])).toEqual(bases);
+            expect(b.settings.configDiskWriteId).toBe(diskWriteId);
+            expect((await b.vault.list(BACKUPS)).folders).toHaveLength(generations);
+            expect(b.reloads).toBe(reloads);
+            expect(warnings()).toContain("Config Pull & Overwrite cancelled — Nothing was changed.");
+        });
+
+        it("asks nothing and changes nothing when the disk already is the shared state", async () => {
+            const { b } = await sharedPair();
+            const reloads = b.reloads;
+            expect(await b.cs.overwrite()).toBe(0);
+            expect(b.modal.overwriteCalls).toHaveLength(0);
+            expect(b.reloads).toBe(reloads);
+        });
+
+        it("is refused when the server has no shared config for this device", async () => {
+            const a = await device("dev-A");
+            put(a, { k: 1 });
+            a.vault.addFile(CSS, "a {}");
+            expect(await a.cs.overwrite()).toBe(0);
+            expect(a.modal.overwriteCalls).toHaveLength(0);
+            expect(json(a)).toEqual({ k: 1 });
+            expect(a.vault.readText(CSS)).toBe("a {}");
+        });
+
+        it("a deleted file loses its base, so a later shared version is written as new", async () => {
+            const { a, b } = await sharedPair();
+            // B's snippet is not shared: the overwrite deletes it. When A
+            // later shares the same path, B's Pull writes it.
+            b.vault.addFile(CSS, "b {}");
+            b.modal.overwriteResponses.push(true);
+            await b.cs.overwrite();
+            expect(b.cs.currentBinding()!.lastSynced.get(CSS)).toBeUndefined();
+            a.vault.addFile(CSS, "a {}");
+            await a.cs.push();
+            expect(await b.cs.pull()).toBe(1);
+            expect(b.vault.readText(CSS)).toBe("a {}");
+        });
     });
 
     // ── Migration of an older store ─────────────────────

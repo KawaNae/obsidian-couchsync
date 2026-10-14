@@ -311,6 +311,22 @@ export default class CouchSyncPlugin extends Plugin {
                         (this.app as any).commands.executeCommandById("app:reload");
                     }, 500);
                 },
+                // Pull unloads a plugin before writing or deleting its files,
+                // so its unload cannot save in-memory settings over them.
+                // `disablePlugin` only unloads; the enabled list on disk is
+                // what the reload starts the plugins from.
+                stopPlugins: async (dirs) => {
+                    const plugins = (this.app as any).plugins;
+                    const manifests = Object.values(plugins.manifests ?? {}) as Array<{ id: string; dir?: string }>;
+                    for (const m of manifests) {
+                        if (!m.dir || !dirs.includes(m.dir) || !plugins.plugins?.[m.id]) continue;
+                        try {
+                            await plugins.disablePlugin(m.id);
+                        } catch (e: any) {
+                            logWarn(`could not stop plugin "${m.id}" before writing its config: ${e?.message ?? e}`);
+                        }
+                    }
+                },
                 // Receive-side platform gate: don't materialise desktop-only
                 // plugins on a mobile device. Mirrors the getPlatform wiring.
                 getIsMobile: () => Platform.isMobile,

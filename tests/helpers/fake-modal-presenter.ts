@@ -9,6 +9,7 @@ import type {
     ConflictModalResult,
     ConflictBatchItem,
     BatchDecision,
+    ConfigOverwritePreview,
 } from "../../src/types/modal-presenter.ts";
 import { defaultSelection, type PushReview } from "../../src/sync/config-push-review.ts";
 
@@ -31,6 +32,11 @@ export class FakeModalPresenter implements IModalPresenter {
     pushResponder: (review: PushReview) => string[] | null = defaultSelection;
     /** Record of all config Push lists shown (for assertions). */
     pushCalls: PushReview[] = [];
+
+    /** Answers the overwrite confirmation. Default: cancel. */
+    overwriteResponses: boolean[] = [];
+    /** Record of all overwrite confirmations shown (for assertions). */
+    overwriteCalls: ConfigOverwritePreview[] = [];
 
     /** Dismiss callbacks for currently open conflict modals. */
     private openDismiss = new Map<string, () => void>();
@@ -84,6 +90,11 @@ export class FakeModalPresenter implements IModalPresenter {
     async showConfigPushModal(review: PushReview): Promise<string[] | null> {
         this.pushCalls.push(review);
         return this.pushResponder(review);
+    }
+
+    async showConfigOverwriteModal(preview: ConfigOverwritePreview): Promise<boolean> {
+        this.overwriteCalls.push(preview);
+        return this.overwriteResponses.shift() ?? false;
     }
 
     /** Dismiss the open conflict modal for the given path (simulates auto-resolve). */

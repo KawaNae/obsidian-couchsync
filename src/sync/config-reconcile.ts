@@ -229,9 +229,19 @@ export interface PullPlanEntry {
     decision: PullDecision;
 }
 
+/** A file the Pull deletes, with its content before the Pull. */
+export interface PullPlanDelete {
+    path: string;
+    local: Uint8Array;
+}
+
 export interface PullPlan {
     entries: PullPlanEntry[];
-    /** Paths left alone because their shared content is not available. */
+    /** Files to delete. Only an overwriting Pull deletes: a merging Pull
+     *  never removes a file. */
+    deletes: PullPlanDelete[];
+    /** Paths left alone because their content (shared or on disk) is not
+     *  available or too large. */
     unavailable: string[];
 }
 
@@ -268,6 +278,51 @@ async function readBase(deps: ReconcileDeps, path: string): Promise<{ value: Con
     return { value, bytes };
 }
 
+/** The live shared docs that take part in sharing here. Unsafe remote
+ *  paths are rejected. */
+async function participatingSharedDocs(deps: ReconcileDeps): Promise<ConfigDoc[]> {
+    const docs = (await deps.store.allConfigDocs()).filter((d) => !d.deleted);
+    const out: ConfigDoc[] = [];
+    for (const doc of docs) {
+        const path = configPathFromId(doc._id);
+        const violation = unsafeVaultPathReason(path);
+        if (violation) {
+            logWarn(`rejecting unsafe remote config path "${path}" — ${violation}`);
+            continue;
+        }
+        if (deps.participates(path)) out.push(doc);
+    }
+    return out;
+}
+
+/** The shared content of `shared` and the disk of its path, or null when
+ *  either is not available (logged). */
+async function readSharedAndDisk(
+    deps: ReconcileDeps,
+    path: string,
+    shared: ConfigDoc,
+): Promise<{ sharedBytes: Uint8Array; local: Uint8Array | null } | null> {
+    if (shared.size > deps.maxSize) {
+        logWarn(`Skipping config ${path} — ${shared.size} bytes exceeds the config size limit`);
+        return null;
+    }
+    let sharedBytes = await readChunks(deps.store, shared.chunks);
+    if (!sharedBytes && deps.fetchChunks) {
+        await deps.fetchChunks(shared);
+        sharedBytes = await readChunks(deps.store, shared.chunks);
+    }
+    if (!sharedBytes) {
+        logWarn(`Skipping config ${path} — its content is not available locally (missing chunks)`);
+        return null;
+    }
+    const local = await readDisk(deps.vault, path, deps.maxSize);
+    if (local === "too-large") {
+        logWarn(`Skipping config ${path} — the file on disk exceeds the config size limit`);
+        return null;
+    }
+    return { sharedBytes, local };
+}
+
 /**
  * Plan a Pull: for every shared doc that takes part in sharing here and
  * whose version the disk has not taken in yet, decide what the disk
@@ -278,20 +333,10 @@ export async function planPull(
     onProgress?: (path: string, index: number, total: number) => void,
 ): Promise<PullPlan> {
     await deps.lastSynced.ensureLoaded();
-    const docs = (await deps.store.allConfigDocs()).filter((d) => !d.deleted);
-    const candidates: ConfigDoc[] = [];
-    for (const doc of docs) {
-        const path = configPathFromId(doc._id);
-        const violation = unsafeVaultPathReason(path);
-        if (violation) {
-            logWarn(`rejecting unsafe remote config path "${path}" — ${violation}`);
-            continue;
-        }
-        if (!deps.participates(path)) continue;
-        const base = deps.lastSynced.get(path);
-        if (base && sameVersion(base, doc)) continue;
-        candidates.push(doc);
-    }
+    const candidates = (await participatingSharedDocs(deps)).filter((doc) => {
+        const base = deps.lastSynced.get(configPathFromId(doc._id));
+        return !(base && sameVersion(base, doc));
+    });
 
     const entries: PullPlanEntry[] = [];
     const unavailable: string[] = [];
@@ -300,33 +345,17 @@ export async function planPull(
         const path = configPathFromId(shared._id);
         onProgress?.(path, i + 1, candidates.length);
         try {
-            if (shared.size > deps.maxSize) {
-                logWarn(`Skipping config ${path} — ${shared.size} bytes exceeds the config size limit`);
-                unavailable.push(path);
-                continue;
-            }
-            let sharedBytes = await readChunks(deps.store, shared.chunks);
-            if (!sharedBytes && deps.fetchChunks) {
-                await deps.fetchChunks(shared);
-                sharedBytes = await readChunks(deps.store, shared.chunks);
-            }
-            if (!sharedBytes) {
-                logWarn(`Skipping config ${path} — its content is not available locally (missing chunks)`);
-                unavailable.push(path);
-                continue;
-            }
-            const local = await readDisk(deps.vault, path, deps.maxSize);
-            if (local === "too-large") {
-                logWarn(`Skipping config ${path} — the file on disk exceeds the config size limit`);
+            const got = await readSharedAndDisk(deps, path, shared);
+            if (!got) {
                 unavailable.push(path);
                 continue;
             }
             const base = await readBase(deps, path);
             const noBase: NoBaseRule = deps.localFirst.has(path) ? "local-first" : "remote-first";
             entries.push({
-                path, shared, local,
+                path, shared, local: got.local,
                 decision: decidePull(
-                    path, base?.bytes ?? null, local, sharedBytes, noBase,
+                    path, base?.bytes ?? null, got.local, got.sharedBytes, noBase,
                     deps.deviceOnly?.(path) ?? [],
                 ),
             });
@@ -335,7 +364,71 @@ export async function planPull(
             unavailable.push(path);
         }
     }
-    return { entries, unavailable };
+    return { entries, deletes: [], unavailable };
+}
+
+/**
+ * Plan an overwriting Pull: make the disk the shared state. Every shared
+ * doc that takes part in sharing here is written as it is where the disk
+ * differs: no merge, no base, and this device's own keys are not kept.
+ * Every file of `deletable` that takes part in sharing here and that the
+ * shared state does not have is deleted.
+ *
+ * A path whose shared content is not available is left alone, and never
+ * deleted: the shared state has it. Files that do not take part in sharing
+ * here are neither written nor deleted.
+ */
+export async function planOverwrite(
+    deps: ReconcileDeps,
+    deletable: readonly string[],
+    onProgress?: (path: string, index: number, total: number) => void,
+): Promise<PullPlan> {
+    const docs = await participatingSharedDocs(deps);
+    const sharedPaths = new Set(docs.map((d) => configPathFromId(d._id)));
+    const extra = deletable.filter((p) => deps.participates(p) && !sharedPaths.has(p));
+    const total = docs.length + extra.length;
+
+    const entries: PullPlanEntry[] = [];
+    const unavailable: string[] = [];
+    for (let i = 0; i < docs.length; i++) {
+        const shared = docs[i];
+        const path = configPathFromId(shared._id);
+        onProgress?.(path, i + 1, total);
+        try {
+            const got = await readSharedAndDisk(deps, path, shared);
+            if (!got) {
+                unavailable.push(path);
+                continue;
+            }
+            const same = got.local !== null && bytesEqual(got.local, got.sharedBytes);
+            entries.push({
+                path, shared, local: got.local,
+                decision: { write: same ? null : got.sharedBytes, conflicts: [], deviceOnlyKept: 0 },
+            });
+        } catch (e: any) {
+            logWarn(`Failed to compare config ${path}: ${e?.message ?? e}`);
+            unavailable.push(path);
+        }
+    }
+
+    const deletes: PullPlanDelete[] = [];
+    for (let i = 0; i < extra.length; i++) {
+        const path = extra[i];
+        onProgress?.(path, docs.length + i + 1, total);
+        try {
+            const local = await readDisk(deps.vault, path, deps.maxSize);
+            if (local === "too-large") {
+                logWarn(`Skipping config ${path} — the file on disk exceeds the config size limit`);
+                unavailable.push(path);
+                continue;
+            }
+            if (local) deletes.push({ path, local });
+        } catch (e: any) {
+            logWarn(`Failed to read config ${path}: ${e?.message ?? e}`);
+            unavailable.push(path);
+        }
+    }
+    return { entries, deletes, unavailable };
 }
 
 export interface PushPlanEntry {

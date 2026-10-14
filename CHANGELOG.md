@@ -261,6 +261,20 @@ All notable changes to obsidian-couchsync.
   list or with "Share again" under "Kept on this device" in the Config
   Sync tab. A Push whose only changes are keys kept on this device shows
   no list.
+- **Pull & Overwrite makes this device's config the shared config.** A new
+  button in the Config Sync tab, next to Pull & Reload. It does not merge:
+  every selected file the server has is written as the server has it,
+  selected files the server does not have are deleted, and keys kept on
+  this device take the shared value and are shared again. Files the Filter
+  leaves out, a plugin's files where the plugin is not installed, a
+  desktop-only plugin's files on mobile, the workspace layout and the
+  CouchSync plugin's own folder are not touched; per-file choices in the
+  Filter stay. A confirmation lists the files it deletes and writes; Cancel
+  changes nothing. The files are backed up to `backups/config/` first, as
+  with Pull & Reload, and Obsidian reloads. When the server has no config
+  for this device's selection, nothing is deleted. Pull & Reload and Pull &
+  Overwrite stop a community plugin before writing or deleting its files,
+  so it cannot save its settings over them before the reload.
 - **Coming back to a config database merges as after a Join.** When another
   config database's Pull wrote this vault's config since this database was
   last used, the next Push or Pull here no longer treats those values as

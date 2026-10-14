@@ -210,6 +210,18 @@ current database, the step says so.
   it overwrites to `backups/config/` in the plugin's folder, then reloads
   Obsidian. When no file changes, it shows `No config files changed; no
   reload needed.` and does not reload. A failed Pull does not reload.
+- **Pull & Overwrite** (**Overwrite ↓**) — makes the selected files exactly
+  the shared config, without merging: changes not pushed are lost, selected
+  files the server does not have are deleted, and **Kept on this device** is
+  emptied (file overrides in the tree stay). Files that do not take part on
+  this device (left out by the tree, a plugin not installed here, a
+  desktop-only plugin on mobile, the workspace layout, CouchSync's own
+  folder) are not touched. A confirmation lists the files to delete and to
+  write; Cancel changes nothing. The files are backed up to
+  `backups/config/`, then Obsidian reloads. When the server has no config
+  for the selection, nothing is changed.
+- Both Pulls stop a community plugin before writing or deleting its files,
+  so it cannot save its in-memory settings over them before the reload.
 - After another config database's Pull wrote this vault's config, Push and
   Pull on this database merge as after a Join: the shared values win, keys
   only this device has stay.
