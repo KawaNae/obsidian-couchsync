@@ -96,7 +96,8 @@ function childPointer(parent: string, key: string): string {
     return `${parent}/${escapeToken(key)}`;
 }
 
-function pointerTokens(pointer: string): string[] {
+/** The unescaped reference tokens of `pointer` (none for the root). */
+export function pointerTokens(pointer: string): string[] {
     if (pointer === "") return [];
     return pointer.slice(1).split("/").map(unescapeToken);
 }

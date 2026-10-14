@@ -59,10 +59,18 @@ export interface PushReview {
 
 export const VALUE_TEXT_MAX = 200;
 
-function valueText(v: JsonValue | undefined): string | undefined {
+/** A value as JSON text, cut to `VALUE_TEXT_MAX`. */
+export function valueText(v: JsonValue | undefined): string | undefined {
     if (v === undefined) return undefined;
     const s = JSON.stringify(v);
     return s.length > VALUE_TEXT_MAX ? `${s.slice(0, VALUE_TEXT_MAX)}…` : s;
+}
+
+/** Values of `path` come from a plugin's data.json, which may hold API
+ *  keys or tokens: they are shown only on request. Obsidian's own settings
+ *  files hold none. */
+export function hidesValues(path: string): boolean {
+    return classifyConfigPath(path).unit === "community-settings";
 }
 
 function declaredIn(policy: ConfigSyncPolicy, path: string): readonly string[] {
@@ -91,7 +99,7 @@ export function buildPushReview(
     const items: PushItem[] = [];
     const sorted = [...entries].sort((a, b) => a.path.localeCompare(b.path));
     for (const e of sorted) {
-        const hideValues = classifyConfigPath(e.path).unit === "community-settings";
+        const hideValues = hidesValues(e.path);
         if (e.diff.kind !== "json") {
             items.push({
                 id: itemId(e.path, null),

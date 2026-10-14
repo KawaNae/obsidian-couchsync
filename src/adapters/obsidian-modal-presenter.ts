@@ -13,12 +13,14 @@ import type {
     ConflictBatchItem,
     BatchDecision,
     ConfigOverwritePreview,
+    ConfigShareAgainPreview,
 } from "../types/modal-presenter.ts";
 import { ConflictModal } from "../ui/conflict-modal.ts";
 import { ConflictBatchModal } from "../ui/conflict-batch-modal.ts";
 import { ConfirmModal } from "../ui/confirm-modal.ts";
 import { ConfigPushModal } from "../ui/config-push-modal.ts";
 import { ConfigOverwriteModal } from "../ui/config-overwrite-modal.ts";
+import { ConfigShareAgainModal } from "../ui/config-share-again-modal.ts";
 import type { PushReview } from "../sync/config-push-review.ts";
 
 export class ObsidianModalPresenter implements IModalPresenter {
@@ -63,5 +65,9 @@ export class ObsidianModalPresenter implements IModalPresenter {
 
     showConfigOverwriteModal(preview: ConfigOverwritePreview): Promise<boolean> {
         return new ConfigOverwriteModal(this.app, preview).waitForResult();
+    }
+
+    showConfigShareAgainModal(preview: ConfigShareAgainPreview): Promise<boolean> {
+        return new ConfigShareAgainModal(this.app, preview).waitForResult();
     }
 }

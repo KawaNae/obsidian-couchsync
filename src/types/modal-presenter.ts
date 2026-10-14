@@ -7,6 +7,7 @@
  */
 
 import type { PushReview } from "../sync/config-push-review.ts";
+import type { SharedAtPointer } from "../sync/config-reconcile.ts";
 
 /**
  * A conflict resolution choice.
@@ -66,6 +67,17 @@ export interface ConfigOverwritePreview {
     skipped: string[];
 }
 
+/** A key kept on this device that is about to take the shared value. */
+export interface ConfigShareAgainPreview {
+    path: string;
+    /** JSON Pointer of the key (`/<plugin id>` in community-plugins.json). */
+    pointer: string;
+    /** The shared value as the config DB has it before the Pull. */
+    shared: SharedAtPointer;
+    /** The value comes from a plugin's data.json: shown only on request. */
+    hideValue: boolean;
+}
+
 export interface IModalPresenter {
     /**
      * Show a side-by-side conflict diff and wait for the user to pick a
@@ -116,4 +128,11 @@ export interface IModalPresenter {
      * (nothing is changed).
      */
     showConfigOverwriteModal(preview: ConfigOverwritePreview): Promise<boolean>;
+
+    /**
+     * Show the key that Share again makes take the shared value, and wait
+     * for the user. Resolves true to go ahead, false on cancel or close
+     * (nothing is changed; the key stays kept on this device).
+     */
+    showConfigShareAgainModal(preview: ConfigShareAgainPreview): Promise<boolean>;
 }

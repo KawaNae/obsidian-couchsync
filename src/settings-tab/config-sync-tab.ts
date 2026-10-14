@@ -416,7 +416,7 @@ export class ConfigSyncTab {
         // ── Filter (meaning-unit policy tree) — the "what", shown first
         //    since it governs both Push and Pull below. ────────
         this.renderFilterTree(el, configEnabled);
-        this.renderDeviceOnlyKeys(el);
+        this.renderDeviceOnlyKeys(el, configEnabled);
 
         new Setting(el)
             .setName("Push")
@@ -638,9 +638,9 @@ export class ConfigSyncTab {
         void this.populateFilterTree(treeEl);
     }
 
-    /** The keys a Push left out, each with a button that shares it again.
-     *  Shown only when there are some. */
-    private renderDeviceOnlyKeys(el: HTMLElement): void {
+    /** The keys a Push left out, each with a button that makes it take the
+     *  shared value. Shown only when there are some. */
+    private renderDeviceOnlyKeys(el: HTMLElement, configEnabled: boolean): void {
         const policy = this.deps.getSettings().configSyncPolicy;
         const paths = Object.keys(policy.deviceOnlyKeys)
             .filter((p) => policy.deviceOnlyKeys[p].length > 0)
@@ -649,8 +649,9 @@ export class ConfigSyncTab {
         el.createEl("h4", { text: "Kept on this device" });
         el.createEl("p", {
             text: "Keys left out of a Push. Push does not send them and Pull does not " +
-                "change them. \"Share again\" makes a key sync as usual: if this " +
-                "device's value differs from the shared one, the next Push lists it.",
+                "change them. \"Share again\" makes a key take the shared value and sync " +
+                "as usual from then on: it shows the shared value, then runs Pull & Reload. " +
+                "To share this device's value instead, check the key in the Push list.",
             cls: "setting-item-description",
         });
         const box = el.createDiv({ cls: "cs-config-tree" });
@@ -661,13 +662,16 @@ export class ConfigSyncTab {
                     text: `${path.replace(/^\.obsidian\//, "")}  ${pointer === "" ? "(whole value)" : pointer}`,
                 });
                 const btn = row.createEl("button", { text: "Share again" });
+                btn.disabled = !configEnabled;
                 btn.addEventListener("click", async () => {
-                    const cur = this.deps.getSettings().configSyncPolicy.deviceOnlyKeys;
-                    const rest = (cur[path] ?? []).filter((p) => p !== pointer);
-                    const next = { ...cur };
-                    if (rest.length > 0) next[path] = rest;
-                    else delete next[path];
-                    await this.updatePolicy({ deviceOnlyKeys: next });
+                    btn.disabled = true;
+                    try {
+                        // ConfigSync confirms, pulls, reports in one Notice
+                        // and reloads Obsidian when it wrote a file.
+                        await this.trackOp(this.deps.configSync.shareAgain(path, pointer));
+                    } catch {
+                        // Reported by ConfigSync (ProgressNotice + log).
+                    }
                     this.deps.refresh();
                 });
             }

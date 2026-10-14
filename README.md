@@ -31,7 +31,8 @@ Simplified CouchDB-only vault sync for Obsidian. Fork of [Self-hosted LiveSync](
   key, and backs up the files it overwrites; Push lists this device's
   changes key by key, sends the checked ones, and holds files the server
   changed until the next Pull. A key left out of a Push stays this
-  device's own: it is not sent and later Pulls do not change it. Pull &
+  device's own: it is not sent and later Pulls do not change it, until
+  "Share again" makes it take the shared value through a Pull. Pull &
   Overwrite makes this device's selected config exactly the shared config,
   deleting selected files the server does not have, after listing them and
   backing them up. Plugin

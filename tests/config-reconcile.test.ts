@@ -97,7 +97,7 @@ describe("this device's own keys", () => {
 
     it("Pull keeps the disk's value of a declared key and does not report it", () => {
         const d = decidePull(
-            APP, enc(`{"a":0,"b":0}`), enc(`{"a":1,"b":0}`), enc(`{"a":2,"b":2}`), "remote-first", ["/a"],
+            APP, enc(`{"a":0,"b":0}`), enc(`{"a":1,"b":0}`), enc(`{"a":2,"b":2}`), "remote-first", { deviceOnly: ["/a"] },
         );
         expect(JSON.parse(dec(d.write)!)).toEqual({ a: 1, b: 2 });
         expect(d.conflicts).toEqual([]);
@@ -105,21 +105,50 @@ describe("this device's own keys", () => {
     });
 
     it("Pull leaves a declared key absent when the disk has none", () => {
-        const d = decidePull(APP, null, enc(`{"b":0}`), enc(`{"a":2,"b":0}`), "remote-first", ["/a"]);
+        const d = decidePull(APP, null, enc(`{"b":0}`), enc(`{"a":2,"b":0}`), "remote-first", { deviceOnly: ["/a"] });
         expect(d.write).toBeNull();
         expect(d.deviceOnlyKept).toBe(1);
     });
 
     it("Pull keeps a declared plugin's membership in community-plugins.json", () => {
         const d = decidePull(
-            PLUGINS, enc(`["x","y"]`), enc(`["y"]`), enc(`["x","y","z"]`), "remote-first", ["/y"],
+            PLUGINS, enc(`["x","y"]`), enc(`["y"]`), enc(`["x","y","z"]`), "remote-first", { deviceOnly: ["/y"] },
         );
         // x: removed here (a local change, kept); z: added remotely (taken);
         // y: declared, stays as on disk.
         expect(JSON.parse(dec(d.write)!)).toEqual(["y", "z"]);
-        const d2 = decidePull(PLUGINS, enc(`["y"]`), enc(`["y"]`), enc(`[]`), "remote-first", ["/y"]);
+        const d2 = decidePull(PLUGINS, enc(`["y"]`), enc(`["y"]`), enc(`[]`), "remote-first", { deviceOnly: ["/y"] });
         expect(d2.write).toBeNull();
         expect(d2.deviceOnlyKept).toBe(1);
+    });
+
+    it("Pull writes the shared value of a key it takes, and keeps the disk's other changes", () => {
+        const base = enc(`{"a":0,"b":0}`);
+        const d = decidePull(APP, base, enc(`{"a":1,"b":1}`), base, "remote-first", { takeShared: ["/a"] });
+        expect(JSON.parse(dec(d.write)!)).toEqual({ a: 0, b: 1 });
+        expect(d.conflicts).toEqual([]);
+    });
+
+    it("a key taken from the shared version wins over its declaration and is not reported", () => {
+        const d = decidePull(
+            APP, enc(`{"a":0}`), enc(`{"a":1}`), enc(`{"a":2}`), "remote-first",
+            { deviceOnly: ["/a"], takeShared: ["/a"] },
+        );
+        expect(JSON.parse(dec(d.write)!)).toEqual({ a: 2 });
+        expect(d.conflicts).toEqual([]);
+        expect(d.deviceOnlyKept).toBe(0);
+    });
+
+    it("a key taken that the shared version does not have is removed", () => {
+        const d = decidePull(APP, enc(`{}`), enc(`{"a":1}`), enc(`{}`), "remote-first", { takeShared: ["/a"] });
+        expect(JSON.parse(dec(d.write)!)).toEqual({});
+    });
+
+    it("a plugin taken follows the shared membership in community-plugins.json", () => {
+        const on = decidePull(PLUGINS, enc(`["y"]`), enc(`[]`), enc(`["y"]`), "remote-first", { takeShared: ["/y"] });
+        expect(JSON.parse(dec(on.write)!)).toEqual(["y"]);
+        const off = decidePull(PLUGINS, enc(`[]`), enc(`["y"]`), enc(`[]`), "remote-first", { takeShared: ["/y"] });
+        expect(JSON.parse(dec(off.write)!)).toEqual([]);
     });
 
     it("Push leaves a declared key at the base's value, even under a selected change", () => {

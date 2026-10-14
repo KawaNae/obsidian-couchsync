@@ -10,6 +10,7 @@ import type {
     ConflictBatchItem,
     BatchDecision,
     ConfigOverwritePreview,
+    ConfigShareAgainPreview,
 } from "../../src/types/modal-presenter.ts";
 import { defaultSelection, type PushReview } from "../../src/sync/config-push-review.ts";
 
@@ -37,6 +38,11 @@ export class FakeModalPresenter implements IModalPresenter {
     overwriteResponses: boolean[] = [];
     /** Record of all overwrite confirmations shown (for assertions). */
     overwriteCalls: ConfigOverwritePreview[] = [];
+
+    /** Answers the Share again confirmation. Default: cancel. */
+    shareAgainResponses: boolean[] = [];
+    /** Record of all Share again confirmations shown (for assertions). */
+    shareAgainCalls: ConfigShareAgainPreview[] = [];
 
     /** Dismiss callbacks for currently open conflict modals. */
     private openDismiss = new Map<string, () => void>();
@@ -95,6 +101,11 @@ export class FakeModalPresenter implements IModalPresenter {
     async showConfigOverwriteModal(preview: ConfigOverwritePreview): Promise<boolean> {
         this.overwriteCalls.push(preview);
         return this.overwriteResponses.shift() ?? false;
+    }
+
+    async showConfigShareAgainModal(preview: ConfigShareAgainPreview): Promise<boolean> {
+        this.shareAgainCalls.push(preview);
+        return this.shareAgainResponses.shift() ?? false;
     }
 
     /** Dismiss the open conflict modal for the given path (simulates auto-resolve). */
