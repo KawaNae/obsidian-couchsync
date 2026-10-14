@@ -20,8 +20,13 @@ class FakeWindow extends EventTarget {
     innerHeight = 900;
     visualViewport = new FakeViewport(900);
     toolbarTop: number | null = null;
+    safeAreaTop = "";
+    getComputedStyle = () => ({
+        getPropertyValue: (name: string) => (name === "--safe-area-inset-top" ? this.safeAreaTop : ""),
+    });
     document = {
         body: {},
+        documentElement: {},
         querySelector: (sel: string) => {
             if (sel !== ".mobile-toolbar" || this.toolbarTop === null) return null;
             const top = this.toolbarTop;
@@ -137,6 +142,14 @@ describe("MobileStatusPlacement", () => {
         win.visualViewport.dispatchEvent(new Event("resize"));
         // 900 - 100 - 4 - 18
         expect(el.style.bottom).toBe("778px");
+    });
+
+    it("keeps the status below the system's status bar, as the safe area's top inset tells", () => {
+        position = { ...position, bottom: 600 };
+        win.safeAreaTop = "51.8px";
+        win.dispatchEvent(keyboardEvent("keyboardWillShow", 336));
+        // floor(900 - 51.8 - 4 - 18)
+        expect(el.style.bottom).toBe("826px");
     });
 
     it("stops following the keyboard and the toolbar on stop", () => {

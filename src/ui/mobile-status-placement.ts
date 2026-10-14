@@ -18,9 +18,11 @@ const EDGE_GAP = 4;
  * toolbar may be laid out after the keyboard's events.
  *
  * The status is there to be seen, so it never goes above the top of what is
- * visible either (the window, or the visual viewport's top where that is
- * lower), whether the keyboard is open or not: a large `bottom` raised by the
- * keyboard would otherwise put it off the screen.
+ * visible and readable either, whether the keyboard is open or not: a large
+ * `bottom` raised by the keyboard would otherwise put it off the screen. That
+ * top is the visual viewport's top, lowered by the safe area's top inset: the
+ * WebView reaches under the system's status bar, and Obsidian publishes the
+ * inset as `--safe-area-inset-top` on the root element (0 where it does not).
  */
 export class MobileStatusPlacement {
     private readonly keyboard: VirtualKeyboard;
@@ -67,9 +69,17 @@ export class MobileStatusPlacement {
 
     /** The largest `bottom` that keeps the whole status below the visible top. */
     private highestBottom(): number {
-        const visibleTop = Math.max(0, this.win.visualViewport?.offsetTop ?? 0);
+        const visibleTop = Math.max(0, this.win.visualViewport?.offsetTop ?? 0) + this.safeAreaTop();
         const height = this.el.getBoundingClientRect().height;
         return Math.max(0, Math.floor(this.win.innerHeight - visibleTop - EDGE_GAP - height));
+    }
+
+    /** CSS px the system's status bar covers at the top; 0 when it is not told. */
+    private safeAreaTop(): number {
+        const root = this.win.document.documentElement;
+        const raw = this.win.getComputedStyle(root).getPropertyValue("--safe-area-inset-top");
+        const px = parseFloat(raw);
+        return Number.isFinite(px) && px > 0 ? px : 0;
     }
 
     /** CSS px from the window's bottom up to the editing toolbar's top; 0 without one. */
