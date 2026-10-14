@@ -699,7 +699,7 @@ export class Reconciler {
     private async tryStep(
         path: string,
         label: string,
-        op: () => Promise<void>,
+        op: () => Promise<unknown>,
         mode: ReconcileMode,
     ): Promise<boolean> {
         if (mode !== "apply") return true;

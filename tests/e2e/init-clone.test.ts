@@ -84,6 +84,20 @@ describe("E2E: Init + Clone (real setup + real CouchDB)", () => {
         const b = h.addDevice("b3", { syncIgnore: "^private/" });
         const summary = await b.runClone();
         expect(summary).toBe("2 files written.");
+        expect(b.progress).toContain("Writing 2 vault files...");
+        expect(b.progress.filter((m) => m.startsWith("Writing: "))).toEqual([
+            expect.stringMatching(/\(1\/2\)$/), expect.stringMatching(/\(2\/2\)$/),
+        ]);
         expect(b.vault.getFiles().map((f) => f.path).sort()).toEqual(["keep/one.md", "keep/two.md"]);
+    });
+
+    it("Init counts the files it pushed, not files kept out by the filter", async () => {
+        const a = h.addDevice("a4", { syncIgnore: "^private/" });
+        a.vault.addFile("keep/one.md", "one");
+        a.vault.addFile("keep/two.md", "two");
+        a.vault.addFile("private/secret.md", "kept out on the initialising device");
+        const summary = await a.runInit({ encryption: false, compression: false });
+        expect(summary).toMatch(/^2 files, \d+ docs pushed\.$/);
+        expect(await h.adminClient.getDoc(makeFileId("private/secret.md"))).toBeNull();
     });
 });
