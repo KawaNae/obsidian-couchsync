@@ -9,11 +9,11 @@
  * Also renders the existing server info + database list dashboard (read
  * from the live server state via raw fetch, not CouchClient).
  */
-import { type App, Modal, Setting, type ButtonComponent } from "obsidian";
+import { type App, Setting, type ButtonComponent } from "obsidian";
 import type { CouchSyncSettings, ConnectionState } from "../settings.ts";
 import type { SyncEngine } from "../db/sync-engine.ts";
 import type { AuthGate } from "../db/sync/auth-gate.ts";
-import { ConfirmModal } from "../ui/confirm-modal.ts";
+import { ConfirmModal, TypeToConfirmModal } from "../ui/confirm-modal.ts";
 import {
     AuthError, fetchJson, deleteDb, formatBytes, formatTimestamp,
     type ServerInfo, type DbInfo,
@@ -24,65 +24,6 @@ import type { VaultBinding } from "../sync/vault-binding.ts";
 import { logWarn } from "../ui/log.ts";
 import { ProgressNotice, showNotice } from "../ui/notices.ts";
 import { UserFacingError } from "../ui/describe-error.ts";
-
-class TypeToConfirmModal extends Modal {
-    private resolved = false;
-    private resolve: (value: boolean) => void = () => {};
-
-    constructor(app: App, private expectedName: string) {
-        super(app);
-    }
-
-    onOpen(): void {
-        const { contentEl } = this;
-        contentEl.createEl("h3", { text: "Type database name to confirm" });
-        contentEl.createEl("p", {
-            text: `Type "${this.expectedName}" to permanently delete this database.`,
-        });
-
-        let deleteBtnComponent: ButtonComponent;
-        const setting = new Setting(contentEl)
-            .addText((text) => {
-                text.setPlaceholder(this.expectedName);
-                text.onChange((value) => {
-                    const matches = value === this.expectedName;
-                    deleteBtnComponent.setDisabled(!matches);
-                    deleteBtnComponent.buttonEl.toggleClass("mod-warning", matches);
-                });
-            })
-            .addButton((btn) => {
-                deleteBtnComponent = btn;
-                btn.setButtonText("Delete").setDisabled(true);
-                btn.onClick(() => {
-                    this.resolved = true;
-                    this.resolve(true);
-                    this.close();
-                });
-            })
-            .addButton((btn) =>
-                btn.setButtonText("Cancel").onClick(() => {
-                    this.resolved = true;
-                    this.resolve(false);
-                    this.close();
-                }),
-            );
-        // Prevent Obsidian from auto-focusing the delete button.
-        const input = setting.controlEl.querySelector("input");
-        if (input) setTimeout(() => input.focus(), 0);
-    }
-
-    onClose(): void {
-        if (!this.resolved) this.resolve(false);
-        this.contentEl.empty();
-    }
-
-    waitForResult(): Promise<boolean> {
-        return new Promise((resolve) => {
-            this.resolve = resolve;
-            this.open();
-        });
-    }
-}
 
 // ── Public interface ──────────────────────────────────────────────────
 

@@ -1,4 +1,5 @@
-import { App, Modal, Setting } from "obsidian";
+import { App, Setting } from "obsidian";
+import { ConfirmationModal } from "./confirm-modal.ts";
 import type { ConfigOverwritePreview } from "../types/modal-presenter.ts";
 
 /**
@@ -6,10 +7,7 @@ import type { ConfigOverwritePreview } from "../types/modal-presenter.ts";
  * files it writes, each as a list, and the keys kept on this device that
  * it stops keeping. Closing the dialog changes nothing.
  */
-export class ConfigOverwriteModal extends Modal {
-    private resolved = false;
-    private resolve: (value: boolean) => void = () => {};
-
+export class ConfigOverwriteModal extends ConfirmationModal {
     constructor(app: App, private preview: ConfigOverwritePreview) {
         super(app);
     }
@@ -46,10 +44,7 @@ export class ConfigOverwriteModal extends Modal {
             });
         }
 
-        new Setting(contentEl)
-            .addButton((btn) =>
-                btn.setButtonText("Overwrite").setWarning().onClick(() => this.finish(true)))
-            .addButton((btn) => btn.setButtonText("Cancel").onClick(() => this.finish(false)));
+        this.addActions(new Setting(contentEl), "Overwrite", "warning");
     }
 
     private renderList(parent: HTMLElement, title: string, paths: string[]): void {
@@ -57,23 +52,5 @@ export class ConfigOverwriteModal extends Modal {
         parent.createEl("h4", { text: title });
         const list = parent.createDiv({ cls: "cs-push-list" });
         for (const path of paths) list.createDiv({ text: path });
-    }
-
-    private finish(value: boolean): void {
-        this.resolved = true;
-        this.resolve(value);
-        this.close();
-    }
-
-    onClose(): void {
-        if (!this.resolved) this.resolve(false);
-        this.contentEl.empty();
-    }
-
-    waitForResult(): Promise<boolean> {
-        return new Promise((resolve) => {
-            this.resolve = resolve;
-            this.open();
-        });
     }
 }
