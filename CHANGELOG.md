@@ -275,10 +275,16 @@ All notable changes to obsidian-couchsync.
   own: later Pushes do not send it and Pulls do not change it, and neither
   reports it as a conflict. An unchecked file stops syncing on this device,
   as if turned off in the Filter. These choices are device settings and
-  are not synced. A key is shared again by checking it in a later Push
-  list or with "Share again" under "Kept on this device" in the Config
-  Sync tab. A Push whose only changes are keys kept on this device shows
-  no list.
+  are not synced. A key is shared again in one of two ways. Checking it in
+  a later Push list sends this device's value. "Share again" under "Kept on
+  this device" in the Config Sync tab takes the shared value instead: it
+  runs Pull & Reload, shows the shared value once the server is taken in,
+  and on confirmation writes that value
+  for the key (removes the key, or disables the plugin, where the shared
+  config has none) while every other key and file is pulled as usual. When
+  the disk already has the shared value, it only stops keeping the key and
+  does not reload. A Push whose only changes are keys kept on this device
+  shows no list.
 - **Pull & Overwrite makes this device's config the shared config.** A new
   button in the Config Sync tab, next to Pull & Reload. It does not merge:
   every selected file the server has is written as the server has it,

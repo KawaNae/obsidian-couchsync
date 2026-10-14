@@ -209,8 +209,18 @@ current database, the step says so.
   held: the notice asks to run Pull & Reload, then Push again.
 - **Kept on this device** (`configSyncPolicy.deviceOnlyKeys`, shown when
   there are any) — the keys left out of a Push, per file. **Share again**
-  removes one; if this device's value differs from the shared one, the
-  next Push lists it.
+  makes one take the shared value through a Pull & Reload. After the Pull
+  takes in the server, a confirmation shows the key and the shared value it
+  is about to write (hidden behind **Show value** for a plugin's
+  `data.json`); a Pull that cannot reach the server fails before asking.
+  On confirmation the Pull writes the shared value for the key (removes
+  the key, or disables the plugin in `community-plugins.json`, where the
+  shared config has none) even though this device changed it, and pulls
+  every other key and file as usual. The file is backed up first, the key
+  is no longer kept, and Obsidian reloads. When the disk already has the
+  shared value, nothing is written and Obsidian does not reload. Cancel
+  leaves the files and the key as they were. To share this device's value
+  instead, check the key in the Push list.
 - **Pull & Reload** (**Pull & Reload ↓**) — pulls, merges the selected files
   with this device's changes (JSON settings key by key), backs up the files
   it overwrites to `backups/config/` in the plugin's folder, then reloads

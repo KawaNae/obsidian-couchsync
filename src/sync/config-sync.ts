@@ -45,6 +45,7 @@ import {
     planPull,
     planPush,
     pushContent,
+    readSharedAt,
     type PullPlan,
     type PullPlanEntry,
     type ReconcileDeps,
@@ -54,6 +55,7 @@ import {
     applyPushSelection,
     buildPushReview,
     hasUndeclaredChange,
+    hidesValues,
     type AppliedSelection,
 } from "./config-push-review.ts";
 import {
@@ -851,6 +853,27 @@ export class ConfigSync {
      * of files written.
      */
     async pull(): Promise<number> {
+        return this.pullAndReload(null);
+    }
+
+    /**
+     * Share again: the key `pointer` of `path`, kept on this device
+     * (`deviceOnlyKeys`), takes the shared value and is shared from now on.
+     *
+     * It is Pull & Reload: after the copy, a confirmation shows the shared
+     * value the Pull is about to write; Cancel leaves the disk, the bases
+     * and the declaration as they were. That one key is taken from the shared
+     * version (removed where the shared version has none) instead of kept
+     * as a change of this device. Every other key and file is pulled as
+     * usual. The declaration is dropped once the file holds the shared
+     * value; it stays when the shared content is not available or the write
+     * fails. Returns the number of files written.
+     */
+    async shareAgain(path: string, pointer: string): Promise<number> {
+        return this.pullAndReload({ path, pointer });
+    }
+
+    private async pullAndReload(take: { path: string; pointer: string } | null): Promise<number> {
         const outcome = await this.runOperation("pull", async (ctx, progress, binding, keys) => {
             await binding.ensureCheckpointsLoaded();
             const writer = this.makePullWriter(binding, ctx, keys!);
@@ -862,11 +885,31 @@ export class ConfigSync {
             // progress.fail as is.
             const received = await writer.run((msg) => progress.update(msg));
 
-            const plan = await planPull(deps, (path, i, total) => {
-                progress.update(`Comparing: ${path} (${i}/${total})`);
-            });
+            // Confirmed after the copy, so the value shown is the one the
+            // plan writes. The copy writes only the config DB: Cancel leaves
+            // the disk, the bases and the declaration as they were.
+            if (take) {
+                progress.update("Confirm the shared value to take...");
+                const go = await this.modal.showConfigShareAgainModal({
+                    path: take.path,
+                    pointer: take.pointer,
+                    shared: await readSharedAt(binding.store, take.path, take.pointer, deps.fetchChunks),
+                    hideValue: hidesValues(take.path),
+                });
+                if (!go) throw abortError("Nothing was changed.");
+            }
+
+            const plan = await planPull(
+                take ? { ...deps, takeShared: (p) => (p === take.path ? [take.pointer] : []) } : deps,
+                (path, i, total) => {
+                    progress.update(`Comparing: ${path} (${i}/${total})`);
+                },
+            );
             await this.backupPlan(plan, progress);
             const applied = await this.applyPlan(binding, plan, progress, "Config Pull");
+            const taken = take !== null
+                && !plan.unavailable.includes(take.path) && !applied.failed.includes(take.path);
+            if (take && taken) await this.releaseDeclaration(take.path, take.pointer);
 
             const conflicts = plan.entries.filter((e) => e.decision.conflicts.length > 0);
             if (conflicts.length > 0) {
@@ -882,6 +925,11 @@ export class ConfigSync {
                 logInfo(`Config Pull: ${kept} key(s) kept on this device were not taken in.`);
             }
             const parts: string[] = [];
+            if (take) {
+                parts.push(taken
+                    ? "The key takes the shared value and is shared again."
+                    : "The key is still kept on this device: its shared value could not be written (see log).");
+            }
             if (received.received + received.deleted > 0) {
                 parts.push(`Received ${received.received + received.deleted} change(s).`);
             }
@@ -898,9 +946,26 @@ export class ConfigSync {
                     : "No config files changed; no reload needed.");
             progress.done(parts.join(" "));
             return applied;
-        });
+        }, take ? { label: "Config Share again" } : {});
         if (outcome.reload) this.reload();
         return outcome.written;
+    }
+
+    /** Stop keeping `pointer` of `path` on this device, and log it without
+     *  the value. */
+    private async releaseDeclaration(path: string, pointer: string): Promise<void> {
+        const s = this.getSettings();
+        const cur = s.configSyncPolicy.deviceOnlyKeys;
+        const rest = (cur[path] ?? []).filter((p) => p !== pointer);
+        const next = { ...cur };
+        if (rest.length > 0) next[path] = rest;
+        else delete next[path];
+        s.configSyncPolicy = { ...s.configSyncPolicy, deviceOnlyKeys: next };
+        await this.saveSettings();
+        logInfo(
+            `Config Share again: ${path}: ${pointer === "" ? "(whole value)" : pointer} ` +
+            `takes the shared value and is shared again.`,
+        );
     }
 
     /**
@@ -1012,16 +1077,17 @@ export class ConfigSync {
      * write and delete the planned files, and move every planned path's
      * base to its shared version (a deleted path loses its base). A file
      * that fails to write or delete keeps its old base, so the next Pull
-     * tries it again. `reload` is true when the disk changed or a plugin
-     * was stopped.
+     * tries it again; it is listed in `failed`. `reload` is true when the
+     * disk changed or a plugin was stopped.
      */
     private async applyPlan(
         binding: ConfigBinding,
         plan: PullPlan,
         progress: ProgressNotice,
         label: string,
-    ): Promise<{ written: number; deleted: number; reload: boolean }> {
+    ): Promise<{ written: number; deleted: number; failed: string[]; reload: boolean }> {
         const writes = plan.entries.filter((e) => e.decision.write !== null);
+        const failed: string[] = [];
         const changed = [...writes.map((e) => e.path), ...plan.deletes.map((d) => d.path)];
         const stopped = await this.stopPluginsOf(changed, label);
         if (changed.length > 0) await binding.recordDiskWrite();
@@ -1040,6 +1106,7 @@ export class ConfigSync {
                 }
             } catch (err: any) {
                 logError(`Failed to write config ${e.path}: ${err?.message ?? err}`);
+                failed.push(e.path);
                 continue;
             }
             await this.settleBase(binding, [e]);
@@ -1055,6 +1122,7 @@ export class ConfigSync {
                 await this.removeEmptyFolders(d.path);
             } catch (err: any) {
                 logError(`Failed to delete config ${d.path}: ${err?.message ?? err}`);
+                failed.push(d.path);
                 continue;
             }
             await this.dropBase(binding, d.path);
@@ -1062,7 +1130,7 @@ export class ConfigSync {
         }
 
         await this.settleBase(binding, plan.entries.filter((e) => e.decision.write === null));
-        return { written, deleted, reload: written + deleted > 0 || stopped };
+        return { written, deleted, failed, reload: written + deleted > 0 || stopped };
     }
 
     /** Stop the community plugins (other than this one) whose files are in

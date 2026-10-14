@@ -15,6 +15,8 @@
  *   - a Pull that writes nothing does not reload and shows one Notice
  *   - the Push list: what it selects is sent, what it leaves out is kept
  *     on this device (not sent, not taken in) until selected again
+ *   - Share again: a key kept on this device takes the shared value
+ *     through a Pull, other keys and files are pulled as usual
  *   - Pull & Overwrite: the disk becomes the shared state, files the
  *     shared state does not have are deleted, declarations are dropped,
  *     files that do not take part are left alone; Cancel changes nothing
@@ -567,6 +569,166 @@ describe("config three-way merge across devices", () => {
         expect(await serverDoc()).toBeNull();
         expect(a.settings.configSyncPolicy.deviceOnlyKeys).toEqual({});
         expect(warnings()).toContain("Config Push cancelled — Nothing was pushed.");
+    });
+
+    // ── Share again ─────────────────────────────────────
+
+    describe("Share again", () => {
+        /** A shares {k: 0, mine: 0}; B keeps mine = 1 on this device. */
+        async function keptPair(): Promise<{ a: Device; b: Device }> {
+            const a = await device("dev-A");
+            const b = await device("dev-B");
+            put(a, { k: 0, mine: 0 });
+            await a.cs.push();
+            await b.cs.pull();
+            put(b, { k: 0, mine: 1 });
+            b.modal.pushResponder = leaveOut(`${APP}#/mine`);
+            expect(await b.cs.push()).toBe(0);
+            b.modal.pushResponder = (r) => r.items.map((i) => i.id);
+            expect(b.settings.configSyncPolicy.deviceOnlyKeys).toEqual({ [APP]: ["/mine"] });
+            return { a, b };
+        }
+
+        it("writes the shared value, drops the declaration, and keeps other unpushed edits", async () => {
+            const { a, b } = await keptPair();
+            await a.cs.pull();
+            put(a, { k: 0, mine: 2 });
+            await a.cs.push();
+            put(b, { k: 5, mine: 1 });
+            const reloads = b.reloads;
+
+            b.modal.shareAgainResponses.push(true);
+            expect(await b.cs.shareAgain(APP, "/mine")).toBe(1);
+
+            // The confirmation comes after the copy: it shows the newest
+            // shared value, the one the Pull writes.
+            expect(b.modal.shareAgainCalls).toEqual([
+                { path: APP, pointer: "/mine", shared: { kind: "value", value: 2 }, hideValue: false },
+            ]);
+            expect(json(b)).toEqual({ k: 5, mine: 2 });
+            expect(b.settings.configSyncPolicy.deviceOnlyKeys).toEqual({});
+            expect(b.reloads).toBe(reloads + 1);
+            const gens = (await b.vault.list(BACKUPS)).folders.sort();
+            expect(JSON.parse(b.vault.readText(`${gens.at(-1)}/app.json`))).toEqual({ k: 5, mine: 1 });
+
+            // The unpushed edit is still a local change; the key is not.
+            expect(await b.cs.push()).toBe(1);
+            expect(b.modal.pushCalls.at(-1)!.items.map((i) => i.pointer)).toEqual(["/k"]);
+            expect(await serverJson()).toEqual({ k: 5, mine: 2 });
+
+            // Shared again: A's next change of the key reaches B.
+            await a.cs.pull();
+            put(a, { k: 5, mine: 3 });
+            await a.cs.push();
+            await b.cs.pull();
+            expect(json(b)).toEqual({ k: 5, mine: 3 });
+        });
+
+        it("removes the key when the shared version does not have it", async () => {
+            const a = await device("dev-A");
+            const b = await device("dev-B");
+            put(a, { k: 0 });
+            await a.cs.push();
+            await b.cs.pull();
+            put(b, { k: 0, mine: 1 });
+            b.modal.pushResponder = leaveOut(`${APP}#/mine`);
+            await b.cs.push();
+
+            b.modal.shareAgainResponses.push(true);
+            expect(await b.cs.shareAgain(APP, "/mine")).toBe(1);
+            expect(b.modal.shareAgainCalls[0].shared).toEqual({ kind: "absent" });
+            expect(json(b)).toEqual({ k: 0 });
+            expect(b.settings.configSyncPolicy.deviceOnlyKeys).toEqual({});
+        });
+
+        it("a plugin kept off in community-plugins.json follows the shared list again", async () => {
+            const PLUGINS = ".obsidian/community-plugins.json";
+            const enableList = (d: Device) => { d.settings.configSyncPolicy.unitDefaults["enabled-list"] = true; };
+            const desktop = await device("desktop");
+            const mobile = await device("mobile", { mobile: true });
+            enableList(desktop);
+            enableList(mobile);
+            put(desktop, ["a", "heavy"], PLUGINS);
+            await desktop.cs.push();
+            await mobile.cs.pull();
+            put(mobile, ["a"], PLUGINS);
+            mobile.modal.pushResponder = leaveOut(`${PLUGINS}#/heavy`);
+            await mobile.cs.push();
+
+            mobile.modal.shareAgainResponses.push(true);
+            expect(await mobile.cs.shareAgain(PLUGINS, "/heavy")).toBe(1);
+            expect(mobile.modal.shareAgainCalls[0].shared).toEqual({ kind: "member" });
+            expect(json(mobile, PLUGINS)).toEqual(["a", "heavy"]);
+            expect(mobile.settings.configSyncPolicy.deviceOnlyKeys).toEqual({});
+        });
+
+        it("hides a plugin's data.json value in the confirmation", async () => {
+            const PLUGIN = ".obsidian/plugins/p";
+            const a = await device("dev-A");
+            const b = await device("dev-B");
+            for (const d of [a, b]) d.vault.addFile(`${PLUGIN}/main.js`, "code");
+            put(a, { token: "shared" }, `${PLUGIN}/data.json`);
+            await a.cs.push();
+            await b.cs.pull();
+            put(b, { token: "mine" }, `${PLUGIN}/data.json`);
+            b.modal.pushResponder = leaveOut(`${PLUGIN}/data.json#/token`);
+            await b.cs.push();
+
+            b.modal.shareAgainResponses.push(true);
+            expect(await b.cs.shareAgain(`${PLUGIN}/data.json`, "/token")).toBe(1);
+            expect(b.modal.shareAgainCalls[0].hideValue).toBe(true);
+            expect(json(b, `${PLUGIN}/data.json`)).toEqual({ token: "shared" });
+        });
+
+        it("Cancel changes nothing: disk, bases, the declaration, backups", async () => {
+            const { b } = await keptPair();
+            put(b, { k: 5, mine: 1 });
+            const binding = b.cs.currentBinding()!;
+            const bases = binding.lastSynced.paths().map((p) => [p, binding.lastSynced.get(p)]);
+            const diskWriteId = b.settings.configDiskWriteId;
+            const generations = (await b.vault.list(BACKUPS)).folders.length;
+            const reloads = b.reloads;
+
+            await expect(b.cs.shareAgain(APP, "/mine")).rejects.toThrow();
+
+            expect(b.modal.shareAgainCalls).toHaveLength(1);
+            expect(json(b)).toEqual({ k: 5, mine: 1 });
+            expect(b.settings.configSyncPolicy.deviceOnlyKeys).toEqual({ [APP]: ["/mine"] });
+            expect(binding.lastSynced.paths().map((p) => [p, binding.lastSynced.get(p)])).toEqual(bases);
+            expect(b.settings.configDiskWriteId).toBe(diskWriteId);
+            expect((await b.vault.list(BACKUPS)).folders).toHaveLength(generations);
+            expect(b.reloads).toBe(reloads);
+            expect(warnings()).toContain("Config Share again cancelled — Nothing was changed.");
+        });
+
+        it("a copy that fails shows no confirmation and changes nothing", async () => {
+            const { b } = await keptPair();
+            const reloads = b.reloads;
+            shown.length = 0;
+            vi.spyOn(remote, "changes").mockRejectedValue(new TypeError("Failed to fetch"));
+
+            await expect(b.cs.shareAgain(APP, "/mine")).rejects.toThrow();
+
+            expect(b.modal.shareAgainCalls).toHaveLength(0);
+            expect(json(b)).toEqual({ k: 0, mine: 1 });
+            expect(b.settings.configSyncPolicy.deviceOnlyKeys).toEqual({ [APP]: ["/mine"] });
+            expect(b.reloads).toBe(reloads);
+            expect(shown.filter((t) => t.startsWith("CouchSync: Config Share again"))).toHaveLength(1);
+        });
+
+        it("drops the declaration without a reload when the disk already has the shared value", async () => {
+            const { b } = await keptPair();
+            put(b, { k: 0, mine: 0 });
+            const reloads = b.reloads;
+            shown.length = 0;
+
+            b.modal.shareAgainResponses.push(true);
+            expect(await b.cs.shareAgain(APP, "/mine")).toBe(0);
+            expect(b.settings.configSyncPolicy.deviceOnlyKeys).toEqual({});
+            expect(b.reloads).toBe(reloads);
+            expect(shown.filter((t) => t.startsWith("CouchSync: Config Share again")))
+                .toEqual([expect.stringMatching(/shared again\. No config files changed; no reload needed\./)]);
+        });
     });
 
     // ── Pull & Overwrite ────────────────────────────────

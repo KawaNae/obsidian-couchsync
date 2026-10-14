@@ -21,7 +21,7 @@ import type {
     ConfigLastSyncedValue,
 } from "../db/sync/config-last-synced.ts";
 import { splitIntoChunks, joinChunks, MAX_CHUNK_BYTES_CONFIG, type ChunkHasher } from "../db/chunker.ts";
-import { configPathFromId } from "../types/doc-id.ts";
+import { configPathFromId, makeConfigId } from "../types/doc-id.ts";
 import { chunkListsEqual } from "./chunk-equality.ts";
 import { compareVC } from "./vector-clock.ts";
 import { classifyConfigPath, type ConfigUnit } from "./config-policy/classify.ts";
@@ -37,9 +37,12 @@ import {
     parseJsonBytes,
     pinPointers,
     pointerCovers,
+    pointerTokens,
     sameAtPointer,
     serializeJson,
+    valueAt,
     type JsonChange,
+    type JsonValue,
     type NoBaseRule,
     type ParsedJson,
 } from "./config-merge.ts";
@@ -80,6 +83,17 @@ export function sameVersion(
 
 // ── Pull decision ────────────────────────────────────────
 
+/** Positions of one file that a Pull fixes, as JSON Pointers. */
+export interface PullPins {
+    /** Declared this device's own: keep the disk's value (or stay
+     *  absent). */
+    deviceOnly?: readonly string[];
+    /** Taken from the shared version (or removed when it has none),
+     *  even where the disk changed them: the user chose to take the
+     *  shared value. Wins over `deviceOnly` at the positions it covers. */
+    takeShared?: readonly string[];
+}
+
 export interface PullDecision {
     /** Bytes to write to the disk, or null to leave the disk as it is. */
     write: Uint8Array | null;
@@ -98,9 +112,8 @@ export interface PullDecision {
  * local file takes the shared content: deleting a config file is not a
  * change that is shared.
  *
- * `deviceOnly` are the JSON Pointers declared this device's own in this
- * file: they keep the disk's value (or stay absent), whatever the merge
- * says, and are never reported as conflicts.
+ * `pins` fix positions of a settings JSON file whatever the merge says;
+ * neither kind is reported as a conflict.
  */
 export function decidePull(
     path: string,
@@ -108,7 +121,7 @@ export function decidePull(
     local: Uint8Array | null,
     shared: Uint8Array,
     noBase: NoBaseRule,
-    deviceOnly: readonly string[] = [],
+    pins: PullPins = {},
 ): PullDecision {
     if (!local) return { write: shared, conflicts: [], deviceOnlyKept: 0 };
     if (bytesEqual(local, shared)) return { write: null, conflicts: [], deviceOnlyKept: 0 };
@@ -119,15 +132,20 @@ export function decidePull(
         const b = base ? parseJsonBytes(base) : undefined;
         if (l && r && b !== null) {
             const set = path === SET_FILE;
+            const taken = pins.takeShared ?? [];
+            const kept = (pins.deviceOnly ?? []).filter((d) => !taken.some((t) => pointerCovers(t, d)));
             const merged = mergeJson(b?.value, l.value, r.value, { set, noBase });
             // Declared keys the shared version changed to a value the disk
             // does not have.
-            const deviceOnlyKept = deviceOnly.filter((p) =>
+            const deviceOnlyKept = kept.filter((p) =>
                 !sameAtPointer(r.value, l.value, p, { set })
                 && (!b || !sameAtPointer(r.value, b.value, p, { set }))).length;
-            const value = orderLike(pinPointers(merged.value, l.value, deviceOnly, { set }), l.value);
+            const pinned = pinPointers(
+                pinPointers(merged.value, l.value, kept, { set }), r.value, taken, { set },
+            );
+            const value = orderLike(pinned, l.value);
             const conflicts = merged.conflicts.filter(
-                (c) => !deviceOnly.some((d) => pointerCovers(d, c)),
+                (c) => ![...kept, ...taken].some((d) => pointerCovers(d, c)),
             );
             if (jsonEqual(value, l.value)) return { write: null, conflicts, deviceOnlyKept };
             return {
@@ -219,6 +237,9 @@ export interface ReconcileDeps {
     /** JSON Pointers declared this device's own in `path`: not sent, not
      *  taken in. Omitted: none. */
     deviceOnly?: (path: string) => readonly string[];
+    /** JSON Pointers of `path` whose shared value a Pull writes, even where
+     *  the disk changed them (`PullPins.takeShared`). Omitted: none. */
+    takeShared?: (path: string) => readonly string[];
 }
 
 export interface PullPlanEntry {
@@ -326,7 +347,9 @@ async function readSharedAndDisk(
 /**
  * Plan a Pull: for every shared doc that takes part in sharing here and
  * whose version the disk has not taken in yet, decide what the disk
- * becomes. Paths whose base already is the shared version are not read.
+ * becomes. Paths whose base already is the shared version are not read,
+ * unless some of their positions take the shared value (`takeShared`):
+ * the disk may differ there from a base that is current.
  */
 export async function planPull(
     deps: ReconcileDeps,
@@ -334,7 +357,9 @@ export async function planPull(
 ): Promise<PullPlan> {
     await deps.lastSynced.ensureLoaded();
     const candidates = (await participatingSharedDocs(deps)).filter((doc) => {
-        const base = deps.lastSynced.get(configPathFromId(doc._id));
+        const path = configPathFromId(doc._id);
+        if ((deps.takeShared?.(path) ?? []).length > 0) return true;
+        const base = deps.lastSynced.get(path);
         return !(base && sameVersion(base, doc));
     });
 
@@ -354,10 +379,10 @@ export async function planPull(
             const noBase: NoBaseRule = deps.localFirst.has(path) ? "local-first" : "remote-first";
             entries.push({
                 path, shared, local: got.local,
-                decision: decidePull(
-                    path, base?.bytes ?? null, got.local, got.sharedBytes, noBase,
-                    deps.deviceOnly?.(path) ?? [],
-                ),
+                decision: decidePull(path, base?.bytes ?? null, got.local, got.sharedBytes, noBase, {
+                    deviceOnly: deps.deviceOnly?.(path) ?? [],
+                    takeShared: deps.takeShared?.(path) ?? [],
+                }),
             });
         } catch (e: any) {
             logWarn(`Failed to compare config ${path}: ${e?.message ?? e}`);
@@ -429,6 +454,46 @@ export async function planOverwrite(
         }
     }
     return { entries, deletes, unavailable };
+}
+
+/** The shared value at one position, as the config DB has it. */
+export type SharedAtPointer =
+    | { kind: "value"; value: JsonValue }
+    /** The shared version has the file but not the key (for
+     *  community-plugins.json: the plugin is not enabled). */
+    | { kind: "absent" }
+    /** community-plugins.json: the plugin is enabled. */
+    | { kind: "member" }
+    /** The shared state has no such file. */
+    | { kind: "no-file" }
+    /** The content is not available (chunks missing) or is not JSON. */
+    | { kind: "unknown" };
+
+/** The shared value of `pointer` in `path` from the config DB, reading
+ *  the content as `planPull` does: chunks the store lacks are fetched with
+ *  `fetchChunks` when given. */
+export async function readSharedAt(
+    store: ConfigLocalDB,
+    path: string,
+    pointer: string,
+    fetchChunks?: (doc: ConfigDoc) => Promise<void>,
+): Promise<SharedAtPointer> {
+    const doc = await store.get(makeConfigId(path));
+    if (!doc || doc.deleted) return { kind: "no-file" };
+    let bytes = await readChunks(store, doc.chunks);
+    if (!bytes && fetchChunks) {
+        await fetchChunks(doc);
+        bytes = await readChunks(store, doc.chunks);
+    }
+    const parsed = bytes ? parseJsonBytes(bytes) : null;
+    if (!parsed) return { kind: "unknown" };
+    if (path === SET_FILE) {
+        const tokens = pointerTokens(pointer);
+        if (tokens.length !== 1 || !Array.isArray(parsed.value)) return { kind: "unknown" };
+        return parsed.value.includes(tokens[0]) ? { kind: "member" } : { kind: "absent" };
+    }
+    const value = valueAt(parsed.value, pointer);
+    return value === undefined ? { kind: "absent" } : { kind: "value", value };
 }
 
 export interface PushPlanEntry {
