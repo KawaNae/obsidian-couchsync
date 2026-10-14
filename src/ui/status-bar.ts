@@ -1,6 +1,7 @@
 import { Platform, type Plugin } from "obsidian";
 import type { SyncState, SyncErrorDetail } from "../db/reconnect-policy.ts";
 import type { CouchSyncSettings } from "../settings.ts";
+import { MobileStatusPlacement } from "./mobile-status-placement.ts";
 
 const STATE_LABELS: Record<SyncState, string> = {
     disconnected: "Disconnected",
@@ -35,6 +36,7 @@ export class StatusBar {
     private dotEl: HTMLSpanElement | null = null;
     private textEl: HTMLSpanElement | null = null;
     private floatingEl: HTMLElement | null = null;
+    private placement: MobileStatusPlacement | null = null;
     private getSettings: () => CouchSyncSettings;
     private getLastHealthyAt: () => number;
     private getErrorDetail: () => SyncErrorDetail | null;
@@ -64,7 +66,12 @@ export class StatusBar {
             this.dotEl = this.floatingEl.createSpan({ cls: "cs-status__dot" });
             this.textEl = this.floatingEl.createSpan();
             document.body.appendChild(this.floatingEl);
-            this.applyPosition();
+            this.placement = new MobileStatusPlacement(
+                this.floatingEl,
+                window,
+                () => this.getSettings().mobileStatus,
+            );
+            this.placement.start();
         }
 
         this.update("disconnected");
@@ -121,12 +128,7 @@ export class StatusBar {
 
     /** Re-apply position from settings (call after settings change) */
     applyPosition(): void {
-        if (!this.floatingEl) return;
-        const s = this.getSettings();
-        const m = s.mobileStatus;
-        this.floatingEl.style.bottom = `${m.bottom}px`;
-        this.floatingEl.style.left = m.align === "left" ? `${m.offset}px` : "";
-        this.floatingEl.style.right = m.align === "right" ? `${m.offset}px` : "";
+        this.placement?.apply();
     }
 
     destroy(): void {
@@ -134,6 +136,8 @@ export class StatusBar {
             clearInterval(this.tickTimer);
             this.tickTimer = null;
         }
+        this.placement?.stop();
+        this.placement = null;
         this.floatingEl?.remove();
         this.floatingEl = null;
     }
