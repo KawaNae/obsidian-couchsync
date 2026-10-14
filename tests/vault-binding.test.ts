@@ -21,6 +21,7 @@ import { makeSettings } from "./helpers/settings-factory.ts";
 import type { CouchSyncSettings } from "../src/settings.ts";
 import type { ICouchClient } from "../src/db/interfaces.ts";
 import type { DbCheckResult } from "../src/db/sync/vault-remote-ops.ts";
+import type { VaultSetupPlan } from "../src/sync/vault-setup-confirm.ts";
 
 interface Rig {
     binding: VaultBinding;
@@ -40,6 +41,12 @@ interface Rig {
     /** When set, the destructive step waits for it. */
     setupGate: Promise<void> | null;
     dbCheckResult: DbCheckResult;
+    /** The plans the confirm dialog was shown, in order. */
+    confirmed: VaultSetupPlan[];
+    /** The answer to the confirm dialog. */
+    confirmAnswer: boolean;
+    /** Each host call that asks the user, in order. */
+    prompts: ("passphrase" | "confirm")[];
 }
 
 function rig(opts: {
@@ -59,6 +66,7 @@ function rig(opts: {
         settings, remote, auth: new AuthGate(),
         stops: 0, starts: 0, saves: [], stateAtSetup: null, failures: [], dones: [], setupError: null, setupGate: null, onSetup: () => {},
         dbCheckResult: { status: "exists", docCount: 5 },
+        confirmed: [], confirmAnswer: true, prompts: [],
     };
     const result = { vaultFiles: 3, totalDocs: 7 };
     const host: VaultBindingHost = {
@@ -91,7 +99,15 @@ function rig(opts: {
             done: (s) => { r.dones.push(s); },
             fail: (e) => { r.failures.push(e); },
         }),
-        askPassphrase: opts.ask ?? (async () => null),
+        askPassphrase: (reason, tryUnlock) => {
+            r.prompts.push("passphrase");
+            return (opts.ask ?? (async () => null))(reason, tryUnlock);
+        },
+        confirmSetup: async (plan) => {
+            r.prompts.push("confirm");
+            r.confirmed.push(plan);
+            return r.confirmAnswer;
+        },
     };
     r.binding = new VaultBinding(host);
     return r;
@@ -240,6 +256,43 @@ describe("VaultBinding.init", () => {
         expect(await r.binding.chunkHasher.hash(data)).toBe(await unlocked!.crypto.hmacHash(data));
     });
 
+    it("asks to confirm after the preparation, shown what the DB holds and the codec it builds", async () => {
+        const r = rig({ settings: { encryptionEnabled: true, encryptionPassphrase: "pw", compressionEnabled: false } });
+        await pushVaultMeta(r.remote, (await buildInitialVaultMeta({ encryption: false, compression: true })).meta);
+        await r.binding.init();
+        expect(r.confirmed).toEqual([{
+            op: "init", dbName: "vault", docCount: 1, encryption: true, compression: false,
+        }]);
+    });
+
+    it("a missing DB is confirmed as one Init creates", async () => {
+        const r = rig();
+        r.remote.info = async () => { throw Object.assign(new Error("not_found"), { status: 404 }); };
+        await r.binding.init();
+        expect(r.confirmed[0]).toMatchObject({ op: "init", docCount: null });
+    });
+
+    it("a preparation that refuses never asks to confirm", async () => {
+        const r = rig({ client: unreachable });
+        await expect(r.binding.init()).rejects.toThrow();
+        expect(r.confirmed).toEqual([]);
+    });
+
+    it("declining changes nothing and is not recorded: no stop, no settingUp, the DB untouched", async () => {
+        const r = rig();
+        r.confirmAnswer = false;
+        await expect(r.binding.init()).rejects.toMatchObject({
+            name: "AbortError", message: "Init cancelled — nothing was changed.",
+        });
+        expect(r.stops).toBe(0);
+        expect(r.saves).toEqual([]);
+        expect(r.stateAtSetup).toBeNull();
+        expect(r.settings.connectionState).toBe("setupDone");
+        expect(await fetchVaultMeta(r.remote)).toBeNull();
+        expect(r.binding.relation().lastOp).toBeNull();
+        expect(r.binding.busy()).toBeNull();
+    });
+
     it("mints a fresh salt on each Init with the same passphrase", async () => {
         const r = rig({ settings: { encryptionEnabled: true, encryptionPassphrase: "pw" } });
         await r.binding.init();
@@ -342,6 +395,49 @@ describe("VaultBinding.clone", () => {
         expect(r.stops).toBe(0);
         expect(r.settings.connectionState).toBe("setupDone");
         expect(r.binding.relation().dbCheck?.result).toEqual({ status: "exists", docCount: 0 });
+    });
+
+    it("asks for the passphrase first, then to confirm, shown the server's codec", async () => {
+        const r = rig({
+            settings: { encryptionEnabled: false, encryptionPassphrase: "" },
+            ask: async (_reason, tryUnlock) => (await tryUnlock("pw")) ? "pw" : null,
+        });
+        await encryptedRemote(r.remote, "pw");
+        await r.binding.clone();
+        expect(r.prompts).toEqual(["passphrase", "confirm"]);
+        expect(r.confirmed).toEqual([{
+            op: "clone", dbName: "vault", docCount: 1, encryption: true, compression: true,
+        }]);
+    });
+
+    it("a cancelled passphrase prompt and an empty DB never ask to confirm", async () => {
+        const cancelled = rig({ settings: { encryptionPassphrase: "" } });
+        await encryptedRemote(cancelled.remote, "pw");
+        await expect(cancelled.binding.clone()).rejects.toMatchObject({ name: "AbortError" });
+        expect(cancelled.prompts).toEqual(["passphrase"]);
+
+        const empty = rig();
+        await expect(empty.binding.clone()).rejects.toThrow(/empty/);
+        expect(empty.prompts).toEqual([]);
+    });
+
+    it("declining changes nothing and is not recorded: no stop, no settingUp, no codec committed", async () => {
+        const r = rig({ settings: { encryptionEnabled: false, encryptionPassphrase: "pw", compressionEnabled: false } });
+        await encryptedRemote(r.remote, "pw");
+        r.confirmAnswer = false;
+        await expect(r.binding.clone()).rejects.toMatchObject({
+            name: "AbortError", message: "Clone cancelled — nothing was changed.",
+        });
+        expect(r.stops).toBe(0);
+        expect(r.saves).toEqual([]);
+        expect(r.stateAtSetup).toBeNull();
+        expect(r.settings).toMatchObject({
+            encryptionEnabled: false, compressionEnabled: false, connectionState: "setupDone",
+        });
+        expect(r.settings.vaultCipherVersion).toBeUndefined();
+        expect(r.binding.relation().lastOp).toBeNull();
+        // The vault decorator stack is the persisted one again.
+        expect(r.binding.chunkHasher.alg).toBe("x64");
     });
 
     it("an outcome about another vault DB is not shown", async () => {

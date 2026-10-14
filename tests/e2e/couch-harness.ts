@@ -291,6 +291,8 @@ export async function createE2EHarness(opts: CreateE2EHarnessOpts = {}): Promise
             askPassphrase: async (reason) => {
                 throw new Error(`the harness answers no passphrase prompt (${reason} passphrase)`);
             },
+            // The user confirms every Init and Clone the test runs.
+            confirmSetup: async () => true,
         });
         let seeded: CryptoProvider | undefined = sharedCrypto;
         const wrapVaultClient = (raw: ICouchClient): ICouchClient => {

@@ -37,6 +37,7 @@ import { EditorAwareVaultWriter } from "./adapters/editor-aware-vault-writer.ts"
 import { CompositionGate } from "./sync/composition-gate.ts";
 import { makeCouchClient } from "./db/couch-client.ts";
 import { VaultBinding } from "./sync/vault-binding.ts";
+import { describeVaultSetupConfirm } from "./sync/vault-setup-confirm.ts";
 import { PassphraseModal } from "./ui/passphrase-modal.ts";
 import type { ICouchClient } from "./db/interfaces.ts";
 
@@ -211,6 +212,11 @@ export default class CouchSyncPlugin extends Plugin {
                         : "This passphrase does not unlock the vault.",
                 },
             ).waitForResult(),
+            // Destructive: the dialog opens with the focus on Cancel.
+            confirmSetup: (plan) => {
+                const c = describeVaultSetupConfirm(plan);
+                return modalPresenter.showConfirmModal(c.title, c.message, c.confirmText, true);
+            },
         });
         const vaultChunkHasher = this.vaultBinding.chunkHasher;
         const wrapVaultClient = this.vaultBinding.wrapClient;
