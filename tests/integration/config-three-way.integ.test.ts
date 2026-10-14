@@ -119,7 +119,12 @@ describe("config three-way merge across devices", () => {
                 rawClientFactory: () => remote,
                 getIsMobile: () => opts.mobile ?? false,
                 reload: () => { dev.reloads++; },
-                stopPlugins: async (dirs) => { dev.stopped.push(dirs); },
+                // Stops every plugin it is asked to; the folder name stands
+                // for the plugin id.
+                stopPlugins: async (dirs) => {
+                    dev.stopped.push(dirs);
+                    return dirs.map((d) => d.split("/").at(-1)!);
+                },
             },
         );
         await dev.cs.rebind(DB);
@@ -583,6 +588,22 @@ describe("config three-way merge across devices", () => {
             expect(await b.cs.pull()).toBe(2);
             return { a, b };
         }
+
+        it("Pull and Overwrite log the plugins they stop before writing", async () => {
+            const infos = () => getLogEntries().filter((e) => e.level === "info").map((e) => e.message);
+            // sharedPair's Pull on B writes the plugin's data.json.
+            const { b } = await sharedPair();
+            expect(infos()).toContainEqual(
+                expect.stringMatching(/^Config Pull: stopped 1 plugin\(s\) before writing their files .*: p$/),
+            );
+
+            put(b, { token: "mine" }, `${PLUGIN}/data.json`);
+            b.modal.overwriteResponses.push(true);
+            expect(await b.cs.overwrite()).toBe(1);
+            expect(infos()).toContainEqual(
+                expect.stringMatching(/^Config Pull & Overwrite: stopped 1 plugin\(s\) .*: p$/),
+            );
+        });
 
         it("makes the disk the shared state: unpushed edits and kept keys are dropped", async () => {
             const { b } = await sharedPair();

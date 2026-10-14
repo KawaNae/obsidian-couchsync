@@ -318,14 +318,17 @@ export default class CouchSyncPlugin extends Plugin {
                 stopPlugins: async (dirs) => {
                     const plugins = (this.app as any).plugins;
                     const manifests = Object.values(plugins.manifests ?? {}) as Array<{ id: string; dir?: string }>;
+                    const stopped: string[] = [];
                     for (const m of manifests) {
                         if (!m.dir || !dirs.includes(m.dir) || !plugins.plugins?.[m.id]) continue;
                         try {
                             await plugins.disablePlugin(m.id);
+                            stopped.push(m.id);
                         } catch (e: any) {
                             logWarn(`could not stop plugin "${m.id}" before writing its config: ${e?.message ?? e}`);
                         }
                     }
+                    return stopped;
                 },
                 // Receive-side platform gate: don't materialise desktop-only
                 // plugins on a mobile device. Mirrors the getPlatform wiring.

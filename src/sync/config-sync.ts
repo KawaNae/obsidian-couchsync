@@ -141,8 +141,9 @@ export interface ConfigSyncOptions {
      *  (`.obsidian/plugins/<folder>`), without changing which plugins are
      *  enabled. Pull calls it before it writes or deletes a plugin's files,
      *  so a running plugin cannot save its in-memory state over them before
-     *  the reload. Omitted in tests. */
-    stopPlugins?: (pluginDirs: string[]) => Promise<void>;
+     *  the reload. Resolves to the ids of the plugins it stopped (a plugin
+     *  that was not running is not among them). Omitted in tests. */
+    stopPlugins?: (pluginDirs: string[]) => Promise<string[]>;
     /** Persist settings. Bindings write their settings entry
      *  (`settings.configBindings`: cipher floor, setup flag, the DB's
      *  passphrase) into the live settings object, then call this. Omitted
@@ -224,7 +225,7 @@ export class ConfigSync {
     /** Where Pull keeps copies of the files it overwrites. */
     private readonly backupRoot: string;
     private readonly reload: () => void;
-    private readonly stopPlugins: (pluginDirs: string[]) => Promise<void>;
+    private readonly stopPlugins: (pluginDirs: string[]) => Promise<string[]>;
     /** This plugin's folder: an overwriting Pull deletes nothing in it,
      *  and Pull never stops this plugin. */
     private readonly pluginDir: string;
@@ -282,7 +283,7 @@ export class ConfigSync {
         this.backupsDir = `${pluginDir}/backups`;
         this.backupRoot = `${this.backupsDir}/config`;
         this.reload = opts.reload ?? (() => {});
-        this.stopPlugins = opts.stopPlugins ?? (async () => {});
+        this.stopPlugins = opts.stopPlugins ?? (async () => []);
     }
 
     // ── Binding lifecycle ──────────────────────────────
@@ -865,7 +866,7 @@ export class ConfigSync {
                 progress.update(`Comparing: ${path} (${i}/${total})`);
             });
             await this.backupPlan(plan, progress);
-            const applied = await this.applyPlan(binding, plan, progress);
+            const applied = await this.applyPlan(binding, plan, progress, "Config Pull");
 
             const conflicts = plan.entries.filter((e) => e.decision.conflicts.length > 0);
             if (conflicts.length > 0) {
@@ -949,7 +950,7 @@ export class ConfigSync {
             const declared = this.getSettings().configSyncPolicy.deviceOnlyKeys;
             const keptKeys = Object.values(declared).reduce((n, ps) => n + ps.length, 0);
             if (writes.length === 0 && plan.deletes.length === 0 && keptKeys === 0) {
-                await this.applyPlan(binding, plan, progress);
+                await this.applyPlan(binding, plan, progress, "Config Pull & Overwrite");
                 progress.done("This device's config already is the shared config. Nothing was changed.");
                 return { written: 0, deleted: 0, reload: false };
             }
@@ -970,7 +971,7 @@ export class ConfigSync {
                 await this.saveSettings();
                 logInfo(`Config Pull & Overwrite: ${keptKeys} key(s) kept on this device are shared again.`);
             }
-            const applied = await this.applyPlan(binding, plan, progress);
+            const applied = await this.applyPlan(binding, plan, progress, "Config Pull & Overwrite");
             if (applied.deleted > 0) {
                 logInfo(
                     `Config Pull & Overwrite deleted ${applied.deleted} file(s) the shared config does not have:\n` +
@@ -1018,10 +1019,11 @@ export class ConfigSync {
         binding: ConfigBinding,
         plan: PullPlan,
         progress: ProgressNotice,
+        label: string,
     ): Promise<{ written: number; deleted: number; reload: boolean }> {
         const writes = plan.entries.filter((e) => e.decision.write !== null);
         const changed = [...writes.map((e) => e.path), ...plan.deletes.map((d) => d.path)];
-        const stopped = await this.stopPluginsOf(changed);
+        const stopped = await this.stopPluginsOf(changed, label);
         if (changed.length > 0) await binding.recordDiskWrite();
 
         let written = 0;
@@ -1064,9 +1066,10 @@ export class ConfigSync {
     }
 
     /** Stop the community plugins (other than this one) whose files are in
-     *  `paths`. Returns whether any was asked to stop. A failure is logged:
-     *  the reload that follows unloads them anyway. */
-    private async stopPluginsOf(paths: readonly string[]): Promise<boolean> {
+     *  `paths`, and log the ones stopped. Returns whether any was asked to
+     *  stop. A failure is logged: the reload that follows unloads them
+     *  anyway. */
+    private async stopPluginsOf(paths: readonly string[], label: string): Promise<boolean> {
         const dirs = new Set<string>();
         for (const path of paths) {
             const dir = classifyConfigPath(path).pluginDir;
@@ -1074,9 +1077,15 @@ export class ConfigSync {
         }
         if (dirs.size === 0) return false;
         try {
-            await this.stopPlugins([...dirs]);
+            const ids = await this.stopPlugins([...dirs]);
+            if (ids.length > 0) {
+                logInfo(
+                    `${label}: stopped ${ids.length} plugin(s) before writing their files ` +
+                    `(Obsidian reloads them): ${ids.join(", ")}`,
+                );
+            }
         } catch (e: any) {
-            logWarn(`Config Pull: stopping plugins before writing their files failed: ${e?.message ?? e}`);
+            logWarn(`${label}: stopping plugins before writing their files failed: ${e?.message ?? e}`);
         }
         return true;
     }
