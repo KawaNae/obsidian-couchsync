@@ -22,21 +22,20 @@ import { logDebug, logInfo, logWarn } from "../ui/log.ts";
 import { DbError, type VclockUpdate } from "../db/write-transaction.ts";
 
 /**
- * Subset of ChangeTracker that EditorAwareVaultWriter needs.
- *
- * `ignoreNextModify` suppresses the modify event that follows a sync-driven
- * `writeBinary` (disk-write truth: disk holds the pulled content). The `chunksEqual` short-circuit
- * in `fileToDb` is still data-level idempotent, but suppressing here saves
- * the debounce timer and avoids history double-capture through the modify
- * → fileToDb → captureLocal path.
+ * Subset of ChangeTracker that EditorAwareVaultWriter needs: the vault
+ * events its own writes cause are not edits to push.
  */
 export interface IWriteIgnore {
     /** Mark the next `delete` event on `path` as sync-driven. */
     ignoreDelete(path: string): void;
-    /** Mark the next `modify` event on `path` as sync-driven (echo from a
-     *  pull-side writeBinary). Consumed by the modify handler before any
-     *  scheduling work runs. */
-    ignoreNextModify(path: string): void;
+    /**
+     * Sync is about to write `content` to `path`. A `modify` event that
+     * finds exactly these bytes on disk is that write, however often it
+     * comes; one that finds anything else is an edit, and from then on
+     * nothing is ignored for `path`. Register before the write: the
+     * event can come before the write returns.
+     */
+    ignoreModifyTo(path: string, content: ArrayBuffer): void;
 }
 
 /**
@@ -553,8 +552,8 @@ export class VaultSync {
 
         // Delegate the vault write to the editor-aware VaultWriter.
         // For new files we use createFile (no editor session can exist
-        // yet); for existing files applyRemoteContent picks the right
-        // strategy (CM dispatch, defer-on-composing, or fallback).
+        // yet); for existing files applyRemoteContent declines over unsaved
+        // input, defers during an IME composition, or writes the disk.
         let result: WriteResult;
         // The path the bytes actually landed under (createFile may resolve
         // the parent dir to an existing folder's case). Same PathKey as

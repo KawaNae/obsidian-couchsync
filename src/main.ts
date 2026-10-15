@@ -234,11 +234,9 @@ export default class CouchSyncPlugin extends Plugin {
         this.historyCapture = new HistoryCapture(vaultIO, vaultEvents, this.historyStorage, () => this.settings);
 
         // Editor-aware write layer: declines a vault write while an open
-        // editor holds input not yet saved, defers it while the path's
-        // editor is in IME composition, dispatches CodeMirror transactions
-        // instead of triggering Obsidian's external-edit reload (which
-        // would break IME), and writes the disk directly when no editor
-        // session exists.
+        // note holds input not yet saved, defers it while the note is in
+        // IME composition, and otherwise writes the disk only; Obsidian
+        // reloads the open notes from the disk.
         this.compositionTracker = new ObsidianCompositionTracker(this.app);
         this.compositionGate = new CompositionGate(this.compositionTracker);
         this.vaultWriter = new EditorAwareVaultWriter(
@@ -246,10 +244,9 @@ export default class CouchSyncPlugin extends Plugin {
             null, this.historyCapture,
         );
         this.vaultSync = new VaultSync(vaultIO, this.localDb, () => this.settings, this.vaultWriter, vaultChunkHasher);
-        this.changeTracker = new ChangeTracker(vaultEvents, this.vaultSync, () => this.settings);
-        // Late-bind the writeIgnore once ChangeTracker exists. It is
-        // used by VaultWriter only on the deletion path (the modify
-        // path now relies on chunksEqual idempotency in fileToDb).
+        this.changeTracker = new ChangeTracker(vaultEvents, vaultIO, this.vaultSync, () => this.settings);
+        // Late-bind the writeIgnore once ChangeTracker exists: the modify
+        // and delete events the writer's own writes cause are not edits.
         this.vaultWriter.setWriteIgnore(this.changeTracker);
         // Late-bind the pending-edit probe. VaultSync uses
         // it from `hasUnpushedChanges` to detect debounced user edits
@@ -780,7 +777,9 @@ export default class CouchSyncPlugin extends Plugin {
     }
 
     async restoreFromHistory(filePath: string, recordId: number): Promise<boolean> {
-        this.changeTracker.ignoreNextModify(filePath);
+        // The restore is an edit: its modify event reaches fileToDb like any
+        // other. forceLocalEdit commits it even when the doc has moved on,
+        // and fileToDb then finds the content already recorded.
         const content = await this.historyManager.restoreToRecord(filePath, recordId);
         if (content === null) return false;
         try {

@@ -45,6 +45,17 @@ All notable changes to obsidian-couchsync.
   the next sync check. A file with Windows line breaks (CRLF) or a BOM is
   not taken for unsaved typing. An IME composition that commits text is
   handled the same way.
+- **A version pulled into an open note with Windows line breaks (CRLF) is
+  no longer doubled.** The pulled text was set into the open editor as well
+  as written to the file, and Obsidian took that for typing: it merged the
+  change into the new file a second time, so each changed line appeared
+  twice, and saved the result with LF line breaks (a BOM was dropped too).
+  The pulled version is now written to the file only, and Obsidian shows
+  it in the open note the way it shows any change made outside the editor;
+  the cursor stays where it was. If something is typed just as the version
+  arrives, Obsidian merges the typing into it and saves; that save is now
+  sent to the other devices at once, where before a save within 5 seconds
+  of a pull was held back until the next sync check.
 - **The confirmation of Delete local vault database says what happens to
   the vault's files.** It said that unpushed edits would be lost. Edits in
   the vault's files are kept: after the restart, a file whose content
