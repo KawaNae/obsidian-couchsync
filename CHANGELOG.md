@@ -16,6 +16,14 @@ All notable changes to obsidian-couchsync.
   measure progress by each change the pull processes rather than by whole
   batches, so a slow batch keeps going and only a pull that stops
   processing changes is cut off.
+- **A large change from another device no longer holds up sending.**
+  While connected, the pull received everything another device had changed
+  in one response and applied it as one batch, which the session cannot
+  stop partway. A deletion of 6,820 files on another device became one such
+  batch: a reconnect waited 26 minutes for it to finish, and this device
+  sent nothing in that time. The live pull now receives at most 100 changes
+  at a time, as the catchup does, and fetches the rest right away without
+  waiting, so a reconnect waits for one batch at most.
 - **Take Remote no longer replaces a version newer than the one shown.**
   When this device's version changed while a conflict dialog was open (a
   newer version was pulled, or an edit in the vault was synced), Take Remote

@@ -133,6 +133,28 @@ async function seedRemote(
     return doc;
 }
 
+/** Put `count` files (with their chunks) on the remote in one bulkDocs,
+ *  so they sit there as one backlog of changes. */
+async function seedRemoteMany(
+    h: SyncHarness,
+    a: DeviceHarness,
+    count: number,
+): Promise<string[]> {
+    const paths: string[] = [];
+    const docs: CouchSyncDoc[] = [];
+    for (let i = 0; i < count; i++) {
+        const path = `bulk/f${i}.md`;
+        a.vault.addFile(path, `body ${i}`);
+        await a.vs.fileToDb(path);
+        const doc = (await a.db.get(makeFileId(path))) as FileDoc;
+        const chunks = await a.db.getChunks(doc.chunks);
+        docs.push(doc as unknown as CouchSyncDoc, ...(chunks as unknown as CouchSyncDoc[]));
+        paths.push(path);
+    }
+    await h.couch.bulkDocs(docs);
+    return paths;
+}
+
 describe("PullPipeline integration", () => {
     let h: SyncHarness;
 
@@ -158,6 +180,22 @@ describe("PullPipeline integration", () => {
             await expectDb(b.db).toHaveFileDoc("notes/two.md").withChunks(d2.chunks.length);
             // Checkpoint advanced past the seeded docs.
             expect(Number(rig.checkpoints.getRemoteSeq())).toBeGreaterThan(0);
+        });
+
+        it("drains a backlog larger than one batch in batches of 100, landing every doc", async () => {
+            h = createSyncHarness();
+            const a = h.addDevice("dev-A");
+            const b = h.addDevice("dev-B");
+            const paths = await seedRemoteMany(h, a, 120);
+            const rig = attachPullPipeline({ device: b, couch: h.couch });
+            const spy = vi.spyOn(h.couch, "changes");
+
+            await rig.pipeline.runCatchup();
+
+            for (const path of paths) await expectDb(b.db).toHaveFileDoc(path);
+            expect(rig.checkpoints.getRemoteSeq()).toBe((await h.couch.info()).update_seq);
+            expect(spy.mock.calls.every(([opts]) => opts.limit === 100)).toBe(true);
+            spy.mockRestore();
         });
 
         it("exits cleanly on empty remote (no docs, no errors)", async () => {
@@ -291,6 +329,92 @@ describe("PullPipeline integration", () => {
 
             await expectDb(b.db).toHaveFileDoc("live.md");
             expect(rig.pausedCount.value).toBeGreaterThanOrEqual(1);
+        });
+
+        it("pulls a backlog larger than one batch in batches of 100 and advances the checkpoint with each", async () => {
+            h = createSyncHarness();
+            const a = h.addDevice("dev-A");
+            const b = h.addDevice("dev-B");
+            const paths = await seedRemoteMany(h, a, 120);
+            const remoteSeq = (await h.couch.info()).update_seq;
+            // 120 file docs and their chunks: more than two batches, and the
+            // last one not full.
+            expect(Number(remoteSeq) % 100).not.toBe(0);
+            const batches = Math.ceil(Number(remoteSeq) / 100);
+            expect(batches).toBeGreaterThanOrEqual(3);
+            const rig = attachPullPipeline({ device: b, couch: h.couch });
+
+            const fetched: Array<{ limit?: number; rows: number }> = [];
+            const record = (fetch: (...args: any[]) => Promise<any>) =>
+                async (...args: any[]) => {
+                    const result = await fetch(...args);
+                    fetched.push({ limit: args[0].limit, rows: result.results.length });
+                    return result;
+                };
+            const realLongpoll = h.couch.changesLongpoll.bind(h.couch);
+            const realChanges = h.couch.changes.bind(h.couch);
+            const longpollSpy = vi.spyOn(h.couch, "changesLongpoll").mockImplementation(record(realLongpoll));
+            const changesSpy = vi.spyOn(h.couch, "changes").mockImplementation(record(realChanges));
+            // The checkpoint each batch leaves behind; stop once caught up.
+            const seqs: Array<number | string> = [];
+            rig.events.on("paused", () => {
+                seqs.push(rig.checkpoints.getRemoteSeq());
+                if (rig.checkpoints.getRemoteSeq() === remoteSeq) rig.cancel();
+            });
+
+            await rig.pipeline.runLongpoll();
+
+            for (const path of paths) await expectDb(b.db).toHaveFileDoc(path);
+            expect(fetched).toEqual([
+                ...Array.from({ length: batches - 1 }, () => ({ limit: 100, rows: 100 })),
+                { limit: 100, rows: Number(remoteSeq) % 100 },
+            ]);
+            // One checkpoint per batch, each 100 changes past the last.
+            expect(seqs).toEqual([
+                ...Array.from({ length: batches - 1 }, (_, i) => (i + 1) * 100),
+                remoteSeq,
+            ]);
+            expect(await b.db.getMeta("_sync/remote-seq")).toBe(remoteSeq);
+            longpollSpy.mockRestore();
+            changesSpy.mockRestore();
+        });
+
+        it("after a full batch fetches the rest without a longpoll wait, then goes back to the longpoll", async () => {
+            h = createSyncHarness();
+            const a = h.addDevice("dev-A");
+            const b = h.addDevice("dev-B");
+            await seedRemoteMany(h, a, 120);
+            const batches = Math.ceil(Number((await h.couch.info()).update_seq) / 100);
+            const rig = attachPullPipeline({ device: b, couch: h.couch });
+
+            const order: string[] = [];
+            const realLongpoll = h.couch.changesLongpoll.bind(h.couch);
+            const realChanges = h.couch.changes.bind(h.couch);
+            const longpollSpy = vi.spyOn(h.couch, "changesLongpoll")
+                .mockImplementation(async (...args: any[]) => {
+                    order.push("longpoll");
+                    if (order.filter((o) => o === "longpoll").length === 2) {
+                        // Caught up: this is where the loop would wait.
+                        rig.cancel();
+                        return { results: [], last_seq: args[0].since };
+                    }
+                    return realLongpoll(...(args as [any, any]));
+                });
+            const changesSpy = vi.spyOn(h.couch, "changes")
+                .mockImplementation(async (...args: any[]) => {
+                    order.push("changes");
+                    return realChanges(...(args as [any, any]));
+                });
+
+            await rig.pipeline.runLongpoll();
+
+            expect(order).toEqual([
+                "longpoll",
+                ...Array.from({ length: batches - 1 }, () => "changes"),
+                "longpoll",
+            ]);
+            longpollSpy.mockRestore();
+            changesSpy.mockRestore();
         });
 
         it("empty longpoll result emits no paused (no batch applied)", async () => {
