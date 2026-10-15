@@ -1,6 +1,6 @@
 {
     "name": "obsidian-couchsync",
-    "version": "0.30.2",
+    "version": "0.31.0",
     "description": "CouchDB vault sync for Obsidian with local history",
     "main": "main.js",
     "scripts": {
