@@ -310,13 +310,23 @@ describe("VaultSync", () => {
                 expect(await vs.classifyFileVsDoc(doc, "a.md", stat)).toBe("true-divergent");
             });
 
-            it("declines a file with no baseline and another size without reading it", async () => {
+            it("declines a file with no baseline and another size", async () => {
                 vault.addFile("a.md", "never synced");
                 const doc = await remoteDoc("a.md", "theirs", { "dev-B": 1 });
-                const read = vi.spyOn(vault, "readBinary");
 
                 expect(await vs.dbToFile(doc)).toEqual(DECLINED);
-                expect(read).not.toHaveBeenCalled();
+                expect(vault.readText("a.md")).toBe("never synced");
+            });
+
+            it("takes the baseline where a file with no baseline holds the content of a doc whose size is wrong", async () => {
+                vault.addFile("a.md", "same content", { mtime: 1000 });
+                const doc = { ...await remoteDoc("a.md", "same content", { "dev-B": 1 }), size: 3 };
+
+                expect(await vs.dbToFile(doc)).toEqual({ applied: true });
+                expect((await vault.stat("a.md"))?.mtime).toBe(1000);
+                const ls = vs.getLastSynced("a.md");
+                expect(ls?.chunks).toEqual(doc.chunks);
+                expect(ls?.size).toBe(12);
             });
 
             it("takes the baseline where a file with no baseline already holds the content", async () => {
@@ -519,10 +529,12 @@ describe("VaultSync", () => {
             expect(vs.getLastSynced("c.md")?.mtime).toBe(7000);
         });
 
-        it("alignLastSyncedToDoc skips the stamp when the stat size mismatches the doc", async () => {
+        it("alignLastSyncedToDoc records the disk's size, not a doc's that misstates it", async () => {
             vault.addFile("c.md", "cached", { mtime: 7000 });
             await vs.fileToDb("c.md");
-            const doc = await db.get(makeFileId("c.md")) as FileDoc;
+            const synced = await db.get(makeFileId("c.md")) as FileDoc;
+            // A baseline taken from a doc whose size is not its content's.
+            const doc = { ...synced, size: 3 };
             await db.runWriteTx({
                 vclocks: [{
                     path: "c.md", op: "set", clock: doc.vclock,
@@ -531,11 +543,11 @@ describe("VaultSync", () => {
             });
             await vs.loadLastSyncedVclocks();
 
-            // A stat whose size disagrees with the doc does not describe the
-            // integrated content (unflushed editor buffer) — no stamp.
-            const r = await vs.alignLastSyncedToDoc("c.md", doc, { mtime: 9000, size: 999 });
-            expect(r).toBe("already-aligned");
-            expect(vs.getLastSynced("c.md")?.mtime).toBeUndefined();
+            const r = await vs.alignLastSyncedToDoc("c.md", doc, { mtime: 7000, size: 6 });
+            expect(r).toBe("stamped-mtime");
+            expect(vs.getLastSynced("c.md")).toMatchObject({ size: 6, mtime: 7000 });
+            expect(await vs.alignLastSyncedToDoc("c.md", doc, { mtime: 7000, size: 6 }))
+                .toBe("already-aligned");
         });
 
         it("a stamp too recent to trust is not kept: a same-size rewrite with the same mtime is seen", async () => {

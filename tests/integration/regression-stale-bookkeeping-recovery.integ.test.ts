@@ -88,7 +88,7 @@ describe("regression: stale-bookkeeping recovery", () => {
         expect(before.chunks).toBeUndefined();
         expect(before.size).toBeUndefined();
 
-        const result = await vs.alignLastSyncedToDoc(path, fileDoc);
+        const result = await vs.alignLastSyncedToDoc(path, fileDoc, (await vault.stat(path))!);
         expect(result).toBe("upgraded-legacy");
 
         const after = vs.getLastSynced(path)!;
@@ -120,7 +120,7 @@ describe("regression: stale-bookkeeping recovery", () => {
         expect(before.chunks).toEqual(["chunk:bogus"]);
         expect(before.size).toBe(9999);
 
-        const result = await vs.alignLastSyncedToDoc(path, fileDoc);
+        const result = await vs.alignLastSyncedToDoc(path, fileDoc, (await vault.stat(path))!);
         expect(result).toBe("recovered-stale");
 
         const after = vs.getLastSynced(path)!;
@@ -130,12 +130,12 @@ describe("regression: stale-bookkeeping recovery", () => {
 
     it("aligned lastSynced is unchanged (no-op)", async () => {
         const path = "notes/clean.md";
-        vault.addFile(path, "clean content");
+        vault.addFile(path, "clean content", { mtime: 1000 });
         await vs.fileToDb(path);
         await vs.loadLastSyncedVclocks();
 
         const fileDoc = (await db.get(makeFileId(path))) as FileDoc;
-        const result = await vs.alignLastSyncedToDoc(path, fileDoc);
+        const result = await vs.alignLastSyncedToDoc(path, fileDoc, (await vault.stat(path))!);
         expect(result).toBe("already-aligned");
     });
 

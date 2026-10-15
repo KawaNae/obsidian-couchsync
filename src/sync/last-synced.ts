@@ -9,6 +9,12 @@ import type { VectorClock } from "./vector-clock.ts";
  * integration baseline → safe to apply remote) or a divergent local edit
  * (vault drifted → must be routed to conflict orchestrator).
  *
+ * The content is compared by `chunks`. `size` is the size this device
+ * measured for it: the bytes it read or wrote, or the stat of the file
+ * whose chunks it compared. It is never copied from a FileDoc, whose
+ * `size` is the sender's record, and it serves with `mtime` as the
+ * stat-cache key.
+ *
  * Legacy entries written before the chunks/size extension carry only
  * `vclock`; the consumers (compareFileToDoc, reconciler divergent check)
  * treat undefined chunks/size as "skip the divergent-edit guard for

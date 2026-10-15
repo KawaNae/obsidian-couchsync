@@ -17,10 +17,8 @@ function input(partial: Partial<ClassifyInput>): ClassifyInput {
     return {
         leftVC: VC({}),
         leftChunks: C("a"),
-        leftSize: 10,
         rightVC: VC({}),
         rightChunks: C("a"),
-        rightSize: 10,
         ...partial,
     };
 }
@@ -45,8 +43,6 @@ describe("classifySyncRelation", () => {
                 rightVC: VC({ a: 5, b: 3 }),
                 leftChunks: C("c1", "c2"),
                 rightChunks: C("c1", "c2"),
-                leftSize: 100,
-                rightSize: 100,
             }))).toBe("identical");
         });
     });
@@ -82,8 +78,6 @@ describe("classifySyncRelation", () => {
                 rightVC: VC({ "melchior-main": 72, "ipadpro11gen4-main": 11, "pixel7a-main": 1 }),
                 leftChunks: C("hash"),
                 rightChunks: C("hash"),
-                leftSize: 200,
-                rightSize: 200,
             }))).toBe("vclock-only-drift");
         });
     });
@@ -96,8 +90,6 @@ describe("classifySyncRelation", () => {
                 rightVC: VC({ b: 1 }),
                 leftChunks: C("L"),
                 rightChunks: C("R"),
-                leftSize: 5,
-                rightSize: 5,
             }))).toBe("true-divergent");
         });
 
@@ -111,10 +103,8 @@ describe("classifySyncRelation", () => {
                 leftVC: VC({ a: 1 }),
                 rightVC: VC({ a: 2 }),
                 leftChunks: C("local-edit"),  // user edited stale
-                leftSize: 11,
                 leftVCAttributed: true,
                 rightChunks: C("remote-edit"),
-                rightSize: 11,
                 lastSynced,
             }))).toBe("true-divergent");
         });
@@ -127,8 +117,6 @@ describe("classifySyncRelation", () => {
                 rightVC: VC({ b: 1 }),
                 leftChunks: C("mine"),
                 rightChunks: C("theirs"),
-                leftSize: 4,
-                rightSize: 6,
                 leftVCAttributed: true,
             }))).toBe("true-divergent");
         });
@@ -139,8 +127,6 @@ describe("classifySyncRelation", () => {
                 rightVC: VC({ a: 2 }),
                 leftChunks: C(),
                 rightChunks: C("new"),
-                leftSize: 0,
-                rightSize: 3,
                 leftVCAttributed: true,
                 lastSynced: { vclock: VC({ a: 1 }), chunks: [], size: 0, deleted: true },
             }))).toBe("true-divergent");
@@ -155,8 +141,6 @@ describe("classifySyncRelation", () => {
                 rightVC: VC({ a: 2 }),
                 leftChunks: C("old"),
                 rightChunks: C("new"),
-                leftSize: 3,
-                rightSize: 3,
             }))).toBe("remote-edit");
         });
 
@@ -170,10 +154,8 @@ describe("classifySyncRelation", () => {
                 leftVC: VC({ a: 1 }),
                 rightVC: VC({ a: 2 }),
                 leftChunks: C("base"),
-                leftSize: 4,
                 leftVCAttributed: true,
                 rightChunks: C("new"),
-                rightSize: 3,
                 lastSynced,
             }))).toBe("remote-edit");
         });
@@ -190,8 +172,6 @@ describe("classifySyncRelation", () => {
                 rightVC: VC({ a: 1 }),
                 leftChunks: C("user-edit"),
                 rightChunks: C("old"),
-                leftSize: 9,
-                rightSize: 3,
                 leftVCAttributed: true,
             }))).toBe("local-edit");
         });
@@ -202,8 +182,6 @@ describe("classifySyncRelation", () => {
                 rightVC: VC({ a: 1 }),
                 leftChunks: C("user-edit"),
                 rightChunks: C("old"),
-                leftSize: 9,
-                rightSize: 3,
             }))).toBe("local-edit");
         });
 
@@ -221,8 +199,6 @@ describe("classifySyncRelation", () => {
                 rightVC: VC({ a: 1 }),
                 leftChunks: C("user-edit"),
                 rightChunks: C("old"),
-                leftSize: 9,
-                rightSize: 3,
                 lastSynced,
                 leftVCAttributed: true,
             }))).toBe("local-edit");
@@ -243,8 +219,6 @@ describe("classifySyncRelation", () => {
                 rightVC: VC({ a: 1 }),
                 leftChunks: C("zombie"),
                 rightChunks: C("fresh-build"),
-                leftSize: 6,
-                rightSize: 11,
             }))).toBe("true-divergent");
         });
 
@@ -254,8 +228,6 @@ describe("classifySyncRelation", () => {
                 rightVC: VC({ a: 1 }),
                 leftChunks: C("same"),
                 rightChunks: C("same"),
-                leftSize: 4,
-                rightSize: 4,
             }))).toBe("identical");
         });
 
@@ -267,8 +239,6 @@ describe("classifySyncRelation", () => {
                 rightVC: VC({ a: 1 }),
                 leftChunks: C("local-newer"),
                 rightChunks: C("old"),
-                leftSize: 11,
-                rightSize: 3,
             }))).toBe("local-edit");
         });
 
@@ -282,8 +252,6 @@ describe("classifySyncRelation", () => {
                 rightVC: VC({ a: 1 }),
                 leftChunks: C("old-key-id"),
                 rightChunks: C("new-key-id"),
-                leftSize: 6,
-                rightSize: 6,
                 recreateAuthority: true,
             }))).toBe("remote-edit");
         });
@@ -296,8 +264,6 @@ describe("classifySyncRelation", () => {
                 rightVC: VC({ a: 1 }),
                 leftChunks: C("disk-edit"),
                 rightChunks: C("doc"),
-                leftSize: 9,
-                rightSize: 3,
                 leftVCAttributed: true,
                 recreateAuthority: true,
             }))).toBe("local-edit");
@@ -313,8 +279,6 @@ describe("classifySyncRelation", () => {
                 rightVC: VC({ a: 2 }),
                 leftChunks: C("L"),
                 rightChunks: C("R"),
-                leftSize: 1,
-                rightSize: 1,
                 leftVCAttributed: true,
                 lastSynced,
             }))).toBe("true-divergent");
@@ -331,8 +295,6 @@ describe("classifySyncRelation", () => {
                 rightVC: VC({ a: 2 }),
                 leftChunks: C("L"),
                 rightChunks: C("R"),
-                leftSize: 1,
-                rightSize: 1,
                 leftVCAttributed: true,
                 lastSynced,
             }))).toBe("true-divergent");
@@ -387,9 +349,7 @@ describe("classifySyncRelation", () => {
                 leftVC: { ...baseVC },
                 rightVC: { ...baseVC },
                 leftChunks: C("OLD-chunk"),
-                leftSize: 24,
                 rightChunks: C("NEW-chunk"),
-                rightSize: 77,
                 lastSynced,
                 // Vault-disk classify (compareFileToDoc): leftVC is the
                 // attributed lastSynced.vclock, so equal+differ = disk edit
@@ -410,9 +370,7 @@ describe("classifySyncRelation", () => {
                 leftVC: { ...baseVC },
                 rightVC: { ...baseVC },
                 leftChunks: C("NEW-chunk"),
-                leftSize: 77,
                 rightChunks: C("NEW-chunk"),
-                rightSize: 77,
                 lastSynced,
             }))).toBe("identical");
         });
@@ -424,22 +382,22 @@ describe("classifySyncRelation", () => {
     // carries the deleted state.
     describe("deleted axis", () => {
         // The wild tombstone shape: retains the chunks it deleted.
-        const tomb = { rightDeleted: true, rightChunks: C("a"), rightSize: 10 };
+        const tomb = { rightDeleted: true, rightChunks: C("a") };
 
         it("deleted×deleted with differing retained chunks → identical (not conflict)", () => {
             // Local markDeleted-tombstone (chunks retained) vs pulled
             // buildAcceptedTombstone (chunks []) — same deletion state.
             expect(classifySyncRelation(input({
-                leftDeleted: true, leftChunks: C("a"), leftSize: 10,
-                rightDeleted: true, rightChunks: C(), rightSize: 0,
+                leftDeleted: true, leftChunks: C("a"),
+                rightDeleted: true, rightChunks: C(),
                 leftVC: VC({ a: 2 }), rightVC: VC({ a: 2 }),
             }))).toBe("identical");
         });
 
         it("deleted×deleted with vclock drift → vclock-only-drift (concurrent deletions converge)", () => {
             expect(classifySyncRelation(input({
-                leftDeleted: true, leftChunks: C("a"), leftSize: 10,
-                rightDeleted: true, rightChunks: C(), rightSize: 0,
+                leftDeleted: true, leftChunks: C("a"),
+                rightDeleted: true, rightChunks: C(),
                 leftVC: VC({ a: 2 }), rightVC: VC({ b: 2 }),
             }))).toBe("vclock-only-drift");
         });
@@ -449,9 +407,9 @@ describe("classifySyncRelation", () => {
             // chunks: must fall through to vclock comparison, never
             // vclock-only-drift → silent-merge.
             expect(classifySyncRelation(input({
-                leftDeleted: true, leftChunks: C("a"), leftSize: 10,
+                leftDeleted: true, leftChunks: C("a"),
                 leftVC: VC({ a: 1 }),
-                rightChunks: C("a"), rightSize: 10,
+                rightChunks: C("a"),
                 rightVC: VC({ a: 1, b: 1 }),
             }))).toBe("remote-edit"); // legitimate resurrection (pull site, real vclocks)
         });
@@ -463,7 +421,7 @@ describe("classifySyncRelation", () => {
                 ...tomb,
                 leftVCAttributed: true,
                 leftVC: VC({ m: 2 }), rightVC: VC({ m: 2 }),
-                leftChunks: C("new"), leftSize: 20,
+                leftChunks: C("new"),
                 lastSynced: { vclock: VC({ m: 2 }), chunks: [], size: 0, deleted: true },
             }))).toBe("local-edit");
         });
@@ -473,7 +431,7 @@ describe("classifySyncRelation", () => {
                 ...tomb,
                 leftVCAttributed: true,
                 leftVC: VC({}), rightVC: VC({ m: 2 }),
-                leftChunks: C("new"), leftSize: 20,
+                leftChunks: C("new"),
             }))).toBe("true-divergent");
         });
 
@@ -482,7 +440,7 @@ describe("classifySyncRelation", () => {
                 ...tomb,
                 leftVCAttributed: true,
                 leftVC: VC({ m: 1 }), rightVC: VC({ m: 2 }),
-                leftChunks: C("new"), leftSize: 20,
+                leftChunks: C("new"),
                 lastSynced: { vclock: VC({ m: 1 }) }, // no chunks/size
             }))).toBe("true-divergent");
         });
@@ -493,7 +451,7 @@ describe("classifySyncRelation", () => {
                 leftVCAttributed: true,
                 rightVC: VC({ m: 2, i: 1 }),
                 leftVC: VC({ m: 2 }),
-                leftChunks: C("new"), leftSize: 20,
+                leftChunks: C("new"),
                 lastSynced: { vclock: VC({ m: 2 }), chunks: [], size: 0, deleted: true },
             }))).toBe("true-divergent");
         });
@@ -503,7 +461,7 @@ describe("classifySyncRelation", () => {
                 ...tomb,
                 leftVCAttributed: true,
                 leftVC: VC({ m: 1 }), rightVC: VC({ m: 2 }),
-                leftChunks: C("a"), leftSize: 10,
+                leftChunks: C("a"),
                 lastSynced: { vclock: VC({ m: 1 }), chunks: C("a"), size: 10 },
             }))).toBe("remote-edit");
         });
@@ -513,7 +471,7 @@ describe("classifySyncRelation", () => {
                 ...tomb,
                 leftVCAttributed: true,
                 leftVC: VC({ m: 1 }), rightVC: VC({ m: 2 }),
-                leftChunks: C("edited"), leftSize: 30,
+                leftChunks: C("edited"),
                 lastSynced: { vclock: VC({ m: 1 }), chunks: C("a"), size: 10 },
             }))).toBe("true-divergent");
         });
@@ -522,17 +480,17 @@ describe("classifySyncRelation", () => {
             // resolveOnPull compares two real doc vclocks; a dominating
             // tombstone is a legitimate deletion to take, baseline or not.
             expect(classifySyncRelation(input({
-                rightDeleted: true, rightChunks: C(), rightSize: 0,
+                rightDeleted: true, rightChunks: C(),
                 leftVC: VC({ a: 1 }), rightVC: VC({ a: 2 }),
-                leftChunks: C("c"), leftSize: 10,
+                leftChunks: C("c"),
             }))).toBe("remote-edit");
         });
 
         it("pull site: alive doc concurrent with tombstone → true-divergent (delete-vs-edit modal)", () => {
             expect(classifySyncRelation(input({
-                rightDeleted: true, rightChunks: C(), rightSize: 0,
+                rightDeleted: true, rightChunks: C(),
                 leftVC: VC({ a: 1 }), rightVC: VC({ b: 2 }),
-                leftChunks: C("c"), leftSize: 10,
+                leftChunks: C("c"),
             }))).toBe("true-divergent");
         });
 

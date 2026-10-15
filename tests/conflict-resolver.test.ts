@@ -102,6 +102,17 @@ describe("ConflictResolver — resolveOnPull", () => {
         expect(verdict).toBe("silent-merge");
     });
 
+    it("judges content by chunks: a doc whose size misstates the same chunks is not a conflict", async () => {
+        // A sender that took `size` from a stat before reading the file can
+        // record one save's size with the next save's chunks.
+        const resolver = new ConflictResolver();
+        const local = { ...makeFile("doc.md", { A: 1 }, "shared-chunk"), size: 339 };
+        const remote = { ...makeFile("doc.md", { B: 1 }, "shared-chunk"), size: 321 };
+
+        const verdict = await resolver.resolveOnPull(local, remote);
+        expect(verdict).toBe("silent-merge");
+    });
+
     it("returns silent-merge when local dominates but content is identical", async () => {
         // Edge case: a re-introduced
         // device with chunks-equal but vclock-divergent post sync.
