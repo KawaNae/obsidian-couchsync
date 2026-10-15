@@ -102,8 +102,9 @@ describe("config ops never overlap, their confirmation dialogs included", () => 
             () => cs.join(),
             () => cs.runExclusive(async () => {}),
             () => cs.rebind(null),
+            () => cs.changeCodecSetting({ configCompressionEnabled: true }),
         ]) {
-            await expect(other()).rejects.toMatchObject({ kind: "busy" });
+            await expect(other()).rejects.toMatchObject({ name: "BusyError" });
         }
     }
 
@@ -165,6 +166,34 @@ describe("config ops never overlap, their confirmation dialogs included", () => 
         remote.info = async () => { throw new TypeError("Failed to fetch"); };
         await expect(cs.create()).rejects.toThrow();
         expect(modal.createCalls).toEqual([]);
+    });
+
+    it("Step 1 cannot change while Create's confirmation is open: the DB is built with the codec it showed, and Step 1 still describes it", async () => {
+        await attachPlain(settings, remote, db);
+        const creating = cs.create();
+        await vi.waitFor(() => expect(modal.create.open).toBe(true));
+        expect(modal.createCalls[0].next).toMatchObject({ encryption: false, compression: false });
+
+        for (const patch of [
+            { configCompressionEnabled: true },
+            { configEncryptionEnabled: true },
+            { configEncryptionPassphrase: "other" },
+        ]) {
+            await expect(cs.changeCodecSetting(patch)).rejects.toMatchObject({
+                name: "BusyError",
+                message: expect.stringMatching(/^Another config operation is already in progress/),
+            });
+        }
+        expect(settings).not.toHaveProperty("configCompressionEnabled", true);
+        expect(settings).not.toHaveProperty("configEncryptionEnabled", true);
+        expect(settings).not.toHaveProperty("configEncryptionPassphrase", "other");
+
+        modal.create.close(true);
+        await creating;
+        expect((await getAttachment(db))!.codec).toMatchObject({ encryption: false, compression: false });
+
+        await cs.changeCodecSetting({ configCompressionEnabled: true });
+        expect(settings.configCompressionEnabled).toBe(true);
     });
 
     it("announces when an op starts and when it ends", async () => {

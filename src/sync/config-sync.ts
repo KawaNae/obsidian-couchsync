@@ -22,7 +22,7 @@ import { ProgressNotice } from "../ui/notices.ts";
 import type { ICouchClient } from "../db/interfaces.ts";
 import { makeCouchClient } from "../db/couch-client.ts";
 import { logError, logInfo, logWarn } from "../ui/log.ts";
-import { describeError } from "../ui/describe-error.ts";
+import { BusyError, describeError } from "../ui/describe-error.ts";
 import { classifyConfigPath } from "./config-policy/classify.ts";
 import { participates, type DeviceContext } from "./config-policy/policy.ts";
 import { readLocalIsDesktopOnly } from "./config-policy/manifest.ts";
@@ -190,7 +190,8 @@ export interface ConfigRebindOptions {
     /** Persist the settings that name the new binding (DB name / server).
      *  Runs under the rebind lock right after the switch — also when
      *  opening the new store failed (the device is then unbound under the
-     *  new settings) — and NOT at all when the rebind is refused as busy.
+     *  new settings) — and NOT at all when the rebind is refused
+     *  (`BusyError`).
      *  See the invariant on `ConfigSync.rebind`. */
     commit?: () => Promise<void>;
 }
@@ -334,7 +335,7 @@ export class ConfigSync {
      *   - `commit` runs inside the rebind lock, right after the switch, so
      *     no op can start between the binding change and the settings
      *     change (ops and rebinds are refused while `rebinding` is set);
-     *   - a rebind refused as `busy` (an op or another rebind running) runs
+     *   - a rebind refused (`BusyError`: an op or another rebind running) runs
      *     no `commit`: settings and binding both stay as they were. The tabs
      *     also disable Apply while `bindingChangeBlocker()` says so.
      * Because of it, the paths that read the binding WITHOUT the op lock
@@ -346,7 +347,7 @@ export class ConfigSync {
      */
     async rebind(dbName: string | null, opts: ConfigRebindOptions = {}): Promise<void> {
         const blocked = this.bindingChangeBlocker();
-        if (blocked) throw configNotReady("busy");
+        if (blocked) throw new BusyError(blocked);
         const serverUri = opts.serverUri ?? this.getSettings().couchdbUri;
         const target = dbName || null;
         const run = (async () => {
@@ -376,17 +377,47 @@ export class ConfigSync {
 
     /** Why the binding cannot be changed right now (an op or a rebind is
      *  running), or null. The settings tabs disable their Apply with this
-     *  text; `rebind` refuses as `busy` under the same condition. */
+     *  text; `rebind` refuses (`BusyError`) with it under the same
+     *  condition. */
     bindingChangeBlocker(): string | null {
+        return this.lockBlocker() === null
+            ? null
+            : "A config operation is running — Apply is available when it finishes.";
+    }
+
+    /** Why a config op or a change of what it reads cannot start now (an
+     *  op or a rebind is running), or null. */
+    private lockBlocker(): string | null {
         if (this.inflight !== null || this.rebinding !== null) {
-            return "A config operation is running — Apply is available when it finishes.";
+            return "Another config operation is already in progress. " +
+                "Wait for it to finish or cancel it first.";
         }
         return null;
     }
 
+    /**
+     * A Step 1 codec setting changed (encryption, compression, passphrase):
+     * the input of the next Create, and a passphrase Join tries. Refused
+     * (`BusyError`) while an op or a rebind runs, its confirmation dialogs
+     * included: Create reads the codec when it starts and builds the DB with
+     * it after the user confirms, so a change in between would be saved but
+     * not built, and Step 1 would no longer describe the DB just created.
+     */
+    async changeCodecSetting(
+        patch: Partial<Pick<
+            CouchSyncSettings,
+            "configEncryptionEnabled" | "configEncryptionPassphrase" | "configCompressionEnabled"
+        >>,
+    ): Promise<void> {
+        const blocked = this.lockBlocker();
+        if (blocked) throw new BusyError(blocked);
+        Object.assign(this.getSettings(), patch);
+        await this.saveSettings();
+    }
+
     /** Why `op` cannot start now because of an operation outside config
      *  sync (a vault Init or Clone, or a reload about to happen), or null.
-     *  The op is refused as `busy` with this text; the tab disables its
+     *  The op is refused (`BusyError`) with this text; the tab disables its
      *  button. Redraw on the guard's `onChange`. */
     reloadConflict(op: LockedConfigOp): string | null {
         const role = RELOAD_ROLES[op];
@@ -510,9 +541,9 @@ export class ConfigSync {
      * the outcome on the binding (the status line reads it) and hands the
      * error to `progress.fail`, which words it (`describeError`), shows and
      * logs it. The error is rethrown, so the settings tab's catch only has
-     * to restore its button. A success is recorded too. Neither a busy
-     * refusal (nothing ran) nor a cancellation (the user chose it) is an
-     * outcome of the relation, so neither is recorded.
+     * to restore its button. A success is recorded too. Neither a refusal
+     * (`BusyError`: nothing ran) nor a cancellation (the user chose it) is
+     * an outcome of the relation, so only failures are recorded.
      *
      * `reloadAfter` says from the op's result whether Obsidian must reload.
      * The reload is asked for here, after the lock is released, and the
@@ -541,10 +572,10 @@ export class ConfigSync {
         const label = opts.label ?? OP_LABELS[opName];
         const progress = new ProgressNotice(label);
         const role = RELOAD_ROLES[opName];
-        const conflict = role ? this.reloadGuard.blocker(role) : null;
-        if (this.inflight !== null || this.rebinding !== null || conflict !== null) {
+        const busy = (role ? this.reloadGuard.blocker(role) : null) ?? this.lockBlocker();
+        if (busy !== null) {
             // Nothing was started — the running op (if any) keeps its lock.
-            const e = configNotReady("busy", conflict ? { blocker: conflict } : {});
+            const e = new BusyError(busy);
             progress.fail(e);
             throw e;
         }
@@ -581,7 +612,7 @@ export class ConfigSync {
             reload = opts.reloadAfter?.(result) ?? false;
             return result;
         } catch (e) {
-            if (binding && !describeError(e).cancelled) {
+            if (binding && describeError(e).outcome === "failed") {
                 binding.record({
                     op: opName, at, against: binding.attachment?.metaFingerprint ?? null, error: e,
                 });
@@ -603,13 +634,12 @@ export class ConfigSync {
      * Run local-only work on the current binding's store under the op lock
      * (Maintenance "Delete local config database", the config GC command),
      * so it never runs under a live Push / Pull / Join / Create and a
-     * rebind cannot close the store mid-way. Throws `busy` / `not-configured`
-     * without running `fn`; the caller reports.
+     * rebind cannot close the store mid-way. Throws `BusyError` /
+     * `not-configured` without running `fn`; the caller reports.
      */
     async runExclusive<T>(fn: (binding: ConfigBinding) => Promise<T>): Promise<T> {
-        if (this.inflight !== null || this.rebinding !== null) {
-            throw configNotReady("busy");
-        }
+        const blocked = this.lockBlocker();
+        if (blocked) throw new BusyError(blocked);
         const binding = this.requireBinding();
         this.setInflight({ cancel: () => {} });
         try {

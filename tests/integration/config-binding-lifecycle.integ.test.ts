@@ -972,12 +972,12 @@ describe("config binding lifecycle", () => {
 
             await expect(dev.cs.rebind("cfg-B")).rejects.toMatchObject({
                 name: "ConfigNotReadyError",
-                kind: "busy",
+                name: "BusyError",
             });
-            await expect(dev.cs.rebind(null)).rejects.toMatchObject({ kind: "busy" });
+            await expect(dev.cs.rebind(null)).rejects.toMatchObject({ name: "BusyError" });
             // Local maintenance (GC, Delete local config DB) is refused too.
             const task = vi.fn(async () => 1);
-            await expect(dev.cs.runExclusive(task)).rejects.toMatchObject({ kind: "busy" });
+            await expect(dev.cs.runExclusive(task)).rejects.toMatchObject({ name: "BusyError" });
             expect(task).not.toHaveBeenCalled();
             expect(dev.cs.currentStore()).toBe(storeA);
             expect(dev.cs.currentBinding()!.isClosed()).toBe(false);
@@ -994,8 +994,8 @@ describe("config binding lifecycle", () => {
         it("an op started while a rebind is switching stores is refused as busy", async () => {
             const dev = makeDevice("dev-X");
             const switching = dev.cs.rebind("cfg-A");
-            await expect(dev.cs.pull()).rejects.toMatchObject({ kind: "busy" });
-            await expect(dev.cs.rebind("cfg-B")).rejects.toMatchObject({ kind: "busy" });
+            await expect(dev.cs.pull()).rejects.toMatchObject({ name: "BusyError" });
+            await expect(dev.cs.rebind("cfg-B")).rejects.toMatchObject({ name: "BusyError" });
             await switching;
             expect(dev.cs.currentBinding()!.dbName).toBe("cfg-A");
         });
@@ -1006,7 +1006,7 @@ describe("config binding lifecycle", () => {
             await apply(dev, "cfg-A");
             let release!: () => void;
             const held = dev.cs.runExclusive(() => new Promise<void>((r) => { release = r; }));
-            await expect(dev.cs.join()).rejects.toMatchObject({ kind: "busy" });
+            await expect(dev.cs.join()).rejects.toMatchObject({ name: "BusyError" });
             release();
             await held;
             await dev.cs.join();
@@ -1365,7 +1365,7 @@ describe("config binding lifecycle", () => {
             // The CouchDB tab's Apply is disabled, with the reason...
             expect(d.cs.bindingChangeBlocker()).toMatch(/config operation is running/);
             // ...and one that gets through anyway changes nothing.
-            expect(await applyServer(d, Y)).toEqual({ kind: "refused-busy" });
+            expect(await applyServer(d, Y)).toMatchObject({ kind: "refused", error: { name: "BusyError" } });
             expect(d.settings.couchdbUri).toBe(X);
             remote("cfg", X).unpark();
             await running;
@@ -1400,7 +1400,7 @@ describe("config binding lifecycle", () => {
             remote("cfg", X).park();
             const running = d.cs.pull().catch(() => {});
             await vi.waitFor(() => expect(remote("cfg", X).parked).toBe(true));
-            expect(await applyServer(d, Y)).toEqual({ kind: "refused-busy" });
+            expect(await applyServer(d, Y)).toMatchObject({ kind: "refused", error: { name: "BusyError" } });
             remote("cfg", X).unpark();
             await running;
 
@@ -1430,7 +1430,7 @@ describe("config binding lifecycle", () => {
             const running = d.cs.pull().catch(() => {});
             await vi.waitFor(() => expect(remote("cfg-A").parked).toBe(true));
             const commit = vi.fn(async () => { d.settings.couchdbConfigDbName = "cfg-B"; });
-            await expect(d.cs.rebind("cfg-B", { commit })).rejects.toMatchObject({ kind: "busy" });
+            await expect(d.cs.rebind("cfg-B", { commit })).rejects.toMatchObject({ name: "BusyError" });
             expect(commit).not.toHaveBeenCalled();
             expect(d.settings.couchdbConfigDbName).toBe("cfg-A");
             remote("cfg-A").unpark();

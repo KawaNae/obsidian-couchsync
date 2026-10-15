@@ -8,6 +8,7 @@
  * the error.
  */
 import { describe, it, expect, beforeEach } from "vitest";
+import { describeError } from "../src/ui/describe-error.ts";
 import {
     VaultBinding, VaultEncryptionPausedError, vaultTarget, type VaultBindingHost, type AskVaultPassphrase,
 } from "../src/sync/vault-binding.ts";
@@ -175,6 +176,8 @@ describe("VaultBinding.init", () => {
         expect(r.stops).toBe(0);
         expect(r.stateAtSetup).toBeNull();
         expect(r.failures).toHaveLength(1);
+        // The credentials have to be fixed: a failure, not "not started".
+        expect(describeError(r.failures[0]).outcome).toBe("failed");
         // Once a Test clears the latch, nothing claims requests are on hold.
         r.auth.clear();
         expect(r.binding.relation().lastOp).toBeNull();
@@ -228,6 +231,9 @@ describe("VaultBinding.init", () => {
         expect(r.binding.busy()).toBe("init");
         await expect(r.binding.clone()).rejects.toThrow(/Init is running/);
         expect(r.failures).toHaveLength(1);
+        expect(describeError(r.failures[0])).toEqual({
+            text: "Init is running — wait for it to finish.", outcome: "refused",
+        });
         release();
         await first;
         expect(r.binding.relation().lastOp).toMatchObject({ op: "init", error: null });
@@ -768,10 +774,11 @@ describe("VaultBinding: the one writer of the setup state", () => {
         const running = r.binding.init();
         await new Promise((res) => setTimeout(res, 0));
         expect(r.binding.changeBlocker()).toMatch(/Init is running/);
-        await expect(r.binding.setLiveSync(true)).rejects.toThrow(/Init is running/);
-        await expect(r.binding.applyDatabase("x")).rejects.toThrow(/Init is running/);
-        await expect(r.binding.changeCodecSetting({ compressionEnabled: false })).rejects.toThrow(/Init is running/);
-        await expect(r.binding.applyServer({ couchdbUser: "x" }, true)).rejects.toThrow(/Init is running/);
+        const refused = { name: "BusyError", message: expect.stringMatching(/Init is running/) };
+        await expect(r.binding.setLiveSync(true)).rejects.toMatchObject(refused);
+        await expect(r.binding.applyDatabase("x")).rejects.toMatchObject(refused);
+        await expect(r.binding.changeCodecSetting({ compressionEnabled: false })).rejects.toMatchObject(refused);
+        await expect(r.binding.applyServer({ couchdbUser: "x" }, true)).rejects.toMatchObject(refused);
         expect(r.settings.couchdbDbName).toBe("vault");
         release();
         await running;

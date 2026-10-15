@@ -55,7 +55,7 @@ import {
 } from "../db/vault-meta.ts";
 import { checkEncryptionAgreement } from "../db/encryption-agreement.ts";
 import { classifyError } from "../db/sync/errors.ts";
-import { describeError, rawErrorMessage, UserFacingError } from "../ui/describe-error.ts";
+import { BusyError, describeError, rawErrorMessage, UserFacingError } from "../ui/describe-error.ts";
 import { logWarn } from "../ui/log.ts";
 import { OutcomeLedger, type OpOutcome } from "./op-outcome.ts";
 import { ReloadGuard } from "./reload-guard.ts";
@@ -333,7 +333,7 @@ export class VaultBinding {
 
     private assertIdle(): void {
         const blocked = this.changeBlocker();
-        if (blocked) throw new UserFacingError(blocked);
+        if (blocked) throw new BusyError(blocked);
     }
 
     /**
@@ -465,17 +465,19 @@ export class VaultBinding {
 
     /**
      * Run Init or Clone. The notice is opened first, so no failure goes
-     * unreported. A second run while one is in flight is refused; so is a
-     * run while an operation that reloads Obsidian runs (`ReloadGuard`),
-     * and a run while the auth latch is raised. Neither refusal is recorded:
+     * unreported. A second run while one is in flight is refused
+     * (`BusyError`, "not started"); so is a run while an operation that
+     * reloads Obsidian runs (`ReloadGuard`). A run while the auth latch is
+     * raised fails with the latch's error. None of them is recorded:
      * nothing was attempted. `body` prepares (reads, derives, asks —
      * nothing is changed, and a failure leaves the setup state and live
      * sync as they were), then calls `beginDestructive`, which asks the
      * user to confirm, and executes.
      *
      * This is the one exit of an Init / Clone failure: the outcome is
-     * recorded, and the notice words the error. Three failures are not
-     * recorded, because something else already tells them: a cancellation;
+     * recorded, and the notice words the error. A cancellation is not a
+     * failure and is not recorded. Two failures are not recorded either,
+     * because something else already tells them:
      * a rejection of the credentials (401/403), which raises the auth
      * latch — the status line shows the latch while it is raised, and once
      * a Test clears it the rejection no longer holds; and a Clone of an
@@ -491,7 +493,7 @@ export class VaultBinding {
         const progress = this.host.openProgress(OP_LABELS[op]);
         const busy = this.changeBlocker() ?? this.reloadConflict();
         const refusal = busy !== null
-            ? new UserFacingError(busy)
+            ? new BusyError(busy)
             : this.host.auth.isBlocked() ? this.host.auth.blockedError() : null;
         if (refusal) {
             progress.fail(refusal);
@@ -512,7 +514,7 @@ export class VaultBinding {
             if (rejected) this.host.auth.raise(d.code!, rawErrorMessage(e));
             if (
                 !rejected && !(e instanceof AuthBlockedError)
-                && !(e instanceof VaultDbEmptyError) && !describeError(e).cancelled
+                && !(e instanceof VaultDbEmptyError) && describeError(e).outcome === "failed"
             ) {
                 this.outcomes.record({ op, at, against, error: e });
             }

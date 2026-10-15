@@ -9,7 +9,7 @@ import type { LogManager } from "../log/log-manager.ts";
 import { DOC_ID } from "../types/doc-id.ts";
 import { logError } from "../ui/log.ts";
 import { ProgressNotice } from "../ui/notices.ts";
-import { UserFacingError } from "../ui/describe-error.ts";
+import { BusyError } from "../ui/describe-error.ts";
 import type { VaultBinding } from "../sync/vault-binding.ts";
 
 interface MaintenanceTabDeps {
@@ -369,7 +369,7 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
                     const progress = new ProgressNotice("Delete local vault database");
                     try {
                         const blocked = deps.vault.changeBlocker();
-                        if (blocked) throw new UserFacingError(blocked);
+                        if (blocked) throw new BusyError(blocked);
                         deps.replicator.stop();
                         await deps.localDb.destroy();
                     } catch (e) {

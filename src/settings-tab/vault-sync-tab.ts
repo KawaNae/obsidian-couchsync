@@ -14,7 +14,7 @@ import { describeDbFound, type DbCheckResult } from "../db/sync/vault-remote-ops
 import type { LocalDB } from "../db/local-db.ts";
 import { validateDeviceName } from "../utils/device-name.ts";
 import { setupGating } from "./setup-gating.ts";
-import { showNotice } from "../ui/notices.ts";
+import { reportError, showNotice } from "../ui/notices.ts";
 import { describeError } from "../ui/describe-error.ts";
 import type { VaultBinding, VaultRelation } from "../sync/vault-binding.ts";
 import { cloneDescription, encryptionChangedElsewhere, vaultRelationView } from "./vault-relation-view.ts";
@@ -212,7 +212,7 @@ export class VaultSyncTab {
                     .setValue(state === "syncing")
                     .setDisabled(!syncToggleEnabled || !idle)
                     .onChange(async (value) => {
-                        await this.changeSetup(() => this.deps.vault.setLiveSync(value));
+                        await this.changeSetup("Live Sync change", () => this.deps.vault.setLiveSync(value));
                     })
             );
 
@@ -272,19 +272,20 @@ export class VaultSyncTab {
     }
 
     private async handleApply(): Promise<void> {
-        await this.changeSetup(async () => {
+        await this.changeSetup("Database change", async () => {
             await this.deps.vault.applyDatabase(this.draft.db);
             this.testPassed = false;
         });
     }
 
-    /** Run a change of the vault setup; a refusal (Init or Clone runs) is
-     *  shown as a notice. The tab is redrawn either way. */
-    private async changeSetup(change: () => Promise<void>): Promise<void> {
+    /** Run `label`, a change of the vault setup; a refusal (Init or Clone
+     *  runs) or a failure is reported under `label`. The tab is redrawn
+     *  either way, which puts back the saved value of a refused change. */
+    private async changeSetup(label: string, change: () => Promise<void>): Promise<void> {
         try {
             await change();
         } catch (e) {
-            showNotice(describeError(e).text, 8000);
+            reportError(label, e);
         }
         this.deps.refresh();
     }
@@ -416,7 +417,7 @@ export class VaultSyncTab {
                     .setValue(settings.encryptionEnabled)
                     .setDisabled(!editable)
                     .onChange(async (value) => {
-                        await this.changeSetup(() => this.deps.vault.changeCodecSetting(
+                        await this.changeSetup("Encryption change", () => this.deps.vault.changeCodecSetting(
                             value ? { encryptionEnabled: true } : { encryptionEnabled: false, encryptionPassphrase: "" },
                         ));
                     })
@@ -459,7 +460,7 @@ export class VaultSyncTab {
                     .setValue(settings.compressionEnabled)
                     .setDisabled(!editable)
                     .onChange(async (value) => {
-                        await this.changeSetup(() => this.deps.vault.changeCodecSetting({ compressionEnabled: value }));
+                        await this.changeSetup("Compression change", () => this.deps.vault.changeCodecSetting({ compressionEnabled: value }));
                     })
             );
     }
