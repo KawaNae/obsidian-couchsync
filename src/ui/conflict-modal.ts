@@ -1,14 +1,54 @@
 import { App, Modal, Setting } from "obsidian";
 import { buildSideBySide } from "./diff-utils.ts";
-import type { ConflictChoice } from "../types/modal-presenter.ts";
+import { formatBytes } from "../settings-tab/couch-fetch.ts";
+import type { ConflictChoice, ConflictContent } from "../types/modal-presenter.ts";
 
 // Re-export so existing importers of `ConflictChoice` from this module keep
 // working; the canonical definition lives in types/modal-presenter.ts.
 export type { ConflictChoice };
 
 /**
- * Side-by-side diff modal for concurrent conflict resolution.
- * Shows local vs remote versions and lets the user choose which to keep.
+ * Render the two versions of a conflicting file side by side: a line diff
+ * for text, and for binary a note that the versions cannot be compared
+ * with each side's size. Shared by the single and the batch conflict modal.
+ */
+export function renderConflictContent(el: HTMLElement, content: ConflictContent): void {
+    if (content.kind === "binary") {
+        el.createEl("p", {
+            text: "This is a binary file, so the two versions cannot be compared here. " +
+                "Their sizes are shown below.",
+            cls: "setting-item-description",
+        });
+    }
+    const container = el.createDiv({ cls: "diff-compare-container" });
+    const leftPanel = container.createDiv({ cls: "diff-compare-panel diff-compare-left" });
+    leftPanel.createDiv({ cls: "diff-compare-panel-header", text: "Local (this device)" });
+    const leftContent = leftPanel.createDiv({ cls: "diff-compare-content" });
+
+    const rightPanel = container.createDiv({ cls: "diff-compare-panel diff-compare-right" });
+    rightPanel.createDiv({ cls: "diff-compare-panel-header", text: "Remote (other device)" });
+    const rightContent = rightPanel.createDiv({ cls: "diff-compare-content" });
+
+    if (content.kind === "binary") {
+        leftContent.createDiv({ cls: "cs-conflict-binary-size", text: describeSize(content.localSize) });
+        rightContent.createDiv({ cls: "cs-conflict-binary-size", text: describeSize(content.remoteSize) });
+        return;
+    }
+
+    buildSideBySide(content.localText, content.remoteText, leftContent, rightContent);
+    leftContent.addEventListener("scroll", () => { rightContent.scrollTop = leftContent.scrollTop; });
+    rightContent.addEventListener("scroll", () => { leftContent.scrollTop = rightContent.scrollTop; });
+}
+
+/** The exact byte count tells apart two versions of the same rounded size. */
+function describeSize(bytes: number): string {
+    if (bytes < 1024) return `Size: ${bytes} bytes`;
+    return `Size: ${formatBytes(bytes)} (${bytes.toLocaleString()} bytes)`;
+}
+
+/**
+ * Conflict resolution modal for one file: shows the local and the remote
+ * version and lets the user choose which to keep.
  */
 export class ConflictModal extends Modal {
     private resolved = false;
@@ -19,8 +59,7 @@ export class ConflictModal extends Modal {
     constructor(
         app: App,
         private filePath: string,
-        private localText: string,
-        private remoteText: string,
+        private content: ConflictContent,
     ) {
         super(app);
     }
@@ -36,19 +75,7 @@ export class ConflictModal extends Modal {
             cls: "setting-item-description",
         });
 
-        const container = contentEl.createDiv({ cls: "diff-compare-container" });
-        const leftPanel = container.createDiv({ cls: "diff-compare-panel diff-compare-left" });
-        leftPanel.createDiv({ cls: "diff-compare-panel-header", text: "Local (this device)" });
-        const leftContent = leftPanel.createDiv({ cls: "diff-compare-content" });
-
-        const rightPanel = container.createDiv({ cls: "diff-compare-panel diff-compare-right" });
-        rightPanel.createDiv({ cls: "diff-compare-panel-header", text: "Remote (other device)" });
-        const rightContent = rightPanel.createDiv({ cls: "diff-compare-content" });
-
-        buildSideBySide(this.localText, this.remoteText, leftContent, rightContent);
-
-        leftContent.addEventListener("scroll", () => { rightContent.scrollTop = leftContent.scrollTop; });
-        rightContent.addEventListener("scroll", () => { leftContent.scrollTop = rightContent.scrollTop; });
+        renderConflictContent(contentEl, this.content);
 
         // Action buttons
         new Setting(contentEl)

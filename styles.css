@@ -490,6 +490,11 @@
     height: 35vh;
 }
 
+.cs-conflict-binary-size {
+    padding: 8px 12px;
+    font-family: var(--font-interface);
+}
+
 /* ─── Side-by-side diff modal ────────────────────────── */
 
 .diff-history-compare-modal {

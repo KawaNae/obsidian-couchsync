@@ -20,6 +20,13 @@ All notable changes to obsidian-couchsync.
   the same content as the pulled version is not a conflict: the device only
   records it as synced. Files the filters keep out are not offered. Clone
   still replaces the files at the same path, as its confirmation says.
+- **A conflict on a binary file, such as an image or a PDF, is asked about
+  like one on a note.** The device kept its own version without asking, so
+  the vault's copy of an attachment could replace a newer one from another
+  device. The conflict dialog now shows the file, says that the two versions
+  cannot be compared, and gives each version's size; the user keeps one, or
+  chooses later. In the dialog for many conflicts, clicking a binary file
+  shows the same.
 - **A new install no longer shows the notice that config sync filtering was
   upgraded.** The notice is for settings that had the old path list to
   convert; a first start, with no settings saved, was taken for one.

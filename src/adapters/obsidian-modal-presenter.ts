@@ -10,6 +10,7 @@ import type { App } from "obsidian";
 import type {
     IModalPresenter,
     ConflictModalResult,
+    ConflictContent,
     ConflictBatchItem,
     BatchDecision,
     ConfigOverwritePreview,
@@ -29,10 +30,9 @@ export class ObsidianModalPresenter implements IModalPresenter {
 
     showConflictModal(
         filePath: string,
-        localText: string,
-        remoteText: string,
+        content: ConflictContent,
     ): { result: Promise<ConflictModalResult>; dismiss: () => void } {
-        const modal = new ConflictModal(this.app, filePath, localText, remoteText);
+        const modal = new ConflictModal(this.app, filePath, content);
         const result = modal.waitForResult().then((choice) => ({
             choice,
             dismissed: modal.wasDismissed,

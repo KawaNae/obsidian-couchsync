@@ -7,7 +7,7 @@ import type { WriteResult } from "../sync/vault-writer.ts";
 import type { VaultSync, DbToFileOptions } from "../sync/vault-sync.ts";
 import type { IVaultIO } from "../types/vault-io.ts";
 import type { FileDoc, CouchSyncDoc } from "../types.ts";
-import type { IModalPresenter, ConflictBatchItem } from "../types/modal-presenter.ts";
+import type { IModalPresenter, ConflictBatchItem, ConflictContent } from "../types/modal-presenter.ts";
 import { isFileDoc, isConfigDoc } from "../types.ts";
 import { joinChunks } from "../db/chunker.ts";
 import { isDiffableText } from "../utils/binary.ts";
@@ -36,6 +36,21 @@ export interface ConflictOrchestratorDeps {
 }
 
 const EMPTY_BUF = new ArrayBuffer(0);
+
+/** What the conflict modals show: a diff when both sides are text, each
+ *  side's size when either is binary. Either way the user chooses. */
+function conflictContent(localBuf: ArrayBuffer, remoteBuf: ArrayBuffer): ConflictContent {
+    if (isDiffableText(localBuf) && isDiffableText(remoteBuf)) {
+        const dec = new TextDecoder("utf-8");
+        return { kind: "text", localText: dec.decode(localBuf), remoteText: dec.decode(remoteBuf) };
+    }
+    return { kind: "binary", localSize: localBuf.byteLength, remoteSize: remoteBuf.byteLength };
+}
+
+/** The conflict history keeps the text of a side; a binary side is kept as "". */
+function historyText(buf: ArrayBuffer): string {
+    return isDiffableText(buf) ? new TextDecoder("utf-8").decode(buf) : "";
+}
 
 /** A divergent-vault conflict answered with the remote version: the modal
  *  showed the vault's version, and the user chose to replace it. */
@@ -316,17 +331,10 @@ export class ConflictOrchestrator {
 
     /** Present many conflicts as ONE batch modal and apply the bulk decision. */
     private async processBatch(items: QueuedConflict[]): Promise<void> {
-        const dec = new TextDecoder("utf-8");
-        const batchItems: ConflictBatchItem[] = items.map((it) => {
-            const ld = isDiffableText(it.localBuf);
-            const rd = isDiffableText(it.remoteBuf);
-            return {
-                filePath: it.filePath,
-                localText: ld ? dec.decode(it.localBuf) : "",
-                remoteText: rd ? dec.decode(it.remoteBuf) : "",
-                binary: !(ld && rd),
-            };
-        });
+        const batchItems: ConflictBatchItem[] = items.map((it) => ({
+            filePath: it.filePath,
+            content: conflictContent(it.localBuf, it.remoteBuf),
+        }));
 
         const decision = await this.deps.modal.showConflictBatchModal(batchItems);
         switch (decision.kind) {
@@ -369,14 +377,13 @@ export class ConflictOrchestrator {
         item: QueuedConflict,
         choice: "keep-local" | "take-remote",
     ): Promise<void> {
-        const dec = new TextDecoder("utf-8");
         try {
             if (choice === "take-remote") await item.applyTakeRemote();
             else await item.applyKeepLocal();
             await this.deps.historyCapture.saveConflict(
                 item.filePath,
-                isDiffableText(item.localBuf) ? dec.decode(item.localBuf) : "",
-                isDiffableText(item.remoteBuf) ? dec.decode(item.remoteBuf) : "",
+                historyText(item.localBuf),
+                historyText(item.remoteBuf),
                 choice === "take-remote" ? "remote" : "local",
             );
             await item.clearDurable();
@@ -530,10 +537,10 @@ export class ConflictOrchestrator {
     }
 
     /**
-     * Shared modal+apply pipeline used by all three conflict entries.
-     * Decodes the bufs, picks text/binary path, shows the modal, awaits
-     * the user's choice (or auto-dismiss), invokes the matching apply
-     * callback, and persists conflict history.
+     * Shared modal+apply pipeline used by all conflict entries. Shows the
+     * two versions (a diff for text, the sizes for binary), awaits the
+     * user's choice (or auto-dismiss), invokes the matching apply callback,
+     * and persists conflict history.
      */
     private async runConflictModalAndApply(args: {
         filePath: string;
@@ -545,53 +552,31 @@ export class ConflictOrchestrator {
         const { filePath, localBuf, remoteBuf, applyTakeRemote, applyKeepLocal } = args;
         const { modal, historyCapture } = this.deps;
         const fileName = filePath.split("/").pop();
-        const dec = new TextDecoder("utf-8");
 
-        const localDiffable = isDiffableText(localBuf);
-        const remoteDiffable = isDiffableText(remoteBuf);
+        const { result, dismiss } = modal.showConflictModal(
+            filePath, conflictContent(localBuf, remoteBuf),
+        );
+        this.openConflictDismiss.set(filePath, dismiss);
+        const { choice, dismissed } = await result;
+        this.openConflictDismiss.delete(filePath);
 
-        if (localDiffable && remoteDiffable) {
-            const localText = dec.decode(localBuf);
-            const remoteText = dec.decode(remoteBuf);
-            const { result, dismiss } = modal.showConflictModal(filePath, localText, remoteText);
-            this.openConflictDismiss.set(filePath, dismiss);
-            const { choice, dismissed } = await result;
-            this.openConflictDismiss.delete(filePath);
-
-            if (dismissed) {
-                logInfo(`Conflict auto-resolved for ${fileName} (other device resolved)`);
-                return "resolved";
-            }
-            if (choice === "defer") {
-                // × / Esc / "Later" — apply NOTHING, keep the durable record
-                // so it re-presents next session. Never overwrite remote.
-                logInfo(`Conflict deferred for ${fileName} — kept for later (no change applied)`);
-                return "deferred";
-            }
-            if (choice === "take-remote") {
-                await applyTakeRemote();
-                await historyCapture.saveConflict(filePath, localText, remoteText, "remote");
-            } else {
-                await applyKeepLocal();
-                await historyCapture.saveConflict(filePath, localText, remoteText, "local");
-            }
+        if (dismissed) {
+            logInfo(`Conflict auto-resolved for ${fileName} (other device resolved)`);
             return "resolved";
         }
-
-        // Binary path — auto keep-local (matches existing concurrent
-        // behavior). saveConflict captures whichever side is text-like.
-        logInfo(`Conflict resolved: keep-local (binary) for ${fileName}`);
-        await applyKeepLocal();
+        if (choice === "defer") {
+            // × / Esc / "Later" — apply NOTHING, keep the durable record
+            // so it re-presents next session. Never overwrite remote.
+            logInfo(`Conflict deferred for ${fileName} — kept for later (no change applied)`);
+            return "deferred";
+        }
+        if (choice === "take-remote") await applyTakeRemote();
+        else await applyKeepLocal();
         await historyCapture.saveConflict(
             filePath,
-            localDiffable ? dec.decode(localBuf) : "",
-            remoteDiffable ? dec.decode(remoteBuf) : "",
-            "local",
-        );
-        notify(
-            `concurrent edit on binary file ${fileName} — ` +
-                "keeping local version. Check Diff History for details.",
-            10000,
+            historyText(localBuf),
+            historyText(remoteBuf),
+            choice === "take-remote" ? "remote" : "local",
         );
         return "resolved";
     }
