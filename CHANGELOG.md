@@ -30,6 +30,13 @@ All notable changes to obsidian-couchsync.
   the next sync check. A file with Windows line breaks (CRLF) or a BOM is
   not taken for unsaved typing. An IME composition that commits text is
   handled the same way.
+- **The confirmation of Delete local vault database says what happens to
+  the vault's files.** It said that unpushed edits would be lost. Edits in
+  the vault's files are kept: after the restart, a file whose content
+  differs from the remote's version is offered as a conflict, and a file the
+  remote does not have is sent to it. What is lost is a deletion or rename
+  not yet sent: the deleted file, or the file under its old name, comes back
+  from the remote.
 - **A conflict on a binary file, such as an image or a PDF, is asked about
   like one on a note.** The device kept its own version without asking, so
   the vault's copy of an attachment could replace a newer one from another
