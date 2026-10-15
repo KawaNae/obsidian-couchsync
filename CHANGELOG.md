@@ -2,7 +2,7 @@
 
 All notable changes to obsidian-couchsync.
 
-## Unreleased
+## 0.31.0
 
 Sync no longer replaces a change it has not seen: a pull leaves alone a file
 edited in the vault but not yet synced and a note with unsaved typing, binary
@@ -438,6 +438,89 @@ one Join per device after updating (see Migration).
   lacks are marked "new key"), so they can be left out.
 - **Vault setups need no action.** A device set up before this release
   takes the server's `vault:meta` as its own the first time sync starts.
+
+## 0.30.2
+
+Ends a conflict that kept coming back on one device: after Take Remote,
+the same file was reported as a concurrent conflict again and again.
+Five independent causes are fixed.
+
+### Fixed
+
+- **Take Remote no longer leaves this device's mark on the version clock.**
+  Take Remote on a file that is not deleted adopts the remote doc's vclock
+  as is instead of incrementing it. The incremented clock made the push
+  loop see a concurrent edit, and the conflict came back on every cycle.
+- **Edits made while sync was stopped are no longer overwritten by the
+  catchup.** Before the catchup pull, files whose modification time or
+  size drifted from the last record are stamped into the local DB, so a
+  pull that follows reports a conflict instead of replacing the edit.
+- **A queued conflict follows newer remote revisions.** A new revision that
+  arrives while the conflict waits in the queue updates the queued entry.
+  When a resolution finishes and the remote version already contains the
+  local one, the remote version is taken without a dialog, so no false
+  conflict dialogs follow one another.
+- **A stale editor buffer flush is no longer taken as a local edit.** The
+  write that sync makes is ignored for 5 seconds instead of for exactly one
+  modify event, so Obsidian writing back an old buffer on resume or when
+  hidden does not stamp the old content.
+- **History keeps the disk content before sync writes over it.** Edits made
+  after the last history capture were missing from the history when a
+  pulled version replaced them.
+- The bundled Dexie uses its own global symbol (`Dexie-couchsync`), so it
+  no longer collides with another plugin's Dexie.
+
+## 0.30.1
+
+### Fixed
+
+- **IME composition on mobile is no longer cut off.** The composition was
+  force-ended on `window.blur`, which fires on mobile when the
+  notification drawer or control center opens or the keyboard switches.
+  It is now force-ended on `visibilitychange` to hidden, which fires only
+  when the app goes to the background. Composition lifecycle logs (tracker
+  rebind, force-end, vault writer defer and dispatch with `cm.composing`)
+  are added for the remaining iOS / Android cases.
+- **A cipher-version floor error no longer loops.** A non-retriable
+  `EncryptionError` (schema mismatch) from config sync now goes to the
+  reconnect bridge, so the vault session stops instead of retrying the
+  same error.
+- **The encrypt layer follows the encryption setting.** `wrapVaultClient`
+  and `wrapConfigClient` apply it only when encryption is on
+  (`encryptionEnabled` / `codec.encryption`), not whenever a crypto
+  provider exists in memory, so a stale provider cannot encrypt a
+  plaintext vault.
+
+### Changed
+
+- Dev dependencies: esbuild 0.28.1, vite 8.0.16, postcss 8.5.10.
+
+## 0.30.0
+
+Diff history becomes a git-style branching tree, and the settings separate
+the server connection from the database setup.
+
+### Changed
+
+- **Diff history is a branching tree.** Restore starts an implicit branch
+  instead of overwriting the snapshot in place. Overwriting broke the diff
+  reconstruction of every record after the restore point; records now link
+  to their parent, so every path stays readable.
+- **Git-graph view.** The history view draws the main path, branches and
+  merges as lines, places columns by subtree size, marks the current
+  position with a HEAD badge and colors the main path apart from branches.
+  Entries are grouped under date separators.
+- **CouchDB tab.** The server URI, user and password moved to a new first
+  tab with its own Test and Apply. Vault Sync and Config Sync each get a
+  Step 2 "Database" whose Check verifies the database and creates it when
+  missing; a database name that did not exist used to block the whole
+  setup. Clone is disabled while the database is empty.
+
+### Fixed
+
+- The history view refreshes when a file is edited while it is open.
+- The settings keep their scroll position when they redraw.
+- History graph dots stay circular and line up with the lines on mobile.
 
 ## 0.29.0
 
