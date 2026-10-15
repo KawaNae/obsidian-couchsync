@@ -135,6 +135,10 @@ export class ConflictOrchestrator {
     private draining = false;
     private debounceTimer: ReturnType<typeof setTimeout> | null = null;
 
+    /** The pull's judgment of local vs remote. Shared with the replicator so
+     *  a remote version re-checked here is judged by the same rules. */
+    private readonly resolver = new ConflictResolver();
+
     constructor(private deps: ConflictOrchestratorDeps) {}
 
     private get batchThreshold(): number {
@@ -151,8 +155,7 @@ export class ConflictOrchestrator {
     register(): void {
         const { replicator } = this.deps;
 
-        const conflictResolver = new ConflictResolver();
-        replicator.setConflictResolver(conflictResolver);
+        replicator.setConflictResolver(this.resolver);
 
         replicator.events.on("concurrent", ({ filePath, localDoc, remoteDoc }) =>
             this.handleConcurrent(filePath, localDoc, remoteDoc),
@@ -306,7 +309,10 @@ export class ConflictOrchestrator {
                         const pending = this.pendingUpdates.get(it.filePath);
                         if (pending) {
                             this.pendingUpdates.delete(it.filePath);
-                            void this.reEnqueueIfStillConcurrent(it.filePath, pending.remoteDoc);
+                            void this.recheckStashed(it.filePath, pending).catch((e: any) => {
+                                logError(`Re-check of ${it.filePath.split("/").pop()} failed: ${e?.message ?? e}`);
+                                void this.handleConcurrent(it.filePath, pending.localDoc, pending.remoteDoc);
+                            });
                         }
                     }
                 }
@@ -627,52 +633,75 @@ export class ConflictOrchestrator {
     }
 
     /**
-     * Apply user's conflict resolution choice for the pull-time
-     * `concurrent` event. Merges vclocks and writes to localDB so the
-     * push loop carries the result to remote.
+     * Judge again a remote version that arrived while its path's conflict
+     * was being resolved, against the local doc as it is now. The pull
+     * judged it against the local doc of that moment; the resolution has
+     * since changed that doc, often by taking the remote in (Keep Local
+     * merges the remote vclock, Take Remote adopts it). So the same
+     * resolver judges it again:
+     *   - concurrent: still a conflict, offered with the current local doc.
+     *   - keep-local: the local doc already includes the remote (or equals
+     *     it). Nothing to do; offering it again would show a conflict the
+     *     user just resolved.
+     *   - take-remote: the remote is newer than the local doc. Taken
+     *     without a modal.
+     *   - silent-merge: the same content. Taken without a modal only when
+     *     the remote vclock is ahead; otherwise there is nothing to choose.
+     *
+     * The tombstone a remote hard-deletion produces carries `vclock: {}`
+     * and so no causal history: the resolver would always find the local
+     * doc ahead of it. It stays a conflict while the local doc is alive,
+     * as the pending-conflict drain decides for it.
+     *
+     * A failure here offers the conflict as stashed (the caller catches).
      */
-    /**
-     * Re-check whether a stashed concurrent event is still concurrent
-     * against the CURRENT local doc (which may have changed during the
-     * in-flight resolution). Three outcomes:
-     *   - equal: both sides converged — nothing to do.
-     *   - dominated: local is behind the stashed remote — silently
-     *     apply take-remote to close the gap (no modal needed).
-     *   - concurrent/dominates: still divergent — re-enqueue for a
-     *     fresh modal with the latest data.
-     */
-    private async reEnqueueIfStillConcurrent(
+    private async recheckStashed(
         filePath: string,
-        remoteDoc: CouchSyncDoc,
+        stashed: { localDoc: CouchSyncDoc; remoteDoc: CouchSyncDoc },
     ): Promise<void> {
-        let currentLocal: CouchSyncDoc | null = null;
-        try {
-            currentLocal = await this.deps.localDb.get<CouchSyncDoc>(
-                makeFileId(filePath),
-            );
-            if (currentLocal && isFileDoc(currentLocal) && isFileDoc(remoteDoc)) {
-                const rel = compareVC(
-                    currentLocal.vclock ?? {},
-                    remoteDoc.vclock ?? {},
-                );
-                if (rel === "equal") {
-                    logDebug(
-                        `Stashed concurrent for ${filePath.split("/").pop()} already converged — skipping`,
-                    );
-                    return;
-                }
-                if (rel === "dominated") {
-                    logDebug(
-                        `Stashed concurrent for ${filePath.split("/").pop()} dominated — silent take-remote`,
-                    );
+        const { remoteDoc } = stashed;
+        const fileName = filePath.split("/").pop();
+        const currentLocal = await this.deps.localDb.get<CouchSyncDoc>(makeFileId(filePath));
+        if (!currentLocal || !isFileDoc(currentLocal) || !isFileDoc(remoteDoc)) {
+            void this.handleConcurrent(filePath, currentLocal ?? stashed.localDoc, remoteDoc);
+            return;
+        }
+
+        if (remoteDoc.deleted === true && Object.keys(remoteDoc.vclock ?? {}).length === 0) {
+            if (currentLocal.deleted === true) {
+                logDebug(`Stashed deletion for ${fileName} already applied — skipping`);
+                return;
+            }
+            void this.handleConcurrent(filePath, currentLocal, remoteDoc);
+            return;
+        }
+
+        const verdict = await this.resolver.resolveOnPull(currentLocal, remoteDoc);
+        switch (verdict) {
+            case "concurrent":
+                void this.handleConcurrent(filePath, currentLocal, remoteDoc);
+                return;
+            case "keep-local":
+                logDebug(`Stashed concurrent for ${fileName} already included in local — skipping`);
+                return;
+            case "take-remote":
+                logDebug(`Stashed concurrent for ${fileName} newer than local — silent take-remote`);
+                await this.applyConflictChoice("take-remote", filePath, currentLocal, remoteDoc);
+                return;
+            case "silent-merge":
+                if (compareVC(currentLocal.vclock ?? {}, remoteDoc.vclock ?? {}) === "dominated") {
+                    logDebug(`Stashed concurrent for ${fileName} same content, newer clock — silent take-remote`);
                     await this.applyConflictChoice("take-remote", filePath, currentLocal, remoteDoc);
                     return;
                 }
+                logDebug(`Stashed concurrent for ${fileName} same content — skipping`);
+                return;
+            default: {
+                const _exhaustive: never = verdict;
+                void _exhaustive;
+                return;
             }
-        } catch {
-            // DB read failed — fall through to re-enqueue (safe side)
         }
-        void this.handleConcurrent(filePath, currentLocal ?? remoteDoc, remoteDoc);
     }
 
     /**

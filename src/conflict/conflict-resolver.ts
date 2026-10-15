@@ -41,7 +41,8 @@ type ResolvableDoc = FileDoc | ConfigDoc;
  * silent regression. On the ConfigSync side, a fall-through once dropped
  * `silent-merge` and raised false-positive concurrent conflicts.
  *
- * Current consumer: `pull-writer.ts:classify`.
+ * Current consumers: `pull-writer.ts:classify` and
+ * `conflict-orchestrator.ts:recheckStashed`.
  */
 export type PullVerdict = "take-remote" | "keep-local" | "concurrent" | "silent-merge";
 
