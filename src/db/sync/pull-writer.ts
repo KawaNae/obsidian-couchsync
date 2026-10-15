@@ -179,6 +179,18 @@ export class PullWriter {
      *  session (the set starts empty each session). */
     private emittedConflicts = new Set<string>();
 
+    /** When this writer last finished a step of a batch: a change row
+     *  classified, or a doc's vault write settled. `null` before the first
+     *  batch. The pull's watchdogs read it to tell a long batch from a
+     *  stuck one: a batch of thousands of deletions runs for minutes with
+     *  the transport silent and the cursor still, but lands a doc every
+     *  second or so; a stuck write lands none. */
+    private lastProgressAt: number | null = null;
+
+    getLastProgressAt(): number | null { return this.lastProgressAt; }
+
+    private noteProgress(): void { this.lastProgressAt = Date.now(); }
+
     async apply(result: ChangesResult<CouchSyncDoc>): Promise<PullApplyResult> {
         const { accepted, concurrent, stats, pendingConflictAdd } = await this.classify(result);
 
@@ -230,6 +242,9 @@ export class PullWriter {
         const resolver = this.deps.getConflictResolver();
 
         for (const row of result.results) {
+            // Taking up a row means the previous one is done (the first:
+            // the batch has arrived). The last row is noted after the loop.
+            this.noteProgress();
             if (row.deleted) {
                 if (isFileDocId(row.id)) {
                     await this.handlePulledDeletion(row.id, accepted, concurrent, pendingConflictAdd);
@@ -385,6 +400,7 @@ export class PullWriter {
 
             accepted.push(remoteDoc);
         }
+        this.noteProgress();
 
         return { accepted, concurrent, stats, pendingConflictAdd };
     }
@@ -586,6 +602,7 @@ export class PullWriter {
                         logError(`pull vault write failed: ${path}: ${e?.message ?? e}`);
                         stats.writeFailCount++;
                     }
+                    this.noteProgress();
                 }
             },
         });

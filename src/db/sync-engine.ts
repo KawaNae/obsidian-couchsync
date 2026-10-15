@@ -70,15 +70,14 @@ export interface RemoteAgreement {
 
 const HEALTH_CHECK_INTERVAL = 30000; // 30s
 
-/** Grace window for the pull-side transport-activity signal in
- *  `checkHealth()`. As long as the pull stream received at least one
- *  chunk within this window, stall detection is suppressed: the request
- *  is alive and we are simply waiting for the apply/persist cycle to
- *  finish. Symmetric with `BODY_STALE_MS` in `couch-client.ts` — past
- *  that threshold the per-chunk stale timer would already have aborted
- *  the request, so any further inactivity is the transport's problem,
- *  not the stall detector's. */
-const TRANSPORT_GRACE_MS = 30_000;
+/** Grace window for the pull-activity signal in `checkHealth()`
+ *  (`SyncSession.lastPullActivityAt`). As long as the pull moved within
+ *  this window — a body chunk arrived, or the writer finished a step of a
+ *  batch — stall detection is suppressed. Symmetric with `BODY_STALE_MS`
+ *  in `couch-client.ts`: past that threshold the per-chunk stale timer
+ *  would already have aborted a silent request, and a single doc's apply
+ *  taking this long is not a slow batch but a stuck one. */
+const PULL_ACTIVITY_GRACE_MS = 30_000;
 
 /** How long a transient error stays in `reconnecting` before escalating
  *  to a hard `error`. The live session may self-heal inside this window. */
@@ -1066,31 +1065,31 @@ export class SyncEngine {
             const remoteNum = SyncEngine.seqNumericPrefix(currentRemoteSeq);
             const consumedNum = SyncEngine.seqNumericPrefix(this.checkpoints.getRemoteSeq());
 
-            // Pull-side transport progress is a peer indicator alongside
-            // checkpoint advance. A multi-MB catchup over a slow link
-            // can keep `consumedNum` static for tens of seconds while
-            // bytes are still flowing on `_changes`/`_bulk_get`. Without
-            // this guard, the seq-mismatch predicate below would
-            // misclassify that as a stall and tear down the in-flight
-            // request, only to re-fetch the same delta. Longpoll
-            // heartbeats also keep this stamp fresh during idle, so a
-            // healthy live session never trips the predicate either.
-            const lastChunk = session.client.getLastPullBodyChunkAt();
-            if (lastChunk !== null && (Date.now() - lastChunk) < TRANSPORT_GRACE_MS) {
+            // The checkpoint advances once per batch, so `consumedNum`
+            // can sit behind the remote for minutes while the pull is
+            // working: bytes still flowing on `_changes`/`_bulk_get` over
+            // a slow link, or a batch of thousands of deletions landing
+            // one doc at a time. Either kind of movement is progress; the
+            // seq-mismatch predicate below would otherwise tear down a
+            // working session, only to re-fetch the same delta. Longpoll
+            // heartbeats also keep the transport stamp fresh during idle,
+            // so a healthy live session never trips the predicate either.
+            const lastActivity = session.lastPullActivityAt();
+            if (lastActivity !== null && (Date.now() - lastActivity) < PULL_ACTIVITY_GRACE_MS) {
                 // Hold `lastObservedRemoteSeq` so the next tick can still
                 // evaluate the 2-tick stable-remote backstop once the
-                // transport quiets down. Only update the healthy stamp.
+                // pull stops moving. Only update the healthy stamp.
                 this.lastHealthyAt = Date.now();
                 return;
             }
 
-            // Backstop: transport is quiet (`getLastPullBodyChunkAt()`
-            // is stale or null) and `consumedNum` lags behind a stable
-            // `remoteNum` for ≥2 ticks. The per-chunk stale timer in
-            // `couch-client.ts` already aborts genuinely-dead requests
-            // at 30s of silence, so anything reaching here is a
-            // non-transport deadlock (e.g. apply/persist hung) — force
-            // a session restart to recover.
+            // Backstop: the pull has not moved (no body chunk, no doc
+            // processed) within the grace window and `consumedNum` lags
+            // behind a stable `remoteNum` for ≥2 ticks. The per-chunk
+            // stale timer in `couch-client.ts` already aborts genuinely
+            // dead requests at 30s of silence, so anything reaching here
+            // is a non-transport deadlock (e.g. a vault write or the
+            // persist hung) — force a session restart to recover.
             if (remoteNum !== consumedNum
                 && remoteNum === SyncEngine.seqNumericPrefix(this.lastObservedRemoteSeq)) {
                 logDebug(`health: stall detected (remote=${remoteNum}, consumed=${consumedNum})`);

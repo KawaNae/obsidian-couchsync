@@ -590,7 +590,7 @@ describe("SyncEngine integration", () => {
         });
 
         // Regression backstop: if the seq mismatch persists AND the
-        // pull-transport stamp is older than `TRANSPORT_GRACE_MS`, this
+        // pull-transport stamp is older than `PULL_ACTIVITY_GRACE_MS`, this
         // is a non-transport deadlock (e.g. apply/persist hung) and
         // stall detection must still escalate to a reconnect.
         it("transport stale → backstop fires", async () => {
@@ -620,6 +620,64 @@ describe("SyncEngine integration", () => {
             reconnectSpy.mockRestore();
             spy.mockRestore();
             a.engine.stop();
+        });
+
+        // A long batch (thousands of deletions) keeps the transport quiet
+        // and the checkpoint behind the remote for minutes after its body
+        // arrived. Each doc that lands is progress; only a doc that stops
+        // landing is a stall.
+        it("a long batch whose docs keep landing is not a stall; a doc that never lands is", async () => {
+            h = createSyncHarness();
+            const a = h.addDevice("dev-A");
+            const b = h.addDevice("dev-B");
+            await seedRemoteVia(h, a, "words/one.md", "one");
+            await seedRemoteVia(h, a, "words/two.md", "two");
+            await seedRemoteVia(h, a, "words/three.md", "three");
+
+            // Each vault write waits for the test to let it land.
+            const gates: Array<() => void> = [];
+            const writeSpy = vi.spyOn(b.vs, "dbToFile").mockImplementation(async () => {
+                await new Promise<void>((r) => gates.push(r));
+                return { applied: true };
+            });
+            const infoSpy = vi.spyOn(h.couch, "info").mockResolvedValue({
+                db_name: "x", doc_count: 0, update_seq: "999",
+            });
+            const reconnectSpy = vi
+                .spyOn(b.engine as any, "requestReconnect")
+                .mockResolvedValue(undefined);
+
+            // Only Date is faked (waitFor still polls on real timers, and
+            // stops at the test timeout rather than its own).
+            vi.useFakeTimers({ toFake: ["Date"] });
+            const started = b.engine.start();
+            try {
+                await waitFor(() => gates.length === 1);
+                // Two docs land 20s apart, a health tick after each: 40s
+                // into the batch, the transport silent all along.
+                for (let i = 1; i <= 2; i++) {
+                    vi.setSystemTime(Date.now() + 20_000);
+                    gates[i - 1]();
+                    await waitFor(() => gates.length === i + 1);
+                    await (b.engine as any).checkHealth();
+                }
+                expect(reconnectSpy).not.toHaveBeenCalled();
+
+                // The third doc never lands.
+                vi.setSystemTime(Date.now() + 31_000);
+                await (b.engine as any).checkHealth();
+                await (b.engine as any).checkHealth();
+                expect(reconnectSpy).toHaveBeenCalledTimes(1);
+                expect(reconnectSpy.mock.calls[0][0]).toBe("stalled");
+            } finally {
+                vi.useRealTimers();
+                for (const g of gates) g();
+                await started;
+                writeSpy.mockRestore();
+                infoSpy.mockRestore();
+                reconnectSpy.mockRestore();
+                b.engine.stop();
+            }
         });
     });
 });

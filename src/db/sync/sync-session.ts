@@ -148,6 +148,17 @@ export class SyncSession {
 
     get disposed(): boolean { return this._disposed; }
 
+    /** When the pull last moved: a body chunk arrived on a pull-side read
+     *  (the server is answering), or the writer finished a step of a batch
+     *  (the local apply is going). `null` before either. */
+    lastPullActivityAt(): number | null {
+        const transport = this.client.getLastPullBodyChunkAt();
+        const apply = this.pullWriter.getLastProgressAt();
+        if (transport === null) return apply;
+        if (apply === null) return transport;
+        return Math.max(transport, apply);
+    }
+
     async runCatchup(): Promise<void> {
         const p = this.pullPipeline.runCatchup();
         this.track("catchup", p);

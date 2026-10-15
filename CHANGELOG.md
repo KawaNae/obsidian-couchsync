@@ -6,6 +6,16 @@ All notable changes to obsidian-couchsync.
 
 ### Fixed
 
+- **A long pull is no longer cut off while it is still applying changes.**
+  Receiving a large deletion from another device (thousands of files)
+  could take one to two and a half minutes per batch of 100 changes. The
+  catchup counted each batch from the moment it started, so a batch longer
+  than 60 seconds ended with "Catchup timed out (no progress for 60s)" right
+  after it finished, and the session started over. The health check could
+  likewise take a long batch for a stalled pull and reconnect. Both now
+  measure progress by each change the pull processes rather than by whole
+  batches, so a slow batch keeps going and only a pull that stops
+  processing changes is cut off.
 - **Take Remote no longer replaces a version newer than the one shown.**
   When this device's version changed while a conflict dialog was open (a
   newer version was pulled, or an edit in the vault was synced), Take Remote
