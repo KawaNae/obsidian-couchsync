@@ -29,6 +29,7 @@ import { EncryptionError } from "../../src/db/codec-errors.ts";
 import { makePendingApply } from "../helpers/pending-apply.ts";
 import { buildInitialVaultMeta, pushVaultMeta, type VaultMetaDoc } from "../../src/db/vault-meta.ts";
 import { VaultEncryptionPausedError } from "../../src/sync/vault-binding.ts";
+import type { WriteResult } from "../../src/sync/vault-writer.ts";
 
 interface PipelineRig {
     pipeline: PullPipeline;
@@ -51,6 +52,10 @@ function attachPullPipeline(opts: {
     couch: SyncHarness["couch"];
     /** Stand-in for the vault setup's verdict; passes by default. */
     recheckRoot?: (observed?: VaultMetaDoc | null) => Promise<void>;
+    /** Stand-in for the vault write of each pulled file doc. */
+    applyPullWrite?: (doc: FileDoc) => Promise<WriteResult>;
+    /** Stand-in for the session's backoff sleep; returns at once by default. */
+    delay?: (ms: number) => Promise<void>;
 }): PipelineRig {
     const events = new SyncEvents();
     const echoes = new EchoTracker();
@@ -67,6 +72,7 @@ function attachPullPipeline(opts: {
         getConflictResolver: () => opts.device.resolver,
         ensureChunks: async () => {},
         pendingApply,
+        applyPullWrite: opts.applyPullWrite,
     });
 
     let cancelled = false;
@@ -91,7 +97,7 @@ function attachPullPipeline(opts: {
             rechecks.push(observed === undefined ? "read" : observed);
             await opts.recheckRoot?.(observed);
         },
-        delay: async () => {},
+        delay: opts.delay ?? (async () => {}),
     });
 
     return {
@@ -194,6 +200,76 @@ describe("PullPipeline integration", () => {
             const persisted = await b.db.getMeta<number | string>("_sync/remote-seq");
             expect(persisted).toBeNull();
             expect(rig.checkpoints.getRemoteSeq()).toBe(0);
+        });
+    });
+
+    // ── Catchup idle timeout ─────────────────────────────
+
+    describe("catchup idle timeout counts the docs actually processed", () => {
+        // Only Date is faked: the pipeline reads the clock with Date.now(),
+        // and the in-memory DB still needs real timers to settle.
+        afterEach(() => { vi.useRealTimers(); });
+
+        /** A vault write that takes `ms` of the fake clock. */
+        const slowWrite = (ms: number) => async (): Promise<WriteResult> => {
+            vi.setSystemTime(Date.now() + ms);
+            return { applied: true };
+        };
+
+        it("a batch that takes longer than 60s in all is not cut off while its docs keep landing", async () => {
+            vi.useFakeTimers({ toFake: ["Date"] });
+            h = createSyncHarness();
+            const a = h.addDevice("dev-A");
+            const b = h.addDevice("dev-B");
+            await seedRemote(h, a, "words/one.md", "one");
+            await seedRemote(h, a, "words/two.md", "two");
+            await seedRemote(h, a, "words/three.md", "three");
+            const rig = attachPullPipeline({
+                device: b, couch: h.couch, applyPullWrite: slowWrite(30_000),
+            });
+
+            // One batch of three docs, 30s each: 90s for the batch.
+            await rig.pipeline.runCatchup();
+
+            await expectDb(b.db).toHaveFileDoc("words/one.md");
+            await expectDb(b.db).toHaveFileDoc("words/three.md");
+            expect(Number(rig.checkpoints.getRemoteSeq()))
+                .toBe(Number((await h.couch.info()).update_seq));
+        });
+
+        it("a catchup that processes nothing for more than 60s is cut off, counted from the last doc", async () => {
+            vi.useFakeTimers({ toFake: ["Date"] });
+            h = createSyncHarness();
+            const a = h.addDevice("dev-A");
+            const b = h.addDevice("dev-B");
+            await seedRemote(h, a, "words/one.md", "one");
+            await seedRemote(h, a, "words/two.md", "two");
+            let lastWriteAt = 0;
+            const rig = attachPullPipeline({
+                device: b, couch: h.couch,
+                applyPullWrite: async () => {
+                    vi.setSystemTime(Date.now() + 50_000);
+                    lastWriteAt = Date.now();
+                    return { applied: true };
+                },
+                delay: async (ms) => { vi.setSystemTime(Date.now() + ms); },
+            });
+
+            // The first fetch delivers the batch; every later one fails to
+            // decrypt, which the catchup retries with backoff.
+            const realChanges = h.couch.changes.bind(h.couch);
+            let calls = 0;
+            const spy = vi.spyOn(h.couch, "changes").mockImplementation(async (...args) => {
+                calls++;
+                if (calls === 1) return realChanges(...args);
+                throw new EncryptionError("Failed to decrypt doc x"); // retriable
+            });
+
+            await expect(rig.pipeline.runCatchup()).rejects.toThrow(/Catchup timed out/);
+
+            await expectDb(b.db).toHaveFileDoc("words/two.md");
+            expect(Date.now() - lastWriteAt).toBeGreaterThan(60_000);
+            spy.mockRestore();
         });
     });
 

@@ -101,11 +101,19 @@ export class PullPipeline {
 
     async runCatchup(): Promise<void> {
         logDebug("catchup: starting HTTP changes pull");
-        let lastProgressAt = Date.now();
+        const startedAt = Date.now();
 
         while (true) {
             if (this.deps.isCancelled()) return;
 
+            // Progress is the docs the writer has processed, not the batches
+            // started: a batch may run for minutes while it lands docs. A
+            // fetch has its own transport timeouts and a hard failure throws,
+            // so what this catches is a catchup that keeps retrying (a body
+            // that does not decrypt) without processing anything.
+            const lastProgressAt = Math.max(
+                startedAt, this.deps.pullWriter.getLastProgressAt() ?? 0,
+            );
             if (Date.now() - lastProgressAt > CATCHUP_IDLE_TIMEOUT_MS) {
                 logInfo("Catchup timed out (no progress for 60s)");
                 throw new Error("Catchup timed out");
@@ -149,7 +157,6 @@ export class PullPipeline {
                     if (recreated) throw recreated;
                     throw new Error("Remote database was recreated (seq regression)");
                 }
-                lastProgressAt = Date.now();
                 await this.applyBatch(result);
                 logDebug(
                     `catchup: batch ${result.results.length} docs, seq=${result.last_seq}`,
