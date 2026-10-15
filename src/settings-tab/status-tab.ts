@@ -22,8 +22,8 @@ import { addPasswordToggle } from "./vault-sync-tab.ts";
 import { applyServerSettings, type ConfigServerSwitch } from "./server-apply.ts";
 import type { VaultBinding } from "../sync/vault-binding.ts";
 import { logWarn } from "../ui/log.ts";
-import { ProgressNotice, showNotice } from "../ui/notices.ts";
-import { UserFacingError } from "../ui/describe-error.ts";
+import { ProgressNotice, reportError } from "../ui/notices.ts";
+import { BusyError, UserFacingError } from "../ui/describe-error.ts";
 
 // ── Public interface ──────────────────────────────────────────────────
 
@@ -42,6 +42,9 @@ export interface CouchDbTabDeps {
     configBinding?: ConfigServerSwitch;
     refresh: () => void;
 }
+
+/** How a refused Apply is named in its notice and the log. */
+const SERVER_CHANGE = "Server change";
 
 interface Draft {
     uri: string;
@@ -226,7 +229,7 @@ export class CouchDbTab {
 
         const vaultBlocked = this.deps.vault.changeBlocker();
         if (vaultBlocked) {
-            showNotice(`${vaultBlocked} The server was not changed.`, 10000);
+            reportError(SERVER_CHANGE, new BusyError(vaultBlocked));
             this.updateDirtyState();
             return;
         }
@@ -241,12 +244,8 @@ export class CouchDbTab {
             newUri: this.draft.uri,
             save: () => this.deps.vault.applyServer(patch, credentialsChanged),
         });
-        if (result.kind === "refused-busy") {
-            showNotice(
-                "a config operation is running — the server was not " +
-                    "changed. Apply again when it finishes.",
-                10000,
-            );
+        if (result.kind === "refused") {
+            reportError(SERVER_CHANGE, result.error);
             this.updateDirtyState();
             return;
         }

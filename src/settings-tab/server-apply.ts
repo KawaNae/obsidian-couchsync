@@ -9,7 +9,7 @@
  * switch (`commit`), and a switch refused because a config op is running
  * saves nothing.
  */
-import { ConfigNotReadyError } from "../sync/config-errors.ts";
+import { BusyError } from "../ui/describe-error.ts";
 
 /** What the CouchDB tab needs from config sync (ConfigSync, via index.ts). */
 export interface ConfigServerSwitch {
@@ -18,8 +18,8 @@ export interface ConfigServerSwitch {
     changeBlocker(): string | null;
     /** Switch the config binding to `serverUri` and run `commit` (which
      *  saves the settings) inside the switch, so settings and binding
-     *  change together. Throws `ConfigNotReadyError("busy")` WITHOUT
-     *  running `commit` when an op is running (`ConfigSync.rebind`). */
+     *  change together. Throws `BusyError` WITHOUT running `commit` when
+     *  an op is running (`ConfigSync.rebind`). */
     switchServer(serverUri: string, commit: () => Promise<void>): Promise<void>;
 }
 
@@ -29,8 +29,8 @@ export type ServerApplyResult =
     /** Settings saved, but the new server's config store failed to open:
      *  config sync is unbound (its next op reports it). */
     | { kind: "saved-config-unbound"; error: unknown }
-    /** A config op is running: NOTHING was saved. */
-    | { kind: "refused-busy" };
+    /** A config op is running: NOTHING was saved. `error` says what runs. */
+    | { kind: "refused"; error: BusyError };
 
 /**
  * Save the CouchDB tab's settings (`save`). When the server URI changes and
@@ -47,17 +47,19 @@ export async function applyServerSettings(opts: {
         await opts.save();
         return { kind: "saved" };
     }
+    let saving = false;
     let committed = false;
     try {
         await cfg.switchServer(opts.newUri, async () => {
+            saving = true;
             await opts.save();
             committed = true;
         });
         return { kind: "saved" };
     } catch (e) {
-        if (e instanceof ConfigNotReadyError && e.kind === "busy" && !committed) {
-            return { kind: "refused-busy" };
-        }
+        // Refused only when the switch itself refused: a save that throws
+        // runs after the binding was switched.
+        if (e instanceof BusyError && !saving) return { kind: "refused", error: e };
         if (committed) return { kind: "saved-config-unbound", error: e };
         throw e;
     }

@@ -27,10 +27,7 @@ import type { CouchSyncSettings } from "../settings.ts";
 import type { ConfigSync, RemoteConfigListing } from "../sync/config-sync.ts";
 import type { SyncEngine } from "../db/sync-engine.ts";
 import type { AuthGate } from "../db/sync/auth-gate.ts";
-import { describeDbFound, type VaultRemoteOps } from "../db/sync/vault-remote-ops.ts";
 import { addPasswordToggle } from "./vault-sync-tab.ts";
-import { logWarn } from "../ui/log.ts";
-import { ConfigNotReadyError } from "../sync/config-errors.ts";
 import { configRelationView } from "./config-relation-view.ts";
 import {
     classifyConfigPath,
@@ -66,7 +63,8 @@ import {
     isInheritingConfigCompression,
 } from "../sync/config-codec-policy.ts";
 import { describeCodec, sameCodec } from "../sync/config-binding-record.ts";
-import { ProgressNotice, showNotice } from "../ui/notices.ts";
+import { reportError, showNotice } from "../ui/notices.ts";
+import { BusyError } from "../ui/describe-error.ts";
 
 export interface ConfigSyncTabDeps {
     app: App;
@@ -75,7 +73,6 @@ export interface ConfigSyncTabDeps {
     configSync: ConfigSync;
     replicator: SyncEngine;
     auth: AuthGate;
-    remoteOps: VaultRemoteOps;
     refresh: () => void;
 }
 
@@ -146,8 +143,7 @@ export class ConfigSyncTab {
             pencilEl.style.display = this.isFieldDirty(field) ? "inline" : "none";
         }
         if (this.testBtn) {
-            // Test is allowed once a non-empty draft DB name is typed.
-            this.testBtn.setDisabled(this.draft.db.trim() === "");
+            this.testBtn.setDisabled(!this.canCheck());
         }
         if (this.applyBtn) {
             this.applyBtn.setDisabled(!this.canApply());
@@ -160,20 +156,28 @@ export class ConfigSyncTab {
     private canApply(): boolean {
         // Apply rebinds the config DB (closes the current local store), which
         // ConfigSync refuses while an op runs — mirror that in the button.
-        // Same check as the CouchDB tab's Apply (`bindingChangeBlocker`).
-        if (this.deps.configSync.bindingChangeBlocker()) return false;
+        // Same check as the CouchDB tab's Apply (`changeBlocker`).
+        if (this.deps.configSync.changeBlocker()) return false;
         // Empty value is a valid Apply (means "disable config sync") and
         // doesn't require Test. Non-empty must be Tested first.
         if (this.draft.db.trim() === "") return true;
         return this.testPassed;
     }
 
+    /** Check is allowed once a non-empty draft DB name is typed, and not
+     *  while a config op runs: ConfigSync runs it under the op lock, since
+     *  a Check that passes clears the auth latch. */
+    private canCheck(): boolean {
+        return this.draft.db.trim() !== "" && this.idle();
+    }
+
     /** No config op or rebind runs. ConfigSync refuses an op while one
      *  runs (its confirmation dialogs included); the controls that start an
-     *  op, or change the Filter an op reads, are disabled to show it. The
-     *  settings tab redraws when this changes (`ConfigSync.onChange`). */
+     *  op, or change what an op reads (Step 1, the Filter), are disabled to
+     *  show it. The settings tab redraws when this changes
+     *  (`ConfigSync.onChange`). */
     private idle(): boolean {
-        return this.deps.configSync.bindingChangeBlocker() === null;
+        return this.deps.configSync.changeBlocker() === null;
     }
 
     /** No operation outside config sync keeps `op` from starting: a vault
@@ -185,7 +189,7 @@ export class ConfigSyncTab {
     }
 
     private applyDescText(): string {
-        const blocked = this.deps.configSync.bindingChangeBlocker();
+        const blocked = this.deps.configSync.changeBlocker();
         if (blocked) return blocked;
         if (this.draft.db.trim() === "") {
             return "Apply with empty name to disable config sync.";
@@ -213,6 +217,9 @@ export class ConfigSyncTab {
      * joined is kept with that database's binding — Join asks for it when
      * none at hand unlocks the database — so this field never has to be
      * edited to sync, and two databases never share one field.
+     *
+     * Changes go through `ConfigSync.changeCodecSetting`, which refuses them
+     * while a config op runs; the controls are disabled then.
      */
     private renderConfigCodecStep(el: HTMLElement, settings: CouchSyncSettings): void {
         el.createEl("h3", { text: "Step 1: Encryption & compression" });
@@ -240,6 +247,7 @@ export class ConfigSyncTab {
             note.style.color = "var(--text-accent)";
         }
 
+        const idle = this.idle();
         const encEnabled = codec.encryption;
         const inheritingEnc = isInheritingConfigEncryption(settings);
         new Setting(el)
@@ -252,10 +260,11 @@ export class ConfigSyncTab {
             .addToggle((toggle) =>
                 toggle
                     .setValue(encEnabled)
+                    .setDisabled(!idle)
                     .onChange(async (value) => {
                         // The passphrase is kept for when encryption is
                         // turned on again.
-                        await this.deps.updateSettings({ configEncryptionEnabled: value });
+                        await this.changeCodec("Config encryption change", { configEncryptionEnabled: value });
                         this.deps.refresh();
                     })
             );
@@ -273,8 +282,13 @@ export class ConfigSyncTab {
                 .addText((text) => {
                     text.setPlaceholder("Empty: inherit the Vault Sync passphrase")
                         .setValue(settings.configEncryptionPassphrase ?? "")
+                        .setDisabled(!idle)
                         .onChange(async (value) => {
-                            await this.deps.updateSettings({ configEncryptionPassphrase: value });
+                            // No redraw on a keystroke that is saved: it
+                            // would take the focus from the field.
+                            if (!await this.changeCodec("Config passphrase change", { configEncryptionPassphrase: value })) {
+                                this.deps.refresh();
+                            }
                         });
                     text.inputEl.type = "password";
                 });
@@ -293,11 +307,28 @@ export class ConfigSyncTab {
             .addToggle((toggle) =>
                 toggle
                     .setValue(compressEnabled)
+                    .setDisabled(!idle)
                     .onChange(async (value) => {
-                        await this.deps.updateSettings({ configCompressionEnabled: value });
+                        await this.changeCodec("Config compression change", { configCompressionEnabled: value });
                         this.deps.refresh();
                     })
             );
+    }
+
+    /** Save a Step 1 change through ConfigSync. False when it was not
+     *  saved (refused while a config op runs, or the save failed), after
+     *  reporting why; the caller's redraw then shows the saved value. */
+    private async changeCodec(
+        label: string,
+        patch: Parameters<ConfigSync["changeCodecSetting"]>[0],
+    ): Promise<boolean> {
+        try {
+            await this.deps.configSync.changeCodecSetting(patch);
+            return true;
+        } catch (e) {
+            reportError(label, e);
+            return false;
+        }
     }
 
     render(el: HTMLElement): void {
@@ -350,7 +381,7 @@ export class ConfigSyncTab {
             .addButton((btn) => {
                 this.testBtn = btn;
                 btn.setButtonText("Check")
-                    .setDisabled(this.draft.db.trim() === "")
+                    .setDisabled(!this.canCheck())
                     .onClick(async () => this.handleCheck(btn));
             });
 
@@ -559,9 +590,15 @@ export class ConfigSyncTab {
 
     // ── Filter tree (meaning-unit policy) ───────────────
 
+    /** Change the Filter through `ConfigSync.changePolicy`, which refuses
+     *  it while a config op runs (the controls are disabled then). A
+     *  refusal is reported; the caller's redraw shows the saved policy. */
     private async updatePolicy(patch: Partial<ConfigSyncPolicy>): Promise<void> {
-        const cur = this.deps.getSettings().configSyncPolicy;
-        await this.deps.updateSettings({ configSyncPolicy: { ...cur, ...patch } });
+        try {
+            await this.deps.configSync.changePolicy(patch);
+        } catch (e) {
+            reportError("Filter change", e);
+        }
     }
 
     private renderFilterTree(el: HTMLElement, configEnabled: boolean): void {
@@ -753,7 +790,7 @@ export class ConfigSyncTab {
         )) {
             return { paths: cached.paths, ok: cached.ok, bindingKey: cached.bindingKey };
         }
-        const busyBefore = this.deps.configSync.bindingChangeBlocker() !== null;
+        const busyBefore = this.deps.configSync.changeBlocker() !== null;
         const listing = await this.deps.configSync.listRemoteConfigPathsQuiet();
         const current = this.deps.configSync.currentBinding()?.key ?? null;
         if (listing.bindingKey !== key || current !== key) return null;
@@ -876,21 +913,12 @@ export class ConfigSyncTab {
             return;
         }
 
-        const progress = new ProgressNotice("Database check");
-        const result = await this.deps.remoteOps.checkDatabaseWith(
-            settings.couchdbUri,
-            settings.couchdbUser,
-            settings.couchdbPassword,
-            this.draft.db,
-        );
-
-        if (result.status === "error") {
+        try {
+            const result = await this.deps.configSync.checkDatabase(this.draft.db);
+            this.testPassed = result.status !== "error";
+        } catch {
+            // Refused (a config op runs); ConfigSync reported it.
             this.testPassed = false;
-            progress.fail(result.error);
-        } else {
-            this.testPassed = true;
-            this.deps.auth.clear();
-            progress.done(`"${this.draft.db}" ${describeDbFound(result)}`);
         }
         this.deps.refresh();
     }
@@ -916,9 +944,10 @@ export class ConfigSyncTab {
      * effect without a reload and nothing of the old DB is used against the
      * new one.
      *
-     * A busy refusal changes nothing (settings stay as they were). Any other
-     * rebind failure leaves config sync unbound; the name is still saved so
-     * ops report the failure against the name the user chose.
+     * A refusal (`BusyError`: an op runs) changes nothing (settings stay
+     * as they were). Any other rebind failure leaves config sync unbound;
+     * the name is still saved so ops report the failure against the name
+     * the user chose.
      */
     private async handleApply(): Promise<void> {
         const name = this.draft.db.trim();
@@ -927,10 +956,9 @@ export class ConfigSyncTab {
             await this.deps.configSync.rebind(name || null, {
                 commit: () => this.deps.updateSettings({ couchdbConfigDbName: name }),
             });
-        } catch (e: any) {
-            logWarn(`config database switch failed: ${e?.message ?? e}`);
-            showNotice(`could not switch the config database — ${e?.message ?? e}`, 10000);
-            if (e instanceof ConfigNotReadyError && e.kind === "busy") {
+        } catch (e) {
+            reportError("Config database change", e);
+            if (e instanceof BusyError) {
                 this.updateDirtyState();
                 return;
             }

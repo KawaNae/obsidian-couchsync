@@ -196,7 +196,7 @@ describe("config ops that reload and vault Init / Clone exclude each other", () 
             () => cs.shareAgain(".obsidian/app.json", "/theme"),
         ]) {
             await expect(op()).rejects.toMatchObject({
-                kind: "busy",
+                name: "BusyError",
                 message: "Vault Init is running — wait for it to finish.",
             });
         }
@@ -255,8 +255,8 @@ describe("config ops that reload and vault Init / Clone exclude each other", () 
         expect(vb.reloadConflict()).toMatch(reloading);
         await expect(vb.init()).rejects.toThrow(reloading);
         await expect(vb.clone()).rejects.toThrow(reloading);
-        await expect(cs.create()).rejects.toMatchObject({ kind: "busy", message: expect.stringMatching(reloading) });
-        await expect(cs.join()).rejects.toMatchObject({ kind: "busy", message: expect.stringMatching(reloading) });
+        await expect(cs.create()).rejects.toMatchObject({ name: "BusyError", message: expect.stringMatching(reloading) });
+        await expect(cs.join()).rejects.toMatchObject({ name: "BusyError", message: expect.stringMatching(reloading) });
         expect(modal.createCalls).toEqual([]);
         expect(setupStarted).toBe(false);
     });

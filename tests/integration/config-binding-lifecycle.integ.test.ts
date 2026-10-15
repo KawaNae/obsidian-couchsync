@@ -177,7 +177,7 @@ describe("config binding lifecycle", () => {
      *  the index.ts wiring): the settings are saved inside the rebind. */
     function serverSwitch(d: Device): ConfigServerSwitch {
         return {
-            changeBlocker: () => d.cs.bindingChangeBlocker(),
+            changeBlocker: () => d.cs.changeBlocker(),
             switchServer: (serverUri, commit) => d.cs.rebind(
                 d.settings.couchdbConfigDbName || null, { serverUri, commit },
             ),
@@ -540,7 +540,7 @@ describe("config binding lifecycle", () => {
             expect(b.cs.currentBinding()!.keyDerivations).toBe(2);
         });
 
-        it("cancelling the prompt: 'Join cancelled — nothing was changed', and nothing is", async () => {
+        it("cancelling the prompt: 'Join cancelled — Nothing was changed', and nothing is", async () => {
             await seed("cfg-enc", { ".obsidian/app.json": "{}" }, ENC);
             const b = makeDevice("dev-B", {
                 configEncryptionEnabled: true, configEncryptionPassphrase: "wrong",
@@ -555,7 +555,7 @@ describe("config binding lifecycle", () => {
             });
             clearLog();
             const err = await b.cs.join().catch((e) => e);
-            expect(err).toMatchObject({ name: "AbortError", message: "Join cancelled — nothing was changed." });
+            expect(err).toMatchObject({ name: "AbortError", userMessage: "Nothing was changed." });
             expect(await attachmentOf(b)).toBeNull();
             expect(getEntry(b.settings)).toBeUndefined();
             expect(b.settings.configEncryptionPassphrase).toBe("wrong");
@@ -565,7 +565,7 @@ describe("config binding lifecycle", () => {
             const logs = getLogEntries();
             expect(logs.filter((e) => e.level === "error")).toEqual([]);
             expect(logs.some((e) => e.level === "warn"
-                && e.message === "Config Join cancelled — nothing was changed.")).toBe(true);
+                && e.message === "Config Join cancelled — Nothing was changed.")).toBe(true);
         });
 
         it("without a passphrase and no prompt: passphrase-missing, nothing recorded", async () => {
@@ -972,12 +972,12 @@ describe("config binding lifecycle", () => {
 
             await expect(dev.cs.rebind("cfg-B")).rejects.toMatchObject({
                 name: "ConfigNotReadyError",
-                kind: "busy",
+                name: "BusyError",
             });
-            await expect(dev.cs.rebind(null)).rejects.toMatchObject({ kind: "busy" });
+            await expect(dev.cs.rebind(null)).rejects.toMatchObject({ name: "BusyError" });
             // Local maintenance (GC, Delete local config DB) is refused too.
             const task = vi.fn(async () => 1);
-            await expect(dev.cs.runExclusive(task)).rejects.toMatchObject({ kind: "busy" });
+            await expect(dev.cs.runExclusive("Config GC", task)).rejects.toMatchObject({ name: "BusyError" });
             expect(task).not.toHaveBeenCalled();
             expect(dev.cs.currentStore()).toBe(storeA);
             expect(dev.cs.currentBinding()!.isClosed()).toBe(false);
@@ -986,7 +986,7 @@ describe("config binding lifecycle", () => {
             expect(await running).toBe(1);
 
             // Once idle the switch goes through.
-            expect(await dev.cs.runExclusive(task)).toBe(1);
+            expect(await dev.cs.runExclusive("Config GC", task)).toBe(1);
             await dev.cs.rebind("cfg-B");
             expect(dev.cs.currentBinding()!.dbName).toBe("cfg-B");
         });
@@ -994,8 +994,8 @@ describe("config binding lifecycle", () => {
         it("an op started while a rebind is switching stores is refused as busy", async () => {
             const dev = makeDevice("dev-X");
             const switching = dev.cs.rebind("cfg-A");
-            await expect(dev.cs.pull()).rejects.toMatchObject({ kind: "busy" });
-            await expect(dev.cs.rebind("cfg-B")).rejects.toMatchObject({ kind: "busy" });
+            await expect(dev.cs.pull()).rejects.toMatchObject({ name: "BusyError" });
+            await expect(dev.cs.rebind("cfg-B")).rejects.toMatchObject({ name: "BusyError" });
             await switching;
             expect(dev.cs.currentBinding()!.dbName).toBe("cfg-A");
         });
@@ -1005,8 +1005,8 @@ describe("config binding lifecycle", () => {
             const dev = makeDevice("dev-X");
             await apply(dev, "cfg-A");
             let release!: () => void;
-            const held = dev.cs.runExclusive(() => new Promise<void>((r) => { release = r; }));
-            await expect(dev.cs.join()).rejects.toMatchObject({ kind: "busy" });
+            const held = dev.cs.runExclusive("Config GC", () => new Promise<void>((r) => { release = r; }));
+            await expect(dev.cs.join()).rejects.toMatchObject({ name: "BusyError" });
             release();
             await held;
             await dev.cs.join();
@@ -1193,7 +1193,7 @@ describe("config binding lifecycle", () => {
         it("the floor outlives the local store: after deleting it, Join still asks", async () => {
             const { a, b } = await decrypted();
             // Maintenance → Delete local config database, then a restart.
-            await b.cs.runExclusive((binding) => binding.store.destroy());
+            await b.cs.runExclusive("Delete local config database", (binding) => binding.store.destroy());
             await b.cs.close();
             const b2 = makeDevice("dev-B", {}, undefined, b);
             await b2.cs.rebind("cfg-enc");
@@ -1363,13 +1363,13 @@ describe("config binding lifecycle", () => {
             await vi.waitFor(() => expect(remote("cfg", X).parked).toBe(true));
 
             // The CouchDB tab's Apply is disabled, with the reason...
-            expect(d.cs.bindingChangeBlocker()).toMatch(/config operation is running/);
+            expect(d.cs.changeBlocker()).toBe("Config Join is running — wait for it to finish.");
             // ...and one that gets through anyway changes nothing.
-            expect(await applyServer(d, Y)).toEqual({ kind: "refused-busy" });
+            expect(await applyServer(d, Y)).toMatchObject({ kind: "refused", error: { name: "BusyError" } });
             expect(d.settings.couchdbUri).toBe(X);
             remote("cfg", X).unpark();
             await running;
-            expect(d.cs.bindingChangeBlocker()).toBeNull();
+            expect(d.cs.changeBlocker()).toBeNull();
 
             // Settings and binding agree on X: Create's confirmation reads
             // X, and Create wipes X — the DB the dialog described. Y is
@@ -1400,7 +1400,7 @@ describe("config binding lifecycle", () => {
             remote("cfg", X).park();
             const running = d.cs.pull().catch(() => {});
             await vi.waitFor(() => expect(remote("cfg", X).parked).toBe(true));
-            expect(await applyServer(d, Y)).toEqual({ kind: "refused-busy" });
+            expect(await applyServer(d, Y)).toMatchObject({ kind: "refused", error: { name: "BusyError" } });
             remote("cfg", X).unpark();
             await running;
 
@@ -1430,7 +1430,7 @@ describe("config binding lifecycle", () => {
             const running = d.cs.pull().catch(() => {});
             await vi.waitFor(() => expect(remote("cfg-A").parked).toBe(true));
             const commit = vi.fn(async () => { d.settings.couchdbConfigDbName = "cfg-B"; });
-            await expect(d.cs.rebind("cfg-B", { commit })).rejects.toMatchObject({ kind: "busy" });
+            await expect(d.cs.rebind("cfg-B", { commit })).rejects.toMatchObject({ name: "BusyError" });
             expect(commit).not.toHaveBeenCalled();
             expect(d.settings.couchdbConfigDbName).toBe("cfg-A");
             remote("cfg-A").unpark();
@@ -1455,7 +1455,7 @@ describe("config binding lifecycle", () => {
             fail = true;
             const r = await applyServerSettings({
                 configBinding: {
-                    changeBlocker: () => cs.bindingChangeBlocker(),
+                    changeBlocker: () => cs.changeBlocker(),
                     switchServer: (serverUri, commit) => cs.rebind("cfg", { serverUri, commit }),
                 },
                 oldUri: X, newUri: Y,

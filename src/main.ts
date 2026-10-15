@@ -345,6 +345,11 @@ export default class CouchSyncPlugin extends Plugin {
                 // Receive-side platform gate: don't materialise desktop-only
                 // plugins on a mobile device. Mirrors the getPlatform wiring.
                 getIsMobile: () => Platform.isMobile,
+                // Step 2's Check of a config DB name, with the saved
+                // server and credentials (like the vault's Check).
+                checkDatabase: (db) => this.remoteOps.checkDatabaseWith(
+                    this.settings.couchdbUri, this.settings.couchdbUser, this.settings.couchdbPassword, db,
+                ),
                 // Bindings persist their settings entry (cipher floor, setup
                 // flag, the DB's passphrase).
                 saveSettings: () => this.saveSettings(),

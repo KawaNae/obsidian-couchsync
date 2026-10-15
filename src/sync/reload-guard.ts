@@ -23,6 +23,7 @@
  * and with it the guard.
  */
 import { logWarn } from "../ui/log.ts";
+import { runningBlocker } from "../ui/describe-error.ts";
 
 export type ReloadRole = "reloads" | "uninterruptible";
 
@@ -51,7 +52,7 @@ export class ReloadGuard {
             if (e.role === role) continue;
             return e.reloading
                 ? `Obsidian is about to reload after ${e.label} — wait for it to restart.`
-                : `${e.label} is running — wait for it to finish.`;
+                : runningBlocker(e.label);
         }
         return null;
     }

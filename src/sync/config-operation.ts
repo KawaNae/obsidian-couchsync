@@ -32,6 +32,7 @@ import type { ICouchClient } from "../db/interfaces.ts";
 import { classifyError } from "../db/sync/errors.ts";
 import type { ReconnectBridge } from "./reconnect-bridge.ts";
 import { ConfigNotReadyError, configNotReady } from "./config-errors.ts";
+import { cancellation } from "../ui/describe-error.ts";
 
 /**
  * Per-request timeouts, kept centralised so they can be tuned per
@@ -135,7 +136,7 @@ export class ConfigOperation {
     }
 
     private async runInner<T>(body: (ctx: ConfigOpContext) => Promise<T>): Promise<T> {
-        if (this.controller.signal.aborted) throw makeAbortError();
+        if (this.controller.signal.aborted) throw cancellation();
 
         // 1. Auth latch.
         if (this.deps.auth.isBlocked()) {
@@ -145,7 +146,7 @@ export class ConfigOperation {
         // 2. Visibility — wait until visible, or until cancelled. Never
         //    throws by contract; we re-check the signal afterwards.
         await this.deps.visibility.waitVisible(this.controller.signal);
-        if (this.controller.signal.aborted) throw makeAbortError();
+        if (this.controller.signal.aborted) throw cancellation();
 
         // 3. Build client. A null return means config sync isn't configured.
         const client = this.deps.makeClient();
@@ -170,7 +171,7 @@ export class ConfigOperation {
         const bodyClient = this.deps.prepare
             ? await this.deps.prepare(client, this.controller.signal)
             : client;
-        if (this.controller.signal.aborted) throw makeAbortError();
+        if (this.controller.signal.aborted) throw cancellation();
 
         // 6. Body. Full-timeout client; the body owns the timeout budget.
         return body({ client: bodyClient, signal: this.controller.signal });
@@ -201,8 +202,3 @@ export class ConfigOperation {
     }
 }
 
-function makeAbortError(): Error {
-    const e: any = new Error("The operation was aborted.");
-    e.name = "AbortError";
-    return e;
-}

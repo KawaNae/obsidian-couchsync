@@ -74,6 +74,7 @@ import {
     type ConfigCodec,
 } from "./config-binding-record.ts";
 import { logWarn } from "../ui/log.ts";
+import { cancellation, NOTHING_CHANGED } from "../ui/describe-error.ts";
 import { OutcomeLedger, type OpOutcome } from "./op-outcome.ts";
 
 /** Builds (but does not open) the local store with the given IndexedDB
@@ -591,7 +592,7 @@ export class ConfigBinding {
         if (weaker) {
             const ok = await (opts.confirmWeaker?.(weaker.title, weaker.message) ?? Promise.resolve(false));
             throwIfAborted(signal);
-            if (!ok) throw joinCancelled();
+            if (!ok) throw cancellation(NOTHING_CHANGED);
         }
 
         // 3. Unlock.
@@ -669,7 +670,7 @@ export class ConfigBinding {
             return true;
         });
         throwIfAborted(signal);
-        if (answer === null || unlockedWith === null) throw joinCancelled();
+        if (answer === null || unlockedWith === null) throw cancellation(NOTHING_CHANGED);
         return unlockedWith;
     }
 
@@ -767,20 +768,6 @@ export class ConfigBinding {
     }
 }
 
-/** The user declined a confirmation or a passphrase prompt of Join. A
- *  cancellation (`AbortError`): it is not recorded as an outcome, and the
- *  notice reads "Config Join cancelled — nothing was changed." */
-function joinCancelled(): Error {
-    const e: any = new Error("Join cancelled — nothing was changed.");
-    e.name = "AbortError";
-    e.userMessage = "nothing was changed.";
-    return e;
-}
-
 function throwIfAborted(signal?: AbortSignal): void {
-    if (signal?.aborted) {
-        const e: any = new Error("The operation was aborted.");
-        e.name = "AbortError";
-        throw e;
-    }
+    if (signal?.aborted) throw cancellation();
 }

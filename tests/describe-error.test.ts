@@ -7,7 +7,7 @@
  * `userMessage` wins over classification; a cancellation is not a failure.
  */
 import { describe, it, expect } from "vitest";
-import { describeError, UserFacingError } from "../src/ui/describe-error.ts";
+import { BusyError, cancellation, describeError, UserFacingError } from "../src/ui/describe-error.ts";
 import { configNotReady, type ConfigNotReadyKind } from "../src/sync/config-errors.ts";
 import { AuthGate } from "../src/db/sync/auth-gate.ts";
 import { SchemaVersionMismatchError } from "../src/db/sync/schema-gate.ts";
@@ -18,12 +18,7 @@ function httpError(status: number, message: string): Error {
     return e;
 }
 
-function abort(userMessage?: string): Error {
-    const e: any = new Error("The operation was aborted.");
-    e.name = "AbortError";
-    if (userMessage) e.userMessage = userMessage;
-    return e;
-}
+const abort = cancellation;
 
 describe("describeError — classified transport failures", () => {
     it.each([
@@ -35,27 +30,27 @@ describe("describeError — classified transport failures", () => {
         ["not-found", httpError(404, "not_found"), /not found on the server \(404\)/],
     ])("%s: names the cause and the fix, then the raw message", (_k, err, pattern) => {
         const d = describeError(err);
-        expect(d.cancelled).toBe(false);
+        expect(d.outcome).toBe("failed");
         expect(d.text).toMatch(pattern);
         expect(d.text.endsWith(`(${(err as Error).message})`)).toBe(true);
     });
 
     it("an interrupted request (not a cancel) says so", () => {
         const d = describeError(new Error("the request was aborted by the OS"));
-        expect(d.cancelled).toBe(false);
+        expect(d.outcome).toBe("failed");
         expect(d.text).toMatch(/interrupted/);
     });
 
     it("an unknown error is shown as thrown", () => {
-        expect(describeError(new Error("boom"))).toEqual({ text: "boom", cancelled: false });
-        expect(describeError("plain string")).toEqual({ text: "plain string", cancelled: false });
+        expect(describeError(new Error("boom"))).toEqual({ text: "boom", outcome: "failed" });
+        expect(describeError("plain string")).toEqual({ text: "plain string", outcome: "failed" });
     });
 });
 
 describe("describeError — userMessage wins over classification", () => {
     it("a ConfigNotReadyError is shown as written", () => {
         const e = configNotReady("unattached", { db: "cfg" });
-        expect(describeError(e)).toEqual({ text: e.message, cancelled: false });
+        expect(describeError(e)).toEqual({ text: e.message, outcome: "failed" });
     });
 
     it("a sentence that happens to contain transport words is not reclassified", () => {
@@ -89,12 +84,28 @@ describe("describeError — userMessage wins over classification", () => {
 
 describe("describeError — cancellation", () => {
     it("an AbortError is a cancellation, not a failure", () => {
-        expect(describeError(abort())).toEqual({ text: "", cancelled: true });
+        expect(describeError(abort())).toEqual({ text: "", outcome: "cancelled" });
     });
 
     it("keeps what the cancel left behind", () => {
-        expect(describeError(abort("nothing was changed."))).toEqual({
-            text: "nothing was changed.", cancelled: true,
+        expect(describeError(abort("Nothing was changed."))).toEqual({
+            text: "Nothing was changed.", outcome: "cancelled",
         });
+    });
+});
+
+describe("describeError — refusal", () => {
+    it("another operation running is a refusal, worded by what runs", () => {
+        expect(describeError(new BusyError("Init is running — wait for it to finish."))).toEqual({
+            text: "Init is running — wait for it to finish.", outcome: "refused",
+        });
+    });
+
+    it("the other preconditions stay failures", () => {
+        const auth = new AuthGate();
+        auth.raise(401, "bad");
+        expect(describeError(auth.blockedError()).outcome).toBe("failed");
+        expect(describeError(configNotReady("unattached", { db: "cfg" })).outcome).toBe("failed");
+        expect(describeError(new UserFacingError("The database is empty.")).outcome).toBe("failed");
     });
 });

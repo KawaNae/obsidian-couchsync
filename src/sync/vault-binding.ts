@@ -36,7 +36,7 @@
  * runner, the live-sync switch, the progress notice, the passphrase
  * prompt and the confirm dialog.
  */
-import type { CouchSyncSettings, ConnectionState, VaultPauseRecord } from "../settings.ts";
+import { MAX_PREVIOUS_DEVICE_IDS, type CouchSyncSettings, type ConnectionState, type VaultPauseRecord } from "../settings.ts";
 import type { DbInfo, ICouchClient } from "../db/interfaces.ts";
 import type { CryptoProvider } from "../db/crypto-provider.ts";
 import { AuthBlockedError, type AuthGate } from "../db/sync/auth-gate.ts";
@@ -55,7 +55,9 @@ import {
 } from "../db/vault-meta.ts";
 import { checkEncryptionAgreement } from "../db/encryption-agreement.ts";
 import { classifyError } from "../db/sync/errors.ts";
-import { describeError, rawErrorMessage, UserFacingError } from "../ui/describe-error.ts";
+import {
+    BusyError, cancellation, describeError, NOTHING_CHANGED, rawErrorMessage, runningBlocker, UserFacingError,
+} from "../ui/describe-error.ts";
 import { logWarn } from "../ui/log.ts";
 import { OutcomeLedger, type OpOutcome } from "./op-outcome.ts";
 import { ReloadGuard } from "./reload-guard.ts";
@@ -187,6 +189,11 @@ export class VaultBinding {
      *  commits `settings.vaultCipherVersion`. Undefined at all other times. */
     private cipherVersionOverride?: number;
     private inflight: VaultOpName | null = null;
+    /** Step 2's Check runs. It takes the same lock as Init and Clone: a
+     *  Check that passes clears the auth latch, which must not happen
+     *  under a run that raised it, and nothing it reads may change under
+     *  it. */
+    private checking = false;
     /** Init and Clone only; the agreement check's conclusion is the
      *  persisted pause (`settings.vaultPause`). */
     private readonly outcomes = new OutcomeLedger<VaultOpName>(() => false);
@@ -315,12 +322,13 @@ export class VaultBinding {
         return this.inflight;
     }
 
-    /** Why the vault setup cannot be changed now (Init or Clone runs), or
-     *  null. */
+    /** Why the vault setup cannot be changed now (Init, Clone or Step 2's
+     *  Check runs), or null. Init, Clone and Check are refused under the
+     *  same condition. */
     changeBlocker(): string | null {
-        return this.inflight
-            ? `${OP_LABELS[this.inflight]} is running — wait for it to finish.`
-            : null;
+        if (this.inflight) return runningBlocker(OP_LABELS[this.inflight]);
+        if (this.checking) return runningBlocker("Database check");
+        return null;
     }
 
     /** Why Init and Clone cannot start now because of an operation outside
@@ -333,7 +341,7 @@ export class VaultBinding {
 
     private assertIdle(): void {
         const blocked = this.changeBlocker();
-        if (blocked) throw new UserFacingError(blocked);
+        if (blocked) throw new BusyError(blocked);
     }
 
     /**
@@ -369,9 +377,10 @@ export class VaultBinding {
         this.changed();
     }
 
-    /** A Step 1 codec setting changed (encryption, compression). The vault
-     *  on the server was set up with the old one, so a finished setup no
-     *  longer holds: `setupDone` drops to `tested` (Init or Clone again). */
+    /** A Step 1 codec setting changed (encryption, compression; turning
+     *  encryption off also clears the passphrase). The vault on the server
+     *  was set up with the old one, so a finished setup no longer holds:
+     *  `setupDone` drops to `tested` (Init or Clone again). */
     async changeCodecSetting(
         patch: Partial<Pick<CouchSyncSettings, "encryptionEnabled" | "encryptionPassphrase" | "compressionEnabled">>,
     ): Promise<void> {
@@ -381,6 +390,51 @@ export class VaultBinding {
         if (s.connectionState === "setupDone") s.connectionState = "tested";
         await this.host.saveSettings();
         this.changed();
+    }
+
+    /** Step 1's passphrase changed. It is not part of the codec: the vault
+     *  on the server keeps its key, and the passphrase only unlocks it (the
+     *  startup unlock, the agreement check, Clone) or encrypts the next
+     *  Init. So a finished setup still holds and the state is kept. Refused
+     *  while Init, Clone or Check runs, like every other change of what
+     *  they read. Not announced: the tab is not redrawn on each keystroke. */
+    async setPassphrase(passphrase: string): Promise<void> {
+        this.assertIdle();
+        this.settings().encryptionPassphrase = passphrase;
+        await this.host.saveSettings();
+    }
+
+    /** The Filters changed (sync filter, ignore filter, max file size).
+     *  Init's scan and Clone's writes test each file against them as they
+     *  go, and the reconcile that ends both does too, so a change in the
+     *  middle would make one run follow two filters. Refused while Init,
+     *  Clone or Check runs, like every other change of what they read. Not
+     *  announced: the fields save on each keystroke. */
+    async setFilters(
+        patch: Partial<Pick<CouchSyncSettings, "syncFilter" | "syncIgnore" | "maxFileSizeMB">>,
+    ): Promise<void> {
+        this.assertIdle();
+        Object.assign(this.settings(), patch);
+        await this.host.saveSettings();
+    }
+
+    /** This device's name, the id it advances vclocks under. Init records
+     *  the vault under it, and the reconcile that ends Init and Clone tells
+     *  this device's writes by it, so it is refused while Init, Clone or
+     *  Check runs. The name it replaces stays known as this device's
+     *  (`previousDeviceIds`), so what was written under it is still told
+     *  apart. Config Push writes under it too; the caller refuses while a
+     *  config op runs. */
+    async setDeviceName(name: string): Promise<void> {
+        this.assertIdle();
+        const s = this.settings();
+        if (s.deviceId && s.deviceId !== name) {
+            const prev = [...(s.previousDeviceIds ?? [])];
+            if (!prev.includes(s.deviceId)) prev.push(s.deviceId);
+            s.previousDeviceIds = prev.slice(-MAX_PREVIOUS_DEVICE_IDS);
+        }
+        s.deviceId = name;
+        await this.host.saveSettings();
     }
 
     /** The CouchDB tab's Apply. New credentials (or server) send the vault
@@ -444,38 +498,55 @@ export class VaultBinding {
      * how many documents it holds; a missing DB is created. Kept so Step 3
      * can tell whether Clone has something to pull. A failure is reported
      * on the notice, worded by `describeError`; a success clears the auth
-     * latch (the credentials were accepted).
+     * latch (the credentials were accepted). Refused (`BusyError`, thrown
+     * after the notice says so) while Init, Clone or another Check runs;
+     * Init, Clone and the changes of the setup are refused while it runs.
      */
     async checkDatabase(dbName: string): Promise<DbCheckResult> {
         const at = Date.now();
         const against = vaultTarget({ couchdbUri: this.settings().couchdbUri, couchdbDbName: dbName });
         const progress = this.host.openProgress("Database check");
-        const result = await this.host.checkDatabase(dbName);
-        this.recordDbCheck({ at, against, result });
-        if (result.status === "error") {
-            progress.fail(result.error);
-        } else {
-            this.host.auth.clear();
-            progress.done(`"${dbName}" ${describeDbFound(result)}`);
+        const blocked = this.changeBlocker();
+        if (blocked) {
+            const e = new BusyError(blocked);
+            progress.fail(e);
+            throw e;
         }
-        return result;
+        this.checking = true;
+        this.changed();
+        try {
+            const result = await this.host.checkDatabase(dbName);
+            this.recordDbCheck({ at, against, result });
+            if (result.status === "error") {
+                progress.fail(result.error);
+            } else {
+                this.host.auth.clear();
+                progress.done(`"${dbName}" ${describeDbFound(result)}`);
+            }
+            return result;
+        } finally {
+            this.checking = false;
+            this.changed();
+        }
     }
 
     // ── Init / Clone ───────────────────────────────────
 
     /**
      * Run Init or Clone. The notice is opened first, so no failure goes
-     * unreported. A second run while one is in flight is refused; so is a
-     * run while an operation that reloads Obsidian runs (`ReloadGuard`),
-     * and a run while the auth latch is raised. Neither refusal is recorded:
+     * unreported. A second run while one is in flight is refused
+     * (`BusyError`, "not started"); so is a run while an operation that
+     * reloads Obsidian runs (`ReloadGuard`). A run while the auth latch is
+     * raised fails with the latch's error. None of them is recorded:
      * nothing was attempted. `body` prepares (reads, derives, asks —
      * nothing is changed, and a failure leaves the setup state and live
      * sync as they were), then calls `beginDestructive`, which asks the
      * user to confirm, and executes.
      *
      * This is the one exit of an Init / Clone failure: the outcome is
-     * recorded, and the notice words the error. Three failures are not
-     * recorded, because something else already tells them: a cancellation;
+     * recorded, and the notice words the error. A cancellation is not a
+     * failure and is not recorded. Two failures are not recorded either,
+     * because something else already tells them:
      * a rejection of the credentials (401/403), which raises the auth
      * latch — the status line shows the latch while it is raised, and once
      * a Test clears it the rejection no longer holds; and a Clone of an
@@ -491,7 +562,7 @@ export class VaultBinding {
         const progress = this.host.openProgress(OP_LABELS[op]);
         const busy = this.changeBlocker() ?? this.reloadConflict();
         const refusal = busy !== null
-            ? new UserFacingError(busy)
+            ? new BusyError(busy)
             : this.host.auth.isBlocked() ? this.host.auth.blockedError() : null;
         if (refusal) {
             progress.fail(refusal);
@@ -512,7 +583,7 @@ export class VaultBinding {
             if (rejected) this.host.auth.raise(d.code!, rawErrorMessage(e));
             if (
                 !rejected && !(e instanceof AuthBlockedError)
-                && !(e instanceof VaultDbEmptyError) && !describeError(e).cancelled
+                && !(e instanceof VaultDbEmptyError) && describeError(e).outcome === "failed"
             ) {
                 this.outcomes.record({ op, at, against, error: e });
             }
@@ -549,7 +620,7 @@ export class VaultBinding {
      */
     private async beginDestructive(progress: VaultProgress, plan: VaultSetupPlan): Promise<void> {
         progress.update("Waiting for confirmation...");
-        if (!(await this.host.confirmSetup(plan))) throw setupCancelled(plan.op);
+        if (!(await this.host.confirmSetup(plan))) throw cancellation(NOTHING_CHANGED);
         this.host.stopLive();
         await this.writeState("settingUp");
     }
@@ -730,7 +801,7 @@ export class VaultBinding {
             unlocked = { crypto: r.crypto, passphrase: p };
             return true;
         });
-        if (answer === null || unlocked === null) throw setupCancelled("clone");
+        if (answer === null || unlocked === null) throw cancellation(NOTHING_CHANGED);
         return unlocked;
     }
 
@@ -1009,12 +1080,3 @@ class VaultDbEmptyError extends UserFacingError {
     }
 }
 
-/** The user declined the confirmation of Init or Clone, or cancelled the
- *  passphrase prompt of Clone: a cancellation, not recorded as an outcome;
- *  the notice reads "<Init|Clone> cancelled — nothing was changed." */
-function setupCancelled(op: VaultOpName): Error {
-    const e: any = new Error(`${OP_LABELS[op]} cancelled — nothing was changed.`);
-    e.name = "AbortError";
-    e.userMessage = "nothing was changed.";
-    return e;
-}

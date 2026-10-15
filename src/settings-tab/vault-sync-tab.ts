@@ -7,15 +7,15 @@
  * tab since v0.30.0 — this tab reads them from saved settings.
  */
 import { type App, Setting, type ButtonComponent } from "obsidian";
-import { MAX_PREVIOUS_DEVICE_IDS, type ConnectionState, type CouchSyncSettings } from "../settings.ts";
+import type { ConnectionState, CouchSyncSettings } from "../settings.ts";
 import type { SyncEngine } from "../db/sync-engine.ts";
 import type { AuthGate } from "../db/sync/auth-gate.ts";
 import { describeDbFound, type DbCheckResult } from "../db/sync/vault-remote-ops.ts";
 import type { LocalDB } from "../db/local-db.ts";
 import { validateDeviceName } from "../utils/device-name.ts";
 import { setupGating } from "./setup-gating.ts";
-import { showNotice } from "../ui/notices.ts";
-import { describeError } from "../ui/describe-error.ts";
+import { reportError, showNotice } from "../ui/notices.ts";
+import { BusyError, describeError } from "../ui/describe-error.ts";
 import type { VaultBinding, VaultRelation } from "../sync/vault-binding.ts";
 import { cloneDescription, encryptionChangedElsewhere, vaultRelationView } from "./vault-relation-view.ts";
 
@@ -29,6 +29,9 @@ export interface VaultSyncTabDeps {
     /** Owner of the vault setup: Init, Clone and every change of the setup
      *  state go through it. */
     vault: VaultBinding;
+    /** Why a config op keeps the device name from changing now (it runs,
+     *  and Config Push writes under the name), or null. */
+    configChangeBlocker: () => string | null;
     refresh: () => void;
 }
 
@@ -86,7 +89,9 @@ export class VaultSyncTab {
         const { locked, initEnabled, cloneEnabled, syncToggleEnabled } =
             setupGating(state, settings.serverTested);
         const relation = this.deps.vault.relation();
-        const idle = relation.busy === null;
+        // No Init, Clone or Check runs: the binding refuses each of them, and
+        // every change of what they read, while one does.
+        const idle = this.deps.vault.changeBlocker() === null;
         // A config Pull reloads Obsidian when it writes files, which would
         // stop an Init or Clone half-way.
         const reloadFree = this.deps.vault.reloadConflict() === null;
@@ -99,7 +104,7 @@ export class VaultSyncTab {
         this.renderDeviceIdentity(el, locked);
 
         // ── Step 1: Encryption ─────────────────────────────────
-        this.renderEncryptionStep(el, relation);
+        this.renderEncryptionStep(el, relation, idle);
 
         // ── Step 2: Database ───────────────────────────────────
         el.createEl("h3", { text: "Step 2: Database" });
@@ -126,7 +131,7 @@ export class VaultSyncTab {
             .addButton((btn) =>
                 btn
                     .setButtonText("Check")
-                    .setDisabled(!dbEditable)
+                    .setDisabled(!dbEditable || !idle)
                     .onClick(async () => this.handleCheck(btn))
             );
 
@@ -212,12 +217,12 @@ export class VaultSyncTab {
                     .setValue(state === "syncing")
                     .setDisabled(!syncToggleEnabled || !idle)
                     .onChange(async (value) => {
-                        await this.changeSetup(() => this.deps.vault.setLiveSync(value));
+                        await this.changeSetup("Live Sync change", () => this.deps.vault.setLiveSync(value));
                     })
             );
 
         // ── Filters (vault file inclusion / exclusion) ──────────
-        this.renderFilters(el, settings);
+        this.renderFilters(el, settings, idle);
     }
 
     // ── Step 2 helpers ────────────────────────────────────────────
@@ -254,8 +259,13 @@ export class VaultSyncTab {
     private async handleCheck(btn: ButtonComponent): Promise<void> {
         btn.setButtonText("Checking...");
         btn.setDisabled(true);
-        const result = await this.deps.vault.checkDatabase(this.draft.db);
-        this.testPassed = result.status !== "error";
+        try {
+            const result = await this.deps.vault.checkDatabase(this.draft.db);
+            this.testPassed = result.status !== "error";
+        } catch {
+            // Refused (Init or Clone runs); the binding reported it.
+            this.testPassed = false;
+        }
         this.deps.refresh();
     }
 
@@ -272,19 +282,20 @@ export class VaultSyncTab {
     }
 
     private async handleApply(): Promise<void> {
-        await this.changeSetup(async () => {
+        await this.changeSetup("Database change", async () => {
             await this.deps.vault.applyDatabase(this.draft.db);
             this.testPassed = false;
         });
     }
 
-    /** Run a change of the vault setup; a refusal (Init or Clone runs) is
-     *  shown as a notice. The tab is redrawn either way. */
-    private async changeSetup(change: () => Promise<void>): Promise<void> {
+    /** Run `label`, a change of the vault setup; a refusal (Init or Clone
+     *  runs) or a failure is reported under `label`. The tab is redrawn
+     *  either way, which puts back the saved value of a refused change. */
+    private async changeSetup(label: string, change: () => Promise<void>): Promise<void> {
         try {
             await change();
         } catch (e) {
-            showNotice(describeError(e).text, 8000);
+            reportError(label, e);
         }
         this.deps.refresh();
     }
@@ -307,6 +318,12 @@ export class VaultSyncTab {
         let inputValue = isLegacy ? "" : settings.deviceId;
         let validationMsg: HTMLElement | null = null;
 
+        // Init, Clone and Check of the vault, and every config op (Config
+        // Push writes under the name), refuse a rename while they run.
+        const blocker = (): string | null =>
+            this.deps.vault.changeBlocker() ?? this.deps.configChangeBlocker();
+        const disabled = locked || blocker() !== null;
+
         const setting = new Setting(el).setName("Device name");
 
         setting.addText((text) => {
@@ -320,14 +337,14 @@ export class VaultSyncTab {
                         validationMsg.style.display = error ? "block" : "none";
                     }
                 });
-            text.setDisabled(locked);
+            text.setDisabled(disabled);
         });
 
         setting.addButton((btn) =>
             btn
                 .setButtonText("Apply")
                 .setCta()
-                .setDisabled(locked)
+                .setDisabled(disabled)
                 .onClick(async () => {
                     const error = validateDeviceName(inputValue);
                     if (error) {
@@ -338,17 +355,14 @@ export class VaultSyncTab {
                         showNotice("Device name unchanged.");
                         return;
                     }
-                    if (settings.deviceId) {
-                        const prev = [...(settings.previousDeviceIds ?? [])];
-                        if (!prev.includes(settings.deviceId)) {
-                            prev.push(settings.deviceId);
-                        }
-                        await this.deps.updateSettings({
-                            deviceId: inputValue,
-                            previousDeviceIds: prev.slice(-MAX_PREVIOUS_DEVICE_IDS),
-                        });
-                    } else {
-                        await this.deps.updateSettings({ deviceId: inputValue });
+                    try {
+                        const blocked = this.deps.configChangeBlocker();
+                        if (blocked) throw new BusyError(blocked);
+                        await this.deps.vault.setDeviceName(inputValue);
+                    } catch (e) {
+                        reportError("Device name change", e);
+                        this.deps.refresh();
+                        return;
                     }
                     showNotice(`Device name set to "${inputValue}". Restart sync to apply.`);
                     this.deps.refresh();
@@ -381,7 +395,7 @@ export class VaultSyncTab {
 
     // ── Step 1: Encryption ────────────────────────────────────────
 
-    private renderEncryptionStep(el: HTMLElement, relation: VaultRelation): void {
+    private renderEncryptionStep(el: HTMLElement, relation: VaultRelation, idle: boolean): void {
         const settings = this.deps.getSettings();
         const state = settings.connectionState;
         const editable = state !== "syncing";
@@ -414,9 +428,9 @@ export class VaultSyncTab {
             .addToggle((toggle) =>
                 toggle
                     .setValue(settings.encryptionEnabled)
-                    .setDisabled(!editable)
+                    .setDisabled(!editable || !idle)
                     .onChange(async (value) => {
-                        await this.changeSetup(() => this.deps.vault.changeCodecSetting(
+                        await this.changeSetup("Encryption change", () => this.deps.vault.changeCodecSetting(
                             value ? { encryptionEnabled: true } : { encryptionEnabled: false, encryptionPassphrase: "" },
                         ));
                     })
@@ -434,10 +448,17 @@ export class VaultSyncTab {
                     text.setPlaceholder("Enter passphrase")
                         .setValue(settings.encryptionPassphrase)
                         .onChange(async (value) => {
-                            await this.deps.updateSettings({ encryptionPassphrase: value });
+                            // A saved keystroke is not redrawn, so the field
+                            // keeps the focus; a refused one is.
+                            try {
+                                await this.deps.vault.setPassphrase(value);
+                            } catch (e) {
+                                reportError("Passphrase change", e);
+                                this.deps.refresh();
+                            }
                         });
                     text.inputEl.type = "password";
-                    text.setDisabled(!editable);
+                    text.setDisabled(!editable || !idle);
                 });
             addPasswordToggle(passphraseSetting);
         }
@@ -457,16 +478,19 @@ export class VaultSyncTab {
             .addToggle((toggle) =>
                 toggle
                     .setValue(settings.compressionEnabled)
-                    .setDisabled(!editable)
+                    .setDisabled(!editable || !idle)
                     .onChange(async (value) => {
-                        await this.changeSetup(() => this.deps.vault.changeCodecSetting({ compressionEnabled: value }));
+                        await this.changeSetup("Compression change", () => this.deps.vault.changeCodecSetting({ compressionEnabled: value }));
                     })
             );
     }
 
     // ── Filters ───────────────────────────────────────────────────
 
-    private renderFilters(el: HTMLElement, settings: CouchSyncSettings): void {
+    /** The Filters save on each keystroke through `VaultBinding.setFilters`,
+     *  which refuses a change while Init, Clone or Check runs; the fields
+     *  are disabled then. */
+    private renderFilters(el: HTMLElement, settings: CouchSyncSettings, idle: boolean): void {
         el.createEl("h3", { text: "Filters" });
         el.createEl("p", {
             text:
@@ -482,9 +506,8 @@ export class VaultSyncTab {
                 text
                     .setPlaceholder(".*\\.md$")
                     .setValue(settings.syncFilter)
-                    .onChange(async (value) => {
-                        await this.deps.updateSettings({ syncFilter: value });
-                    })
+                    .setDisabled(!idle)
+                    .onChange((value) => this.setFilters({ syncFilter: value }))
             );
 
         new Setting(el)
@@ -494,9 +517,8 @@ export class VaultSyncTab {
                 text
                     .setPlaceholder("node_modules|^\\.trash")
                     .setValue(settings.syncIgnore)
-                    .onChange(async (value) => {
-                        await this.deps.updateSettings({ syncIgnore: value });
-                    })
+                    .setDisabled(!idle)
+                    .onChange((value) => this.setFilters({ syncIgnore: value }))
             );
 
         new Setting(el)
@@ -505,15 +527,27 @@ export class VaultSyncTab {
             .addText((text) =>
                 text
                     .setValue(String(settings.maxFileSizeMB))
+                    .setDisabled(!idle)
                     .onChange(async (value) => {
                         const num = parseFloat(value);
                         if (!isNaN(num) && num >= 0) {
-                            await this.deps.updateSettings({ maxFileSizeMB: num });
+                            await this.setFilters({ maxFileSizeMB: num });
                         }
                     })
             );
 
         renderSkippedFiles(el, this.deps);
+    }
+
+    /** Save a Filters field; a refusal is reported and the redraw shows
+     *  the saved value. */
+    private async setFilters(patch: Parameters<VaultBinding["setFilters"]>[0]): Promise<void> {
+        try {
+            await this.deps.vault.setFilters(patch);
+        } catch (e) {
+            reportError("Filter change", e);
+            this.deps.refresh();
+        }
     }
 }
 

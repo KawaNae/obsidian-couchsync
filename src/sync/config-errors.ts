@@ -13,6 +13,8 @@
  * to run (Join, Create, Check), or a server to verify — so a kind maps to
  * exactly one piece of advice. Transport failures (network / timeout / auth) are NOT not-ready kinds —
  * they stay the transport's own errors and are classified by `classifyError`.
+ * Neither is another operation running: an op refused for that was not
+ * started at all, and throws `BusyError` (describe-error.ts) instead.
  *
  * The user-facing wording of every kind lives in `configNotReady` below, so
  * the preflight, Join, Create and the settings tab all say the same thing.
@@ -21,9 +23,6 @@
 export type ConfigNotReadyKind =
     /** No config DB name, or the local config store is not open. */
     | "not-configured"
-    /** Another config op is in flight, or an operation that cannot run
-     *  beside this one (`ReloadGuard`). */
-    | "busy"
     /** The remote config DB does not exist (404). */
     | "db-missing"
     /** No `config:meta` and no docs — never set up. */
@@ -83,9 +82,6 @@ export interface ConfigNotReadyContext {
     /** Remote cipherVersion and local floor (`cipher-downgrade`). */
     remoteCipherVersion?: number;
     localFloor?: number;
-    /** What runs and keeps the op from starting, worded by `ReloadGuard`
-     *  (`busy` for an operation outside config sync). */
-    blocker?: string;
 }
 
 /**
@@ -114,10 +110,6 @@ export function configNotReady(
                     ? `Config database ${db} is not active on this device — its local ` +
                         "store could not be opened (see the log). Apply the name again in Step 2."
                     : "Config sync is not configured — apply a config database name in Step 2.";
-            case "busy":
-                if (ctx.blocker) return ctx.blocker;
-                return "Another config operation is already in progress. " +
-                    "Wait for it to finish or cancel it first.";
             case "db-missing":
                 return `Config database ${db} does not exist on the server. Run Check in ` +
                     "Step 2 to create it; on the first device, then run Create in Step 3.";

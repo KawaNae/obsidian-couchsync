@@ -48,6 +48,10 @@ function errorLogs(): string[] {
     return getLogEntries().filter((e) => e.level === "error").map((e) => e.message);
 }
 
+function warnLogs(): string[] {
+    return getLogEntries().filter((e) => e.level === "warn").map((e) => e.message);
+}
+
 /** FakeCouchClient whose reachability probe parks until released — holds an
  *  op in flight so a second op can be started against it. */
 class ParkedCouchClient extends FakeCouchClient {
@@ -173,7 +177,7 @@ describe("ConfigSync — failures are surfaced, never swallowed", () => {
     });
 
     describe("in-flight rejection", () => {
-        it("a second op while one runs is reported as busy, and the first op keeps its lock", async () => {
+        it("a second op while one runs is reported as not started, and the first op keeps its lock", async () => {
             const remote = new ParkedCouchClient();
             await attachPlain(settings, remote, db);
             const cs = await makeSync(() => remote);
@@ -182,9 +186,11 @@ describe("ConfigSync — failures are surfaced, never swallowed", () => {
             await vi.waitFor(() => expect(remote.parked).toBe(true));
             expect(cs.isInflight()).toBe(true);
 
-            await expect(cs.push()).rejects.toMatchObject({ kind: "busy" });
-            expect(errorLogs()).toEqual([
-                expect.stringMatching(/^Config Push failed — Another config operation is already in progress/),
+            await expect(cs.push()).rejects.toMatchObject({ name: "BusyError" });
+            // Not a failure: a warning, never an error.
+            expect(errorLogs()).toEqual([]);
+            expect(warnLogs()).toEqual([
+                "Config Push not started — Config Pull is running — wait for it to finish.",
             ]);
             // The rejected op must not have released the running op's lock.
             expect(cs.isInflight()).toBe(true);
@@ -242,7 +248,7 @@ describe("configNotReady messages — where Create is advised", () => {
     it("never mentions Create for key / passphrase / reset / tamper problems", () => {
         for (const kind of [
             "key-missing", "passphrase-missing", "passphrase-mismatch",
-            "root-changed", "encryption-removed", "cipher-downgrade", "busy",
+            "root-changed", "encryption-removed", "cipher-downgrade",
             "not-configured", "unattached", "device-id-missing",
         ] as const) {
             const msg = configNotReady(kind, { db: "cfg", docCount: 2 }).message;
@@ -442,7 +448,7 @@ describe("the op runner records outcomes on the binding", () => {
         await cs.rebind("config-test");
         const first = cs.pull();
         await vi.waitFor(() => expect(remote.parked).toBe(true));
-        await expect(cs.push()).rejects.toMatchObject({ kind: "busy" });
+        await expect(cs.push()).rejects.toMatchObject({ name: "BusyError" });
         expect(cs.currentBinding()!.relation()).toMatchObject({ lastOp: null, lastCheck: null });
         remote.unpark();
         await first;
