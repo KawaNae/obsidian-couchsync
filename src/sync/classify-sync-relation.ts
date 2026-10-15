@@ -53,6 +53,15 @@
  *   reporting `applied: true`. Without this, a stale CM-only path lets
  *   the classifier read a lying baseline.
  *
+ * **Content is its chunk list.**
+ *   Chunk ids are hashes of the bytes, so equal chunk lists mean equal
+ *   content, and the classifier compares content by chunks alone. A size
+ *   adds nothing to that, and a recorded size can be wrong: a FileDoc's
+ *   `size` is whatever its sender wrote, and a sender that took it from a
+ *   stat before reading the file paired one save's size with the next
+ *   save's content. Comparing sizes made such a doc differ from the very
+ *   content it carries.
+ *
  * **Single classifier.**
  *   This file is the only place the chunks×vclock matrix is interpreted.
  *   Call sites consume the discriminated union; they do not branch on
@@ -150,7 +159,6 @@ export interface ClassifyInput {
      *  - pull-writer: local DB doc */
     leftVC: VectorClock;
     leftChunks: readonly string[];
-    leftSize: number;
     /** Whether the left side is a deletion tombstone (deletion is an integration event).
      *  Defaults to false — a disk file is always alive; pull-writer call
      *  sites pass `localDoc.deleted`. */
@@ -170,7 +178,6 @@ export interface ClassifyInput {
      *  - pull-writer: incoming remote doc */
     rightVC: VectorClock;
     rightChunks: readonly string[];
-    rightSize: number;
     /** Whether the right side is a deletion tombstone. */
     rightDeleted?: boolean;
     /** Integration baseline of the path, read only at vault call sites
@@ -197,7 +204,7 @@ export interface ClassifyInput {
 }
 
 export function classifySyncRelation(input: ClassifyInput): SyncRelation {
-    const { leftVC, leftChunks, leftSize, rightVC, rightChunks, rightSize } = input;
+    const { leftVC, leftChunks, rightVC, rightChunks } = input;
     const leftDeleted = input.leftDeleted === true;
     const rightDeleted = input.rightDeleted === true;
     // Deletion is an integration event: the deleted flag outranks the fingerprint. Tombstone
@@ -205,9 +212,8 @@ export function classifySyncRelation(input: ClassifyInput): SyncRelation {
     // (two deletions of the same path are the same state) and deleted×alive
     // is never content-equal (even when the tombstone retained the chunks
     // of the content it deleted).
-    const sizesEqual = leftSize === rightSize;
     const chunksEqual = leftDeleted === rightDeleted && (
-        leftDeleted || (sizesEqual && chunkListsEqual(leftChunks, rightChunks))
+        leftDeleted || chunkListsEqual(leftChunks, rightChunks)
     );
     const vcRel = compareVC(leftVC, rightVC);
 
@@ -281,14 +287,13 @@ export function classifySyncRelation(input: ClassifyInput): SyncRelation {
  */
 function refineRemoteEdit(input: ClassifyInput): SyncRelation {
     if (input.leftVCAttributed !== true) return "remote-edit";
-    const { leftChunks, leftSize, lastSynced } = input;
+    const { leftChunks, lastSynced } = input;
     const leftMatchesBaseline =
         lastSynced !== undefined
         && lastSynced.deleted !== true
         && lastSynced.chunks !== undefined
         && lastSynced.size !== undefined
         && input.leftDeleted !== true
-        && leftSize === lastSynced.size
         && chunkListsEqual(leftChunks, lastSynced.chunks);
     return leftMatchesBaseline ? "remote-edit" : "true-divergent";
 }

@@ -47,19 +47,6 @@ type ResolvableDoc = FileDoc | ConfigDoc;
 export type PullVerdict = "take-remote" | "keep-local" | "concurrent" | "silent-merge";
 
 /**
- * Adapt a doc into the chunks/size fingerprint the classifier expects.
- * v0.26 unifies the shape: FileDoc and ConfigDoc both expose
- * `chunks: string[]` (content-addressed hash list). Pass through
- * directly. Tombstone fingerprints are NOT normalized (`markDeleted`
- * retains the deleted content's chunks); deleted-state comparison is
- * handled by the classifier's `leftDeleted`/`rightDeleted` axis
- * (deletion is an integration event), not by these chunks.
- */
-function asContent(doc: ResolvableDoc): { chunks: readonly string[]; size: number } {
-    return { chunks: doc.chunks, size: doc.size };
-}
-
-/**
  * Extract the user-facing path from a doc id. Throws for unknown id
  * shapes — that should never happen because we filter by `isFileDoc ||
  * isConfigDoc` before calling, and the schema guard rejects bare ids.
@@ -86,8 +73,6 @@ export class ConflictResolver {
         // No local version — always take remote.
         if (!localDoc) return "take-remote";
 
-        const localContent = asContent(localDoc);
-        const remoteContent = asContent(remoteDoc);
         const localVC = localDoc.vclock ?? {};
         const remoteVC = remoteDoc.vclock ?? {};
 
@@ -97,12 +82,10 @@ export class ConflictResolver {
         // initial-sync devices get no false-positive concurrent conflict.
         const relation = classifySyncRelation({
             leftVC: localVC,
-            leftChunks: localContent.chunks,
-            leftSize: localContent.size,
+            leftChunks: localDoc.chunks,
             leftDeleted: localDoc.deleted === true,
             rightVC: remoteVC,
-            rightChunks: remoteContent.chunks,
-            rightSize: remoteContent.size,
+            rightChunks: remoteDoc.chunks,
             rightDeleted: remoteDoc.deleted === true,
             // Config seq-regression re-pull only: adopt the recreated remote
             // for vclock ties instead of surfacing them (see ClassifyInput).

@@ -6,6 +6,16 @@ All notable changes to obsidian-couchsync.
 
 ### Fixed
 
+- **A note being typed on another device no longer stops updating and
+  turns into a false conflict.** The sending device recorded a version's
+  size from the file's state before reading it. When the editor saved the
+  note again in between, the version carried the earlier save's size with
+  the later save's content. The receiving device wrote that content but
+  recorded the earlier size, so it took the note for one changed locally:
+  it stopped writing the next versions and offered a conflict between two
+  versions from the same device. A device now records the size of the
+  content it read or wrote, and compares content by its chunks only, so a
+  version already sent with a wrong size no longer holds anything back.
 - **A long pull is no longer cut off while it is still applying changes.**
   Receiving a large deletion from another device (thousands of files)
   could take one to two and a half minutes per batch of 100 changes. The

@@ -88,6 +88,25 @@ function matchesExpected(existing: FileDoc | null, expected: VectorClock | undef
 /** A baseline (`lastSynced`) entry as the store writes it. */
 type BaselineRow = Extract<VclockUpdate, { op: "set" }>;
 
+/**
+ * The vault file that holds a doc's content, as a baseline records it: the
+ * size of the file and, when a stat describes it, the stat's mtime (the
+ * stat-cache key, see `LastSynced.mtime`). Measured on this device, never
+ * taken from the doc, whose `size` is whatever its sender recorded.
+ */
+interface HeldContent {
+    size: number;
+    mtime?: number;
+}
+
+/** A vault file read once: its chunks, and the size of the bytes they
+ *  were cut from. */
+interface ReadContent {
+    chunks: ChunkDoc[];
+    chunkIds: string[];
+    size: number;
+}
+
 /** What `commitOverShown` writes: the doc with its final vclock, the chunks
  *  to store with it, and the baseline row to move in the same write. */
 interface ShownReplacement {
@@ -120,14 +139,14 @@ function lastSyncedOfRow(row: BaselineRow): LastSynced {
 
 /**
  * Whether the baseline records `doc`'s content as what the vault holds: a
- * deleted baseline for a tombstone, a live one with the same fingerprint
- * for a live doc. A baseline without a fingerprint cannot tell.
+ * deleted baseline for a tombstone, a live one with the same chunks for a
+ * live doc. A baseline without a fingerprint cannot tell.
  */
 function baselineHoldsContent(ls: LastSynced, doc: FileDoc): boolean {
     if (doc.deleted) return ls.deleted === true;
     return ls.deleted !== true
         && ls.chunks !== undefined
-        && ls.size === doc.size
+        && ls.size !== undefined
         && chunkListsEqual(ls.chunks, doc.chunks);
 }
 
@@ -322,9 +341,7 @@ export class VaultSync {
             await this.forgetSkipped(path);
         }
 
-        const content = await this.vault.readBinary(path);
-        const chunks = await splitIntoChunks(content, this.hasher);
-        const chunkIds = chunks.map((c) => c._id);
+        const { chunks, chunkIds, size } = await this.readVaultContent(path);
 
         const deviceId = settings.deviceId;
         const fileId = makeFileId(path);
@@ -360,11 +377,9 @@ export class VaultSync {
                         const relation = classifySyncRelation({
                             leftVC: lastSynced?.vclock ?? {},
                             leftChunks: chunkIds,
-                            leftSize: fileStat.size,
                             leftVCAttributed: true,
                             rightVC: existingVC,
                             rightChunks: existing.chunks,
-                            rightSize: existing.size,
                             rightDeleted: existing.deleted === true,
                             lastSynced,
                         });
@@ -389,7 +404,7 @@ export class VaultSync {
                         chunks: chunkIds,
                         mtime: fileStat.mtime,
                         ctime: fileStat.ctime,
-                        size: fileStat.size,
+                        size,
                         vclock: newVclock,
                     };
                     return {
@@ -404,14 +419,14 @@ export class VaultSync {
                         // miss → re-hash. Always the safe direction.
                         vclocks: [{
                             path, op: "set", clock: newVclock,
-                            chunks: chunkIds, size: fileStat.size,
+                            chunks: chunkIds, size,
                             mtime: fileStat.mtime,
                         }],
                         onCommit: () => {
                             this.lastSynced.set(toPathKey(path), {
                                 vclock: newVclock,
                                 chunks: chunkIds,
-                                size: fileStat.size,
+                                size,
                                 mtime: fileStat.mtime,
                             });
                         },
@@ -498,16 +513,18 @@ export class VaultSync {
             // divergent-local-delete conflict. Applies to the sibling-skip
             // branch too: the tombstone is integrated (bookkeeping advances),
             // only the disk side was skipped.
-            await this.establishBaseline(vaultPath, fileDoc);
+            await this.establishDeletedBaseline(vaultPath, fileDoc);
             return { applied: true };
         }
 
         const existingStat = await this.vault.stat(vaultPath);
         // The disk fingerprint serves both the already-on-disk check and the
-        // unsynced-change check below; read the file at most once.
+        // unsynced-change check below; read the file at most once. The doc's
+        // `size` does not gate the check: it is the sender's record and can
+        // differ from the content its chunks hold.
         let diskChunks: string[] | undefined;
 
-        if (existingStat && existingStat.size === fileDoc.size) {
+        if (existingStat) {
             diskChunks = await this.diskChunkIds(vaultPath, existingStat);
             if (chunkListsEqual(diskChunks, fileDoc.chunks)) {
                 // Content already on disk. Establish the integration baseline
@@ -558,6 +575,15 @@ export class VaultSync {
         }
 
         const content = joinChunks(orderedChunks);
+        if (content.byteLength !== fileDoc.size) {
+            // The sender recorded a size other than its content's (a stat
+            // taken before the file was read and saved again). The content
+            // is what the chunks hold; the baseline records its size.
+            logWarn(
+                `dbToFile: ${vaultPath} doc size ${fileDoc.size} differs from its ` +
+                `content (${content.byteLength} bytes); using the content's size`,
+            );
+        }
 
         // Delegate the vault write to the editor-aware VaultWriter.
         // For new files we use createFile (no editor session can exist
@@ -623,13 +649,17 @@ export class VaultSync {
         if (result.applied === false) return this.declinedByWriter(vaultPath, result);
 
         // Persist the integration point in the docs store's meta so it
-        // lives in the same IDB as the FileDoc itself. The post-write stat
-        // feeds the mtime stamp; if the editor-aware write hasn't flushed
-        // to disk yet the size won't match fileDoc.size and
-        // establishBaseline skips the stamp (cache miss → re-hash later —
-        // the safe direction).
+        // lives in the same IDB as the FileDoc itself. The baseline records
+        // the size of the bytes written. The post-write stat feeds the
+        // mtime stamp only when its size is theirs: if the editor-aware
+        // write hasn't flushed to disk yet, the stat describes something
+        // else and the stamp is skipped (cache miss → re-hash later — the
+        // safe direction).
         const postStat = await this.vault.stat(writtenPath);
-        await this.establishBaseline(vaultPath, fileDoc, postStat ?? undefined);
+        await this.establishBaseline(vaultPath, fileDoc, {
+            size: content.byteLength,
+            ...(postStat && postStat.size === content.byteLength ? { mtime: postStat.mtime } : {}),
+        });
 
         // History capture is now owned by VaultWriter (it knows when
         // the content has actually landed in the editor/disk).
@@ -638,7 +668,8 @@ export class VaultSync {
 
     /**
      * Establish (or refresh) the per-path integration baseline `lastSynced`
-     * to the FileDoc's vclock + content fingerprint. Chunks-equal
+     * to the FileDoc's vclock + content fingerprint, for a vault file that
+     * holds the doc's chunks. Chunks-equal
      * means the FileDoc is the canonical vclock authority for this path, so we
      * adopt `fileDoc.vclock` outright (no merge). Pure meta write — no CAS
      * needed. No-op when already aligned, to keep the pull/clone hot path cheap.
@@ -648,11 +679,12 @@ export class VaultSync {
      * `adoptDocVclock` all funnel through it so the baseline can never be left
      * unset after a successful integration (a re-clone once left it unset).
      *
-     * `diskStat`, when provided AND matching `fileDoc.size`, stamps
-     * `lastSynced.mtime` (the stat-cache key for `diskChunkIds`). A
-     * size mismatch means the stat does not describe the integrated
-     * content (e.g. an editor buffer not yet flushed) — skip the stamp;
-     * the next reconcile align warms it up. When the baseline is already
+     * `held` is the vault file as this device measured it: the size of the
+     * bytes written, or the stat of a file whose chunks were compared. The
+     * doc's own `size` is not recorded; a sender can have paired it with
+     * other content. `held.mtime` stamps `lastSynced.mtime` (the stat-cache
+     * key for `diskChunkIds`); without it the stamp is left out and the
+     * next reconcile align warms it up. When the baseline is already
      * aligned but the mtime stamp is missing or different, we still
      * write — that promotion is how a pre-mtime vault warms up during
      * its first slow scan.
@@ -660,33 +692,18 @@ export class VaultSync {
     private async establishBaseline(
         path: string,
         fileDoc: FileDoc,
-        diskStat?: { mtime: number; size: number },
+        held: HeldContent,
     ): Promise<void> {
         const key = toPathKey(path);
         this.awaitingEditorSave.delete(key);
         const prev = this.lastSynced.get(key);
         const docVC = fileDoc.vclock ?? {};
-        if (fileDoc.deleted) {
-            // Deletion is an integration event: a tombstone establishes a *deleted*
-            // baseline with a normalized fingerprint (tombstones in the wild
-            // carry non-normalized chunks — markDeleted spreads the prior
-            // doc — so we never copy fileDoc.chunks here).
-            const aligned =
-                prev !== undefined &&
-                prev.deleted === true &&
-                compareVC(prev.vclock, docVC) === "equal";
-            if (aligned) return;
-            await this.db.runWriteTx(this.deletedBaselineTx(path, docVC));
-            return;
-        }
-        const mtime = diskStat !== undefined && diskStat.size === fileDoc.size
-            ? diskStat.mtime
-            : undefined;
+        const { size, mtime } = held;
         const aligned =
             prev !== undefined &&
             prev.deleted !== true &&
             prev.chunks !== undefined &&
-            prev.size === fileDoc.size &&
+            prev.size === size &&
             compareVC(prev.vclock, docVC) === "equal" &&
             chunkListsEqual(prev.chunks, fileDoc.chunks) &&
             (mtime === undefined || prev.mtime === mtime);
@@ -697,13 +714,13 @@ export class VaultSync {
         const entry: LastSynced = {
             vclock: clock,
             chunks: fileDoc.chunks,
-            size: fileDoc.size,
+            size,
             ...(mtime !== undefined ? { mtime } : {}),
         };
         await this.db.runWriteTx({
             vclocks: [{
                 path, op: "set", clock,
-                chunks: fileDoc.chunks, size: fileDoc.size,
+                chunks: fileDoc.chunks, size,
                 ...(mtime !== undefined ? { mtime } : {}),
             }],
         });
@@ -711,11 +728,31 @@ export class VaultSync {
     }
 
     /**
+     * The tombstone counterpart of `establishBaseline`. Deletion is an
+     * integration event: a tombstone establishes a *deleted* baseline with
+     * a normalized fingerprint (tombstones in the wild carry non-normalized
+     * chunks — markDeleted spreads the prior doc — so we never copy
+     * `tombstone.chunks` here).
+     */
+    private async establishDeletedBaseline(path: string, tombstone: FileDoc): Promise<void> {
+        const key = toPathKey(path);
+        this.awaitingEditorSave.delete(key);
+        const prev = this.lastSynced.get(key);
+        const docVC = tombstone.vclock ?? {};
+        const aligned =
+            prev !== undefined &&
+            prev.deleted === true &&
+            compareVC(prev.vclock, docVC) === "equal";
+        if (aligned) return;
+        await this.db.runWriteTx(this.deletedBaselineTx(path, docVC));
+    }
+
+    /**
      * Build the `{vclocks, onCommit}` fragment that records "I integrated a
      * deletion of `path` at `tombstoneVC`". The fingerprint is
      * normalized to `chunks: [], size: 0` regardless of what the tombstone
      * doc itself carries. Shared by markDeleted / forceMarkDeleted /
-     * establishBaseline so every deletion-integration sink writes the same
+     * establishDeletedBaseline so every deletion-integration sink writes the same
      * shape.
      */
     private deletedBaselineTx(path: string, tombstoneVC: VectorClock): {
@@ -767,13 +804,11 @@ export class VaultSync {
         return classifySyncRelation({
             leftVC: lastSynced?.vclock ?? {},
             leftChunks: diskChunks,
-            leftSize: fileStat.size,
             // left = a disk file: always alive, vclock borrowed from the
             // integration baseline.
             leftVCAttributed: true,
             rightVC: fileDoc.vclock ?? {},
             rightChunks: fileDoc.chunks,
-            rightSize: fileDoc.size,
             rightDeleted: fileDoc.deleted === true,
             lastSynced,
         });
@@ -783,9 +818,11 @@ export class VaultSync {
      * Whether the vault holds, at `path`, content this device has not
      * synced, so writing `fileDoc` there would replace or remove it.
      *
-     * The disk holds only synced content when it matches an alive baseline
-     * (`lastSynced`) with a fingerprint; the comparison reads through the
-     * same stat cache the reconcile uses (`diskChunkIds`). This is the
+     * The disk holds only synced content when its chunks match an alive
+     * baseline (`lastSynced`) with a fingerprint; the comparison reads
+     * through the same stat cache the reconcile uses (`diskChunkIds`). The
+     * sizes are not compared: equal chunks are equal content, and a size
+     * enters only as part of the stat-cache key. This is the
      * classifier's rule for replacing the disk (`refineRemoteEdit`), so a
      * declined version is not lost: it stays in the local DB, and the
      * reconcile offers it through the conflict orchestrator, or pushes the
@@ -815,7 +852,6 @@ export class VaultSync {
             || ls.chunks === undefined || ls.size === undefined) {
             return true;
         }
-        if (stat.size !== ls.size) return true;
         const disk = diskChunks ?? await this.diskChunkIds(path, stat);
         return !chunkListsEqual(disk, ls.chunks);
     }
@@ -870,7 +906,7 @@ export class VaultSync {
     async adoptDocVclock(
         path: string,
         fileDoc: FileDoc,
-        diskStat?: { mtime: number; size: number },
+        diskStat: { mtime: number; size: number },
     ): Promise<void> {
         const before = this.lastSynced.get(toPathKey(path))?.vclock ?? {};
         await this.establishBaseline(path, fileDoc, diskStat);
@@ -878,25 +914,28 @@ export class VaultSync {
     }
 
     /**
-     * Align `lastSynced.{chunks,size}` to the FileDoc's actual content
-     * fingerprint when the reconciler observes them as identical.
+     * Align `lastSynced.{chunks,size}` to the FileDoc's chunks and the vault
+     * file's stat when the reconciler observes them as identical. The size
+     * comes from `diskStat`, the stat the reconciler took before it read the
+     * file's chunks, never from the doc.
      *
      * Two scenarios this handles:
      *
      *   - **Legacy upgrade**: pre-`{chunks,size}` entries (`chunks: undefined`)
      *     are written by older versions of the plugin. The startup sweep
-     *     piggybacks on the first reconcile to upgrade them in-place by
-     *     reading fileDoc.chunks/size. After one full session every entry
-     *     is in the new shape.
+     *     piggybacks on the first reconcile to upgrade them in-place from
+     *     fileDoc.chunks and the disk stat. After one full session every
+     *     entry is in the new shape.
      *
      *   - **Stale-bookkeeping recovery**: defensive — if the disk-write
      *     truth ever breaks (crash window, external tool), `lastSynced`
      *     can drift from disk. When classifier returns `identical`, we know
      *     disk chunks == fileDoc.chunks; if lastSynced disagrees, align it.
      *
-     *   - **Mtime warm-up** (`stamped-mtime`): the entry is fully aligned
-     *     but lacks the stat-cache stamp (pre-mtime vault, or the stat
-     *     changed via a content-identical rewrite). Stamping here is what
+     *   - **Mtime warm-up** (`stamped-mtime`): the entry holds the doc's
+     *     chunks but its stat-cache key `(mtime, size)` is absent or not
+     *     the disk's (pre-mtime vault, a content-identical rewrite, or a
+     *     size taken from a doc that misstated it). Stamping here is what
      *     makes the FIRST slow scan after upgrade pay the hash cost once
      *     and every later scan hit the `diskChunkIds` cache.
      *
@@ -905,32 +944,31 @@ export class VaultSync {
     async alignLastSyncedToDoc(
         path: string,
         fileDoc: FileDoc,
-        diskStat?: { mtime: number; size: number },
+        diskStat: { mtime: number; size: number },
     ): Promise<"already-aligned" | "upgraded-legacy" | "recovered-stale" | "stamped-mtime"> {
         const key = toPathKey(path);
         const existing = this.lastSynced.get(key);
         const docVC = fileDoc.vclock ?? {};
         // The caller (reconciler, classifier verdict "identical") has just
-        // confirmed disk content == fileDoc.chunks, so a same-size stat
-        // describes exactly that content — safe to stamp as cache key.
-        const mtime = diskStat !== undefined && diskStat.size === fileDoc.size
-            ? diskStat.mtime
-            : undefined;
-        const mtimeRow = mtime !== undefined ? { mtime } : {};
+        // confirmed disk content == fileDoc.chunks, reading the file after
+        // taking `diskStat`. When the file was saved in between, the stat's
+        // mtime is older than the content, so no later stat matches the
+        // stamp — the safe direction.
+        const { size, mtime } = diskStat;
 
         if (!existing) {
             // No baseline at all — establish one from the FileDoc.
             await this.db.runWriteTx({
                 vclocks: [{
                     path, op: "set", clock: docVC,
-                    chunks: fileDoc.chunks, size: fileDoc.size, ...mtimeRow,
+                    chunks: fileDoc.chunks, size, mtime,
                 }],
             });
             this.lastSynced.set(key, {
                 vclock: docVC,
                 chunks: fileDoc.chunks,
-                size: fileDoc.size,
-                ...mtimeRow,
+                size,
+                mtime,
             });
             return "upgraded-legacy";
         }
@@ -941,40 +979,37 @@ export class VaultSync {
             const upgraded: LastSynced = {
                 vclock: existing.vclock,
                 chunks: fileDoc.chunks,
-                size: fileDoc.size,
-                ...mtimeRow,
+                size,
+                mtime,
             };
             await this.db.runWriteTx({
                 vclocks: [{
                     path, op: "set", clock: upgraded.vclock,
-                    chunks: fileDoc.chunks, size: fileDoc.size, ...mtimeRow,
+                    chunks: fileDoc.chunks, size, mtime,
                 }],
             });
             this.lastSynced.set(key, upgraded);
             logDebug(
-                `alignLastSyncedToDoc: ${path} legacy entry upgraded to ${fileDoc.chunks.length} chunks / ${fileDoc.size} bytes`,
+                `alignLastSyncedToDoc: ${path} legacy entry upgraded to ${fileDoc.chunks.length} chunks / ${size} bytes`,
             );
             return "upgraded-legacy";
         }
 
-        const aligned =
-            existing.size === fileDoc.size &&
-            chunkListsEqual(existing.chunks!, fileDoc.chunks);
-        if (aligned) {
+        if (chunkListsEqual(existing.chunks!, fileDoc.chunks)) {
             // No stamp for a deleted baseline (an empty file can content-
             // match one) — diskChunkIds never serves from deleted entries,
             // and the row below would drop the `deleted` flag.
-            if (mtime === undefined || existing.mtime === mtime
+            if ((existing.mtime === mtime && existing.size === size)
                 || existing.deleted === true) {
                 return "already-aligned";
             }
-            // Content-aligned but the stat-cache stamp is absent or stale —
+            // Content-aligned but the stat-cache key is absent or stale —
             // write only to warm it up.
-            const stamped: LastSynced = { ...existing, mtime };
+            const stamped: LastSynced = { ...existing, size, mtime };
             await this.db.runWriteTx({
                 vclocks: [{
                     path, op: "set", clock: stamped.vclock,
-                    chunks: fileDoc.chunks, size: fileDoc.size, mtime,
+                    chunks: fileDoc.chunks, size, mtime,
                 }],
             });
             this.lastSynced.set(key, stamped);
@@ -983,24 +1018,25 @@ export class VaultSync {
 
         // Stale-bookkeeping: lastSynced drifted from the integrated content.
         // The classifier has just confirmed disk == fileDoc, so it's safe
-        // to overwrite the bookkeeping with the doc's fingerprint.
+        // to overwrite the bookkeeping with the doc's chunks and the disk's
+        // stat.
         const realigned: LastSynced = {
             vclock: existing.vclock,
             chunks: fileDoc.chunks,
-            size: fileDoc.size,
-            ...mtimeRow,
+            size,
+            mtime,
         };
         await this.db.runWriteTx({
             vclocks: [{
                 path, op: "set", clock: realigned.vclock,
-                chunks: fileDoc.chunks, size: fileDoc.size, ...mtimeRow,
+                chunks: fileDoc.chunks, size, mtime,
             }],
         });
         this.lastSynced.set(key, realigned);
         logWarn(
             `alignLastSyncedToDoc: ${path} stale-bookkeeping recovered ` +
             `(was ${existing.size} bytes / ${existing.chunks!.length} chunks → ` +
-            `now ${fileDoc.size} bytes / ${fileDoc.chunks.length} chunks)`,
+            `now ${size} bytes / ${fileDoc.chunks.length} chunks)`,
         );
         return "recovered-stale";
     }
@@ -1153,9 +1189,7 @@ export class VaultSync {
     async forceLocalEdit(path: string, expectedVclock?: VectorClock): Promise<ForceWriteOutcome> {
         const fileStat = await this.vault.stat(path);
         if (!fileStat) return "no-file";
-        const content = await this.vault.readBinary(path);
-        const chunks = await splitIntoChunks(content, this.hasher);
-        const chunkIds = chunks.map((c) => c._id);
+        const { chunks, chunkIds, size } = await this.readVaultContent(path);
         const fileId = makeFileId(path);
         const committed = await this.commitKeptVersion(
             path, `forceLocalEdit ${path}`, expectedVclock, {}, () => ({
@@ -1166,7 +1200,7 @@ export class VaultSync {
                     chunks: chunkIds,
                     mtime: fileStat.mtime,
                     ctime: fileStat.ctime,
-                    size: fileStat.size,
+                    size,
                 },
                 chunks: chunks as unknown as CouchSyncDoc[],
                 // The vault holds the kept content. mtime from the pre-read
@@ -1175,7 +1209,7 @@ export class VaultSync {
                 // differs → cache miss → re-hash. Always the safe direction.
                 baseline: (clock) => ({
                     path, op: "set", clock,
-                    chunks: chunkIds, size: fileStat.size, mtime: fileStat.mtime,
+                    chunks: chunkIds, size, mtime: fileStat.mtime,
                 }),
             }),
         );
@@ -1242,7 +1276,7 @@ export class VaultSync {
                             ? VaultSync.deletedBaselineRow(path, clock)
                             : {
                                 path, op: "set", clock,
-                                chunks: shown.chunks, size: shown.size,
+                                chunks: shown.chunks, size: ls.size!,
                                 ...(ls.mtime !== undefined ? { mtime: ls.mtime } : {}),
                             }
                         : null,
@@ -1438,7 +1472,7 @@ export class VaultSync {
             // deletion silently overwrite a divergent, un-integrated on-disk
             // edit. Choose the non-destructive side instead: fall back to
             // the LocalDB FileDoc (which still carries the last-integrated
-            // chunks/size) as the baseline; if even that is unavailable, a
+            // chunks) as the baseline; if even that is unavailable, a
             // present-on-disk file is treated as possibly-unpushed so the
             // deletion surfaces a CONFLICT rather than destroying local work.
             // The legacy entry self-heals to a real baseline on the next
@@ -1446,8 +1480,7 @@ export class VaultSync {
             const stat = await this.vault.stat(path);
             if (!stat) return false; // nothing on disk to lose
             const doc = await this.db.get<FileDoc>(makeFileId(path));
-            if (doc && !doc.deleted && doc.chunks !== undefined && doc.size !== undefined) {
-                if (stat.size !== doc.size) return true;
+            if (doc && !doc.deleted && doc.chunks !== undefined) {
                 const diskChunks = await this.localChunkIds(path);
                 return !chunkListsEqual(diskChunks, doc.chunks);
             }
@@ -1459,7 +1492,6 @@ export class VaultSync {
             // by the `delete` event path, not here.
             return false;
         }
-        if (stat.size !== ls.size) return true;
         // Deliberately localChunkIds, NOT diskChunkIds: this oracle guards
         // destructive judgments (delete-vs-edit, Case F),
         // where the stat-cache's mtime trust model is too weak. Always
@@ -1513,9 +1545,7 @@ export class VaultSync {
         if (!fileStat) return; // re-renamed/deleted already — later events own it
         // Re-chunk from disk: an edit raced into the rename window must not
         // be lost by reusing the old doc's chunks.
-        const content = await this.vault.readBinary(newPath);
-        const chunks = await splitIntoChunks(content, this.hasher);
-        const chunkIds = chunks.map((c) => c._id);
+        const { chunks, chunkIds, size } = await this.readVaultContent(newPath);
 
         try {
             await this.db.runWriteBuilder(
@@ -1584,7 +1614,7 @@ export class VaultSync {
                         chunks: chunkIds,
                         mtime: fileStat.mtime,
                         ctime: fileStat.ctime,
-                        size: fileStat.size,
+                        size,
                         vclock: newVC,
                     };
 
@@ -1612,7 +1642,7 @@ export class VaultSync {
                     // Same PathKey ⇒ exactly one row: the alive baseline.
                     const vclocks: VclockUpdate[] = [{
                         path: newPath, op: "set", clock: newVC,
-                        chunks: chunkIds, size: fileStat.size,
+                        chunks: chunkIds, size,
                         mtime: fileStat.mtime,
                     }];
                     if (!samePathKey) {
@@ -1643,7 +1673,7 @@ export class VaultSync {
                             this.lastSynced.set(newKey, {
                                 vclock: newVC,
                                 chunks: chunkIds,
-                                size: fileStat.size,
+                                size,
                                 mtime: fileStat.mtime,
                             });
                             if (!samePathKey) {
@@ -1750,9 +1780,19 @@ export class VaultSync {
     }
 
     private async localChunkIds(path: string): Promise<string[]> {
+        return (await this.readVaultContent(path)).chunkIds;
+    }
+
+    /**
+     * Read the vault file at `path` once. The size is the length of the
+     * bytes read, never a stat's: Obsidian can save the file again between
+     * a stat and the read, and the stat would then describe one save while
+     * the chunks hold the next.
+     */
+    private async readVaultContent(path: string): Promise<ReadContent> {
         const content = await this.vault.readBinary(path);
         const chunks = await splitIntoChunks(content, this.hasher);
-        return chunks.map((c) => c._id);
+        return { chunks, chunkIds: chunks.map((c) => c._id), size: content.byteLength };
     }
 
     /**
