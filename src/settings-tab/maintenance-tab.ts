@@ -359,10 +359,14 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
                     const ok = await deps.modalPresenter.showConfirmModal(
                         "Delete local vault database",
                         "Destroy the entire local vault database on this device and " +
-                            "restart the plugin? Remote data is preserved — sync will " +
-                            "re-download from the remote on next start, which can take " +
-                            "minutes for large vaults. Local-only state (unpushed edits, " +
-                            "checkpoints) will be lost.",
+                            "restart the plugin? The remote and the files in this vault " +
+                            "are kept. Sync then downloads everything from the remote " +
+                            "again, which can take minutes for large vaults. A file here " +
+                            "whose content differs from the remote's version is offered " +
+                            "as a conflict, and a file the remote does not have is sent " +
+                            "to it. A deletion or rename not yet sent is lost: the " +
+                            "deleted file, or the file under its old name, comes back " +
+                            "from the remote.",
                         "Delete",
                         true,
                     );

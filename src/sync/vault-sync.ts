@@ -3,7 +3,12 @@ import type { LocalDB } from "../db/local-db.ts";
 import type { FileDoc, ChunkDoc, CouchSyncDoc } from "../types.ts";
 import { FILE_SCHEMA_VERSION } from "../types.ts";
 import type { CouchSyncSettings } from "../settings.ts";
-import type { VaultWriter, WriteResult } from "./vault-writer.ts";
+import {
+    UNSAVED_EDITOR_CHANGE,
+    UNSYNCED_VAULT_CHANGE,
+    type VaultWriter,
+    type WriteResult,
+} from "./vault-writer.ts";
 import { splitIntoChunks, joinChunks, type ChunkHasher } from "../db/chunker.ts";
 import { notify } from "../ui/log.ts";
 import { compareVC, incrementVC, mergeVC } from "./vector-clock.ts";
@@ -57,6 +62,67 @@ export interface IPendingProbe {
     hasPending(path: string): boolean;
 }
 
+export interface DbToFileOptions {
+    /** Replace what the vault holds even when the user changed it since the
+     *  last sync. Only for a caller that holds the user's decision to replace
+     *  it: a conflict the user answered with the remote version, or Clone,
+     *  whose confirmation says it replaces the files at the same path. */
+    overwriteVaultChange?: boolean;
+}
+
+type DeclinedWrite = Extract<WriteResult, { applied: false }>;
+
+/** Result of `forceLocalEdit` / `forceMarkDeleted` / `keepLocalDoc`.
+ *  `stale`: the LocalDB doc no longer has the expected vclock, nothing was
+ *  written. `no-file`: the vault file to commit is gone, nothing was written. */
+export type ForceWriteOutcome = "written" | "stale" | "no-file";
+
+/** No expectation always matches. An expectation requires the doc to exist
+ *  with an equal vclock. */
+function matchesExpected(existing: FileDoc | null, expected: VectorClock | undefined): boolean {
+    if (expected === undefined) return true;
+    if (!existing) return false;
+    return compareVC(existing.vclock ?? {}, expected) === "equal";
+}
+
+/** A baseline (`lastSynced`) entry as the store writes it. */
+type BaselineRow = Extract<VclockUpdate, { op: "set" }>;
+
+/**
+ * The version a Keep Local commits, before it has its vclock: the doc's
+ * content, the chunks to store with it, and, when the vault holds that
+ * content as synced, the baseline row for a given vclock.
+ */
+interface KeptVersion {
+    doc: Omit<FileDoc, "vclock">;
+    chunks?: CouchSyncDoc[];
+    baseline: ((vclock: VectorClock) => BaselineRow) | null;
+}
+
+/** The cache entry that mirrors a committed baseline row. */
+function lastSyncedOfRow(row: BaselineRow): LastSynced {
+    return {
+        vclock: { ...row.clock },
+        chunks: row.chunks,
+        size: row.size,
+        ...(row.mtime !== undefined ? { mtime: row.mtime } : {}),
+        ...(row.deleted ? { deleted: true as const } : {}),
+    };
+}
+
+/**
+ * Whether the baseline records `doc`'s content as what the vault holds: a
+ * deleted baseline for a tombstone, a live one with the same fingerprint
+ * for a live doc. A baseline without a fingerprint cannot tell.
+ */
+function baselineHoldsContent(ls: LastSynced, doc: FileDoc): boolean {
+    if (doc.deleted) return ls.deleted === true;
+    return ls.deleted !== true
+        && ls.chunks !== undefined
+        && ls.size === doc.size
+        && chunkListsEqual(ls.chunks, doc.chunks);
+}
+
 /** Max snapshot→commit retries inside runWrite when a concurrent pull lands
  *  between our read and our CAS check. Realistic worst case is 1. */
 const CAS_MAX_ATTEMPTS = 4;
@@ -79,9 +145,10 @@ export class VaultSync {
      * Loaded once via `loadLastSyncedVclocks()` at plugin init; the on-disk
      * representation is per-path meta entries (`_local/vclock/<path>`).
      * Entries written before the chunks/size extension carry only the
-     * vclock (`chunks`/`size` undefined); they are treated as "legacy
-     * skip" by the divergent-edit guard until the next push/pull
-     * rewrites them in full shape.
+     * vclock (`chunks`/`size` undefined). They cannot tell whether the disk
+     * still holds the synced content, so the guards treat them as no
+     * baseline for that question until the next push/pull, or an identical
+     * reconcile, rewrites them in full shape.
      */
     private lastSynced = new LastSyncedCache();
 
@@ -101,6 +168,20 @@ export class VaultSync {
      * `main.ts` wires it up post-construction.
      */
     private pendingProbe: IPendingProbe | null = null;
+
+    /**
+     * Paths whose doc-to-vault write the writer declined because an open
+     * editor held input not yet saved (`UNSAVED_EDITOR_CHANGE`). The
+     * declined version waits in the local DB, and the reconcile that
+     * follows the decline still sees the disk as last synced. Once the
+     * editor saves, the vault records the input as a change (`fileToDb`, or
+     * `markDeleted` when the file went), and the reconcile must look at the
+     * path again: it offers the declined version against the saved input
+     * as a conflict, or writes it when the input was undone. Integrating a
+     * version (`establishBaseline`) ends the wait.
+     */
+    private awaitingEditorSave = new Set<PathKey>();
+    private onEditorSaved: (() => void) | null = null;
 
     private readonly hasher?: ChunkHasher;
 
@@ -124,6 +205,22 @@ export class VaultSync {
      */
     setPendingProbe(probe: IPendingProbe): void {
         this.pendingProbe = probe;
+    }
+
+    /**
+     * Wire what runs when the vault records a change on a path whose write
+     * was declined for an editor's unsaved input (see `awaitingEditorSave`).
+     * `main.ts` schedules a reconcile, as it does after a pull skips a
+     * write.
+     */
+    setOnEditorSaved(cb: () => void): void {
+        this.onEditorSaved = cb;
+    }
+
+    /** The vault is recording a change on `path`: if a write there waited
+     *  for the editor to save, let the reconcile take the path up. */
+    private endEditorWait(path: string): void {
+        if (this.awaitingEditorSave.delete(toPathKey(path))) this.onEditorSaved?.();
     }
 
     /**
@@ -201,6 +298,7 @@ export class VaultSync {
      * a remote edit not yet integrated).
      */
     async fileToDb(path: string): Promise<boolean> {
+        this.endEditorWait(path);
         const settings = this.getSettings();
         const fileStat = await this.vault.stat(path);
         if (!fileStat) return false; // file disappeared before we could read it
@@ -245,9 +343,9 @@ export class VaultSync {
                     // pull-integration check, and the user-edited-stale
                     // check all share one matrix. Skip when the local
                     // disk lags the LocalDB doc (= remote-edit pending
-                    // integration) or both sides have drifted
-                    // (= true-divergent). Push only when the classifier
-                    // confirms `local-edit`.
+                    // integration) or the disk holds content the doc's
+                    // history does not explain (= true-divergent, which
+                    // the reconcile offers as a conflict).
                     if (existing) {
                         const existingVC = existing.vclock ?? {};
                         const lastSynced = this.lastSynced.get(toPathKey(path));
@@ -269,22 +367,6 @@ export class VaultSync {
                                 `integrated=${lastSynced ? JSON.stringify(lastSynced.vclock) : "null"})`,
                             );
                             return null;
-                        }
-                        if (relation === "legacy-skip") {
-                            // Pre-extension lastSynced — fall back to the
-                            // legacy vclock-only check until the startup
-                            // legacy-lastSynced sweep upgrades the entry to the {chunks,size}
-                            // shape.
-                            const isDivergent = lastSynced
-                                ? compareVC(existingVC, lastSynced.vclock) === "dominates"
-                                : Object.keys(existingVC).length > 0;
-                            if (isDivergent) {
-                                logWarn(
-                                    `fileToDb: skipping push for ${path} — legacy-skip divergent ` +
-                                    `(observed=${JSON.stringify(existingVC)})`,
-                                );
-                                return null;
-                            }
                         }
                         // identical / local-edit / vclock-only-drift fall
                         // through to push. (vclock-only-drift requires
@@ -335,7 +417,19 @@ export class VaultSync {
         }
     }
 
-    async dbToFile(fileDoc: FileDoc): Promise<WriteResult> {
+    /**
+     * Bring the vault in line with `fileDoc`: write its content, or apply its
+     * deletion. Every write from a doc to the vault goes through here.
+     *
+     * The vault is changed only while it still holds what this device last
+     * synced for the path (`lastSynced`); see `unsyncedVaultChange`. When the
+     * user changed the file since, the write is declined with
+     * `applied: false` and the bookkeeping is left as it is, so the
+     * reconcile finds the path diverged and the conflict orchestrator lets the
+     * user choose. `opts.overwriteVaultChange` lifts this for a caller that
+     * holds the user's decision to replace the vault's version.
+     */
+    async dbToFile(fileDoc: FileDoc, opts: DbToFileOptions = {}): Promise<WriteResult> {
         const vaultPath = filePathFromId(fileDoc._id);
 
         // Trust boundary: the path is server-controlled on a plaintext
@@ -371,7 +465,14 @@ export class VaultSync {
             // advances); only the disk side is skipped.
             const exactOnDisk = this.vault.getFiles().some((f) => f.path === vaultPath);
             if (exactOnDisk) {
-                await this.vaultWriter.applyRemoteDeletion(vaultPath);
+                if (!opts.overwriteVaultChange) {
+                    const stat = await this.vault.stat(vaultPath);
+                    if (stat && await this.unsyncedVaultChange(vaultPath, fileDoc, stat)) {
+                        return this.declineOverVaultChange(vaultPath);
+                    }
+                }
+                const removed = await this.vaultWriter.applyRemoteDeletion(vaultPath);
+                if (removed.applied === false) return this.declinedByWriter(vaultPath, removed);
                 await this.pruneEmptyParents(vaultPath);
             } else {
                 const sibling = this.findExistingByPathKey(vaultPath);
@@ -394,10 +495,13 @@ export class VaultSync {
         }
 
         const existingStat = await this.vault.stat(vaultPath);
+        // The disk fingerprint serves both the already-on-disk check and the
+        // unsynced-change check below; read the file at most once.
+        let diskChunks: string[] | undefined;
 
         if (existingStat && existingStat.size === fileDoc.size) {
-            const ids = await this.diskChunkIds(vaultPath, existingStat);
-            if (chunkListsEqual(ids, fileDoc.chunks)) {
+            diskChunks = await this.diskChunkIds(vaultPath, existingStat);
+            if (chunkListsEqual(diskChunks, fileDoc.chunks)) {
                 // Content already on disk. Establish the integration baseline
                 // so a later reconcile classifies this path as identical and
                 // never re-pushes it with a self-vclock stamp. Skipping this
@@ -457,6 +561,10 @@ export class VaultSync {
         // vaultPath, but stat() needs the on-disk spelling.
         let writtenPath = vaultPath;
         if (existingStat) {
+            if (!opts.overwriteVaultChange
+                && await this.unsyncedVaultChange(vaultPath, fileDoc, existingStat, diskChunks)) {
+                return this.declineOverVaultChange(vaultPath);
+            }
             result = await this.vaultWriter.applyRemoteContent(vaultPath, content);
         } else {
             const collidingPath = this.findExistingByPathKey(vaultPath);
@@ -487,6 +595,10 @@ export class VaultSync {
                 );
                 return { applied: false, reason: "file-folder-collision" };
             }
+            if (!opts.overwriteVaultChange
+                && await this.unsyncedVaultChange(vaultPath, fileDoc, null)) {
+                return this.declineOverVaultChange(vaultPath);
+            }
             // Resolve the parent dir to an existing same-PathKey folder's
             // case so a case-sensitive FS does not gain a duplicate-case folder
             // beside the canonical one. The file lands under the existing
@@ -500,16 +612,7 @@ export class VaultSync {
             result = { applied: true };
         }
 
-        if (result.applied === false) {
-            // VaultWriter declined to apply (e.g., the local doc diverged
-            // during IME composition). Leave lastSyncedVclock untouched so
-            // the divergent state is detectable: the LocalDB doc has been
-            // advanced to fileDoc.vclock by PullWriter, but vault content
-            // is stale. fileToDb's divergent guard refuses any push from
-            // this state; the pull-skipped → reconcile schedule path
-            // re-attempts dbToFile on the next cycle.
-            return result;
-        }
+        if (result.applied === false) return this.declinedByWriter(vaultPath, result);
 
         // Persist the integration point in the docs store's meta so it
         // lives in the same IDB as the FileDoc itself. The post-write stat
@@ -552,6 +655,7 @@ export class VaultSync {
         diskStat?: { mtime: number; size: number },
     ): Promise<void> {
         const key = toPathKey(path);
+        this.awaitingEditorSave.delete(key);
         const prev = this.lastSynced.get(key);
         const docVC = fileDoc.vclock ?? {};
         if (fileDoc.deleted) {
@@ -619,7 +723,7 @@ export class VaultSync {
     /** The VclockUpdate row of a deleted baseline — composable into larger
      *  transactions (handleRename writes it alongside the new path's alive
      *  baseline in ONE tx). */
-    private static deletedBaselineRow(path: string, tombstoneVC: VectorClock): VclockUpdate {
+    private static deletedBaselineRow(path: string, tombstoneVC: VectorClock): BaselineRow {
         return {
             path, op: "set", clock: { ...tombstoneVC }, chunks: [], size: 0, deleted: true,
         };
@@ -665,6 +769,73 @@ export class VaultSync {
             rightDeleted: fileDoc.deleted === true,
             lastSynced,
         });
+    }
+
+    /**
+     * Whether the vault holds, at `path`, content this device has not
+     * synced, so writing `fileDoc` there would replace or remove it.
+     *
+     * The disk holds only synced content when it matches an alive baseline
+     * (`lastSynced`) with a fingerprint; the comparison reads through the
+     * same stat cache the reconcile uses (`diskChunkIds`). This is the
+     * classifier's rule for replacing the disk (`refineRemoteEdit`), so a
+     * declined version is not lost: it stays in the local DB, and the
+     * reconcile offers it through the conflict orchestrator, or pushes the
+     * vault's change when the doc is not newer than the baseline.
+     *
+     * - File on disk: unsynced unless it matches an alive, fingerprinted
+     *   baseline. With no such baseline the file was made here before its
+     *   first push, came into the filters, or was recreated after a synced
+     *   deletion. dbToFile asks only after finding that the disk differs
+     *   from `fileDoc`; equal content takes the baseline instead.
+     * - No file on disk: a deletion has nothing to remove. Content written
+     *   there would undo the user's deletion when the baseline is a live
+     *   file; the reconcile offers or sends that deletion. With a deleted
+     *   baseline, or none, the vault has lost nothing.
+     */
+    private async unsyncedVaultChange(
+        path: string,
+        fileDoc: FileDoc,
+        stat: { mtime: number; size: number } | null,
+        diskChunks?: string[],
+    ): Promise<boolean> {
+        const ls = this.lastSynced.get(toPathKey(path));
+        if (!stat) {
+            return !fileDoc.deleted && ls !== undefined && ls.deleted !== true;
+        }
+        if (ls === undefined || ls.deleted === true
+            || ls.chunks === undefined || ls.size === undefined) {
+            return true;
+        }
+        if (stat.size !== ls.size) return true;
+        const disk = diskChunks ?? await this.diskChunkIds(path, stat);
+        return !chunkListsEqual(disk, ls.chunks);
+    }
+
+    private declineOverVaultChange(path: string): WriteResult {
+        logWarn(
+            `dbToFile: not writing ${path} — the vault changed since the last sync; ` +
+            `left for reconcile to offer as a conflict`,
+        );
+        return { applied: false, reason: UNSYNCED_VAULT_CHANGE };
+    }
+
+    /**
+     * The writer declined, leaving the vault as it was (an open editor's
+     * input, or a file changed while the write waited for an IME
+     * composition). The bookkeeping stays as it is, so the path stays
+     * detectable: the local DB doc is ahead of the vault, fileToDb's guard
+     * refuses to push from this state, and the reconcile writes the doc
+     * later or offers the vault's change as a conflict. Input still in the
+     * editor reaches the vault only when the editor saves, so the path
+     * waits for that (`awaitingEditorSave`).
+     */
+    private declinedByWriter(path: string, result: DeclinedWrite): WriteResult {
+        if (result.reason === UNSAVED_EDITOR_CHANGE) {
+            this.awaitingEditorSave.add(toPathKey(path));
+        }
+        logInfo(`dbToFile: not writing ${path} — ${result.reason}`);
+        return result;
     }
 
     /**
@@ -827,6 +998,7 @@ export class VaultSync {
     }
 
     async markDeleted(path: string): Promise<void> {
+        this.endEditorWait(path);
         const fileId = makeFileId(path);
         const deviceId = this.getSettings().deviceId;
         try {
@@ -906,7 +1078,13 @@ export class VaultSync {
     }
 
     async applyRemoteDeletion(path: string): Promise<void> {
-        await this.vaultWriter.applyRemoteDeletion(path);
+        const removed = await this.vaultWriter.applyRemoteDeletion(path);
+        if (removed.applied === false) {
+            // The file stays, so its doc must not become a tombstone. The
+            // next reconcile meets the same paths again.
+            this.declinedByWriter(path, removed);
+            return;
+        }
         await this.pruneEmptyParents(path);
         await this.markDeleted(path);
     }
@@ -950,116 +1128,192 @@ export class VaultSync {
     }
 
     /**
-     * Force-push the local vault content for `path`, merging the supplied
-     * `baselineVclock` into the new doc's vclock. Bypasses the divergent
-     * guard. Used by ConflictOrchestrator when the user picks keep-local
-     * in the divergent-edit modal — at that point the divergent state IS
-     * the resolution, and the user's content must reach the LocalDB so
-     * the push loop carries it to remote.
+     * Commit the vault content of `path` over its LocalDB doc, bypassing the
+     * divergent guard. The new vclock dominates the doc it replaces, so the
+     * push loop carries the vault content to remote, and the baseline moves
+     * with it. Used when the user keeps the vault side of a conflict (an edit,
+     * or a file made again over a deletion), and to propagate a history
+     * restore.
+     *
+     * `expectedVclock`: the vclock of the doc the user decided against. When
+     * given, nothing is written unless the LocalDB doc still has exactly that
+     * vclock ("stale" otherwise): a pull may have moved the doc while the
+     * dialog was open, and the newer version must not be replaced unseen.
+     * Omit it only when there is no such decision (a history restore), and
+     * the vault content is committed over whatever doc is there.
      */
-    async forceLocalEdit(path: string, baselineVclock: VectorClock): Promise<void> {
-        const settings = this.getSettings();
+    async forceLocalEdit(path: string, expectedVclock?: VectorClock): Promise<ForceWriteOutcome> {
         const fileStat = await this.vault.stat(path);
-        if (!fileStat) return;
+        if (!fileStat) return "no-file";
         const content = await this.vault.readBinary(path);
         const chunks = await splitIntoChunks(content, this.hasher);
         const chunkIds = chunks.map((c) => c._id);
         const fileId = makeFileId(path);
-        const deviceId = settings.deviceId;
+        const committed = await this.commitKeptVersion(
+            path, `forceLocalEdit ${path}`, expectedVclock, {}, () => ({
+                doc: {
+                    _id: fileId,
+                    schemaVersion: FILE_SCHEMA_VERSION,
+                    type: "file",
+                    chunks: chunkIds,
+                    mtime: fileStat.mtime,
+                    ctime: fileStat.ctime,
+                    size: fileStat.size,
+                },
+                chunks: chunks as unknown as CouchSyncDoc[],
+                // The vault holds the kept content. mtime from the pre-read
+                // stat: if the file changed between stat and readBinary, the
+                // recorded mtime is older than the content → next stat
+                // differs → cache miss → re-hash. Always the safe direction.
+                baseline: (clock) => ({
+                    path, op: "set", clock,
+                    chunks: chunkIds, size: fileStat.size, mtime: fileStat.mtime,
+                }),
+            }),
+        );
+        return committed === "stale" ? "stale" : "written";
+    }
+
+    /**
+     * Tombstone the LocalDB doc of `path`, bypassing the divergent guard,
+     * and record the deletion as the vault's synced state. Used when the
+     * user keeps the vault-side deletion of a conflict. `expectedVclock` is
+     * the vclock of the doc the user decided against, as in
+     * `forceLocalEdit`; there is always such a decision here.
+     */
+    async forceMarkDeleted(path: string, expectedVclock: VectorClock): Promise<ForceWriteOutcome> {
+        const committed = await this.commitKeptVersion(
+            path, `forceMarkDeleted ${path}`, expectedVclock, {}, (existing) => {
+                // The expectation guarantees a doc: an absent one is stale.
+                const { vclock: _replaced, ...doc } = existing!;
+                return {
+                    doc: { ...doc, deleted: true, mtime: Date.now() },
+                    baseline: (clock) => VaultSync.deletedBaselineRow(path, clock),
+                };
+            },
+        );
+        return committed === "stale" ? "stale" : "written";
+    }
+
+    /**
+     * Keep the local DB doc of `path` over a concurrent remote version: the
+     * user chose it in a pull conflict, where the dialog compared that doc
+     * (its vclock `expectedVclock`) with the remote one (`remoteVclock`). The
+     * counterpart of `forceLocalEdit`, whose kept content is the vault's.
+     *
+     * One write commits the doc again with a vclock that dominates both
+     * sides. When the vault holds the kept content (the baseline's
+     * fingerprint matches the doc's), the same write moves the baseline to
+     * the new vclock, so the next vault edit or deletion is judged against
+     * the version kept. A baseline left at the old vclock made fileToDb and
+     * markDeleted take the newer doc for a pull not yet integrated.
+     *
+     * When the vault does not hold it (a pulled version whose vault write is
+     * still to come), the kept version goes to the vault after the commit
+     * through `dbToFile`, as a pulled one would: a vault change not yet
+     * synced is left there, and the reconcile offers it as a conflict.
+     *
+     * Returns "stale" and writes nothing when the doc is no longer the one
+     * the dialog showed, as `forceLocalEdit` does.
+     */
+    async keepLocalDoc(
+        path: string,
+        expectedVclock: VectorClock,
+        remoteVclock: VectorClock,
+    ): Promise<ForceWriteOutcome> {
+        const committed = await this.commitKeptVersion(
+            path, `keepLocalDoc ${path}`, expectedVclock, remoteVclock, (existing) => {
+                // The expectation guarantees a doc: an absent one is stale.
+                const shown = existing!;
+                const ls = this.lastSynced.get(toPathKey(path));
+                const { vclock: _replaced, ...doc } = shown;
+                return {
+                    doc,
+                    baseline: ls && baselineHoldsContent(ls, shown)
+                        ? (clock) => shown.deleted
+                            ? VaultSync.deletedBaselineRow(path, clock)
+                            : {
+                                path, op: "set", clock,
+                                chunks: shown.chunks, size: shown.size,
+                                ...(ls.mtime !== undefined ? { mtime: ls.mtime } : {}),
+                            }
+                        : null,
+                };
+            },
+        );
+        if (committed === "stale") return "stale";
+        if (!committed.baselineRecorded) {
+            const written = await this.dbToFile(committed.doc);
+            if (written.applied === false) {
+                logWarn(`keepLocalDoc: kept ${path} in the local DB; vault write skipped (${written.reason})`);
+            }
+        }
+        return "written";
+    }
+
+    /**
+     * The commit every way of keeping this device's version shares: in one
+     * write, the kept version gets a vclock that dominates the doc it
+     * replaces and `notKeptVclock` (the version not kept, when the local DB
+     * does not hold it), and, when `keep` says what the vault holds as
+     * synced, the baseline takes that vclock.
+     *
+     * `expectedVclock` is the vclock of the doc the user decided against or
+     * chose to keep. When given, nothing is written unless the doc exists
+     * with exactly that vclock, and "stale" is returned. The check runs on
+     * the same read as the commit, so a pull that lands in between fails
+     * the CAS, the builder runs again and the check sees it. When omitted,
+     * the commit builds on whatever doc is there.
+     *
+     * `keep` sees the doc as committed and returns the kept version. It may
+     * run more than once, for the same reason.
+     */
+    private async commitKeptVersion(
+        path: string,
+        context: string,
+        expectedVclock: VectorClock | undefined,
+        notKeptVclock: VectorClock,
+        keep: (existing: FileDoc | null) => KeptVersion,
+    ): Promise<{ doc: FileDoc; baselineRecorded: boolean } | "stale"> {
+        const fileId = makeFileId(path);
+        const deviceId = this.getSettings().deviceId;
+        const outcome: { committed: { doc: FileDoc; baselineRecorded: boolean } | "stale" } = {
+            committed: "stale",
+        };
         try {
             await this.db.runWriteBuilder(
                 async (snap) => {
+                    outcome.committed = "stale";
                     const existing = (await snap.get(fileId)) as FileDoc | null;
-                    const merged = mergeVC(baselineVclock, existing?.vclock ?? {});
-                    const newVclock = incrementVC(merged, deviceId);
-                    const newDoc: FileDoc = {
-                        _id: fileId,
-                        schemaVersion: FILE_SCHEMA_VERSION,
-                        type: "file",
-                        chunks: chunkIds,
-                        mtime: fileStat.mtime,
-                        ctime: fileStat.ctime,
-                        size: fileStat.size,
-                        vclock: newVclock,
-                    };
+                    if (!matchesExpected(existing, expectedVclock)) return null;
+                    const version = keep(existing);
+                    const vclock = incrementVC(mergeVC(notKeptVclock, existing?.vclock ?? {}), deviceId);
+                    const doc = { ...version.doc, vclock } as FileDoc;
+                    const row = version.baseline?.(vclock) ?? null;
+                    const result = { doc, baselineRecorded: row !== null };
                     return {
-                        chunks: chunks as unknown as CouchSyncDoc[],
+                        ...(version.chunks ? { chunks: version.chunks } : {}),
                         docs: [{
-                            doc: newDoc as unknown as CouchSyncDoc,
+                            doc: doc as unknown as CouchSyncDoc,
                             expectedVclock: existing?.vclock ?? {},
                         }],
-                        // mtime from the pre-read stat: if the file changed
-                        // between stat and readBinary, the recorded mtime is
-                        // older than the content → next stat differs → cache
-                        // miss → re-hash. Always the safe direction.
-                        vclocks: [{
-                            path, op: "set", clock: newVclock,
-                            chunks: chunkIds, size: fileStat.size,
-                            mtime: fileStat.mtime,
-                        }],
+                        ...(row ? { vclocks: [row] } : {}),
                         onCommit: () => {
-                            this.lastSynced.set(toPathKey(path), {
-                                vclock: newVclock,
-                                chunks: chunkIds,
-                                size: fileStat.size,
-                                mtime: fileStat.mtime,
-                            });
+                            if (row) this.lastSynced.set(toPathKey(path), lastSyncedOfRow(row));
+                            outcome.committed = result;
                         },
                     };
                 },
                 { maxAttempts: CAS_MAX_ATTEMPTS },
             );
         } catch (e) {
-            this.surfaceWriteError(e, `forceLocalEdit ${path}`);
+            this.surfaceWriteError(e, context);
             throw e;
         }
-    }
-
-    /**
-     * Force-tombstone the local doc for `path`, merging `baselineVclock`
-     * into the tombstone's vclock. Bypasses the divergent guard. Used by
-     * ConflictOrchestrator when the user picks keep-local (= keep
-     * deletion) in the divergent-delete modal.
-     */
-    async forceMarkDeleted(path: string, baselineVclock: VectorClock): Promise<void> {
-        const fileId = makeFileId(path);
-        const deviceId = this.getSettings().deviceId;
-        try {
-            await this.db.runWriteBuilder(
-                async (snap) => {
-                    const existing = (await snap.get(fileId)) as FileDoc | null;
-                    if (!existing) {
-                        return {
-                            vclocks: [{ path, op: "delete" }],
-                            onCommit: () => { this.lastSynced.delete(toPathKey(path)); },
-                        };
-                    }
-                    if (existing.deleted) {
-                        // Already a tombstone — align the deleted baseline
-                        // instead of erasing the entry.
-                        return this.deletedBaselineTx(path, existing.vclock ?? {});
-                    }
-                    const merged = mergeVC(baselineVclock, existing.vclock ?? {});
-                    const newVclock = incrementVC(merged, deviceId);
-                    return {
-                        docs: [{
-                            doc: {
-                                ...existing,
-                                deleted: true,
-                                mtime: Date.now(),
-                                vclock: newVclock,
-                            } as unknown as CouchSyncDoc,
-                            expectedVclock: existing.vclock,
-                        }],
-                        ...this.deletedBaselineTx(path, newVclock),
-                    };
-                },
-                { maxAttempts: CAS_MAX_ATTEMPTS },
-            );
-        } catch (e) {
-            this.surfaceWriteError(e, `forceMarkDeleted ${path}`);
-            throw e;
+        if (outcome.committed === "stale") {
+            logInfo(`${context}: the doc changed since the conflict was shown — nothing written`);
         }
+        return outcome.committed;
     }
 
     /**

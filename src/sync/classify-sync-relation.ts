@@ -21,20 +21,18 @@
  *                         and merging clocks into the baseline loops on
  *                         phantom stamps.
  * - `remote-edit`       — chunks differ + right side dominates. Pure pull
- *                         case (left content matches the integration
- *                         baseline; safe to overwrite).
+ *                         case: at a vault call site, the left content
+ *                         still matches an alive integration baseline, so
+ *                         it is safe to overwrite.
  * - `local-edit`        — chunks differ + left side is at least as
  *                         causally current. Push case.
  * - `true-divergent`    — chunks differ + (vclock concurrent OR right
- *                         dominates AND left has diverged from baseline OR a
+ *                         dominates at a vault call site while no alive
+ *                         baseline explains the left content OR a
  *                         pull-site vclock TIE — equal clocks with differing
  *                         content, the config-Create stale-collision shape, only
  *                         when `leftVCAttributed` is falsy). Genuine conflict
  *                         requiring user resolution.
- * - `legacy-skip`       — `lastSynced.chunks` is undefined (pre-extension
- *                         meta entry); caller falls back to vclock-only
- *                         logic. The startup legacy-lastSynced sweep
- *                         upgrades these.
  *
  * Mapping at call sites:
  *   - vault-scan (compareFileToDoc / reconciler): left = vault disk +
@@ -116,10 +114,21 @@
  *     shape) preserves the legacy chunks-only semantics.
  *   - `remote-edit` against a tombstone means "deletion pending disk
  *     apply" — it is only safe when the left content still matches an
- *     alive baseline. With no baseline (or a deleted/legacy one) the safe
- *     verdict is `true-divergent`: silent-skip wedges the path unpushable
- *     and silent-restore resurrects a user deletion, so the conflict
- *     orchestrator must arbitrate.
+ *     alive baseline. With no baseline (or a deleted one, or one without a
+ *     fingerprint) the safe verdict is `true-divergent`: silent-skip
+ *     wedges the path unpushable and silent-restore resurrects a user
+ *     deletion, so the conflict orchestrator must arbitrate.
+ *
+ * **The disk is replaced only when the baseline explains it.**
+ *   At a vault call site the disk has no clock of its own; "right
+ *   dominates" only says the doc moved past what this device integrated.
+ *   It says nothing about the disk content, so `remote-edit` (overwrite or
+ *   delete the disk) needs an alive baseline with a fingerprint that the
+ *   disk still matches. Without one, differing content is content this
+ *   device never synced — a file made here before its first push, or one
+ *   that came into the filters — and the user chooses (`true-divergent`).
+ *   Equal content never reaches this question: it is `identical` or
+ *   `vclock-only-drift`, and the caller only aligns the baseline.
  */
 
 import { compareVC, type VectorClock } from "./vector-clock.ts";
@@ -131,8 +140,7 @@ export type SyncRelation =
     | "vclock-only-drift"
     | "remote-edit"
     | "local-edit"
-    | "true-divergent"
-    | "legacy-skip";
+    | "true-divergent";
 
 export interface ClassifyInput {
     /** The "left" side: the side asking the question.
@@ -150,12 +158,11 @@ export interface ClassifyInput {
     /** True when `leftVC` is NOT the left side's own causality but the
      *  integration baseline's (vault call sites: a disk file has no vclock,
      *  so `lastSynced.vclock` is attributed to it). With an attributed
-     *  vclock, "right dominates" against a tombstone is only trustworthy
-     *  when a baseline explains the left content — without one the verdict
-     *  must fall to `true-divergent`. Pull call sites compare
-     *  two docs with real vclocks and omit this: there "right dominates"
-     *  is genuine causality and a dominating tombstone is a legitimate
-     *  deletion to take. */
+     *  vclock, "right dominates" is only trustworthy when an alive baseline
+     *  explains the left content — without one the verdict falls to
+     *  `true-divergent`. Pull call sites compare two docs with real vclocks
+     *  and omit this: there "right dominates" is genuine causality, and the
+     *  right side (a newer edit or a dominating tombstone) is taken. */
     leftVCAttributed?: boolean;
     /** The "right" side: the comparing side.
      *  - vault-scan: FileDoc
@@ -166,13 +173,14 @@ export interface ClassifyInput {
     rightSize: number;
     /** Whether the right side is a deletion tombstone. */
     rightDeleted?: boolean;
-    /** Integration baseline. When provided, lets the classifier distinguish
-     *  "pure stale, safe to apply remote" from "user edited stale state,
-     *  conflict needed". When the baseline lacks chunks/size (legacy entry
-     *  pre-extension), the function returns `legacy-skip` for any case
-     *  that would have used baseline content; vclock-only outcomes are
-     *  unaffected. Pull-writer call sites that don't track integration
-     *  state should omit this. */
+    /** Integration baseline of the path, read only at vault call sites
+     *  (`leftVCAttributed`). Undefined when this device has none: it
+     *  distinguishes "disk still holds what was synced, safe to apply
+     *  remote" from "the disk holds content not synced, conflict needed".
+     *  An entry without chunks/size (written before baselines carried a
+     *  fingerprint) cannot explain the disk, so it counts as none for
+     *  that question; vclock-only outcomes are unaffected. Pull call
+     *  sites do not track integration state and omit this. */
     lastSynced?: LastSynced;
     /** True only during a CONFIG pull's seq-regression re-pull (the remote
      *  config DB was destroyed + recreated by a Create elsewhere — see
@@ -256,49 +264,31 @@ export function classifySyncRelation(input: ClassifyInput): SyncRelation {
 }
 
 /**
- * Refine a "right dominates" case: pure remote-edit when the left side
- * still matches the integration baseline; otherwise the local side has
- * drifted (conflict needed).
+ * Refine a "right dominates" case (chunks differ).
  *
- * Tombstone right side: `remote-edit` here means "deletion
- * pending disk apply", which is only safe when the left content still
- * matches an *alive* baseline (= the user has not touched the file since
- * the last integration; the pull pipeline will delete it from disk). With
- * no baseline, a legacy baseline, or a deleted baseline (the tombstone
- * advanced past our integrated deletion — another device deleted again
- * while we recreated), the alive left side is unexplained local content:
- * silent-skip would wedge the path unpushable and silent-restore would
- * resurrect a deletion, so route to the conflict
- * orchestrator via `true-divergent`.
+ * Pull call sites compare two docs with real clocks: the right side is
+ * causally newer, so take it (`remote-edit`).
+ *
+ * Vault call sites (attributed leftVC): the domination is over the
+ * baseline's clock, not over the disk content. Overwriting or deleting the
+ * disk is safe only when an alive baseline with a fingerprint still matches
+ * the disk. Otherwise the disk holds content this device never synced: the
+ * user edited or deleted the synced version (alive baseline that no longer
+ * matches), recreated the path after a synced deletion (deleted baseline),
+ * or made or gained the file without ever syncing it (no baseline, or one
+ * without a fingerprint). Silent overwrite loses it, silent skip wedges the
+ * path, so the conflict orchestrator lets the user choose.
  */
 function refineRemoteEdit(input: ClassifyInput): SyncRelation {
+    if (input.leftVCAttributed !== true) return "remote-edit";
     const { leftChunks, leftSize, lastSynced } = input;
-    const leftDeleted = input.leftDeleted === true;
-    const rightDeleted = input.rightDeleted === true;
-    if (rightDeleted && !leftDeleted && input.leftVCAttributed === true) {
-        // Vault call sites only (attributed leftVC): an alive disk file
-        // under a dominating tombstone. Trust the domination only when an
-        // alive baseline explains the disk content (deletion pending disk
-        // apply). Pull call sites compare real doc vclocks and skip this —
-        // a dominating tombstone there is a legitimate deletion to take.
-        if (!lastSynced || lastSynced.deleted === true) return "true-divergent";
-        if (lastSynced.chunks === undefined || lastSynced.size === undefined) {
-            return "true-divergent";
-        }
-        const leftMatchesBaseline =
-            leftSize === lastSynced.size && chunkListsEqual(leftChunks, lastSynced.chunks);
-        return leftMatchesBaseline ? "remote-edit" : "true-divergent";
-    }
-    if (!lastSynced) return "remote-edit";
-    if (lastSynced.chunks === undefined || lastSynced.size === undefined) {
-        return "legacy-skip";
-    }
-    // A deleted baseline can never explain alive left content (and a
-    // deleted left side never reaches here via vault call sites). Treat a
-    // mismatch the same as drifted content.
     const leftMatchesBaseline =
-        !lastSynced.deleted &&
-        !leftDeleted &&
-        leftSize === lastSynced.size && chunkListsEqual(leftChunks, lastSynced.chunks);
+        lastSynced !== undefined
+        && lastSynced.deleted !== true
+        && lastSynced.chunks !== undefined
+        && lastSynced.size !== undefined
+        && input.leftDeleted !== true
+        && leftSize === lastSynced.size
+        && chunkListsEqual(leftChunks, lastSynced.chunks);
     return leftMatchesBaseline ? "remote-edit" : "true-divergent";
 }

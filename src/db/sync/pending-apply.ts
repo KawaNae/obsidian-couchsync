@@ -247,9 +247,10 @@ export class PendingApply {
             await this.record(doc._id, "missing-chunks");
             return "skipped";
         }
-        // Written, or declined by the writer for a reason that is not a
-        // missing chunk (IME composition, filtered path): either way the doc
-        // no longer waits for chunks.
+        // Written, or declined for a reason that is not a missing chunk
+        // (filtered path, a vault change not yet synced or an editor's input
+        // not yet saved, which the reconcile offers as a conflict): either
+        // way the doc no longer waits for chunks.
         if (await this.has(doc._id)) {
             await this.resolve([doc._id]);
             this.deps.onRecovered?.(path);

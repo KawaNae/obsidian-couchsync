@@ -248,7 +248,8 @@ export class SyncEngine {
         /** Apply a pulled FileDoc to the vault. The pull-writer awaits
          *  this inside its commit closure. Returns `WriteResult`:
          *  `applied:true` means vault now matches doc; `applied:false`
-         *  means writer declined (IME divergence etc.) and the LocalDB
+         *  means the write was declined (a vault change or an editor's
+         *  input not yet synced) and the LocalDB
          *  doc is now ahead of vault — pull-writer counts these as
          *  `skipCount` and emits `pull-skipped` so the supervisor
          *  schedules a reconciler retry. Throws are caught into

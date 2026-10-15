@@ -38,7 +38,7 @@ describe("FilesystemVaultWriter", () => {
         });
 
         it("is a no-op on missing file", async () => {
-            await writer.applyRemoteDeletion("missing.md");
+            expect(await writer.applyRemoteDeletion("missing.md")).toEqual({ applied: true });
             // No throw. Map unchanged.
             expect(io.files.size).toBe(0);
         });
@@ -61,68 +61,19 @@ describe("FilesystemVaultWriter", () => {
 
 // ── EditorAwareVaultWriter ─────────────────────────────────
 
-import { EditorAwareVaultWriter, type CMLike } from "../src/adapters/editor-aware-vault-writer.ts";
+import { EditorAwareVaultWriter } from "../src/adapters/editor-aware-vault-writer.ts";
 import { CompositionGate } from "../src/sync/composition-gate.ts";
+import { UNSAVED_EDITOR_CHANGE, UNSYNCED_VAULT_CHANGE } from "../src/sync/vault-writer.ts";
 import { FakeCompositionTracker } from "./helpers/fake-composition-tracker.ts";
+import { makeFakeApp, makeLeaf, type FakeLeaf } from "./helpers/fake-editor.ts";
 
-interface FakeView {
-    file: { path: string };
-    editor: { cm: FakeCM };
-}
-
-interface FakeLeaf {
-    view: FakeView;
-    detach: ReturnType<typeof vi.fn>;
-}
-
-class FakeCM implements CMLike {
-    composing = false;
-    state: { doc: FakeDoc };
-    dispatchSpy: ReturnType<typeof vi.fn>;
-
-    constructor(initial: string) {
-        this.state = { doc: new FakeDoc(initial) };
-        this.dispatchSpy = vi.fn((spec: { changes: { from: number; to: number; insert: string } }) => {
-            const { from, to, insert } = spec.changes;
-            const cur = this.state.doc.toString();
-            const next = cur.slice(0, from) + insert + cur.slice(to);
-            this.state = { doc: new FakeDoc(next) };
-        });
-    }
-
-    dispatch(spec: { changes: { from: number; to: number; insert: string } }): void {
-        this.dispatchSpy(spec);
-    }
-}
-
-class FakeDoc {
-    constructor(private text: string) {}
-    get length(): number { return this.text.length; }
-    toString(): string { return this.text; }
-}
-
-function makeFakeApp(leaves: FakeLeaf[]) {
-    return {
-        workspace: {
-            getLeavesOfType: (_t: string) => leaves,
-        },
-    } as unknown as import("obsidian").App;
-}
-
-function makeLeaf(path: string, initial: string): FakeLeaf {
-    return {
-        view: {
-            file: { path },
-            editor: { cm: new FakeCM(initial) },
-        },
-        detach: vi.fn(),
-    };
-}
+const bytes = (text: string) => new TextEncoder().encode(text).buffer;
 
 describe("EditorAwareVaultWriter", () => {
     let io: FakeVaultIO;
     let tracker: FakeCompositionTracker;
     let gate: CompositionGate;
+    let writeIgnore: { ignoreDelete: ReturnType<typeof vi.fn>; ignoreNextModify: ReturnType<typeof vi.fn> };
 
     beforeEach(() => {
         vi.useFakeTimers();
@@ -130,6 +81,7 @@ describe("EditorAwareVaultWriter", () => {
         tracker = new FakeCompositionTracker();
         gate = new CompositionGate(tracker, { timeoutMs: 30_000 });
         gate.start();
+        writeIgnore = { ignoreDelete: vi.fn(), ignoreNextModify: vi.fn() };
     });
 
     afterEach(() => {
@@ -137,189 +89,284 @@ describe("EditorAwareVaultWriter", () => {
         vi.useRealTimers();
     });
 
-    function makeWriter(leaves: FakeLeaf[], opts: { writeIgnore?: any; historyCapture?: any } = {}) {
-        const app = makeFakeApp(leaves);
+    function makeWriter(leaves: FakeLeaf[], opts: { historyCapture?: any } = {}) {
         return new EditorAwareVaultWriter(
-            app,
-            io,
-            gate,
-            opts.writeIgnore ?? null,
-            opts.historyCapture ?? null,
+            makeFakeApp(leaves), io, gate, writeIgnore, opts.historyCapture ?? null,
         );
     }
 
-    // ── No-editor fallback ────────────────────────────────
+    /** Start an IME composition in `leaf` with its text unchanged. */
+    function compose(leaf: FakeLeaf): void {
+        leaf.view.editor.cm.composing = true;
+        tracker.startComposition(leaf.view.file.path);
+    }
 
-    it("falls back to IVaultIO when no editor has the file open", async () => {
+    function endComposition(leaf: FakeLeaf): void {
+        leaf.view.editor.cm.composing = false;
+        tracker.endComposition(leaf.view.file.path);
+    }
+
+    // ── No editor ─────────────────────────────────────────
+
+    it("writes the disk when no editor has the file open", async () => {
         io.addFile("a.md", "old");
-        const ignoreNextModify = vi.fn();
-        const writer = makeWriter([], {
-            writeIgnore: { ignoreDelete: vi.fn(), ignoreNextModify },
-        });
-        const result = await writer.applyRemoteContent(
-            "a.md",
-            new TextEncoder().encode("new").buffer,
-        );
-        expect(result).toEqual({ applied: true });
+        const writer = makeWriter([]);
+        expect(await writer.applyRemoteContent("a.md", bytes("new"))).toEqual({ applied: true });
         expect(io.readText("a.md")).toBe("new");
-        // The fallback path also suppresses the echo modify event.
-        expect(ignoreNextModify).toHaveBeenCalledWith("a.md");
+        expect(writeIgnore.ignoreNextModify).toHaveBeenCalledWith("a.md");
     });
 
-    it("captures history for fallback writes", async () => {
+    it("captures history for writes", async () => {
         io.addFile("a.md", "old");
         const captureSyncWrite = vi.fn(async () => {});
         const writer = makeWriter([], { historyCapture: { captureSyncWrite } });
-        await writer.applyRemoteContent(
-            "a.md",
-            new TextEncoder().encode("new").buffer,
-        );
+        await writer.applyRemoteContent("a.md", bytes("new"));
         expect(captureSyncWrite).toHaveBeenCalledWith("a.md", "new");
     });
 
-    // ── Single editor, not composing ──────────────────────
+    // ── Panes that hold what the disk holds ───────────────
 
-    it("dispatches CM transaction AND writes to disk when single pane is not composing", async () => {
-        // Disk-write truth: disk write happens even with editor
-        // open. CM dispatch is the UX overlay; disk is the truth.
+    it("replaces a pane that holds the disk's text, and writes the disk", async () => {
         io.addFile("a.md", "old");
-        const ignoreNextModify = vi.fn();
         const leaf = makeLeaf("a.md", "old");
-        const writer = makeWriter([leaf], {
-            writeIgnore: { ignoreDelete: vi.fn(), ignoreNextModify },
-        });
-        const result = await writer.applyRemoteContent(
-            "a.md",
-            new TextEncoder().encode("new").buffer,
-        );
-        expect(result).toEqual({ applied: true });
-        expect(leaf.view.editor.cm.dispatchSpy).toHaveBeenCalledTimes(1);
-        expect(leaf.view.editor.cm.state.doc.toString()).toBe("new");
-        // Disk has the new content too.
+        const writer = makeWriter([leaf]);
+        expect(await writer.applyRemoteContent("a.md", bytes("new"))).toEqual({ applied: true });
+        expect(leaf.view.editor.cm.text()).toBe("new");
         expect(io.readText("a.md")).toBe("new");
-        // The echo modify event from writeBinary is suppressed.
-        expect(ignoreNextModify).toHaveBeenCalledWith("a.md");
+        expect(writeIgnore.ignoreNextModify).toHaveBeenCalledWith("a.md");
     });
 
-    // ── Multi-pane, none composing ────────────────────────
-
-    it("dispatches on every pane simultaneously and writes disk once", async () => {
+    it("replaces every pane on the path and writes the disk once", async () => {
         io.addFile("file.md", "old");
         const a = makeLeaf("file.md", "old");
         const b = makeLeaf("file.md", "old");
-        const writer = makeWriter([a, b]);
-        await writer.applyRemoteContent(
-            "file.md",
-            new TextEncoder().encode("new").buffer,
-        );
-        expect(a.view.editor.cm.dispatchSpy).toHaveBeenCalledTimes(1);
-        expect(b.view.editor.cm.dispatchSpy).toHaveBeenCalledTimes(1);
-        expect(a.view.editor.cm.state.doc.toString()).toBe("new");
-        expect(b.view.editor.cm.state.doc.toString()).toBe("new");
+        const other = makeLeaf("other.md", "x");
+        const writer = makeWriter([a, b, other]);
+        await writer.applyRemoteContent("file.md", bytes("new"));
+        expect(a.view.editor.cm.text()).toBe("new");
+        expect(b.view.editor.cm.text()).toBe("new");
+        expect(other.view.editor.cm.dispatchSpy).not.toHaveBeenCalled();
         expect(io.readText("file.md")).toBe("new");
     });
 
-    // ── Composing — defer ────────────────────────────────
-
-    it("defers dispatch while editor is composing, then writes disk on drain", async () => {
+    it("replaces the panes before the disk write, so later input lands on the new text", async () => {
         io.addFile("a.md", "old");
         const leaf = makeLeaf("a.md", "old");
-        leaf.view.editor.cm.composing = true;
-        tracker.startComposition("a.md");
+        const writer = makeWriter([leaf]);
+        const textAtDiskWrite: string[] = [];
+        const write = io.writeBinary.bind(io);
+        io.writeBinary = async (p, d) => {
+            textAtDiskWrite.push(leaf.view.editor.cm.text());
+            await write(p, d);
+        };
+        await writer.applyRemoteContent("a.md", bytes("new"));
+        expect(textAtDiskWrite).toEqual(["new"]);
+    });
+
+    it("treats CRLF and a BOM on disk as the pane's LF text", async () => {
+        io.addFile("a.md", "﻿line 1\r\nline 2\r\n");
+        const leaf = makeLeaf("a.md", "line 1\nline 2\n");
+        const writer = makeWriter([leaf]);
+        expect(await writer.applyRemoteContent("a.md", bytes("new\n"))).toEqual({ applied: true });
+        expect(leaf.view.editor.cm.text()).toBe("new\n");
+        expect(io.readText("a.md")).toBe("new\n");
+    });
+
+    // ── Unsaved input ─────────────────────────────────────
+
+    it("declines and touches nothing while a pane holds unsaved input", async () => {
+        io.addFile("a.md", "old");
+        const leaf = makeLeaf("a.md", "old plus typing");
+        const writer = makeWriter([leaf]);
+        expect(await writer.applyRemoteContent("a.md", bytes("new"))).toEqual({
+            applied: false, reason: UNSAVED_EDITOR_CHANGE,
+        });
+        expect(leaf.view.editor.cm.dispatchSpy).not.toHaveBeenCalled();
+        expect(io.readText("a.md")).toBe("old");
+        // No echo suppression: the editor's coming save is the user's change.
+        expect(writeIgnore.ignoreNextModify).not.toHaveBeenCalled();
+    });
+
+    it("declines when any one of several panes holds unsaved input", async () => {
+        io.addFile("a.md", "old");
+        const clean = makeLeaf("a.md", "old");
+        const typing = makeLeaf("a.md", "old!");
+        const writer = makeWriter([clean, typing]);
+        const result = await writer.applyRemoteContent("a.md", bytes("new"));
+        expect(result).toEqual({ applied: false, reason: UNSAVED_EDITOR_CHANGE });
+        expect(clean.view.editor.cm.dispatchSpy).not.toHaveBeenCalled();
+        expect(typing.view.editor.cm.dispatchSpy).not.toHaveBeenCalled();
+    });
+
+    it("declines unsaved input on a file with CRLF line breaks", async () => {
+        io.addFile("a.md", "line 1\r\n");
+        const leaf = makeLeaf("a.md", "line 1\nline 2\n");
+        const writer = makeWriter([leaf]);
+        expect((await writer.applyRemoteContent("a.md", bytes("new"))).applied).toBe(false);
+        expect(io.readText("a.md")).toBe("line 1\r\n");
+    });
+
+    it("writes once the editor has saved its input and the pane matches the disk again", async () => {
+        io.addFile("a.md", "old");
+        const leaf = makeLeaf("a.md", "old!");
+        const writer = makeWriter([leaf]);
+        expect((await writer.applyRemoteContent("a.md", bytes("new"))).applied).toBe(false);
+        io.addFile("a.md", "old!"); // the editor's save
+        expect(await writer.applyRemoteContent("a.md", bytes("new"))).toEqual({ applied: true });
+    });
+
+    // ── IME composition ───────────────────────────────────
+
+    it("waits for a composition that has not changed the text, then writes", async () => {
+        io.addFile("a.md", "old");
+        const leaf = makeLeaf("a.md", "old");
+        compose(leaf);
         const writer = makeWriter([leaf]);
 
-        const promise = writer.applyRemoteContent(
-            "a.md",
-            new TextEncoder().encode("new").buffer,
-        );
-        await Promise.resolve();
+        const promise = writer.applyRemoteContent("a.md", bytes("new"));
+        await vi.advanceTimersByTimeAsync(0);
+        expect(gate.pendingCount("a.md")).toBe(1);
         expect(leaf.view.editor.cm.dispatchSpy).not.toHaveBeenCalled();
-        // Disk is NOT touched while composing.
         expect(io.readText("a.md")).toBe("old");
 
-        // End composition → drain → CM dispatch + disk write
-        leaf.view.editor.cm.composing = false;
-        tracker.endComposition("a.md");
-        const result = await promise;
-        expect(result).toEqual({ applied: true });
-        expect(leaf.view.editor.cm.state.doc.toString()).toBe("new");
+        endComposition(leaf);
+        expect(await promise).toEqual({ applied: true });
+        expect(leaf.view.editor.cm.text()).toBe("new");
         expect(io.readText("a.md")).toBe("new");
     });
 
-    it("skips dispatch when local doc diverges during composition", async () => {
-        const leaf = makeLeaf("a.md", "old");
-        leaf.view.editor.cm.composing = true;
-        tracker.startComposition("a.md");
-        const writer = makeWriter([leaf]);
-
-        const promise = writer.applyRemoteContent(
-            "a.md",
-            new TextEncoder().encode("new").buffer,
-        );
-
-        // Simulate user committing IME text — doc changes underneath us.
-        leaf.view.editor.cm.state = { doc: new FakeDoc("old + user typed") };
-        leaf.view.editor.cm.composing = false;
-        tracker.endComposition("a.md");
-        const result = await promise;
-
-        expect(result).toEqual({
-            applied: false,
-            reason: "local-changed-during-composition",
-        });
-        expect(leaf.view.editor.cm.dispatchSpy).not.toHaveBeenCalled();
-    });
-
-    it("falls back to disk write when all editors close during defer", async () => {
+    it("declines at once when the composing pane already holds input", async () => {
         io.addFile("a.md", "old");
         const leaf = makeLeaf("a.md", "old");
-        leaf.view.editor.cm.composing = true;
-        tracker.startComposition("a.md");
+        compose(leaf);
+        leaf.view.editor.cm.type("old にほん");
+        const writer = makeWriter([leaf]);
 
-        // Use a leaves array we can mutate to simulate close.
+        expect(await writer.applyRemoteContent("a.md", bytes("new"))).toEqual({
+            applied: false, reason: UNSAVED_EDITOR_CHANGE,
+        });
+        expect(gate.pendingCount("a.md")).toBe(0);
+    });
+
+    it("declines when the composition commits text into the pane", async () => {
+        io.addFile("a.md", "old");
+        const leaf = makeLeaf("a.md", "old");
+        compose(leaf);
+        const writer = makeWriter([leaf]);
+
+        const promise = writer.applyRemoteContent("a.md", bytes("new"));
+        await vi.advanceTimersByTimeAsync(0);
+        leaf.view.editor.cm.type("old 日本");
+        endComposition(leaf);
+
+        expect(await promise).toEqual({ applied: false, reason: UNSAVED_EDITOR_CHANGE });
+        expect(leaf.view.editor.cm.dispatchSpy).not.toHaveBeenCalled();
+        expect(io.readText("a.md")).toBe("old");
+    });
+
+    it("declines when the committed text was saved while the write waited", async () => {
+        io.addFile("a.md", "old");
+        const leaf = makeLeaf("a.md", "old");
+        compose(leaf);
+        const writer = makeWriter([leaf]);
+
+        const promise = writer.applyRemoteContent("a.md", bytes("new"));
+        await vi.advanceTimersByTimeAsync(0);
+        leaf.view.editor.cm.type("old 日本");
+        io.addFile("a.md", "old 日本"); // the editor's save: pane == disk again
+        endComposition(leaf);
+
+        expect(await promise).toEqual({ applied: false, reason: UNSYNCED_VAULT_CHANGE });
+        expect(io.readText("a.md")).toBe("old 日本");
+    });
+
+    it("declines, without waiting again, when the composition outlasts the gate's timeout", async () => {
+        io.addFile("a.md", "old");
+        const leaf = makeLeaf("a.md", "old");
+        compose(leaf);
+        const writer = makeWriter([leaf]);
+
+        const promise = writer.applyRemoteContent("a.md", bytes("new"));
+        await vi.advanceTimersByTimeAsync(30_000);
+
+        expect(await promise).toEqual({ applied: false, reason: UNSAVED_EDITOR_CHANGE });
+        expect(gate.pendingCount("a.md")).toBe(0);
+        expect(io.readText("a.md")).toBe("old");
+    });
+
+    it("writes the disk when every pane closed while the write waited", async () => {
+        io.addFile("a.md", "old");
+        const leaf = makeLeaf("a.md", "old");
+        compose(leaf);
         const leaves = [leaf];
-        const writer = new EditorAwareVaultWriter(
-            { workspace: { getLeavesOfType: () => leaves } } as unknown as import("obsidian").App,
-            io,
-            gate,
-            null,
-            null,
-        );
+        const writer = makeWriter(leaves);
 
-        const promise = writer.applyRemoteContent(
-            "a.md",
-            new TextEncoder().encode("fallback").buffer,
-        );
+        const promise = writer.applyRemoteContent("a.md", bytes("fallback"));
+        await vi.advanceTimersByTimeAsync(0);
+        leaves.length = 0;
+        endComposition(leaf);
 
-        leaves.length = 0;  // close all panes
-        leaf.view.editor.cm.composing = false;
-        tracker.endComposition("a.md");
-
-        const result = await promise;
-        expect(result).toEqual({ applied: true });
+        expect(await promise).toEqual({ applied: true });
         expect(io.readText("a.md")).toBe("fallback");
+    });
+
+    it("flushAll rejects a write waiting for a composition", async () => {
+        io.addFile("a.md", "old");
+        const leaf = makeLeaf("a.md", "old");
+        compose(leaf);
+        const writer = makeWriter([leaf]);
+
+        const promise = writer.applyRemoteContent("a.md", bytes("new"));
+        await vi.advanceTimersByTimeAsync(0);
+        writer.flushAll();
+        await expect(promise).rejects.toThrow(/CompositionGate flushed/);
     });
 
     // ── Deletion ──────────────────────────────────────────
 
-    it("detaches open leaves before deletion", async () => {
-        io.addFile("a.md", "x");
-        const ignoreDelete = vi.fn();
-        const leaf = makeLeaf("a.md", "x");
-        const writer = makeWriter([leaf], {
-            writeIgnore: { ignoreDelete },
-        });
+    it("detaches the panes and deletes the file when they hold the disk's text", async () => {
+        io.addFile("a.md", "x\r\n");
+        const leaf = makeLeaf("a.md", "x\n");
+        const writer = makeWriter([leaf]);
 
-        await writer.applyRemoteDeletion("a.md");
-
+        expect(await writer.applyRemoteDeletion("a.md")).toEqual({ applied: true });
         expect(leaf.detach).toHaveBeenCalled();
-        expect(ignoreDelete).toHaveBeenCalledWith("a.md");
+        expect(writeIgnore.ignoreDelete).toHaveBeenCalledWith("a.md");
         expect(await io.exists("a.md")).toBe(false);
     });
 
-    it("applyRemoteDeletion is a no-op when file already gone", async () => {
+    it("keeps the file and its panes while a pane holds unsaved input", async () => {
+        io.addFile("a.md", "x");
+        const leaf = makeLeaf("a.md", "x and more");
+        const writer = makeWriter([leaf]);
+
+        expect(await writer.applyRemoteDeletion("a.md")).toEqual({
+            applied: false, reason: UNSAVED_EDITOR_CHANGE,
+        });
+        expect(leaf.detach).not.toHaveBeenCalled();
+        expect(writeIgnore.ignoreDelete).not.toHaveBeenCalled();
+        expect(await io.exists("a.md")).toBe(true);
+    });
+
+    it("waits for a composition before detaching and deleting", async () => {
+        io.addFile("a.md", "x");
+        const leaf = makeLeaf("a.md", "x");
+        compose(leaf);
+        const writer = makeWriter([leaf]);
+
+        const promise = writer.applyRemoteDeletion("a.md");
+        await vi.advanceTimersByTimeAsync(0);
+        expect(leaf.detach).not.toHaveBeenCalled();
+
+        endComposition(leaf);
+        expect(await promise).toEqual({ applied: true });
+        expect(leaf.detach).toHaveBeenCalled();
+        expect(await io.exists("a.md")).toBe(false);
+    });
+
+    it("applyRemoteDeletion is a no-op when the file is already gone", async () => {
         const writer = makeWriter([]);
-        await writer.applyRemoteDeletion("missing.md");
+        expect(await writer.applyRemoteDeletion("missing.md")).toEqual({ applied: true });
         expect(io.files.size).toBe(0);
     });
 
@@ -328,25 +375,8 @@ describe("EditorAwareVaultWriter", () => {
     it("createFile writes via IVaultIO", async () => {
         const captureSyncWrite = vi.fn(async () => {});
         const writer = makeWriter([], { historyCapture: { captureSyncWrite } });
-        await writer.createFile("new.md", new TextEncoder().encode("hello").buffer);
+        await writer.createFile("new.md", bytes("hello"));
         expect(io.readText("new.md")).toBe("hello");
         expect(captureSyncWrite).toHaveBeenCalledWith("new.md", "hello");
-    });
-
-    // ── flushAll ──────────────────────────────────────────
-
-    it("flushAll rejects pending deferred ops", async () => {
-        const leaf = makeLeaf("a.md", "old");
-        leaf.view.editor.cm.composing = true;
-        tracker.startComposition("a.md");
-        const writer = makeWriter([leaf]);
-
-        const promise = writer.applyRemoteContent(
-            "a.md",
-            new TextEncoder().encode("new").buffer,
-        );
-
-        writer.flushAll();
-        await expect(promise).rejects.toThrow(/CompositionGate flushed/);
     });
 });

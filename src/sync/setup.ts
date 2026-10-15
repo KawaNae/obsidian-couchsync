@@ -114,7 +114,9 @@ export class SetupService {
                     if (!fileDoc.deleted && this.vaultSync.shouldSync(vaultPath)) {
                         onProgress(`Writing: ${vaultPath} (${++done}/${toWrite})`);
                     }
-                    const result = await this.vaultSync.dbToFile(fileDoc);
+                    // Clone replaces the vault's version of every path the server
+                    // has, as its confirmation tells the user.
+                    const result = await this.vaultSync.dbToFile(fileDoc, { overwriteVaultChange: true });
                     if (!fileDoc.deleted && result.applied) vaultFiles++;
                 } catch (e) {
                     logError(`Failed to write ${vaultPath}: ${e?.message ?? e}`);

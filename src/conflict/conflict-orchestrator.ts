@@ -4,10 +4,10 @@ import { ConflictResolver } from "./conflict-resolver.ts";
 import type { HistoryCapture } from "../history/history-capture.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { WriteResult } from "../sync/vault-writer.ts";
-import type { VaultSync } from "../sync/vault-sync.ts";
+import type { VaultSync, DbToFileOptions, ForceWriteOutcome } from "../sync/vault-sync.ts";
 import type { IVaultIO } from "../types/vault-io.ts";
 import type { FileDoc, CouchSyncDoc } from "../types.ts";
-import type { IModalPresenter, ConflictBatchItem } from "../types/modal-presenter.ts";
+import type { IModalPresenter, ConflictBatchItem, ConflictContent } from "../types/modal-presenter.ts";
 import { isFileDoc, isConfigDoc } from "../types.ts";
 import { joinChunks } from "../db/chunker.ts";
 import { isDiffableText } from "../utils/binary.ts";
@@ -22,10 +22,14 @@ export interface ConflictOrchestratorDeps {
     localDb: LocalDB;
     replicator: SyncEngine;
     historyCapture: HistoryCapture;
-    dbToFile: (doc: FileDoc) => Promise<WriteResult>;
+    dbToFile: (doc: FileDoc, opts?: DbToFileOptions) => Promise<WriteResult>;
     getSettings: () => CouchSyncSettings;
     vault: IVaultIO;
     vaultSync: VaultSync;
+    /** Ask the reconcile to look at the vault again. A Keep Local on a
+     *  conflict it found that applied nothing is offered again this way,
+     *  with the versions as they are now. */
+    requestReconcile: () => void;
     /** Conflicts in a single drain ≥ this count are shown as ONE batch modal
      *  instead of N stacked single modals (the black-screen fix). Default 10. */
     batchThreshold?: number;
@@ -37,6 +41,35 @@ export interface ConflictOrchestratorDeps {
 
 const EMPTY_BUF = new ArrayBuffer(0);
 
+/** What the conflict modals show: a diff when both sides are text, each
+ *  side's size when either is binary. Either way the user chooses. */
+function conflictContent(localBuf: ArrayBuffer, remoteBuf: ArrayBuffer): ConflictContent {
+    if (isDiffableText(localBuf) && isDiffableText(remoteBuf)) {
+        const dec = new TextDecoder("utf-8");
+        return { kind: "text", localText: dec.decode(localBuf), remoteText: dec.decode(remoteBuf) };
+    }
+    return { kind: "binary", localSize: localBuf.byteLength, remoteSize: remoteBuf.byteLength };
+}
+
+/** The conflict history keeps the text of a side; a binary side is kept as "". */
+function historyText(buf: ArrayBuffer): string {
+    return isDiffableText(buf) ? new TextDecoder("utf-8").decode(buf) : "";
+}
+
+/** A divergent-vault conflict answered with the remote version: the modal
+ *  showed the vault's version, and the user chose to replace it. */
+const USER_CHOSE_REMOTE: DbToFileOptions = { overwriteVaultChange: true };
+
+/**
+ * What applying the user's choice did.
+ * - `applied`: the chosen version was committed.
+ * - `superseded`: nothing was written, because the local DB doc the dialog
+ *   showed had been replaced before the choice was applied (or the vault
+ *   file it showed was gone). The conflict is presented again with the
+ *   current versions.
+ */
+type ApplyOutcome = "applied" | "superseded";
+
 /**
  * The result of surfacing a conflict to the user.
  * - `resolved`: the user picked a winner, another device resolved it, or an
@@ -44,8 +77,10 @@ const EMPTY_BUF = new ArrayBuffer(0);
  *   (if any) may be cleared.
  * - `deferred`: the user closed without choosing (× = 保留). NOTHING was
  *   applied and the durable record MUST be kept for re-presentation.
+ * - `superseded`: the choice applied nothing (see `ApplyOutcome`). The
+ *   durable record is kept, as for `deferred`.
  */
-type ConflictOutcome = "resolved" | "deferred";
+type ConflictOutcome = "resolved" | "deferred" | "superseded";
 
 /** A conflict waiting to be presented to the user (queued for batch/serial
  *  drain). The apply closures capture the origin-specific resolution logic so
@@ -56,8 +91,8 @@ interface QueuedConflict {
     filePath: string;
     localBuf: ArrayBuffer;
     remoteBuf: ArrayBuffer;
-    applyTakeRemote: () => Promise<void>;
-    applyKeepLocal: () => Promise<void>;
+    applyTakeRemote: () => Promise<ApplyOutcome>;
+    applyKeepLocal: () => Promise<ApplyOutcome>;
     clearDurable: () => Promise<void>;
     waiters: Array<() => void>;
 }
@@ -302,9 +337,10 @@ export class ConflictOrchestrator {
             outcome = "resolved";
         }
         // A defer keeps the durable record so it re-presents next session
-        // (it is not re-derived from the pull feed). Anything else (resolved /
-        // error keep-local) clears it.
-        if (outcome !== "deferred") {
+        // (it is not re-derived from the pull feed), and so does a choice
+        // that applied nothing. Anything else (resolved / error keep-local)
+        // clears it.
+        if (outcome === "resolved") {
             await item.clearDurable();
             this.deps.replicator.events.emit("conflict-resolved", { filePath: item.filePath });
         }
@@ -312,17 +348,10 @@ export class ConflictOrchestrator {
 
     /** Present many conflicts as ONE batch modal and apply the bulk decision. */
     private async processBatch(items: QueuedConflict[]): Promise<void> {
-        const dec = new TextDecoder("utf-8");
-        const batchItems: ConflictBatchItem[] = items.map((it) => {
-            const ld = isDiffableText(it.localBuf);
-            const rd = isDiffableText(it.remoteBuf);
-            return {
-                filePath: it.filePath,
-                localText: ld ? dec.decode(it.localBuf) : "",
-                remoteText: rd ? dec.decode(it.remoteBuf) : "",
-                binary: !(ld && rd),
-            };
-        });
+        const batchItems: ConflictBatchItem[] = items.map((it) => ({
+            filePath: it.filePath,
+            content: conflictContent(it.localBuf, it.remoteBuf),
+        }));
 
         const decision = await this.deps.modal.showConflictBatchModal(batchItems);
         switch (decision.kind) {
@@ -365,14 +394,15 @@ export class ConflictOrchestrator {
         item: QueuedConflict,
         choice: "keep-local" | "take-remote",
     ): Promise<void> {
-        const dec = new TextDecoder("utf-8");
         try {
-            if (choice === "take-remote") await item.applyTakeRemote();
-            else await item.applyKeepLocal();
+            const applied = choice === "take-remote"
+                ? await item.applyTakeRemote()
+                : await item.applyKeepLocal();
+            if (applied === "superseded") return; // keep the durable record
             await this.deps.historyCapture.saveConflict(
                 item.filePath,
-                isDiffableText(item.localBuf) ? dec.decode(item.localBuf) : "",
-                isDiffableText(item.remoteBuf) ? dec.decode(item.remoteBuf) : "",
+                historyText(item.localBuf),
+                historyText(item.remoteBuf),
                 choice === "take-remote" ? "remote" : "local",
             );
             await item.clearDurable();
@@ -414,15 +444,18 @@ export class ConflictOrchestrator {
             localBuf,
             remoteBuf,
             applyTakeRemote: async () => {
-                const writeResult = await this.deps.dbToFile(remoteDoc);
+                const writeResult = await this.deps.dbToFile(remoteDoc, USER_CHOSE_REMOTE);
                 if (writeResult.applied === false) {
                     logWarn(
                         `Divergent-edit take-remote: vault write skipped: ` +
                         `${filePath.split("/").pop()} (${writeResult.reason})`,
                     );
                 }
+                return "applied";
             },
-            applyKeepLocal: () => this.deps.vaultSync.forceLocalEdit(filePath, remoteDoc.vclock ?? {}),
+            applyKeepLocal: async () => this.vaultSideKept(
+                filePath, await this.deps.vaultSync.forceLocalEdit(filePath, remoteDoc.vclock),
+            ),
             clearDurable: async () => {},
             waiters: [],
         });
@@ -456,15 +489,18 @@ export class ConflictOrchestrator {
             localBuf: EMPTY_BUF,
             remoteBuf,
             applyTakeRemote: async () => {
-                const writeResult = await this.deps.dbToFile(remoteDoc);
+                const writeResult = await this.deps.dbToFile(remoteDoc, USER_CHOSE_REMOTE);
                 if (writeResult.applied === false) {
                     logWarn(
                         `Divergent-delete take-remote: vault write skipped: ` +
                         `${filePath.split("/").pop()} (${writeResult.reason})`,
                     );
                 }
+                return "applied";
             },
-            applyKeepLocal: () => this.deps.vaultSync.forceMarkDeleted(filePath, remoteDoc.vclock ?? {}),
+            applyKeepLocal: async () => this.vaultSideKept(
+                filePath, await this.deps.vaultSync.forceMarkDeleted(filePath, remoteDoc.vclock),
+            ),
             clearDurable: async () => {},
             waiters: [],
         });
@@ -509,85 +545,83 @@ export class ConflictOrchestrator {
             applyTakeRemote: async () => {
                 // Accept the deletion: remove the recreated file from disk and
                 // establish the deleted baseline (dbToFile tombstone branch).
-                const writeResult = await this.deps.dbToFile(tombstoneDoc);
+                const writeResult = await this.deps.dbToFile(tombstoneDoc, USER_CHOSE_REMOTE);
                 if (writeResult.applied === false) {
                     logWarn(
                         `Divergent-recreate take-remote: vault write skipped: ` +
                         `${filePath.split("/").pop()} (${writeResult.reason})`,
                     );
                 }
+                return "applied";
             },
             // Keep the recreated file: commit it over the tombstone with a
             // vclock that dominates it, so the recreate replicates everywhere.
-            applyKeepLocal: () => this.deps.vaultSync.forceLocalEdit(filePath, tombstoneDoc.vclock ?? {}),
+            applyKeepLocal: async () => this.vaultSideKept(
+                filePath, await this.deps.vaultSync.forceLocalEdit(filePath, tombstoneDoc.vclock),
+            ),
             clearDurable: async () => {},
             waiters: [],
         });
     }
 
     /**
-     * Shared modal+apply pipeline used by all three conflict entries.
-     * Decodes the bufs, picks text/binary path, shows the modal, awaits
-     * the user's choice (or auto-dismiss), invokes the matching apply
-     * callback, and persists conflict history.
+     * What a Keep Local of a conflict the reconcile found did. When it wrote
+     * nothing (the local DB doc the dialog showed was replaced, or the vault
+     * file is gone), the reconcile looks at the path again and offers what
+     * is there now, as a pull conflict is offered again with the current
+     * version.
+     */
+    private vaultSideKept(filePath: string, outcome: ForceWriteOutcome): ApplyOutcome {
+        if (outcome === "written") return "applied";
+        logInfo(
+            `Conflict on ${filePath.split("/").pop()} not applied: the ` +
+            `${outcome === "no-file" ? "vault file is gone" : "local version moved"}; re-checking`,
+        );
+        this.deps.requestReconcile();
+        return "superseded";
+    }
+
+    /**
+     * Shared modal+apply pipeline used by all conflict entries. Shows the
+     * two versions (a diff for text, the sizes for binary), awaits the
+     * user's choice (or auto-dismiss), invokes the matching apply callback,
+     * and persists conflict history.
      */
     private async runConflictModalAndApply(args: {
         filePath: string;
         localBuf: ArrayBuffer;
         remoteBuf: ArrayBuffer;
-        applyTakeRemote: () => Promise<void>;
-        applyKeepLocal: () => Promise<void>;
+        applyTakeRemote: () => Promise<ApplyOutcome>;
+        applyKeepLocal: () => Promise<ApplyOutcome>;
     }): Promise<ConflictOutcome> {
         const { filePath, localBuf, remoteBuf, applyTakeRemote, applyKeepLocal } = args;
         const { modal, historyCapture } = this.deps;
         const fileName = filePath.split("/").pop();
-        const dec = new TextDecoder("utf-8");
 
-        const localDiffable = isDiffableText(localBuf);
-        const remoteDiffable = isDiffableText(remoteBuf);
+        const { result, dismiss } = modal.showConflictModal(
+            filePath, conflictContent(localBuf, remoteBuf),
+        );
+        this.openConflictDismiss.set(filePath, dismiss);
+        const { choice, dismissed } = await result;
+        this.openConflictDismiss.delete(filePath);
 
-        if (localDiffable && remoteDiffable) {
-            const localText = dec.decode(localBuf);
-            const remoteText = dec.decode(remoteBuf);
-            const { result, dismiss } = modal.showConflictModal(filePath, localText, remoteText);
-            this.openConflictDismiss.set(filePath, dismiss);
-            const { choice, dismissed } = await result;
-            this.openConflictDismiss.delete(filePath);
-
-            if (dismissed) {
-                logInfo(`Conflict auto-resolved for ${fileName} (other device resolved)`);
-                return "resolved";
-            }
-            if (choice === "defer") {
-                // × / Esc / "Later" — apply NOTHING, keep the durable record
-                // so it re-presents next session. Never overwrite remote.
-                logInfo(`Conflict deferred for ${fileName} — kept for later (no change applied)`);
-                return "deferred";
-            }
-            if (choice === "take-remote") {
-                await applyTakeRemote();
-                await historyCapture.saveConflict(filePath, localText, remoteText, "remote");
-            } else {
-                await applyKeepLocal();
-                await historyCapture.saveConflict(filePath, localText, remoteText, "local");
-            }
+        if (dismissed) {
+            logInfo(`Conflict auto-resolved for ${fileName} (other device resolved)`);
             return "resolved";
         }
-
-        // Binary path — auto keep-local (matches existing concurrent
-        // behavior). saveConflict captures whichever side is text-like.
-        logInfo(`Conflict resolved: keep-local (binary) for ${fileName}`);
-        await applyKeepLocal();
+        if (choice === "defer") {
+            // × / Esc / "Later" — apply NOTHING, keep the durable record
+            // so it re-presents next session. Never overwrite remote.
+            logInfo(`Conflict deferred for ${fileName} — kept for later (no change applied)`);
+            return "deferred";
+        }
+        const applied = choice === "take-remote" ? await applyTakeRemote() : await applyKeepLocal();
+        if (applied === "superseded") return "superseded";
         await historyCapture.saveConflict(
             filePath,
-            localDiffable ? dec.decode(localBuf) : "",
-            remoteDiffable ? dec.decode(remoteBuf) : "",
-            "local",
-        );
-        notify(
-            `concurrent edit on binary file ${fileName} — ` +
-                "keeping local version. Check Diff History for details.",
-            10000,
+            historyText(localBuf),
+            historyText(remoteBuf),
+            choice === "take-remote" ? "remote" : "local",
         );
         return "resolved";
     }
@@ -664,7 +698,7 @@ export class ConflictOrchestrator {
         filePath: string,
         localDoc: FileDoc,
         remoteDoc: FileDoc,
-    ): Promise<void> {
+    ): Promise<ApplyOutcome> {
         const { localDb, replicator } = this.deps;
         const deviceId = this.deps.getSettings().deviceId;
         const fileName = filePath.split("/").pop();
@@ -699,6 +733,10 @@ export class ConflictOrchestrator {
                 docs: [{ doc: stripRev(updated) as CouchSyncDoc }],
             });
             await replicator.ensureFileChunks(updated as FileDoc);
+            // No overwrite of a vault change: the choice was made between
+            // the local DB doc and the remote, not the vault's version. If
+            // the vault changed since the last sync, dbToFile keeps it and
+            // the reconcile offers it against this doc.
             const writeResult = await this.deps.dbToFile(updated as FileDoc);
             if (writeResult.applied === false) {
                 logWarn(
@@ -706,20 +744,26 @@ export class ConflictOrchestrator {
                     `${fileName} (${writeResult.reason})`,
                 );
             }
-        } else {
-            logInfo(`Conflict resolved: keep-local for ${fileName}`);
-            const merged = mergeVC(
-                localDoc.vclock ?? {},
-                remoteDoc.vclock ?? {},
-            );
-            const updated = {
-                ...localDoc,
-                vclock: incrementVC(merged, deviceId),
-            };
-            await localDb.runWriteTx({
-                docs: [{ doc: stripRev(updated) as CouchSyncDoc }],
-            });
-            logDebug(`  vclock after merge: ${JSON.stringify(updated.vclock)}`);
+            return "applied";
         }
+
+        // Keep the local DB doc the dialog showed. VaultSync commits it with
+        // the vault's baseline, so the next vault change is judged against
+        // the version kept.
+        const kept = await this.deps.vaultSync.keepLocalDoc(
+            filePath, localDoc.vclock, remoteDoc.vclock,
+        );
+        if (kept !== "written") {
+            // The local version changed while the dialog was open. Present
+            // the conflict again with the current version, as for a newer
+            // remote version that arrives meanwhile; one already waiting
+            // is newer than this one.
+            if (!this.pendingUpdates.has(filePath)) {
+                this.pendingUpdates.set(filePath, { localDoc, remoteDoc });
+            }
+            return "superseded";
+        }
+        logInfo(`Conflict resolved: keep-local for ${fileName}`);
+        return "applied";
     }
 }

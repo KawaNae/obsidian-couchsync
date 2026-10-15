@@ -233,11 +233,12 @@ export default class CouchSyncPlugin extends Plugin {
         await this.historyStorage.ensureSchemaVersion();
         this.historyCapture = new HistoryCapture(vaultIO, vaultEvents, this.historyStorage, () => this.settings);
 
-        // Editor-aware write layer: defers vault writes while the
-        // path's editor is in IME composition, dispatches CodeMirror
-        // transactions instead of triggering Obsidian's external-edit
-        // reload (which would break IME), and falls back to disk
-        // write when no editor session exists.
+        // Editor-aware write layer: declines a vault write while an open
+        // editor holds input not yet saved, defers it while the path's
+        // editor is in IME composition, dispatches CodeMirror transactions
+        // instead of triggering Obsidian's external-edit reload (which
+        // would break IME), and writes the disk directly when no editor
+        // session exists.
         this.compositionTracker = new ObsidianCompositionTracker(this.app);
         this.compositionGate = new CompositionGate(this.compositionTracker);
         this.vaultWriter = new EditorAwareVaultWriter(
@@ -481,10 +482,11 @@ export default class CouchSyncPlugin extends Plugin {
             localDb: this.localDb,
             replicator: this.replicator,
             historyCapture: this.historyCapture,
-            dbToFile: (doc) => this.vaultSync.dbToFile(doc),
+            dbToFile: (doc, opts) => this.vaultSync.dbToFile(doc, opts),
             getSettings: () => this.settings,
             vault: vaultIO,
             vaultSync: this.vaultSync,
+            requestReconcile: () => this.fireReconcile("paused"),
         });
         this.conflictOrchestrator.register();
         this.reconciler.setConflictOrchestrator(this.conflictOrchestrator);
@@ -506,6 +508,11 @@ export default class CouchSyncPlugin extends Plugin {
         // dbToFile retries on the next pass — typically resolves the
         // divergence within seconds rather than hours.
         this.replicator.events.on("pull-skipped", () => this.fireReconcile("paused"));
+        // A write declined for an editor's unsaved input cannot be decided
+        // by the reconcile that pull-skipped fires: the disk still holds the
+        // last sync. The editor's save is when the vault shows the input,
+        // so reconcile again then.
+        this.vaultSync.setOnEditorSaved(() => this.fireReconcile("paused"));
 
         // Run orphan-chunk GC once after the first idle (catchup done,
         // no pending pull/push). Cleans up chunks left by pre-v0.15
@@ -777,7 +784,7 @@ export default class CouchSyncPlugin extends Plugin {
         const content = await this.historyManager.restoreToRecord(filePath, recordId);
         if (content === null) return false;
         try {
-            await this.vaultSync.forceLocalEdit(filePath, {});
+            await this.vaultSync.forceLocalEdit(filePath);
         } catch {
             // Sync propagation failure is non-fatal — file is already restored on disk.
         }

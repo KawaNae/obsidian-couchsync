@@ -6,6 +6,59 @@ All notable changes to obsidian-couchsync.
 
 ### Fixed
 
+- **A pull no longer writes over a change in the vault that has not been
+  synced.** When a file had been edited or deleted in the vault since this
+  device last synced it, a newer version pulled from another device replaced
+  the edit, or brought the deleted file back, without asking. This happened
+  when the pull arrived before the edit was pushed, and also while a conflict
+  about that edit was still waiting for an answer. The same happened to a
+  file this device had never synced — one made here and not yet pushed, or
+  one that came into the filters when they were widened — when another
+  device had a file at the same path. The pull now leaves the file as it is
+  and keeps the pulled version in the local database; the conflict dialog
+  then shows both, and the chosen one is written. If another version is
+  pulled while that dialog is open, Keep Local writes nothing and the
+  dialog asks again with the newer version, instead of replacing it unseen.
+  A never-synced file with
+  the same content as the pulled version is not a conflict: the device only
+  records it as synced. Files the filters keep out are not offered. Clone
+  still replaces the files at the same path, as its confirmation says.
+- **An edit or deletion right after choosing Keep Local is synced.** After
+  Keep Local in a conflict with another device's version, the device still
+  compared the file with the version from before the conflict. An edit made
+  before the next sync check was not sent, and the check then showed a
+  conflict with this device's own earlier version; a deletion was not sent
+  either. Keep Local now records the kept version as the vault's synced
+  state. When the vault does not hold the kept version yet, it is written
+  to the vault, unless the file was changed there since the last sync: then
+  the conflict dialog shows that change. Keep Local of a local deletion
+  works the same way. If the local version changed while the dialog was
+  open, Keep Local writes nothing and the dialog asks again with the
+  current version; before, the version the dialog showed replaced it.
+- **A pull no longer replaces what was just typed in an open note.**
+  Obsidian saves typing about two seconds later; a version pulled in that
+  time replaced the editor's text, and the typing was lost. A pulled
+  version, or a pulled deletion, now leaves the note and its editor as they
+  are while any open editor on it holds text not yet saved. Once the editor
+  saves, the conflict dialog shows the saved text and the pulled version.
+  If the typing was undone before a save, the pulled version is written at
+  the next sync check. A file with Windows line breaks (CRLF) or a BOM is
+  not taken for unsaved typing. An IME composition that commits text is
+  handled the same way.
+- **The confirmation of Delete local vault database says what happens to
+  the vault's files.** It said that unpushed edits would be lost. Edits in
+  the vault's files are kept: after the restart, a file whose content
+  differs from the remote's version is offered as a conflict, and a file the
+  remote does not have is sent to it. What is lost is a deletion or rename
+  not yet sent: the deleted file, or the file under its old name, comes back
+  from the remote.
+- **A conflict on a binary file, such as an image or a PDF, is asked about
+  like one on a note.** The device kept its own version without asking, so
+  the vault's copy of an attachment could replace a newer one from another
+  device. The conflict dialog now shows the file, says that the two versions
+  cannot be compared, and gives each version's size; the user keeps one, or
+  chooses later. In the dialog for many conflicts, clicking a binary file
+  shows the same.
 - **A new install no longer shows the notice that config sync filtering was
   upgraded.** The notice is for settings that had the old path list to
   convert; a first start, with no settings saved, was taken for one.

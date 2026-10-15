@@ -30,15 +30,21 @@ export interface ConflictModalResult {
     dismissed: boolean;
 }
 
+/**
+ * The two versions of a conflicting file, as the modals show them.
+ * - `text`: both sides are UTF-8 text; the modal shows a side-by-side diff.
+ * - `binary`: at least one side is not text, so the versions cannot be
+ *   compared line by line; the modal says so and shows each side's size.
+ *   The user still chooses, as for text.
+ */
+export type ConflictContent =
+    | { kind: "text"; localText: string; remoteText: string }
+    | { kind: "binary"; localSize: number; remoteSize: number };
+
 /** One conflicting file presented in the batch modal. */
 export interface ConflictBatchItem {
     filePath: string;
-    /** UTF-8 decoded local content, or "" when binary (not diffable). */
-    localText: string;
-    /** UTF-8 decoded remote content, or "" when binary. */
-    remoteText: string;
-    /** True when either side is not diffable text (no inline preview). */
-    binary: boolean;
+    content: ConflictContent;
 }
 
 /**
@@ -81,7 +87,8 @@ export interface ConfigShareAgainPreview {
 
 export interface IModalPresenter {
     /**
-     * Show a side-by-side conflict diff and wait for the user to pick a
+     * Show the two versions of a conflicting file (a side-by-side diff for
+     * text, the sizes for binary) and wait for the user to pick a
      * winner. The returned promise resolves when the modal closes.
      *
      * Returns a dismiss handle so callers can auto-dismiss on
@@ -89,8 +96,7 @@ export interface IModalPresenter {
      */
     showConflictModal(
         filePath: string,
-        localText: string,
-        remoteText: string,
+        content: ConflictContent,
     ): {
         result: Promise<ConflictModalResult>;
         dismiss: () => void;

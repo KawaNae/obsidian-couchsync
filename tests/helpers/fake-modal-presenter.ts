@@ -7,6 +7,7 @@ import type {
     IModalPresenter,
     ConflictChoice,
     ConflictModalResult,
+    ConflictContent,
     ConflictBatchItem,
     BatchDecision,
     ConfigOverwritePreview,
@@ -24,7 +25,7 @@ export class FakeModalPresenter implements IModalPresenter {
     batchResponses: BatchDecision[] = [];
 
     /** Record of all conflict modals shown (for assertions). */
-    conflictCalls: Array<{ filePath: string; localText: string; remoteText: string }> = [];
+    conflictCalls: Array<{ filePath: string; content: ConflictContent }> = [];
     /** Record of all confirm modals shown (for assertions). */
     confirmCalls: Array<{ title: string; message: string }> = [];
     /** Record of all batch modals shown (for assertions). */
@@ -55,10 +56,9 @@ export class FakeModalPresenter implements IModalPresenter {
 
     showConflictModal(
         filePath: string,
-        localText: string,
-        remoteText: string,
+        content: ConflictContent,
     ): { result: Promise<ConflictModalResult>; dismiss: () => void } {
-        this.conflictCalls.push({ filePath, localText, remoteText });
+        this.conflictCalls.push({ filePath, content });
 
         let resolveFn!: (value: ConflictModalResult) => void;
         const result = new Promise<ConflictModalResult>((resolve) => {

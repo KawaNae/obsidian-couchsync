@@ -47,8 +47,9 @@ class ApplyingVaultWriter implements VaultWriter {
         await this.io.writeBinary(path, content);
         return { applied: true };
     }
-    async applyRemoteDeletion(path: string): Promise<void> {
+    async applyRemoteDeletion(path: string): Promise<WriteResult> {
         if (await this.io.exists(path)) await this.io.delete(path);
+        return { applied: true };
     }
     async createFile(path: string, content: ArrayBuffer): Promise<void> {
         await this.io.createBinary(path, content);
@@ -171,8 +172,8 @@ describe("regression: tombstone recreate", () => {
         expect(await vault.exists("w24.md")).toBe(true);
 
         // keep-local resolution (what the user picks to rescue the file):
-        // forceLocalEdit merges the tombstone vclock and commits alive.
-        await vs.forceLocalEdit("w24.md", doc.vclock ?? {});
+        // forceLocalEdit commits alive over the tombstone the dialog showed.
+        expect(await vs.forceLocalEdit("w24.md", doc.vclock)).toBe("written");
         doc = await db.get(makeFileId("w24.md")) as FileDoc;
         expect(doc.deleted ?? false).toBe(false);
         expect(doc.vclock).toEqual({ [DEV]: 3 });

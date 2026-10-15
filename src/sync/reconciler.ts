@@ -170,8 +170,8 @@ export class Reconciler {
      * Late-binding setter for `conflictOrchestrator`. Reconciler is
      * constructed before ConflictOrchestrator in main.ts; this setter
      * resolves the dependency cycle. When the orchestrator is null
-     * (tests / pre-init), divergent routing falls back to the prior
-     * silent dbToFile behavior.
+     * (tests / pre-init), a diverged path is left as it is and detected
+     * again by the next reconcile.
      */
     setConflictOrchestrator(co: ConflictOrchestrator): void {
         this.conflictOrchestrator = co;
@@ -424,10 +424,9 @@ export class Reconciler {
                         }
                         break;
                     default:
-                        // identical / vclock-only-drift / legacy-skip cannot be
-                        // produced for alive-file × tombstone input (the deleted
-                        // flag makes contentEqual false and legacy baselines refine
-                        // to true-divergent). Guard for visibility.
+                        // identical / vclock-only-drift cannot be produced for
+                        // alive-file × tombstone input (the deleted flag makes
+                        // contentEqual false). Guard for visibility.
                         logError(
                             `unexpected relation '${relation}' for tombstone reconcile of ${displayPath}`,
                         );
@@ -496,9 +495,9 @@ export class Reconciler {
                     if (rel === "dominates") {
                         // A pull advanced the doc beyond our integration
                         // baseline while the file was locally gone: divergent
-                        // local-delete vs remote-edit → conflict (production
-                        // always wires the orchestrator; without it, fall back
-                        // to remote-wins restore, matching the Case A/B path).
+                        // local-delete vs remote-edit → conflict. Without an
+                        // orchestrator the path is left as it is: dbToFile
+                        // does not recreate a file deleted since the last sync.
                         if (this.conflictOrchestrator) {
                             if (await this.tryStep(displayPath, "conflict-delete",
                                 () => this.conflictOrchestrator!.handleDivergentLocalDelete(displayPath, doc),
@@ -506,9 +505,10 @@ export class Reconciler {
                                 report.deleted.push(displayPath);
                             }
                         } else {
-                            const r = await this.applyRemoteToVault(displayPath, doc, "restore", mode);
-                            if (r === "applied") report.restored.push(displayPath);
-                            else if (r === "quarantined") report.quarantined.push(displayPath);
+                            logWarn(
+                                `divergent local delete on ${displayPath} — no conflict ` +
+                                `orchestrator wired; leaving untouched (re-detected next reconcile).`,
+                            );
                         }
                     } else {
                         // equal/dominated: we integrated this content and the
@@ -542,6 +542,12 @@ export class Reconciler {
             // CLASSIFIER: do not duplicate inline — route through
             // classifyFileVsDoc which delegates to classifySyncRelation.
             if (file && doc && !doc.deleted) {
+                // A path the filters keep out has its content synced neither
+                // way on this device (fileToDb and dbToFile both decline it),
+                // so there is nothing to apply and nothing to ask the user;
+                // without a baseline, differing content would otherwise be
+                // offered as a conflict on every scan.
+                if (!this.vaultSync.shouldSync(file.path)) continue;
                 let relation: SyncRelation;
                 try {
                     relation = await this.vaultSync.classifyFileVsDoc(doc, file.path, file.stat);
@@ -583,18 +589,17 @@ export class Reconciler {
                             report.localWins.push(displayPath);
                         }
                         break;
-                    case "remote-edit":
-                    case "legacy-skip": {
-                        // legacy-skip: pre-extension lastSynced — fall back to
-                        // pull (= old behavior when divergent guard couldn't
-                        // run). The startup legacy-lastSynced sweep upgrades
-                        // the entries.
+                    case "remote-edit": {
                         const r = await this.applyRemoteToVault(displayPath, doc, "pull", mode);
                         if (r === "applied") report.remoteWins.push(displayPath);
                         else if (r === "quarantined") report.quarantined.push(displayPath);
                         break;
                     }
                     case "true-divergent":
+                        // The disk holds content this device has not synced:
+                        // an edit since the last sync, or a file with no
+                        // baseline (made here before its first push, or come
+                        // into the filters) that differs from the doc.
                         if (this.conflictOrchestrator) {
                             if (await this.tryStep(displayPath, "conflict-edit",
                                 () => this.conflictOrchestrator!.handleDivergentLocalEdit(file.path, doc),
@@ -602,13 +607,13 @@ export class Reconciler {
                                 report.remoteWins.push(displayPath);
                             }
                         } else {
-                            // No orchestrator wired (e.g., test harness pre-
-                            // ConflictOrchestrator) — fall back to pull. The
-                            // divergent local edit is lost in this fallback;
-                            // production main.ts always wires the orchestrator.
-                            const r = await this.applyRemoteToVault(displayPath, doc, "pull", mode);
-                            if (r === "applied") report.remoteWins.push(displayPath);
-                            else if (r === "quarantined") report.quarantined.push(displayPath);
+                            // No orchestrator wired (test harness): leave the
+                            // edit. dbToFile would decline the pull anyway,
+                            // since the vault changed since the last sync.
+                            logWarn(
+                                `divergent edit on ${displayPath} — no conflict ` +
+                                `orchestrator wired; leaving untouched (re-detected next reconcile).`,
+                            );
                         }
                         break;
                 }

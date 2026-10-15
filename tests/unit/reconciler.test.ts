@@ -97,8 +97,7 @@ type ClassifyResult =
     | "vclock-only-drift"
     | "remote-edit"
     | "local-edit"
-    | "true-divergent"
-    | "legacy-skip";
+    | "true-divergent";
 
 interface FakeVaultSync {
     fileToDbCalls: string[];

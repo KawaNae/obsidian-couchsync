@@ -1,5 +1,5 @@
 import { App, Modal, Setting } from "obsidian";
-import { buildSideBySide } from "./diff-utils.ts";
+import { renderConflictContent } from "./conflict-modal.ts";
 import type { ConflictBatchItem, BatchDecision } from "../types/modal-presenter.ts";
 
 /**
@@ -43,33 +43,23 @@ export class ConflictBatchModal extends Modal {
         // report modal so a huge batch doesn't blow up the DOM).
         const listWrap = contentEl.createDiv({ cls: "cs-conflict-batch-list" });
         const list = listWrap.createEl("ul");
+        // Inline preview: clicking a path shows its two versions, as the
+        // single conflict modal does (a diff for text, the sizes for binary).
+        const preview = contentEl.createDiv({ cls: "cs-conflict-batch-preview" });
         const SHOWN = 100;
         for (const it of this.items.slice(0, SHOWN)) {
             const li = list.createEl("li", { text: it.filePath });
-            if (it.binary) li.createSpan({ text: "  (binary)", cls: "setting-item-description" });
-        }
-        if (this.items.length > SHOWN) {
-            list.createEl("li", { text: `… and ${this.items.length - SHOWN} more` });
-        }
-
-        // Optional inline preview: clicking a path shows its side-by-side diff.
-        const preview = contentEl.createDiv({ cls: "cs-conflict-batch-preview" });
-        for (const li of Array.from(list.querySelectorAll("li"))) {
-            const path = li.textContent ?? "";
-            const item = this.items.find((i) => i.filePath === path);
-            if (!item || item.binary) continue;
+            if (it.content.kind === "binary") {
+                li.createSpan({ text: "  (binary)", cls: "setting-item-description" });
+            }
             li.style.cursor = "pointer";
             li.addEventListener("click", () => {
                 preview.empty();
-                const container = preview.createDiv({ cls: "diff-compare-container" });
-                const left = container.createDiv({ cls: "diff-compare-panel diff-compare-left" });
-                left.createDiv({ cls: "diff-compare-panel-header", text: "Local (this device)" });
-                const leftBody = left.createDiv({ cls: "diff-compare-content" });
-                const right = container.createDiv({ cls: "diff-compare-panel diff-compare-right" });
-                right.createDiv({ cls: "diff-compare-panel-header", text: "Remote (other device)" });
-                const rightBody = right.createDiv({ cls: "diff-compare-content" });
-                buildSideBySide(item.localText, item.remoteText, leftBody, rightBody);
+                renderConflictContent(preview, it.content);
             });
+        }
+        if (this.items.length > SHOWN) {
+            list.createEl("li", { text: `… and ${this.items.length - SHOWN} more` });
         }
 
         new Setting(contentEl)
