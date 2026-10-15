@@ -44,6 +44,15 @@ export class AuthGate {
         this.fire(detail);
     }
 
+    /**
+     * The error an operation refused by the latch throws: names the
+     * rejection and where to fix it. The latch is cleared by a successful
+     * Test in the CouchDB tab, where the credentials live.
+     */
+    blockedError(): AuthBlockedError {
+        return new AuthBlockedError(this.lastError);
+    }
+
     /** Clear the latch. Idempotent: no-op when already cleared. */
     clear(): void {
         if (!this.blocked) return;
@@ -69,5 +78,20 @@ export class AuthGate {
                 // Listeners shouldn't throw; swallow to keep other listeners running.
             }
         }
+    }
+}
+
+/** An operation was refused because the auth latch is raised. Carries its
+ *  own `userMessage` (see `classifyError`), so it is shown as written and is
+ *  never mistaken for a transport failure. */
+export class AuthBlockedError extends Error {
+    readonly userMessage: string;
+    constructor(readonly detail: AuthErrorDetail | null) {
+        const status = detail ? ` (${detail.status})` : "";
+        const msg = `The server rejected the credentials${status}, so requests are on hold. ` +
+            "Fix the user name and password in the CouchDB tab, then press Test.";
+        super(msg);
+        this.name = "AuthBlockedError";
+        this.userMessage = msg;
     }
 }

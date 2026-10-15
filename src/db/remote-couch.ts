@@ -300,6 +300,42 @@ export async function destroyRemote(
     }
 }
 
+/** Waits between the attempts of `recreateRemote` to create the DB again
+ *  (≈6s in total). */
+const RECREATE_DELAYS_MS = [100, 200, 400, 800, 1600, 3200];
+
+/**
+ * Destroy the remote database and create it empty, returning once the new
+ * database answers.
+ *
+ * CouchDB can still be releasing the deleted database's shard files when
+ * the DELETE has returned; a PUT in that moment answers 412 (file exists)
+ * although the database is gone — `ensureDb` takes a 412 for "exists" — or
+ * the new database cannot open its shards yet (500). A write right after
+ * would then fail with 404 or 500. So the new database is confirmed by
+ * reading its info, and created again while it answers 404 or 5xx.
+ */
+export async function recreateRemote(
+    remote: ICouchClient,
+    signal?: AbortSignal,
+    sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+): Promise<void> {
+    await destroyRemote(remote, signal);
+    for (let attempt = 0; ; attempt++) {
+        await remote.ensureDb(signal);
+        try {
+            await remote.info(signal);
+            return;
+        } catch (e: any) {
+            const settling = e?.status === 404 || (typeof e?.status === "number" && e.status >= 500);
+            if (!settling || attempt >= RECREATE_DELAYS_MS.length) throw e;
+            logWarn(`recreated database does not answer yet (${e.status}); creating it again`);
+        }
+        await sleep(RECREATE_DELAYS_MS[attempt]);
+        if (signal?.aborted) throw signal.reason ?? new Error("aborted");
+    }
+}
+
 /**
  * Push every doc in `local` to `remote` as a one-shot. Used by SetupService
  * during Init to seed the remote from a freshly-scanned vault.
@@ -393,7 +429,7 @@ async function resolveChunkAttachments(
                     notFound.add(id);
                     continue;
                 }
-                // Authenticate at the fetch boundary (Invariant I). The
+                // Authenticate at the fetch boundary. The
                 // decoder stack already decrypted + decompressed; verify the
                 // bytes still hash to the content-addressed id. A hash/alg
                 // mismatch or malformed envelope means the chunk is corrupt
@@ -401,7 +437,7 @@ async function resolveChunkAttachments(
                 // route to repair) instead of writing untrusted bytes.
                 // `isCorruptChunkError` is the SAME rule the live-sync path in
                 // SyncEngine.ensureChunks uses — the two boundaries share it so
-                // they classify a corrupt chunk identically (#4).
+                // they classify a corrupt chunk identically.
                 try {
                     docs[i] = await chunkFromAttachment(id, blob, hasher);
                 } catch (e) {

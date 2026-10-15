@@ -15,18 +15,35 @@ Simplified CouchDB-only vault sync for Obsidian. Fork of [Self-hosted LiveSync](
   iterations) key derivation. When enabled, note contents **and file paths**
   are encrypted before leaving the device. Off by default; the passphrase is
   set at Init. See [SECURITY.md](SECURITY.md).
-- **Four codec modes** — `raw`, `gzip`, `encrypt`, `gzip+encrypt`, chosen at
-  Init and recorded server-side. `gzip+encrypt` is recommended for untrusted
+- **Four codec modes** — `raw`, `gzip`, `encrypt`, `gzip-encrypt`, chosen at
+  Init and recorded server-side. `gzip-encrypt` is recommended for untrusted
   servers.
 - **Conflict handling** — Sync relations are classified by vector clock +
   content-addressed chunks. Identical content with diverged clocks reconciles
   silently; genuinely concurrent, divergent edits open a side-by-side dialog
-  where you choose **keep local** or **take remote**. There is no text-level
-  auto-merge.
+  where you choose **Keep Local**, **Take Remote** or **Later**. A binary
+  file (an image, a PDF) is asked about the same way, with each version's
+  size. There is no text-level auto-merge. A pull never overwrites a change
+  that has not been synced: a file edited or deleted in the vault since its
+  last sync, or an open note with unsaved typing, is left as it is and
+  offered as a conflict instead. If the local version changes while the
+  dialog is open, the choice writes nothing and the conflict is offered
+  again with the current versions.
 - **Config sync (optional, manual)** — Replicate `.obsidian/` settings,
-  snippets, themes, and plugin files through a separate CouchDB database.
-  Button-driven (Init / Push / Pull), not real-time. Opt-in: only active when
-  a config DB name is set.
+  snippets and themes through a separate CouchDB database. Button-driven
+  (Create on the first device, Join on the others, then Push / Pull &
+  Reload), not real-time. Pull merges JSON settings key by key with what
+  this device changed, keeps this device's value where both sides changed a
+  key, and backs up the files it overwrites; Push lists this device's
+  changes key by key, sends the checked ones, and holds files the server
+  changed until the next Pull. A key left out of a Push stays this
+  device's own: it is not sent and later Pulls do not change it, until
+  "Share again" makes it take the shared value through a Pull. Pull &
+  Overwrite makes this device's selected config exactly the shared config,
+  deleting selected files the server does not have, after listing them and
+  backing them up. Plugin
+  code is not synced by default. Opt-in: only active when a config DB name
+  is set.
 
 ## Setup
 
@@ -40,8 +57,8 @@ docker run -d -p 5984:5984 \
   --name couchdb couchdb
 ```
 
-CouchSync creates the vault database itself on first connect, so you only
-need the server reachable with valid admin credentials.
+CouchSync creates the vault database itself (**Check** in Vault Sync →
+Step 2), so you only need the server reachable with valid admin credentials.
 
 **Enable CORS** (required — Obsidian talks to CouchDB from a sandboxed
 origin). Either use Fauxton (`http://localhost:5984/_utils` → Configuration →
@@ -72,21 +89,22 @@ Install from Obsidian Community Plugins (search "CouchSync"), or manually copy
 
 ### 3. Configure and start syncing
 
-Open **Settings → CouchSync → Vault Sync** and work top to bottom:
+Open **Settings → CouchSync**. In the **CouchDB** tab, enter the server
+URI, username, and password, then **Test** → **Apply**. Then open the
+**Vault Sync** tab and work top to bottom:
 
 1. **Device name** — a short identifier for this device (lowercase letters,
    numbers, and hyphens; 2–30 chars, e.g. `desktop`, `iphone`). Required; it
    is this device's vector-clock key.
 2. **Encryption (optional)** — enable end-to-end encryption and set a
    passphrase, and/or toggle gzip compression (on by default).
-3. **Connection** — enter the CouchDB URL, username, password, and vault
-   database name, then **Test Connection** → **Apply**.
-4. **Init or Clone:**
+3. **Database** — enter the vault database name, then **Check** → **Apply**.
+4. **Init or Clone** (each shows what it will change and asks first):
    - On the **first** device, run **Init**. ⚠️ This is **destructive** to the
      remote database — it recreates it from this vault. The codec mode
      (encryption/compression) is fixed here.
-   - On **every other** device, run **Clone** (it prompts for the passphrase
-     if the vault is encrypted).
+   - On **every other** device, run **Clone** (for an encrypted vault it asks
+     for the passphrase unless Step 1 already has the right one).
 5. **Enable Live Sync** to start continuous syncing.
 
 Encrypted vaults need the **same passphrase on every device**. The codec mode
@@ -115,19 +133,21 @@ Migrating is destructive:
 
 See the [CHANGELOG](CHANGELOG.md) for per-version breaking changes.
 
+### Config sync: Join once after updating
+
+If a device uses config sync, run **Join** (Config Sync tab, Step 3) on it
+once after updating from 0.30.2 or earlier. Newer versions record whether a
+device has joined a config database, and with which codec, inside that
+database's local store, and the earlier record cannot be carried over.
+Until the device Joins, its first config Push or Pull asks it to.
+
+Join does not change the server, any config file or the Step 1 settings.
+The next Pull downloads the config again.
+
 ## Development
 
-```bash
-npm install
-npm run dev    # Watch mode, outputs to dev vault
-npm run build  # Type-check + production build
-npm test       # Unit + integration tests (vitest)
-```
-
-Built files are written to
-`{OBSIDIAN_VAULT_PATH}/.obsidian/plugins/obsidian-couchsync/`. Set the
-`OBSIDIAN_VAULT_PATH` environment variable to your vault path (defaults to
-`C:\Obsidian\Dev`).
+See [DEVELOPER.md](DEVELOPER.md) for building, the build output location,
+and running the unit and e2e tests.
 
 ## License
 

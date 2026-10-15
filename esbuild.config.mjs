@@ -4,6 +4,7 @@ import process from "process";
 import builtins from "builtin-modules";
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import { execSync } from "node:child_process";
 
 const prod = process.argv[2] === "production";
@@ -36,7 +37,8 @@ const buildTime = formatBuildTime(new Date());
 const manifestJson = JSON.parse(fs.readFileSync("./manifest.json") + "");
 const packageJson = JSON.parse(fs.readFileSync("./package.json") + "");
 
-const vaultPath = process.env.OBSIDIAN_VAULT_PATH ?? "C:\\Obsidian\\Dev";
+const vaultPath = process.env.OBSIDIAN_VAULT_PATH
+    ?? path.join(os.homedir(), "Develop", "Obsidian", "Dev");
 const outDir = path.join(vaultPath, ".obsidian", "plugins", "obsidian-couchsync");
 
 if (!fs.existsSync(outDir)) {

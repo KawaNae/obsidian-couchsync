@@ -1,6 +1,7 @@
 /**
  * E2E: PathKey (case) collision convergence through the REAL engine + real
- * CouchDB — the scripts/Scripts incident.
+ * CouchDB, for two docs whose paths differ only in case (`scripts/X` and
+ * `Scripts/X`).
  *
  * FakeVaultIO is case-SENSITIVE (exact-string Map keys), so it models an
  * Android-class FS where `scripts/X` and `Scripts/X` are two real files.
@@ -61,7 +62,7 @@ describe("E2E: PathKey collision convergence (real engine + real CouchDB)", () =
         expect(await b.vault.exists("scripts/X.md")).toBe(false);
 
         // The tombstone must propagate back to A through real CouchDB — proving
-        // the #sync-005 churn-guard fix (a tombstone is chunk-equal to the alive
+        // the push churn-guard fix (a tombstone is chunk-equal to the alive
         // remote yet must still push). A's lowercase file is removed by the
         // case-safe pull-deletion, leaving A converged to the same canonical.
         await waitFor(

@@ -1,5 +1,5 @@
 /**
- * Regression: PR5 stale-bookkeeping recovery + legacy lastSynced upgrade.
+ * Regression: stale-bookkeeping recovery + legacy lastSynced upgrade.
  *
  * Two scenarios covered:
  *
@@ -10,8 +10,8 @@
  *    is in the new shape.
  *
  * 2. **Stale-bookkeeping recovery**: defensive — `lastSynced.{chunks,size}`
- *    drifted from the actual integrated content (e.g., PR1 invariant
- *    violation in a crash window, or external tool wrote disk). When
+ *    drifted from the actual integrated content (e.g., the disk write and the
+ *    lastSynced update split by a crash, or external tool wrote disk). When
  *    classifier confirms disk == fileDoc (= identical), recovery aligns
  *    `lastSynced` to the doc's fingerprint.
  */
@@ -36,8 +36,9 @@ class PassthroughWriter implements VaultWriter {
         await this.io.writeBinary(path, content);
         return { applied: true };
     }
-    async applyRemoteDeletion(path: string): Promise<void> {
+    async applyRemoteDeletion(path: string): Promise<WriteResult> {
         if (await this.io.exists(path)) await this.io.delete(path);
+        return { applied: true };
     }
     async createFile(path: string, content: ArrayBuffer): Promise<void> {
         await this.io.createBinary(path, content);
@@ -45,7 +46,7 @@ class PassthroughWriter implements VaultWriter {
     flushAll(): void {}
 }
 
-describe("regression: PR5 stale-bookkeeping recovery", () => {
+describe("regression: stale-bookkeeping recovery", () => {
     let vault: FakeVaultIO;
     let db: LocalDB;
     let vs: VaultSync;
@@ -87,7 +88,7 @@ describe("regression: PR5 stale-bookkeeping recovery", () => {
         expect(before.chunks).toBeUndefined();
         expect(before.size).toBeUndefined();
 
-        const result = await vs.alignLastSyncedToDoc(path, fileDoc);
+        const result = await vs.alignLastSyncedToDoc(path, fileDoc, (await vault.stat(path))!);
         expect(result).toBe("upgraded-legacy");
 
         const after = vs.getLastSynced(path)!;
@@ -103,8 +104,8 @@ describe("regression: PR5 stale-bookkeeping recovery", () => {
         await vs.loadLastSyncedVclocks();
 
         // Force a stale state: lastSynced records different chunks/size
-        // than the integrated FileDoc actually has. Simulates PR1 invariant
-        // violation aftermath.
+        // than the integrated FileDoc actually has. Simulates the aftermath of a
+        // disk write that lastSynced did not follow.
         const fileDoc = (await db.get(makeFileId(path))) as FileDoc;
         await db.runWriteTx({
             vclocks: [{
@@ -119,7 +120,7 @@ describe("regression: PR5 stale-bookkeeping recovery", () => {
         expect(before.chunks).toEqual(["chunk:bogus"]);
         expect(before.size).toBe(9999);
 
-        const result = await vs.alignLastSyncedToDoc(path, fileDoc);
+        const result = await vs.alignLastSyncedToDoc(path, fileDoc, (await vault.stat(path))!);
         expect(result).toBe("recovered-stale");
 
         const after = vs.getLastSynced(path)!;
@@ -129,12 +130,12 @@ describe("regression: PR5 stale-bookkeeping recovery", () => {
 
     it("aligned lastSynced is unchanged (no-op)", async () => {
         const path = "notes/clean.md";
-        vault.addFile(path, "clean content");
+        vault.addFile(path, "clean content", { mtime: 1000 });
         await vs.fileToDb(path);
         await vs.loadLastSyncedVclocks();
 
         const fileDoc = (await db.get(makeFileId(path))) as FileDoc;
-        const result = await vs.alignLastSyncedToDoc(path, fileDoc);
+        const result = await vs.alignLastSyncedToDoc(path, fileDoc, (await vault.stat(path))!);
         expect(result).toBe("already-aligned");
     });
 

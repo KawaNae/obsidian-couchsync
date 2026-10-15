@@ -261,7 +261,7 @@ export class CouchClient implements ICouchClient {
                     // every later request skips compression up front.
                     this.gzipRequestBody = false;
                     logWarn(
-                        "CouchSync: server rejected gzip request body (415) — " +
+                        "server rejected gzip request body (415) — " +
                         "falling back to uncompressed requests for this session",
                     );
                     return await this.request<T>(path, init, opts);
@@ -344,7 +344,7 @@ export class CouchClient implements ICouchClient {
                     throw e;
                 }
                 logWarn(
-                    "CouchSync: compressed request rejected at network layer " +
+                    "compressed request rejected at network layer " +
                     "(CORS preflight?) — falling back to uncompressed requests " +
                     "for this session. Add 'content-encoding' to CouchDB " +
                     "cors.headers to enable push compression.",
@@ -455,7 +455,7 @@ export class CouchClient implements ICouchClient {
             // Render each doc with inline `_attachments.<name>.data` (base64).
             // CouchDB consumes this and stores the body as a native binary
             // attachment, so the wire is base64-inflated on push but storage
-            // and pull-side fetches are binary. Phase 14 / post-v1.0 may swap
+            // and pull-side fetches are binary. A future version may swap
             // this for individual multipart PUTs to recover the push wire
             // bytes — for now JSON-inline keeps the implementation simple and
             // batched.

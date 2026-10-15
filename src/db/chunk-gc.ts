@@ -12,7 +12,7 @@
  * then deletes every chunk not referenced by any live (non-deleted)
  * owner doc.
  *
- * Generic over the owner-doc kind (invariant 16): vault FileDocs live in
+ * Generic over the owner-doc kind: vault FileDocs live in
  * LocalDB, ConfigDocs live in ConfigLocalDB, and chunks are scoped per
  * DB. Two convenience wrappers (`gcOrphanChunks` for vault,
  * `gcOrphanConfigChunks` for config) wire the right doc enumerator into
@@ -28,6 +28,7 @@ import type { ListIdsRange } from "./interfaces.ts";
 import { ID_RANGE, configPathFromId } from "../types/doc-id.ts";
 import { collectFileChunkRefs, collectReferencedChunks } from "./chunk-refs.ts";
 import { logInfo } from "../ui/log.ts";
+import { CONFIG_LAST_SYNCED_PREFIX } from "./sync/config-last-synced.ts";
 
 export interface GcResult {
     scannedChunks: number;
@@ -89,16 +90,30 @@ export async function gcOrphanChunks(db: LocalDB): Promise<GcResult> {
     return sweepOrphanChunks(db, referenced, "Chunk GC");
 }
 
-/** Sweep orphan chunks in the config DB. References are derived from
- *  live ConfigDocs. Invariant 16 keeps the reference graph scoped to
- *  the config DB: config chunks are not visible from the vault DB and
- *  vice versa, so this sweep cannot accidentally delete a chunk that
- *  is still referenced from the other DB. */
+/** Sweep orphan chunks in the config DB. References are the live
+ *  ConfigDocs (the shared versions) and every lastSynced entry (the base
+ *  each path's disk took in): a base outlives its config doc when a newer
+ *  shared version arrives before the disk takes it in, and the merge reads
+ *  the base's content. The reference graph is scoped to the config DB:
+ *  config chunks are not visible from the vault DB and vice versa, so this
+ *  sweep cannot accidentally delete a chunk that is still referenced from
+ *  the other DB. */
 export async function gcOrphanConfigChunks(db: ConfigLocalDB): Promise<GcResult> {
     const configDocs = await db.allConfigDocs();
     const referenced = collectReferencedChunks(
         configDocs,
         (cd) => configPathFromId(cd._id),
     );
+    const bases = await db.getMetaByPrefix<{ chunks?: unknown }>(CONFIG_LAST_SYNCED_PREFIX);
+    for (const { key, value } of bases) {
+        if (!Array.isArray(value?.chunks)) continue;
+        const path = key.slice(CONFIG_LAST_SYNCED_PREFIX.length);
+        for (const id of value.chunks) {
+            if (typeof id !== "string") continue;
+            const owners = referenced.get(id);
+            if (owners) owners.push(path);
+            else referenced.set(id, [path]);
+        }
+    }
     return sweepOrphanChunks(db, referenced, "Config Chunk GC");
 }

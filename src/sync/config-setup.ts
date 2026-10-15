@@ -1,40 +1,39 @@
 /**
- * ConfigSetupService — admin-side init for the config DB.
+ * ConfigSetupService — Create for the config DB (formerly "Config Init").
  *
  * Mirror of `SetupService` (`src/sync/setup.ts`) for vault sync, but
  * targeting the separate config CouchDB (`couchdbConfigDbName`). Owns
- * the destructive "clean slate" sequence — and ONLY that. Init is purely
+ * the destructive "clean slate" sequence — and ONLY that. Create is purely
  * structural: it establishes an empty, correctly-rooted config DB. It does
  * NOT seed content. Sending this device's `.obsidian/` is a separate
  * `ConfigSync.push()` the user runs afterwards (and which is governed by
  * the meaning-unit filter). Splitting the two keeps a single push concept
- * and makes Init free of any filter/content semantics:
+ * and makes Create free of any filter/content semantics:
  *
  *   1. Derive the crypto root (`config:meta`) — pure, pre-destructive.
- *   2. Wipe local: `ConfigLocalDB.destroy()` removes the IndexedDB store
- *      entirely (docs + meta + vclock baselines + cursors), then re-open.
- *   3. Wipe remote: `DELETE /<configDb>` then `PUT /<configDb>`. Requires
- *      CouchDB admin permission. This is the symmetric counterpart to
- *      vault sync's `SetupService.init` and produces a real rev tree
- *      reset (rev=1- instead of the legacy "snapshot push on top of an
- *      existing rev tree" that left tombstones forever).
- *   4. Pin the crypto root: push `config:meta` (raw, never encrypted) as
- *      the FIRST and ONLY write to the fresh remote, then hand the new
- *      provider to the host so the subsequent `push()` encrypts correctly.
+ *   2. Flag the binding as mid-setup, so an interrupted Create blocks
+ *      live ops until a fresh Create completes.
+ *   3. Wipe local: the binding's store is destroyed and re-opened (docs +
+ *      meta + vclock baselines + cursors).
+ *   4. Wipe remote: `DELETE /<configDb>` then `PUT /<configDb>`. Requires
+ *      CouchDB admin permission. The symmetric counterpart to vault sync's
+ *      `SetupService.init`: a real rev tree reset.
+ *   5. Pin the crypto root: push `config:meta` (raw, never encrypted) as
+ *      the FIRST and ONLY write to the fresh remote.
+ *   6. Commit: record the root on the binding (this device is now joined),
+ *      save the passphrase Create encrypted with as the explicit config
+ *      passphrase, and keep the new key for this session, so the next
+ *      `push()` encrypts under the new root.
  *
- * After init the remote holds only `config:meta` (an empty config DB);
- * the user clicks Push to seed it from the current vault, filtered.
+ * After Create the remote holds only `config:meta` (an empty config DB);
+ * the user clicks Push to seed it from the current vault, filtered. Every
+ * other device's record now names the old root, so they must Join again.
  *
- * Caller (ConfigSync.init) supplies the live CouchClient and AbortSignal
+ * Caller (ConfigSync.create) supplies the raw CouchClient and AbortSignal
  * from its ConfigOperation epoch — we don't allocate clients ourselves.
- *
- * No reconcile step (vault sync's SetupService has one): config data
- * lives in the .obsidian/ tree and is reapplied to the filesystem via
- * `ConfigSync.write()` on a subsequent pull, not during init.
  */
 
 import type { ICouchClient } from "../db/interfaces.ts";
-import type { ConfigLocalDB } from "../db/config-local-db.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import * as remoteCouch from "../db/remote-couch.ts";
 import { makeCouchClient } from "../db/couch-client.ts";
@@ -42,157 +41,99 @@ import {
     buildInitialConfigMeta, pushConfigMeta, type ConfigMetaDoc,
 } from "../db/vault-meta.ts";
 import type { CryptoProvider } from "../db/crypto-provider.ts";
-import { codecFingerprint } from "./config-codec-policy.ts";
 import { logWarn } from "../ui/log.ts";
 
 export interface ConfigSetupResult {
-    /** The freshly-built config:meta. Returned so the host can store
-     *  the doc reference for diagnostics / future re-Init paths. */
+    /** The freshly-built config:meta. */
     meta: ConfigMetaDoc;
     /** New `CryptoProvider` derived from the freshly-generated salt.
-     *  Null when `opts.encryption === false`. The host (main.ts)
-     *  installs this onto `configCryptoProvider` so subsequent
-     *  `wrapConfigClient` calls pick it up (invariant 18). */
+     *  Null when `opts.encryption === false`. */
     crypto: CryptoProvider | null;
 }
 
-/** Phase 2 init options: an explicit codec policy passed to
- *  ConfigSetupService.init. Phase 1 cloned silently from vault:meta;
- *  Phase 2 makes the choice explicit at the call site (ConfigSync.init
- *  forwards user settings here). */
-export interface ConfigSetupInitOpts {
+/** The codec Create applies: the resolved config codec of the settings
+ *  (ConfigSync passes `resolveConfigCodec(settings)`). */
+export interface ConfigSetupCreateOpts {
     encryption: boolean;
     passphrase?: string;
     compression: boolean;
 }
 
-/** Local-state callbacks the host ConfigSync exposes. After local DB
- *  destroy, in-memory caches in the host need to be reset so subsequent
- *  ops re-derive from the new (empty) DB. */
+/** Binding-side callbacks. Create never touches settings or the local
+ *  store directly: the binding owns both. */
 export interface ConfigSetupHostHooks {
-    /** Drop in-memory lastSynced cache (mirrors disk wipe). */
-    clearLastSynced: () => void;
-    /** Force checkpoint reload on next ensureCheckpointsLoaded(). */
-    invalidateCheckpoints: () => void;
-    /** Hand the freshly-built cryptoProvider back to the host so it
-     *  takes effect for downstream `wrapConfigClient` / chunk hasher
-     *  calls. Called from inside the init flow once `buildInitialMeta`
-     *  resolves. Null = encryption disabled. The subsequent `push()`
-     *  relies on this being set so its wrapped client encrypts under the
-     *  freshly-derived config keys (#config-codec). */
-    onCryptoProviderReady: (crypto: CryptoProvider | null) => void;
-    /** Build a RAW config-DB client (no codec wrapping) for pushing
-     *  the meta doc, which is itself never encrypted or compressed.
-     *  Production omits this and the meta push falls back to
-     *  `makeCouchClient(settings)`; tests inject a FakeCouchClient so the
-     *  meta push runs against the same in-memory remote as the rest of
-     *  the test fixture. */
+    /** Persist the mid-setup flag on this binding's record. Called
+     *  immediately before the destructive local+remote wipe. A mid-flight
+     *  failure leaves it set, so live ops against this DB refuse to run
+     *  until a fresh Create completes. */
+    beginSetup: () => Promise<void>;
+    /** Empty and re-open this binding's local store. */
+    resetLocal: () => Promise<void>;
+    /** Build a RAW config-DB client (no codec wrapping) for pushing the
+     *  meta doc, which is itself never encrypted or compressed. Omitted →
+     *  `makeCouchClient(settings)`. */
     makeRawConfigClient?: () => ICouchClient;
-    /** Persist the config-setup-in-progress flag (Invariant C, config side).
-     *  Called with `true` immediately before the destructive local+remote
-     *  wipe and `false` only after a fully-successful init. A mid-flight
-     *  failure leaves it `true` so the host blocks sync against the half-built
-     *  config DB (#err-9). Optional: omitted in tests that don't exercise
-     *  crash atomicity. */
-    markSettingUp?: (active: boolean) => Promise<void>;
-    /** Record the codec fingerprint this Init applied, on full success
-     *  (#config-codec). The host persists it as `settings.configCodecApplied`;
-     *  a later live op compares the live resolved codec against it and refuses
-     *  to sync when they drift (the config-side equivalent of vault sync's
-     *  "codec change ⇒ re-init"). Optional: omitted in tests that don't
-     *  exercise the dirty gate. */
-    recordCodecApplied?: (fingerprint: string) => Promise<void>;
+    /** Create fully succeeded: record the new root (clearing the setup
+     *  flag, saving the passphrase) and keep its key — one commit. */
+    commit: (meta: ConfigMetaDoc, crypto: CryptoProvider | null) => Promise<void>;
 }
 
 export class ConfigSetupService {
     constructor(
-        private db: ConfigLocalDB,
         private getSettings: () => CouchSyncSettings,
         private host: ConfigSetupHostHooks,
     ) {}
 
-    async init(
+    async create(
         client: ICouchClient,
         signal: AbortSignal,
         onProgress: (msg: string) => void,
-        opts: ConfigSetupInitOpts,
+        opts: ConfigSetupCreateOpts,
     ): Promise<ConfigSetupResult> {
-        // 0. Derive the crypto root FIRST — a SELF-CONTAINED config:meta
-        //    (Phase 2: invariants 17 + 18): fresh salt + own keyCheck derived
-        //    from `opts.passphrase`. This is a PURE computation (no remote
-        //    I/O), so deriving it BEFORE any destruction means a key-derivation
-        //    failure leaves both the local and remote DBs untouched — nothing
-        //    to recover (M-2). The crypto is fed back to the host after the
-        //    meta is pinned on the remote (step 4) so subsequent
-        //    `wrapConfigClient` / chunk-hasher calls use the correct keys.
+        // 1. Derive the crypto root FIRST — a SELF-CONTAINED config:meta
+        //    (its own crypto root, independent of the vault DB): fresh salt +
+        //    own keyCheck. PURE (no remote I/O), so a key-derivation failure
+        //    leaves both the local and remote DBs untouched — nothing to recover.
         if (!this.getSettings().couchdbConfigDbName) {
             throw new Error("ConfigSetup: couchdbConfigDbName not configured");
         }
         const { meta, crypto } = await buildInitialConfigMeta(opts);
 
-        // 1. Persist the setup-in-progress flag BEFORE the destructive wipe
-        //    (Invariant C, config side). If the process dies after this point
-        //    the flag stays true and the host refuses to sync the half-built
-        //    config DB until a fresh Init clears it (#err-9). The crypto
-        //    derivation above is pre-destructive, so a failure there never
-        //    reaches this latch.
-        await this.host.markSettingUp?.(true);
+        // 2. Flag BEFORE the destructive wipe.
+        await this.host.beginSetup();
 
-        // 2. Wipe local DB completely (meta + docs in one go).
+        // 3. Wipe local.
         onProgress("Wiping local config database...");
-        await this.db.destroy();
-        this.db.open();
-        this.host.clearLastSynced();
-        this.host.invalidateCheckpoints();
+        await this.host.resetLocal();
 
-        // 3. Wipe remote. DELETE /<db> + PUT /<db> — true rev-tree reset
-        //    so the next push lands at rev=1- instead of stacking on top.
+        // 4. Wipe remote. DELETE /<db> + PUT /<db> — true rev-tree reset so
+        //    the next push lands at rev=1- instead of stacking on top.
         //    Requires admin permission; tolerates 404 (DB already gone).
-        onProgress("Destroying remote config database...");
-        await remoteCouch.destroyRemote(client, signal);
         onProgress("Recreating remote config database...");
-        await client.ensureDb(signal);
+        await remoteCouch.recreateRemote(client, signal);
 
-        // 4. Pin the crypto root: push config:meta as the FIRST and ONLY write
-        //    after ensureDb, so the window in which the remote config DB exists
-        //    WITHOUT an authoritative meta is as small as possible (M-2). A
-        //    failure here leaves the remote freshly recreated but meta-less; the
-        //    setup latch (step 1) keeps THIS device fail-closed, and a peer
-        //    reading the DB in that window sees a no-meta DB it treats as un-/
-        //    mid-setup rather than corrupt.
+        // 5. Pin the crypto root: config:meta is the FIRST and ONLY write
+        //    after ensureDb, so the window in which the remote config DB
+        //    exists WITHOUT an authoritative meta is as small as possible.
+        //    A failure here leaves the setup flag set (this device
+        //    stays fail-closed), and a peer sees a meta-less DB it reports
+        //    as uninitialized rather than corrupt.
         await this.pushConfigMetaRaw(meta);
-        this.host.onCryptoProviderReady(crypto);
 
-        // Init is structural only — it does NOT seed content. The remote now
-        // holds just config:meta (an empty config DB). Seeding the vault's
-        // `.obsidian/` is a separate, filter-governed `ConfigSync.push()` the
-        // user runs next; the provider handed over above makes that push
-        // encrypt under the freshly-derived config keys. Keeping the encrypting
-        // push out of Init means there is ONE push concept, and the fail-closed
-        // "no plaintext into an encrypted DB" guard lives where the push
-        // actually happens (wrapConfigClient + the codec-dirty gate), not
-        // duplicated here (#config-codec, L-1).
-
-        // Init fully succeeded — record the codec this Init applied so live ops
-        // can detect a later policy drift (#config-codec), then clear the
-        // setup-in-progress flag (#err-9). Order: record the applied codec
-        // BEFORE clearing settingUp, so an interruption between the two still
-        // leaves the DB blocked (settingUp true) rather than wrongly readable.
-        await this.host.recordCodecApplied?.(codecFingerprint({
-            encryption: opts.encryption,
-            passphrase: opts.passphrase ?? "",
-            compression: opts.compression,
-        }));
-        await this.host.markSettingUp?.(false);
+        // 6. Commit. Create is structural only — seeding is the user's next,
+        //    filter-governed Push, which encrypts under the root committed
+        //    here (the fail-closed "no plaintext into an encrypted DB" guard
+        //    lives in ConfigBinding.wrapClient).
+        await this.host.commit(meta, crypto);
 
         return { meta, crypto };
     }
 
     /** Push an already-built self-contained config:meta via a RAW client so
-     *  the meta itself bypasses the envelope codec stack (a fresh-Clone device
+     *  the meta itself bypasses the envelope codec stack (a joining device
      *  can read it before unlocking the passphrase). Network errors surface up
      *  — this write is **load-bearing** (it pins the crypto root) and must
-     *  succeed before Init can proceed. The meta is built separately, before
+     *  succeed before Create can proceed. The meta is built separately, before
      *  any destruction, so this method only does the (post-ensureDb) push. */
     private async pushConfigMetaRaw(meta: ConfigMetaDoc): Promise<void> {
         const settings = this.getSettings();
@@ -209,7 +150,7 @@ export class ConfigSetupService {
         } catch (e: any) {
             // Network errors here are visible — the meta is the crypto root and
             // a failed write would leave the config DB without an authoritative
-            // descriptor. Re-throw so the user sees the Init failure rather
+            // descriptor. Re-throw so the user sees the Create failure rather
             // than a silent corrupt state.
             logWarn(`ConfigSetup: config:meta push failed: ${e?.message ?? e}`);
             throw e;

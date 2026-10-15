@@ -4,13 +4,14 @@
  * Init builds vault:meta (deriving crypto when encryption is on) and pushes
  * the whole vault through the real codec stack; Clone fetches the meta,
  * unlocks with the passphrase, pulls everything and rebuilds the vault. This
- * is the setup path real devices run on day one — and the one the migration
- * incident lived on. Asserts the vault reconstructs byte-for-byte, the meta
+ * is the setup path real devices run on day one, and the one every
+ * destructive migration (Init on one device, Clone on the rest) runs. Asserts the vault reconstructs byte-for-byte, the meta
  * records the chosen codec, and a wrong passphrase is rejected.
  */
 import "fake-indexeddb/auto";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { createE2EHarness, bytesEqual, type E2EHarness } from "./couch-harness.ts";
+import { createE2EHarness, bytesEqual, waitFor, type E2EHarness } from "./couch-harness.ts";
+import { makeFileId } from "../../src/types/doc-id.ts";
 import { fetchVaultMeta } from "../../src/db/vault-meta.ts";
 
 describe("E2E: Init + Clone (real setup + real CouchDB)", () => {
@@ -63,5 +64,43 @@ describe("E2E: Init + Clone (real setup + real CouchDB)", () => {
         const b = h.addDevice("b2");
         await b.runClone(); // no passphrase needed
         expect(b.vault.readText("plain.md")).toBe("no crypto here");
+    });
+
+    it("Clone counts the files it wrote, not deletions or files kept out by the filter", async () => {
+        const a = h.addDevice("a3");
+        a.vault.addFile("keep/one.md", "one");
+        a.vault.addFile("keep/two.md", "two");
+        a.vault.addFile("gone.md", "deleted before the clone");
+        a.vault.addFile("private/secret.md", "filtered on the cloning device");
+        await a.runInit({ encryption: false, compression: false });
+        await a.vault.delete("gone.md");
+        await a.vs.markDeleted("gone.md");
+        await a.engine.start();
+        await waitFor(async () => (await h.adminClient.getDoc<{ deleted?: boolean }>(makeFileId("gone.md")))?.deleted === true, {
+            label: "tombstone pushed",
+        });
+        await a.engine.stop();
+
+        const b = h.addDevice("b3", { syncIgnore: "^private/" });
+        const summary = await b.runClone();
+        expect(summary).toBe("2 files written.");
+        expect(b.progress).toContain("Writing 2 vault files...");
+        expect(b.progress.filter((m) => m.startsWith("Writing: "))).toEqual([
+            expect.stringMatching(/\(1\/2\)$/), expect.stringMatching(/\(2\/2\)$/),
+        ]);
+        expect(b.vault.getFiles().map((f) => f.path).sort()).toEqual(["keep/one.md", "keep/two.md"]);
+    });
+
+    it("Init counts the files it scans and pushes, not files kept out by the filter", async () => {
+        const a = h.addDevice("a4", { syncIgnore: "^private/" });
+        a.vault.addFile("keep/one.md", "one");
+        a.vault.addFile("keep/two.md", "two");
+        a.vault.addFile("private/secret.md", "kept out on the initialising device");
+        const summary = await a.runInit({ encryption: false, compression: false });
+        expect(summary).toMatch(/^2 files, \d+ docs pushed\.$/);
+        expect(a.progress.filter((m) => m.startsWith("Scanning: "))).toEqual([
+            expect.stringMatching(/\(1\/2\)$/), expect.stringMatching(/\(2\/2\)$/),
+        ]);
+        expect(await h.adminClient.getDoc(makeFileId("private/secret.md"))).toBeNull();
     });
 });

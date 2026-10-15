@@ -1,10 +1,11 @@
-import { ItemView, WorkspaceLeaf, Notice, setIcon } from "obsidian";
+import { ItemView, WorkspaceLeaf, setIcon } from "obsidian";
 import type CouchSyncPlugin from "../main.ts";
 import type { HistoryEntry } from "../history/types.ts";
 import { ConfirmModal } from "./confirm-modal.ts";
 import { DiffCompareModal } from "./diff-compare-modal.ts";
 import { formatTime, formatDate } from "../utils/format.ts";
 import { buildGraphLayout, getMaxColumn, type GraphRow } from "./history-graph.ts";
+import { showNotice } from "./notices.ts";
 
 export const VIEW_TYPE_DIFF_HISTORY = "couchsync-history-view";
 
@@ -225,14 +226,14 @@ export class DiffHistoryView extends ItemView {
         if (!this.currentFile || entry.record.id == null) return;
 
         const reconstructed = await this.plugin.historyManager.reconstructAtRecord(this.currentFile, entry.record.id);
-        if (reconstructed === null) { new Notice("Failed to reconstruct file at this point."); return; }
+        if (reconstructed === null) { showNotice("Failed to reconstruct file at this point."); return; }
 
         let previousContent: string;
         let leftLabel: string;
 
         if (entry.record.parentId != null) {
             const prev = await this.plugin.historyManager.reconstructAtRecord(this.currentFile, entry.record.parentId);
-            if (prev === null) { new Notice("Failed to reconstruct previous state."); return; }
+            if (prev === null) { showNotice("Failed to reconstruct previous state."); return; }
             previousContent = prev;
             const parentEntry = this.graphRows.find((r) => r.entry.record.id === entry.record.parentId);
             if (parentEntry) {
@@ -264,10 +265,10 @@ export class DiffHistoryView extends ItemView {
 
         const success = await this.plugin.restoreFromHistory(this.currentFile, entry.record.id);
         if (success) {
-            new Notice("File restored successfully.");
+            showNotice("File restored successfully.");
             await this.showFileHistory(this.currentFile);
         } else {
-            new Notice("Failed to restore file.");
+            showNotice("Failed to restore file.");
         }
     }
 }

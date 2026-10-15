@@ -29,7 +29,7 @@ describe("classifyDexieError", () => {
         expect(classifyDexieError(fakeDexieErr("InvalidStateError"))).toBe("invalid-state");
     });
 
-    // Invariant III (G5): DatabaseClosedError is a handle-expired signal —
+    // DatabaseClosedError is a handle-expired signal —
     // classify as invalid-state (HandleGuard reopens) instead of "unknown",
     // which produced the "[dexie-store] runTx failed unclassified" noise +
     // the "reconcile vclock-adopt failed ... DbError(unknown)" errors in the

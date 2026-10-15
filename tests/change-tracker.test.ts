@@ -1,6 +1,8 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
 import { ChangeTracker } from "../src/sync/change-tracker.ts";
+import { computeHash } from "../src/db/chunker.ts";
 import { FakeVaultEvents } from "./helpers/fake-vault-events.ts";
+import { FakeVaultIO } from "./helpers/fake-vault-io.ts";
 import { makeSettings } from "./helpers/settings-factory.ts";
 
 /** Minimal VaultSync stub — records calls for assertions. */
@@ -21,19 +23,28 @@ function makeVaultSyncStub() {
 }
 
 const stat = { mtime: 1000, ctime: 1000, size: 100 };
+const bytes = (text: string) => new TextEncoder().encode(text).buffer;
 
 describe("ChangeTracker", () => {
     let events: FakeVaultEvents;
+    let vault: FakeVaultIO;
     let vaultSync: ReturnType<typeof makeVaultSyncStub>;
     let settings: ReturnType<typeof makeSettings>;
     let tracker: ChangeTracker;
 
+    // Load the hasher once, so a comparison with the disk settles within
+    // the microtasks the fake timers flush.
+    beforeAll(async () => {
+        await computeHash(new Uint8Array(1));
+    });
+
     beforeEach(() => {
         vi.useFakeTimers();
         events = new FakeVaultEvents();
+        vault = new FakeVaultIO();
         vaultSync = makeVaultSyncStub();
         settings = makeSettings({ syncDebounceMs: 100, syncMinIntervalMs: 0 });
-        tracker = new ChangeTracker(events, vaultSync as any, () => settings);
+        tracker = new ChangeTracker(events, vault, vaultSync as any, () => settings);
     });
 
     afterEach(() => {
@@ -85,11 +96,6 @@ describe("ChangeTracker", () => {
     });
 
     // ── ignoreDelete ─────────────────────────────────────
-    //
-    // ignoreWrite / clearIgnore was retired in v0.21.0; PR1 of the
-    // sync-classifier plan reintroduced an explicit `ignoreNextModify`
-    // because the new disk-write invariant means every pull-side write
-    // produces a modify event we must drop before it hits the debounce.
 
     describe("ignoreDelete", () => {
         it("suppresses next delete for ignored path", async () => {
@@ -102,49 +108,120 @@ describe("ChangeTracker", () => {
         });
     });
 
-    describe("ignoreNextModify (time-window)", () => {
-        it("suppresses modify events within the 5 s window", async () => {
+    // ── ignoreModifyTo ───────────────────────────────────
+
+    describe("ignoreModifyTo", () => {
+        /** The disk at `path` now holds `text`, and Obsidian says so. */
+        async function modify(path: string, text: string): Promise<void> {
+            if (await vault.exists(path)) await vault.writeBinary(path, bytes(text));
+            else vault.addFile(path, text);
+            events.emit("modify", path, (await vault.stat(path))!);
+        }
+
+        async function settle(): Promise<void> {
+            await vi.advanceTimersByTimeAsync(200);
+        }
+
+        it("ignores a modify that finds the written bytes, however late and however often", async () => {
             tracker.start();
-            tracker.ignoreNextModify("a.md");
+            vault.addFile("a.md", "old");
+            tracker.ignoreModifyTo("a.md", bytes("new"));
 
-            events.emit("modify", "a.md", stat);
-            vi.advanceTimersByTime(200);
-            await vi.runAllTimersAsync();
-            expect(vaultSync.calls.fileToDb).toHaveLength(0);
+            await modify("a.md", "new");
+            await settle();
+            expect(vaultSync.calls.fileToDb).toEqual([]);
 
-            // Second modify still within window — also suppressed.
-            vi.advanceTimersByTime(2000);
-            events.emit("modify", "a.md", stat);
-            vi.advanceTimersByTime(200);
-            await vi.runAllTimersAsync();
-            expect(vaultSync.calls.fileToDb).toHaveLength(0);
+            await vi.advanceTimersByTimeAsync(10_000);
+            await modify("a.md", "new");
+            await settle();
+            expect(vaultSync.calls.fileToDb).toEqual([]);
         });
 
-        it("allows modify after window expires", async () => {
+        it("passes a modify that finds other bytes to fileToDb after the usual debounce", async () => {
             tracker.start();
-            tracker.ignoreNextModify("a.md");
+            vault.addFile("a.md", "old");
+            tracker.ignoreModifyTo("a.md", bytes("new"));
+            await modify("a.md", "new");
 
-            // Advance past the 5 s window.
-            vi.advanceTimersByTime(5001);
-
-            events.emit("modify", "a.md", stat);
-            vi.advanceTimersByTime(200);
-            await vi.runAllTimersAsync();
+            // Obsidian saves the open note's merge of typing and the
+            // written version, right after the write.
+            await vi.advanceTimersByTimeAsync(50);
+            await modify("a.md", "new and typing");
+            await vi.advanceTimersByTimeAsync(100);
             expect(vaultSync.calls.fileToDb).toEqual(["a.md"]);
+        });
+
+        it("compares the bytes when the size is the same", async () => {
+            tracker.start();
+            vault.addFile("a.md", "old");
+            tracker.ignoreModifyTo("a.md", bytes("abc"));
+
+            await modify("a.md", "abd");
+            await settle();
+            expect(vaultSync.calls.fileToDb).toEqual(["a.md"]);
+        });
+
+        it("stops ignoring once a modify found other bytes", async () => {
+            tracker.start();
+            vault.addFile("a.md", "old");
+            tracker.ignoreModifyTo("a.md", bytes("new"));
+
+            await modify("a.md", "edit");
+            await settle();
+            await modify("a.md", "new");
+            await settle();
+            expect(vaultSync.calls.fileToDb).toEqual(["a.md", "a.md"]);
+        });
+
+        it("compares with the latest write to the path", async () => {
+            tracker.start();
+            vault.addFile("a.md", "old");
+            tracker.ignoreModifyTo("a.md", bytes("v1"));
+            tracker.ignoreModifyTo("a.md", bytes("v2"));
+
+            await modify("a.md", "v2");
+            await settle();
+            expect(vaultSync.calls.fileToDb).toEqual([]);
+
+            await modify("a.md", "v1");
+            await settle();
+            expect(vaultSync.calls.fileToDb).toEqual(["a.md"]);
+        });
+
+        it("forgets the written bytes when the file is deleted", async () => {
+            tracker.start();
+            vault.addFile("a.md", "new");
+            tracker.ignoreModifyTo("a.md", bytes("new"));
+            tracker.ignoreDelete("a.md");
+            events.emit("delete", "a.md");
+
+            await modify("a.md", "new");
+            await settle();
+            expect(vaultSync.calls.fileToDb).toEqual(["a.md"]);
+        });
+
+        it("counts a modify as pending while it is compared with the disk", async () => {
+            tracker.start();
+            vault.addFile("a.md", "new");
+            tracker.ignoreModifyTo("a.md", bytes("new"));
+
+            events.emit("modify", "a.md", (await vault.stat("a.md"))!);
+            expect(tracker.hasPending("a.md")).toBe(true);
+            await settle();
+            expect(tracker.hasPending("a.md")).toBe(false);
+            expect(vaultSync.calls.fileToDb).toEqual([]);
         });
 
         it("does not affect other paths", async () => {
             tracker.start();
-            tracker.ignoreNextModify("a.md");
-            events.emit("modify", "b.md", stat);
-
-            vi.advanceTimersByTime(200);
-            await vi.runAllTimersAsync();
+            tracker.ignoreModifyTo("a.md", bytes("new"));
+            await modify("b.md", "new");
+            await settle();
             expect(vaultSync.calls.fileToDb).toEqual(["b.md"]);
         });
     });
 
-    // ── hasPending (PR-A: pending-edit oracle, invariant 4) ─
+    // ── hasPending (pending-edit oracle) ─
 
     describe("hasPending", () => {
         it("returns true while a debounced fileToDb is scheduled", async () => {
@@ -168,7 +245,7 @@ describe("ChangeTracker", () => {
             // Configure a long min-interval so the second emit is deferred
             // through pendingMinInterval after the first sync completes.
             settings = makeSettings({ syncDebounceMs: 50, syncMinIntervalMs: 5000 });
-            tracker = new ChangeTracker(events, vaultSync as any, () => settings);
+            tracker = new ChangeTracker(events, vault, vaultSync as any, () => settings);
             tracker.start();
 
             // First edit goes through cleanly.
@@ -189,9 +266,9 @@ describe("ChangeTracker", () => {
 
         it("does NOT return true for sync-driven echo suppressors", async () => {
             tracker.start();
-            // ignoreNextModify / ignoreDelete arm echo suppressors which
+            // ignoreModifyTo / ignoreDelete arm echo suppressors which
             // are not user edits — hasPending must remain false.
-            tracker.ignoreNextModify("a.md");
+            tracker.ignoreModifyTo("a.md", bytes("new"));
             tracker.ignoreDelete("a.md");
             expect(tracker.hasPending("a.md")).toBe(false);
         });

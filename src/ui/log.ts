@@ -10,9 +10,18 @@
  *   logWarn(msg)    → buffer(warn)  + console(always)
  *   logError(msg)   → buffer(error) + console(always)  + notice(always)
  *   notify(msg, d?) → buffer(info)  + notice(always)   — user-facing
+ *
+ * Messages are bare text. `PLUGIN_PREFIX`, which tells the user which
+ * plugin a line comes from, is added once at each exit that leaves the
+ * plugin: here for the console, and by `showNotice` (notices.ts) for every
+ * Obsidian Notice, including the ones routed through `initLog`. The ring
+ * buffer, the Log View and the log database keep the bare text. A prefix
+ * in the message would show twice.
  */
 
 // ── Types ────────────────────────────────────────────────
+
+export const PLUGIN_PREFIX = "CouchSync: ";
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
@@ -80,27 +89,27 @@ function isVerbose(): boolean {
 /** Debug-level log. Always buffered. Console output only when verbose. */
 export function logDebug(message: string): void {
     pushEntry("debug", message);
-    if (isVerbose()) console.log(message);
+    if (isVerbose()) console.log(PLUGIN_PREFIX + message);
 }
 
 /** Info-level log. Always buffered. Console + Notice only when verbose. */
 export function logInfo(message: string, durationMs = 4000): void {
     pushEntry("info", message);
     if (!isVerbose()) return;
-    console.log(message);
+    console.log(PLUGIN_PREFIX + message);
     _showNotice?.(message, durationMs);
 }
 
 /** Warn-level log. Always buffered + console.warn. */
 export function logWarn(message: string): void {
     pushEntry("warn", message);
-    console.warn(message);
+    console.warn(PLUGIN_PREFIX + message);
 }
 
 /** Error-level log. Always buffered + console.error + Notice. */
 export function logError(message: string): void {
     pushEntry("error", message);
-    console.error(message);
+    console.error(PLUGIN_PREFIX + message);
     _showNotice?.(message, 8000);
 }
 

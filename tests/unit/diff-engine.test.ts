@@ -1,5 +1,5 @@
 /**
- * DiffEngine — surrogate-boundary normalization (incident 2026-06-04).
+ * DiffEngine — surrogate-boundary normalization.
  *
  * diff-match-patch slices diffs at UTF-16 code unit boundaries, so editing
  * near an emoji can produce lone-surrogate segments from perfectly

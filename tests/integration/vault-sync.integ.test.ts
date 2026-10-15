@@ -1,12 +1,16 @@
 import "fake-indexeddb/auto";
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { VaultSync } from "../../src/sync/vault-sync.ts";
 import { FilesystemVaultWriter } from "../../src/sync/vault-writer.ts";
 import { LocalDB } from "../../src/db/local-db.ts";
 import { FakeVaultIO } from "../helpers/fake-vault-io.ts";
 import { makeSettings } from "../helpers/settings-factory.ts";
 import { makeFileId } from "../../src/types/doc-id.ts";
-import type { FileDoc } from "../../src/types.ts";
+import type { FileDoc, CouchSyncDoc } from "../../src/types.ts";
+import { FILE_SCHEMA_VERSION } from "../../src/types.ts";
+import { splitIntoChunks } from "../../src/db/chunker.ts";
+import { RACY_MTIME_WINDOW_MS } from "../../src/sync/last-synced.ts";
+import { toPathKey } from "../../src/utils/path.ts";
 
 let counter = 0;
 function uniqueDbName() { return `vault-sync-test-${Date.now()}-${counter++}`; }
@@ -135,14 +139,28 @@ describe("VaultSync", () => {
     // ── dbToFile ────────────────────────────────────────
 
     describe("dbToFile", () => {
-        it("writes file content to vault", async () => {
-            // First push a file to populate DB
-            vault.addFile("a.md", "Hello from DB");
-            await vs.fileToDb("a.md");
+        /** `text` at `path` as another device sent it, with its chunks
+         *  stored locally as the pull fetches them before writing. */
+        async function remoteDoc(
+            path: string, text: string, vclock: Record<string, number>,
+        ): Promise<FileDoc> {
+            const buf = new TextEncoder().encode(text).buffer;
+            const chunks = await splitIntoChunks(buf);
+            await db.runWriteTx({ chunks: chunks as unknown as CouchSyncDoc[] });
+            return {
+                _id: makeFileId(path), schemaVersion: FILE_SCHEMA_VERSION, type: "file",
+                chunks: chunks.map((c) => c._id), mtime: 1, ctime: 1,
+                size: buf.byteLength, vclock,
+            };
+        }
 
-            // Remove from vault, then pull back
-            vault.files.delete("a.md");
-            const doc = await db.get(makeFileId("a.md")) as FileDoc;
+        /** A tombstone another device made after `doc`. */
+        function remoteTombstone(doc: FileDoc): FileDoc {
+            return { ...doc, deleted: true, vclock: { ...doc.vclock, "dev-B": 9 } };
+        }
+
+        it("writes file content to vault", async () => {
+            const doc = await remoteDoc("a.md", "Hello from DB", { "dev-B": 1 });
 
             await vs.dbToFile(doc);
 
@@ -153,17 +171,11 @@ describe("VaultSync", () => {
         it("overwrites existing file", async () => {
             vault.addFile("a.md", "v1");
             await vs.fileToDb("a.md");
+            const doc = await remoteDoc("a.md", "v2", { "dev-A": 1, "dev-B": 1 });
 
-            // Change DB content
-            vault.addFile("a.md", "v2");
-            await vs.fileToDb("a.md");
+            const res = await vs.dbToFile(doc);
 
-            // Reset vault to v1
-            vault.addFile("a.md", "v1");
-            const doc = await db.get(makeFileId("a.md")) as FileDoc;
-
-            await vs.dbToFile(doc);
-
+            expect(res).toEqual({ applied: true });
             expect(vault.readText("a.md")).toBe("v2");
         });
 
@@ -172,14 +184,177 @@ describe("VaultSync", () => {
             await vs.fileToDb("a.md");
 
             const doc = await db.get(makeFileId("a.md")) as FileDoc;
-            const tombstone = { ...doc, deleted: true } as FileDoc;
-
-            await vs.dbToFile(tombstone);
+            await vs.dbToFile(remoteTombstone(doc));
 
             expect(vault.files.has("a.md")).toBe(false);
         });
 
-        it("rejects a remote path that escapes the vault (#3 traversal)", async () => {
+        it("applies a deletion whose vclock equals the baseline (hard delete on pull)", async () => {
+            // The pull turns a CouchDB deletion into a tombstone carrying the
+            // local doc's vclock; with the vault unchanged it is applied.
+            vault.addFile("a.md", "content");
+            await vs.fileToDb("a.md");
+            const doc = await db.get(makeFileId("a.md")) as FileDoc;
+
+            const res = await vs.dbToFile({ ...doc, deleted: true });
+
+            expect(res).toEqual({ applied: true });
+            expect(vault.files.has("a.md")).toBe(false);
+        });
+
+        describe("a vault changed since the last sync", () => {
+            const DECLINED = { applied: false, reason: "unsynced-vault-change" };
+
+            it("keeps an edited file and leaves the baseline", async () => {
+                vault.addFile("a.md", "v1");
+                await vs.fileToDb("a.md");
+                const before = vs.getLastSynced("a.md");
+                vault.addFile("a.md", "my edit", { mtime: Date.now() + 1000 });
+                const doc = await remoteDoc("a.md", "v2", { "dev-A": 1, "dev-B": 1 });
+
+                const res = await vs.dbToFile(doc);
+
+                expect(res).toEqual(DECLINED);
+                expect(vault.readText("a.md")).toBe("my edit");
+                expect(vs.getLastSynced("a.md")).toEqual(before);
+                // The reconcile finds the path diverged.
+                const stat = (await vault.stat("a.md"))!;
+                expect(await vs.classifyFileVsDoc(doc, "a.md", stat)).toBe("true-divergent");
+            });
+
+            it("keeps an edit of the same size with a fresh mtime", async () => {
+                vault.addFile("a.md", "aaaa", { mtime: 1000 });
+                await vs.fileToDb("a.md");
+                vault.addFile("a.md", "bbbb", { mtime: 2000 });
+                const doc = await remoteDoc("a.md", "cccc", { "dev-A": 1, "dev-B": 1 });
+
+                expect(await vs.dbToFile(doc)).toEqual(DECLINED);
+                expect(vault.readText("a.md")).toBe("bbbb");
+            });
+
+            it("does not recreate a file the user deleted", async () => {
+                vault.addFile("a.md", "v1");
+                await vs.fileToDb("a.md");
+                vault.files.delete("a.md");
+                const doc = await remoteDoc("a.md", "v2", { "dev-A": 1, "dev-B": 1 });
+
+                expect(await vs.dbToFile(doc)).toEqual(DECLINED);
+                expect(vault.files.has("a.md")).toBe(false);
+            });
+
+            it("does not delete an edited file", async () => {
+                vault.addFile("a.md", "v1");
+                await vs.fileToDb("a.md");
+                const doc = await db.get(makeFileId("a.md")) as FileDoc;
+                vault.addFile("a.md", "my edit", { mtime: Date.now() + 1000 });
+
+                expect(await vs.dbToFile(remoteTombstone(doc))).toEqual(DECLINED);
+                expect(vault.readText("a.md")).toBe("my edit");
+                expect(vs.getLastSynced("a.md")?.deleted).toBeUndefined();
+            });
+
+            it("does not delete a file made after a synced deletion", async () => {
+                vault.addFile("a.md", "v1");
+                await vs.fileToDb("a.md");
+                const doc = await db.get(makeFileId("a.md")) as FileDoc;
+                const tomb = remoteTombstone(doc);
+                await vs.dbToFile(tomb);
+                vault.addFile("a.md", "made again");
+
+                const again = { ...tomb, vclock: { ...tomb.vclock, "dev-B": 10 } };
+                expect(await vs.dbToFile(again)).toEqual(DECLINED);
+                expect(vault.readText("a.md")).toBe("made again");
+            });
+
+            it("does not delete a file never synced here", async () => {
+                vault.addFile("a.md", "never synced");
+                const doc = await remoteDoc("a.md", "theirs", { "dev-B": 1 });
+
+                expect(await vs.dbToFile(remoteTombstone(doc))).toEqual(DECLINED);
+                expect(vault.readText("a.md")).toBe("never synced");
+            });
+
+            it("replaces it when the caller holds the user's decision", async () => {
+                vault.addFile("a.md", "v1");
+                await vs.fileToDb("a.md");
+                vault.addFile("a.md", "my edit", { mtime: Date.now() + 1000 });
+                const doc = await remoteDoc("a.md", "v2", { "dev-A": 1, "dev-B": 1 });
+
+                const res = await vs.dbToFile(doc, { overwriteVaultChange: true });
+
+                expect(res).toEqual({ applied: true });
+                expect(vault.readText("a.md")).toBe("v2");
+                expect(vs.getLastSynced("a.md")?.chunks).toEqual(doc.chunks);
+            });
+
+            it("applies a deletion to a file the user already deleted", async () => {
+                vault.addFile("a.md", "v1");
+                await vs.fileToDb("a.md");
+                const doc = await db.get(makeFileId("a.md")) as FileDoc;
+                vault.files.delete("a.md");
+
+                expect(await vs.dbToFile(remoteTombstone(doc))).toEqual({ applied: true });
+                expect(vs.getLastSynced("a.md")?.deleted).toBe(true);
+            });
+
+            it("keeps a file with no baseline whose content differs", async () => {
+                // Made here before its first push, or come into the filters:
+                // the reconcile offers it as a conflict.
+                vault.addFile("a.md", "never synced");
+                const doc = await remoteDoc("a.md", "theirs", { "dev-B": 1 });
+
+                expect(await vs.dbToFile(doc)).toEqual(DECLINED);
+                expect(vault.readText("a.md")).toBe("never synced");
+                expect(vs.getLastSynced("a.md")).toBeUndefined();
+                const stat = (await vault.stat("a.md"))!;
+                expect(await vs.classifyFileVsDoc(doc, "a.md", stat)).toBe("true-divergent");
+            });
+
+            it("declines a file with no baseline and another size", async () => {
+                vault.addFile("a.md", "never synced");
+                const doc = await remoteDoc("a.md", "theirs", { "dev-B": 1 });
+
+                expect(await vs.dbToFile(doc)).toEqual(DECLINED);
+                expect(vault.readText("a.md")).toBe("never synced");
+            });
+
+            it("takes the baseline where a file with no baseline holds the content of a doc whose size is wrong", async () => {
+                vault.addFile("a.md", "same content", { mtime: 1000 });
+                const doc = { ...await remoteDoc("a.md", "same content", { "dev-B": 1 }), size: 3 };
+
+                expect(await vs.dbToFile(doc)).toEqual({ applied: true });
+                expect((await vault.stat("a.md"))?.mtime).toBe(1000);
+                const ls = vs.getLastSynced("a.md");
+                expect(ls?.chunks).toEqual(doc.chunks);
+                expect(ls?.size).toBe(12);
+            });
+
+            it("takes the baseline where a file with no baseline already holds the content", async () => {
+                vault.addFile("a.md", "same", { mtime: 1000 });
+                const doc = await remoteDoc("a.md", "same", { "dev-B": 1 });
+
+                expect(await vs.dbToFile(doc)).toEqual({ applied: true });
+                expect((await vault.stat("a.md"))?.mtime).toBe(1000);
+                const ls = vs.getLastSynced("a.md");
+                expect(ls?.chunks).toEqual(doc.chunks);
+                expect(ls?.vclock).toEqual(doc.vclock);
+            });
+
+            it("keeps a file whose baseline has no fingerprint when the content differs", async () => {
+                vault.addFile("a.md", "mine");
+                await db.runWriteTx({
+                    meta: [{ op: "put", key: "_local/vclock/" + toPathKey("a.md"), value: { "dev-A": 1 } as any }],
+                });
+                await vs.loadLastSyncedVclocks();
+                const doc = await remoteDoc("a.md", "theirs", { "dev-A": 1, "dev-B": 1 });
+
+                expect(await vs.dbToFile(doc)).toEqual(DECLINED);
+                expect(vault.readText("a.md")).toBe("mine");
+            });
+
+        });
+
+        it("rejects a remote path that escapes the vault (traversal)", async () => {
             vault.addFile("seed.md", "payload");
             await vs.fileToDb("seed.md");
             const seed = await db.get(makeFileId("seed.md")) as FileDoc;
@@ -194,7 +369,7 @@ describe("VaultSync", () => {
             expect(vault.files.has("../evil.md")).toBe(false);
         });
 
-        it("rejects a tombstone whose path escapes the vault (#3 delete-via-traversal)", async () => {
+        it("rejects a tombstone whose path escapes the vault (delete-via-traversal)", async () => {
             vault.addFile("seed.md", "payload");
             await vs.fileToDb("seed.md");
             const seed = await db.get(makeFileId("seed.md")) as FileDoc;
@@ -207,7 +382,7 @@ describe("VaultSync", () => {
             expect(res).toEqual({ applied: false, reason: "unsafe-path" });
         });
 
-        it("skips pull when total chunk size exceeds maxFileSizeMB (#4, symmetric to push)", async () => {
+        it("skips pull when total chunk size exceeds maxFileSizeMB (symmetric to push)", async () => {
             vault.addFile("big.md", "y".repeat(4000));
             await vs.fileToDb("big.md");
             vault.files.delete("big.md");
@@ -235,7 +410,7 @@ describe("VaultSync", () => {
         });
     });
 
-    // ── classifyFileVsDoc (PR3 — replaces legacy compareFileToDoc) ─
+    // ── classifyFileVsDoc (replaces legacy compareFileToDoc) ─
 
     describe("classifyFileVsDoc", () => {
         it("returns identical when content matches", async () => {
@@ -274,7 +449,7 @@ describe("VaultSync", () => {
             // Vault has different content from both lastSynced and remote.
             vault.addFile("a.md", "v1-but-different", { size: 777 });
             const result = await vs.classifyFileVsDoc(updated as FileDoc, "a.md", (await vault.stat("a.md"))!);
-            // PR3 classifier detects "right dominates AND left drifted from
+            // The classifier detects "right dominates AND left drifted from
             // baseline" → true-divergent (instead of legacy remote-pending
             // which had a separate divergent-edit guard).
             expect(result).toBe("true-divergent");
@@ -354,10 +529,12 @@ describe("VaultSync", () => {
             expect(vs.getLastSynced("c.md")?.mtime).toBe(7000);
         });
 
-        it("alignLastSyncedToDoc skips the stamp when the stat size mismatches the doc", async () => {
+        it("alignLastSyncedToDoc records the disk's size, not a doc's that misstates it", async () => {
             vault.addFile("c.md", "cached", { mtime: 7000 });
             await vs.fileToDb("c.md");
-            const doc = await db.get(makeFileId("c.md")) as FileDoc;
+            const synced = await db.get(makeFileId("c.md")) as FileDoc;
+            // A baseline taken from a doc whose size is not its content's.
+            const doc = { ...synced, size: 3 };
             await db.runWriteTx({
                 vclocks: [{
                     path: "c.md", op: "set", clock: doc.vclock,
@@ -366,14 +543,51 @@ describe("VaultSync", () => {
             });
             await vs.loadLastSyncedVclocks();
 
-            // A stat whose size disagrees with the doc does not describe the
-            // integrated content (unflushed editor buffer) — no stamp.
-            const r = await vs.alignLastSyncedToDoc("c.md", doc, { mtime: 9000, size: 999 });
-            expect(r).toBe("already-aligned");
-            expect(vs.getLastSynced("c.md")?.mtime).toBeUndefined();
+            const r = await vs.alignLastSyncedToDoc("c.md", doc, { mtime: 7000, size: 6 });
+            expect(r).toBe("stamped-mtime");
+            expect(vs.getLastSynced("c.md")).toMatchObject({ size: 6, mtime: 7000 });
+            expect(await vs.alignLastSyncedToDoc("c.md", doc, { mtime: 7000, size: 6 }))
+                .toBe("already-aligned");
         });
 
-        it("dbToFile stamps the post-write disk mtime", async () => {
+        it("a stamp too recent to trust is not kept: a same-size rewrite with the same mtime is seen", async () => {
+            const t = Date.now();
+            vault.addFile("r.md", "aa", { mtime: t });
+            await vs.fileToDb("r.md");
+            expect(vs.getLastSynced("r.md")?.mtime).toBeUndefined();
+            await vs.loadLastSyncedVclocks();
+            expect(vs.getLastSynced("r.md")?.mtime).toBeUndefined();
+
+            // Rewritten within the mtime resolution: same mtime, same size.
+            vault.addFile("r.md", "bb", { mtime: t });
+            const doc = await db.get(makeFileId("r.md")) as FileDoc;
+            const reads = countReads();
+            const result = await vs.classifyFileVsDoc(doc, "r.md", { mtime: t, size: 2 });
+            expect(reads()).toBe(1);
+            expect(result).not.toBe("identical");
+
+            // The startup drift scan hashes it too and records the rewrite.
+            expect(await vs.stampVaultDrift()).toBe(1);
+            const after = await db.get(makeFileId("r.md")) as FileDoc;
+            expect(after.chunks).not.toEqual(doc.chunks);
+        });
+
+        it("a stamp old enough is kept, and a later check is served from it", async () => {
+            const old = Date.now() - RACY_MTIME_WINDOW_MS - 1;
+            vault.addFile("o.md", "aa", { mtime: old });
+            await vs.fileToDb("o.md");
+            expect(vs.getLastSynced("o.md")?.mtime).toBe(old);
+            await vs.loadLastSyncedVclocks();
+            expect(vs.getLastSynced("o.md")?.mtime).toBe(old);
+
+            const doc = await db.get(makeFileId("o.md")) as FileDoc;
+            const reads = countReads();
+            expect(await vs.classifyFileVsDoc(doc, "o.md", { mtime: old, size: 2 })).toBe("identical");
+            expect(reads()).toBe(0);
+            expect(await vs.stampVaultDrift()).toBe(0);
+        });
+
+        it("dbToFile stamps the post-write disk mtime once it is old enough", async () => {
             const remote: FileDoc = {
                 _id: makeFileId("pulled.md"),
                 type: "file",
@@ -393,7 +607,17 @@ describe("VaultSync", () => {
             const res = await vs.dbToFile(pulled);
             expect(res.applied).toBe(true);
 
+            // Just written: too recent to stamp.
             const stat = (await vault.stat("pulled.md"))!;
+            expect(vs.getLastSynced("pulled.md")!.mtime).toBeUndefined();
+
+            // A later reconcile align stamps the disk mtime (never the sender's).
+            const now = vi.spyOn(Date, "now").mockReturnValue(stat.mtime + RACY_MTIME_WINDOW_MS);
+            try {
+                expect(await vs.alignLastSyncedToDoc("pulled.md", pulled, stat)).toBe("stamped-mtime");
+            } finally {
+                now.mockRestore();
+            }
             const ls = vs.getLastSynced("pulled.md")!;
             expect(ls.mtime).toBe(stat.mtime);
             expect(ls.mtime).not.toBe(123);
@@ -472,7 +696,7 @@ describe("VaultSync", () => {
         });
     });
 
-    // ── hasUnpushedChanges (PR-B: chunks-aware, invariant 4) ─
+    // ── hasUnpushedChanges (chunks-aware pending-edit oracle) ─
 
     describe("hasUnpushedChanges", () => {
         it("returns false when no integration baseline exists", async () => {

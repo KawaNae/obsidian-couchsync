@@ -1,0 +1,282 @@
+/**
+ * Config ops never overlap. A confirmation dialog an op shows (the Push
+ * list, Create's confirmation) is part of the op: while it is open every
+ * other config op, local exclusive task and rebind is refused as busy and
+ * changes nothing, and the op goes on when the user answers. The busy
+ * state is announced when it starts and ends, so a view can disable the
+ * buttons while it lasts.
+ */
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import "fake-indexeddb/auto";
+import { ConfigSync } from "../src/sync/config-sync.ts";
+import { ConfigLocalDB } from "../src/db/config-local-db.ts";
+import { AuthGate } from "../src/db/sync/auth-gate.ts";
+import { ALWAYS_VISIBLE } from "../src/db/visibility-gate.ts";
+import type { ReconnectBridge } from "../src/sync/reconnect-bridge.ts";
+import type { ConfigCreateConfirm } from "../src/sync/config-create-preview.ts";
+import type { PushReview } from "../src/sync/config-push-review.ts";
+import type { DbCheckResult } from "../src/db/sync/vault-remote-ops.ts";
+import { DOC_ID } from "../src/types/doc-id.ts";
+import { FakeCouchClient } from "./helpers/fake-couch-client.ts";
+import { FakeVaultIO } from "./helpers/fake-vault-io.ts";
+import { FakeModalPresenter } from "./helpers/fake-modal-presenter.ts";
+import { makeSettings } from "./helpers/settings-factory.ts";
+import { attachPlain, getAttachment } from "./helpers/config-attach.ts";
+
+let counter = 0;
+function uniqueName() { return `cs-overlap-${Date.now()}-${counter++}`; }
+
+/** A dialog that stays open until the test answers it. */
+class Dialog<T> {
+    private answer!: (v: T) => void;
+    open = false;
+    show(): Promise<T> {
+        this.open = true;
+        return new Promise<T>((r) => { this.answer = r; });
+    }
+    close(v: T): void {
+        this.open = false;
+        this.answer(v);
+    }
+}
+
+class HeldModalPresenter extends FakeModalPresenter {
+    readonly push = new Dialog<string[] | null>();
+    readonly create = new Dialog<boolean>();
+    review: PushReview | null = null;
+    async showConfigPushModal(review: PushReview): Promise<string[] | null> {
+        this.review = review;
+        return this.push.show();
+    }
+    async showConfigCreateModal(confirm: ConfigCreateConfirm): Promise<boolean> {
+        this.createCalls.push(confirm);
+        return this.create.show();
+    }
+}
+
+describe("config ops never overlap, their confirmation dialogs included", () => {
+    let vault: FakeVaultIO;
+    let db: ConfigLocalDB;
+    let remote: FakeCouchClient;
+    let modal: HeldModalPresenter;
+    let settings: ReturnType<typeof makeSettings>;
+    let cs: ConfigSync;
+    let auth: AuthGate;
+    let check: Dialog<DbCheckResult> | null;
+
+    beforeEach(async () => {
+        vi.spyOn(console, "error").mockImplementation(() => {});
+        vi.spyOn(console, "warn").mockImplementation(() => {});
+        vault = new FakeVaultIO();
+        db = new ConfigLocalDB(uniqueName());
+        db.open();
+        remote = new FakeCouchClient();
+        modal = new HeldModalPresenter();
+        settings = makeSettings({
+            deviceId: "dev-A",
+            couchdbUri: "http://localhost:5984",
+            couchdbConfigDbName: "config-test",
+            compressionEnabled: false,
+        });
+        const bridge: ReconnectBridge = { notifyTransient: () => {} };
+        auth = new AuthGate();
+        check = null;
+        cs = new ConfigSync(
+            vault, modal, "test-vault", auth, ALWAYS_VISIBLE, bridge,
+            () => settings,
+            {
+                storeFactory: () => db, clientFactory: () => remote, rawClientFactory: () => remote,
+                checkDatabase: async () => check ? check.show() : { status: "exists", docCount: 0 },
+            },
+        );
+        await cs.rebind("config-test");
+    });
+
+    afterEach(async () => {
+        vi.restoreAllMocks();
+        await cs.close().catch(() => {});
+        await db.destroy().catch(() => {});
+    });
+
+    /** Every other way in is refused as busy. */
+    async function expectAllRefused(): Promise<void> {
+        expect(cs.changeBlocker()).not.toBeNull();
+        for (const other of [
+            () => cs.push(),
+            () => cs.pull(),
+            () => cs.overwrite(),
+            () => cs.shareAgain(".obsidian/app.json", "/theme"),
+            () => cs.create(),
+            () => cs.join(),
+            () => cs.runExclusive("Config GC", async () => {}),
+            () => cs.changePolicy({ blockPluginCode: false }),
+            () => cs.rebind(null),
+            () => cs.changeCodecSetting({ configCompressionEnabled: true }),
+            () => cs.checkDatabase("config-other"),
+        ]) {
+            await expect(other()).rejects.toMatchObject({ name: "BusyError" });
+        }
+    }
+
+    it("while the Push list is open, nothing else runs; the Push then sends what was chosen", async () => {
+        await attachPlain(settings, remote, db);
+        vault.addFile(".obsidian/app.json", `{"theme":"dark"}`);
+        const pushing = cs.push();
+        await vi.waitFor(() => expect(modal.push.open).toBe(true));
+
+        await expectAllRefused();
+        // The refusals changed nothing: no doc on the server, the file as it was.
+        expect(await remote.getDoc(`${DOC_ID.CONFIG}.obsidian/app.json`)).toBeNull();
+        expect(vault.readText(".obsidian/app.json")).toBe(`{"theme":"dark"}`);
+        expect(cs.currentBinding()).not.toBeNull();
+
+        modal.push.close(modal.review!.items.map((i) => i.id));
+        await expect(pushing).resolves.toBe(1);
+        expect(cs.changeBlocker()).toBeNull();
+        expect(await remote.getDoc(`${DOC_ID.CONFIG}.obsidian/app.json`)).not.toBeNull();
+    });
+
+    it("the Filter cannot change while the Push list is open; the Push saves what it left out on the policy it showed", async () => {
+        await attachPlain(settings, remote, db);
+        vault.addFile(".obsidian/app.json", `{"theme":"dark"}`);
+        const pushing = cs.push();
+        await vi.waitFor(() => expect(modal.push.open).toBe(true));
+        const before = settings.configSyncPolicy;
+        await expect(cs.changePolicy({ unitDefaults: { ...before.unitDefaults, snippets: false } }))
+            .rejects.toMatchObject({ name: "BusyError", message: "Config Push is running — wait for it to finish." });
+        expect(settings.configSyncPolicy).toBe(before);
+        // Leave the file out: the Push saves it as an override.
+        modal.push.close([]);
+        await pushing;
+        expect(settings.configSyncPolicy.overrides[".obsidian/app.json"]).toBe(false);
+        expect(settings.configSyncPolicy.unitDefaults).toEqual(before.unitDefaults);
+
+        await cs.changePolicy({ unitDefaults: { ...before.unitDefaults, snippets: false } });
+        expect(settings.configSyncPolicy.unitDefaults.snippets).toBe(false);
+        expect(settings.configSyncPolicy.overrides[".obsidian/app.json"]).toBe(false);
+    });
+
+    it("a refusal names what runs: the op, the Check, a local task or a database change", async () => {
+        await attachPlain(settings, remote, db);
+        const create = cs.create().catch(() => {});
+        await vi.waitFor(() => expect(modal.create.open).toBe(true));
+        expect(cs.changeBlocker()).toBe("Config Create is running — wait for it to finish.");
+        modal.create.close(false);
+        await create;
+
+        check = new Dialog<DbCheckResult>();
+        const checking = cs.checkDatabase("config-other");
+        await vi.waitFor(() => expect(check!.open).toBe(true));
+        expect(cs.changeBlocker()).toBe("Database check is running — wait for it to finish.");
+        check.close({ status: "created" });
+        await checking;
+
+        let release!: () => void;
+        const task = cs.runExclusive("Config GC", () => new Promise<void>((r) => { release = r; }));
+        await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+        expect(cs.changeBlocker()).toBe("Config GC is running — wait for it to finish.");
+        release();
+        await task;
+
+        const switching = cs.rebind(null);
+        expect(cs.changeBlocker()).toBe("Config database change is running — wait for it to finish.");
+        await switching;
+        expect(cs.changeBlocker()).toBeNull();
+    });
+
+    it("Create's confirmation is shown inside the op: nothing else runs while it is open, and Cancel changes nothing", async () => {
+        await attachPlain(settings, remote, db);
+        const before = (await remote.info()).doc_count;
+        const creating = cs.create();
+        await vi.waitFor(() => expect(modal.create.open).toBe(true));
+        expect(modal.createCalls[0]).toMatchObject({
+            dbName: "config-test",
+            server: { kind: "read", docCount: before, meta: "present" },
+        });
+
+        await expectAllRefused();
+
+        modal.create.close(false);
+        await expect(creating).rejects.toMatchObject({ name: "AbortError" });
+        expect((await remote.info()).doc_count).toBe(before);
+        expect(await getAttachment(db)).not.toBeNull();
+        expect(cs.currentBinding()!.relation().lastOp).toBeNull();
+        expect(cs.changeBlocker()).toBeNull();
+    });
+
+    it("a server that cannot be read fails Create before its confirmation", async () => {
+        remote.info = async () => { throw new TypeError("Failed to fetch"); };
+        await expect(cs.create()).rejects.toThrow();
+        expect(modal.createCalls).toEqual([]);
+    });
+
+    it("Step 1 cannot change while Create's confirmation is open: the DB is built with the codec it showed, and Step 1 still describes it", async () => {
+        await attachPlain(settings, remote, db);
+        const creating = cs.create();
+        await vi.waitFor(() => expect(modal.create.open).toBe(true));
+        expect(modal.createCalls[0].next).toMatchObject({ encryption: false, compression: false });
+
+        for (const patch of [
+            { configCompressionEnabled: true },
+            { configEncryptionEnabled: true },
+            { configEncryptionPassphrase: "other" },
+        ]) {
+            await expect(cs.changeCodecSetting(patch)).rejects.toMatchObject({
+                name: "BusyError",
+                message: "Config Create is running — wait for it to finish.",
+            });
+        }
+        expect(settings).not.toHaveProperty("configCompressionEnabled", true);
+        expect(settings).not.toHaveProperty("configEncryptionEnabled", true);
+        expect(settings).not.toHaveProperty("configEncryptionPassphrase", "other");
+
+        modal.create.close(true);
+        await creating;
+        expect((await getAttachment(db))!.codec).toMatchObject({ encryption: false, compression: false });
+
+        await cs.changeCodecSetting({ configCompressionEnabled: true });
+        expect(settings.configCompressionEnabled).toBe(true);
+    });
+
+    it("Step 2's Check runs under the op lock: nothing else runs beside it, and a refused Check leaves the auth latch alone", async () => {
+        await attachPlain(settings, remote, db);
+        vault.addFile(".obsidian/app.json", `{"theme":"dark"}`);
+        check = new Dialog<DbCheckResult>();
+        const checking = cs.checkDatabase("config-other");
+        await vi.waitFor(() => expect(check!.open).toBe(true));
+
+        await expectAllRefused();
+
+        check.close({ status: "exists", docCount: 3 });
+        await expect(checking).resolves.toEqual({ status: "exists", docCount: 3 });
+        expect(cs.changeBlocker()).toBeNull();
+
+        // A Check refused under a running op does not clear the latch.
+        check = null;
+        const pushing = cs.push();
+        await vi.waitFor(() => expect(modal.push.open).toBe(true));
+        auth.raise(401, "nope");
+        await expect(cs.checkDatabase("config-other")).rejects.toMatchObject({ name: "BusyError" });
+        expect(auth.isBlocked()).toBe(true);
+        modal.push.close(null);
+        await pushing.catch(() => {});
+
+        // An idle Check that passes does.
+        await cs.checkDatabase("config-other");
+        expect(auth.isBlocked()).toBe(false);
+    });
+
+    it("announces when an op starts and when it ends", async () => {
+        await attachPlain(settings, remote, db);
+        vault.addFile(".obsidian/app.json", "{}");
+        const seen: boolean[] = [];
+        const off = cs.onChange(() => seen.push(cs.changeBlocker() !== null));
+        const pushing = cs.push();
+        expect(seen).toEqual([true]);
+        await vi.waitFor(() => expect(modal.push.open).toBe(true));
+        modal.push.close(null);
+        await pushing.catch(() => {});
+        expect(seen).toEqual([true, false]);
+        off();
+    });
+});

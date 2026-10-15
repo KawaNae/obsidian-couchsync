@@ -34,11 +34,12 @@ export class SchemaVersionMismatchError extends Error {
     ) {
         super(
             `${kind} DB contains schemaVersion ${String(remoteVersion)} doc ` +
-            `(expected ${expectedVersion}) — re-init required (doc id: ${docId})`,
+            `(expected ${expectedVersion}) — ${kind === "config" ? "Create" : "re-init"} ` +
+            `required (doc id: ${docId})`,
         );
         this.name = "SchemaVersionMismatchError";
-        const initCmd = kind === "config" ? "Config Init" : "Init";
-        const cloneCmd = kind === "config" ? "Config Pull" : "Clone";
+        const initCmd = kind === "config" ? "Config Create" : "Init";
+        const cloneCmd = kind === "config" ? "Config Join, then Config Pull" : "Clone";
         this.userMessage =
             `Remote ${kind} DB is on schemaVersion ${String(remoteVersion)} ` +
             `but this build expects ${expectedVersion}. One device must run ` +

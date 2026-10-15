@@ -1,7 +1,7 @@
 /**
- * Regression: phantom `lastSynced.vclock` rollback (PR-F).
+ * Regression: phantom `lastSynced.vclock` rollback.
  *
- * 2026-05-10 production main vault DEBUG logs showed `silentReconvergeVclock`
+ * Production main vault DEBUG logs showed `silentReconvergeVclock`
  * firing on ~200+ paths every reconcile in a permanent no-op loop. The shape:
  * `lastSynced.vclock` carried an orphan device stamp (`melchior-main:1`)
  * that was NEVER on the remote FileDoc — likely a legacy migration relic.
@@ -9,7 +9,7 @@
  * to lastSynced (because merged === lastSynced.vclock dominated fileDoc),
  * and the next reconcile re-classified as `vclock-only-drift` forever.
  *
- * The fix elevates Invariant 3 to "chunks-equal vclock authority": when
+ * The fix makes chunks-equal the vclock authority: when
  * the classifier returns `vclock-only-drift`, the resolver adopts
  * `fileDoc.vclock` as the new lastSynced (no mergeVC). Phantom stamps drop
  * in 1 reconcile and the 2nd reconcile sees `identical` — loop terminated.
@@ -19,7 +19,7 @@
  * remote tracks the merged state. Reconciler vault-scan deliberately
  * keeps the FileDoc untouched (rev-tree inflation across hundreds of
  * paths is unacceptable), so adoption on the lastSynced side is the only
- * convergence path. See `project_phantom_lastsynced_stamp.md` (memory).
+ * convergence path.
  */
 import "fake-indexeddb/auto";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
@@ -41,8 +41,9 @@ class PassthroughWriter implements VaultWriter {
         await this.io.writeBinary(path, content);
         return { applied: true };
     }
-    async applyRemoteDeletion(path: string): Promise<void> {
+    async applyRemoteDeletion(path: string): Promise<WriteResult> {
         if (await this.io.exists(path)) await this.io.delete(path);
+        return { applied: true };
     }
     async createFile(path: string, content: ArrayBuffer): Promise<void> {
         await this.io.createBinary(path, content);
@@ -50,7 +51,7 @@ class PassthroughWriter implements VaultWriter {
     flushAll(): void {}
 }
 
-describe("regression: phantom lastSynced rollback (PR-F)", () => {
+describe("regression: phantom lastSynced rollback", () => {
     let vault: FakeVaultIO;
     let db: LocalDB;
     let vs: VaultSync;
@@ -86,7 +87,7 @@ describe("regression: phantom lastSynced rollback (PR-F)", () => {
 
         // Inject phantom: a device key that exists ONLY in lastSynced,
         // never on the FileDoc. This is the production-observed shape
-        // (memory: project_phantom_lastsynced_stamp.md, melchior-main:1
+        // (melchior-main:1
         // stamp present in ~200+ lastSynced entries but absent from every
         // matching remote FileDoc).
         const phantomVc = { "dev-self": 1, "ghost-device": 1 };

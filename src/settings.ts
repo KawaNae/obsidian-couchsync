@@ -1,5 +1,6 @@
 import type { ConfigSyncPolicy } from "./sync/config-policy/policy.ts";
 import { defaultConfigSyncPolicy } from "./sync/config-policy/policy.ts";
+import type { VaultPauseDetail, VaultPauseReason } from "./sync/vault-binding.ts";
 
 /** Keep only the N most recent previous device IDs. */
 export const MAX_PREVIOUS_DEVICE_IDS = 10;
@@ -10,8 +11,8 @@ export const MAX_PREVIOUS_DEVICE_IDS = 10;
  *   editing → tested → setupDone → syncing
  *
  * `settingUp` is a non-syncable transient entered at the START of Init/
- * Clone, before the destructive `localDb.destroy()` (Invariant C — setup
- * atomicity). It is persisted pessimistically so that a setup which fails
+ * Clone, before the destructive `localDb.destroy()`, so that setup is
+ * atomic. It is persisted pessimistically so that a setup which fails
  * (or whose process dies) mid-flight can never leave the prior
  * `setupDone`/`syncing` state behind — which would let the user start
  * sync against a half-built local DB. Only a confirmed-successful setup
@@ -21,10 +22,70 @@ export const MAX_PREVIOUS_DEVICE_IDS = 10;
 export type ConnectionState =
     | "editing" | "tested" | "settingUp" | "setupDone" | "syncing";
 
+/**
+ * Why the encryption-agreement check paused vault sync. Written with the
+ * `tested` state the pause persists, so the reason survives a reload with
+ * the state it explains. Cleared when the check passes or an Init / Clone
+ * succeeds. Absent: no pause.
+ */
+export interface VaultPauseRecord {
+    reason: VaultPauseReason;
+    detail: VaultPauseDetail;
+    /** When the check that paused started (ms since epoch). */
+    at: number;
+    /** `vaultTarget` of the vault DB the check ran against. */
+    against: string;
+}
+
+/**
+ * The incarnation of the vault DB this device was set up against: the
+ * `metaFingerprint` of the `vault:meta` its last Init wrote or its last
+ * Clone read. Another device's Init re-creates the DB with a new
+ * `vault:meta`; the agreement check compares the server's meta against
+ * this record and pauses on a difference, so this device stops syncing
+ * with a DB it never cloned.
+ *
+ * Absent: set up before the record existed. The first agreement check that
+ * passes adopts the server's meta, so an existing setup moves over without
+ * any action.
+ */
+export interface VaultRootRecord {
+    /** `metaFingerprint`, or null when the DB had no `vault:meta`. */
+    fingerprint: string | null;
+    /** `vaultTarget` of the vault DB the record is about. */
+    against: string;
+}
+
 export interface MobileStatusPosition {
     align: "left" | "right";
     bottom: number;
     offset: number;
+}
+
+/**
+ * The part of a config binding that must outlive its local store. Keyed by
+ * `configBindingKey`.
+ *
+ * Whether the device is attached, the codec it syncs with and the root it
+ * joined live INSIDE the binding's local store (`ConfigAttachment`), so
+ * deleting the store detaches the device. What stays here is what deleting
+ * the store must not reset: the trust floor, an interrupted Create, and the
+ * passphrase of the DB.
+ */
+export interface ConfigBindingRecord {
+    /** Locally-anchored cipherVersion floor for this DB (TOFU). Set by
+     *  Create / Join, ratcheted up by later unlocks, never lowered by a
+     *  sync op. `undefined` for a plaintext DB. */
+    cipherFloor?: number;
+    /** This device's Create is in progress; true between the destructive
+     *  wipe and the commit, so an interrupted Create is detectable. */
+    settingUp: boolean;
+    /** The passphrase that unlocks this DB's encrypted root: the one Create
+     *  encrypted with, or the one Join unlocked with. Written only by those
+     *  two, and every op on this DB unlocks with it alone. Kept per binding
+     *  so DBs with different passphrases do not overwrite each other's.
+     *  `undefined` for a plaintext DB. */
+    passphrase?: string;
 }
 
 export interface CouchSyncSettings {
@@ -95,28 +156,20 @@ export interface CouchSyncSettings {
      *  chunks keep whatever encoding they were stored with). */
     compressionEnabled: boolean;
 
-    /** Phase 2 (v0.26): config-side codec overrides. Each field is
+    /** v0.26: config-side codec overrides. Each field is
      *  optional — `undefined` means "inherit from the vault setting
      *  above". Concrete values let advanced users decouple config
      *  crypto/compression from vault, e.g. share a plaintext config
-     *  DB across pools while keeping notes encrypted. The settings UI
-     *  surfaces these in a Phase 3 follow-up; the internal code paths
-     *  already honour them today (invariant 18: cryptoProvider is
-     *  per-DB). */
+     *  DB across pools while keeping notes encrypted. Set from Step 1
+     *  of the Config Sync tab; the codec paths honour them because the
+     *  config DB has its own cryptoProvider, independent of the vault's. */
     configEncryptionEnabled?: boolean;
+    /** The passphrase the NEXT Create encrypts the config DB with; empty
+     *  inherits the vault passphrase. Also one of the values Join tries.
+     *  The passphrase of a DB this device joined is on its binding entry
+     *  (`ConfigBindingRecord.passphrase`), not here. */
     configEncryptionPassphrase?: string;
     configCompressionEnabled?: boolean;
-
-    /** Structural fingerprint of the config codec that the last successful
-     *  Config Init actually applied to the remote (see
-     *  `codecFingerprint` / `isConfigCodecDirty`). When the live resolved
-     *  codec no longer matches this, the config DB on the server was built
-     *  with a different codec and live push/pull/write are refused until a
-     *  fresh Config Init re-applies the new policy — symmetric with vault
-     *  sync, where a codec change demands a destructive re-init (#config-codec).
-     *  `undefined` = never Init'd (or a pre-v0.27.2 install): permissive, no
-     *  baseline to drift from. */
-    configCodecApplied?: string;
 
     /** Locally-anchored cipherVersion policy floor (TOFU — trust on first
      *  unlock). Recorded the first time this device trust-unlocks the vault
@@ -126,24 +179,28 @@ export interface CouchSyncSettings {
      *  check refuses a remote `vault:meta` whose cipherVersion is below it.
      *  Sourced from client-local state, never re-read live from the
      *  server-writable meta, so a curious server cannot lower the floor by
-     *  rewriting meta (closes the v3 downgrade hole, #1/#3). `undefined` on a
+     *  rewriting meta (closes the cipherVersion-3 downgrade hole). `undefined` on a
      *  not-yet-observed or plaintext vault — permissive (legacy dual-read). */
     vaultCipherVersion?: number;
-    /** Config-DB equivalent of `vaultCipherVersion` (invariant 18: each DB is
-     *  its own crypto root). */
-    configCipherVersion?: number;
+    /** Per-config-DB cipher floor and Create-interrupted flag, keyed by
+     *  `configBindingKey` (normalised server URI + config DB name).
+     *  Replaces the former global `configCipherVersion` / `configSettingUp`,
+     *  which ignored the DB name and leaked from one config DB to another.
+     *  Attachment itself is recorded in the binding's local store. */
+    configBindings: Record<string, ConfigBindingRecord>;
+    /** Id drawn by the last config Pull that wrote files into this vault's
+     *  `.obsidian/`, whichever config DB it pulled from. Each config store
+     *  records the id its bases were last valid for; a store holding
+     *  another id has not seen that write, so its bases no longer describe
+     *  the disk. Unset until the first such Pull. */
+    configDiskWriteId?: string;
 
     // Internal
     /** Server reachable + auth verified (CouchDB tab Test+Apply). */
     serverTested: boolean;
     connectionState: ConnectionState;
-    /** Config-sync equivalent of `connectionState`'s `settingUp` transient
-     *  (Invariant C). Set true before ConfigSetupService destroys the local
-     *  config DB and cleared only on a fully-successful init; if init dies
-     *  mid-flight it stays true, so config push/pull/write refuse to run
-     *  against a half-built config DB until a fresh Config Init completes
-     *  (#err-9). */
-    configSettingUp: boolean;
+    vaultPause?: VaultPauseRecord;
+    vaultRoot?: VaultRootRecord;
     /** Human-readable device name used as the vclock key (e.g. "desktop", "iphone"). */
     deviceId: string;
     /** Old deviceIds this device has used (UUIDs from pre-v0.12, renamed names).
@@ -190,7 +247,7 @@ export const DEFAULT_SETTINGS: CouchSyncSettings = {
 
     serverTested: false,
     connectionState: "editing",
-    configSettingUp: false,
+    configBindings: {},
     deviceId: "",
     previousDeviceIds: [],
 };

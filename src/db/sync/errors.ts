@@ -7,6 +7,14 @@
  *
  * No I/O, no side effects. The single entry point SyncEngine / pipelines
  * call when an error needs to be classified.
+ *
+ * Convention for domain errors: an error that knows what went wrong in the
+ * user's terms (a config precondition, a schema mismatch, a blocked auth
+ * latch, a local DB failure) carries the sentence to show as
+ * `userMessage: string`. This classifier stays about transport and
+ * retry; turning a failure into text is `describeError`
+ * (src/ui/describe-error.ts), which prefers `userMessage` and otherwise
+ * words the kind classified here.
  */
 
 import type { SyncErrorDetail, SyncErrorKind } from "../reconnect-policy.ts";
@@ -37,14 +45,18 @@ export function classifyError(err: unknown): SyncErrorDetail {
         };
     }
 
-    // Encryption-agreement pause (#1c): the supervised preCatchupCheck found
-    // a user-actionable encryption state (server downgrade, cross-device
-    // mismatch, pre-v2 legacy meta, or wrong passphrase) and set
-    // connectionState back to "tested". Terminal — retrying loops against
-    // the same remote — so map to a kind the engine halts on and the host
-    // surfaces once.
+    // Agreement pause (VaultEncryptionPausedError): the supervised agreement
+    // check found a user-actionable state (server downgrade, cross-device
+    // encryption mismatch, pre-v2 legacy meta, no / a wrong passphrase, or a
+    // vault DB re-created by another device's Init) and set connectionState
+    // back to "tested".
+    // Terminal — retrying loops against the same remote — so map to a kind
+    // the engine halts on and the host surfaces once, with its own sentence.
     if (e?.encryptionPaused === true) {
-        return { kind: "encryption-paused", message: rawMessage };
+        return {
+            kind: "encryption-paused",
+            message: typeof e?.userMessage === "string" ? e.userMessage : rawMessage,
+        };
     }
 
     // A non-retriable EncryptionError is a policy/security violation — a
@@ -52,7 +64,7 @@ export function classifyError(err: unknown): SyncErrorDetail {
     // Like a schema mismatch, retrying never succeeds, so it maps to the same
     // terminal kind the engine halts on rather than the backoff loop. A
     // retriable EncryptionError (decrypt failure) falls through to "unknown"
-    // and stays transient. (#enc-1)
+    // and stays transient.
     if (err instanceof EncryptionError && err.retriable === false) {
         return { kind: "schema-mismatch", message: rawMessage };
     }
@@ -64,7 +76,7 @@ export function classifyError(err: unknown): SyncErrorDetail {
     // this stays a neutral "aborted" kind; verifyReachable disambiguates via
     // elapsed wall-clock (suspend ⇒ elapsed ≫ timeout) before deciding
     // whether to enter a hard error. Mislabeling it "Server unreachable"
-    // was the source of the spurious resume notifications. (#6)
+    // was the source of the spurious resume notifications.
     if (e?.name === "AbortError" || /operation was aborted|\baborted\b/i.test(rawMessage)) {
         return { kind: "aborted", code, message: rawMessage };
     }
@@ -89,6 +101,13 @@ export function classifyError(err: unknown): SyncErrorDetail {
             code,
             message: `Server error (${code}): ${rawMessage}`,
         };
+    }
+    // A streamed body that stops delivering bytes ("CouchDB body stale (no
+    // data for Nms)", CouchClient's per-chunk stale timer) is a transport
+    // timeout, not an unknown failure — so the one-shot retry layer retries
+    // it and live sync labels it as a timeout.
+    if (/\bbody stale\b/i.test(rawMessage)) {
+        return { kind: "timeout", code, message: rawMessage };
     }
     if (/timed?[\s_-]?out|timeout/i.test(rawMessage)) {
         return { kind: "timeout", code, message: rawMessage };

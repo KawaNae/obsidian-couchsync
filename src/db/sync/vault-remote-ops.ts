@@ -22,6 +22,7 @@ import type { ICouchClient } from "../interfaces.ts";
 import type { ChunkHasher } from "../chunker.ts";
 import { CouchClient, makeCouchClient } from "../couch-client.ts";
 import * as remoteCouch from "../remote-couch.ts";
+import { RetryingCouchClient } from "../retrying-couch-client.ts";
 import type { AuthGate } from "./auth-gate.ts";
 
 export type ProgressCallback = (docId: string, count: number) => void;
@@ -29,7 +30,15 @@ export type ProgressCallback = (docId: string, count: number) => void;
 export type DbCheckResult =
     | { status: "exists"; docCount: number }
     | { status: "created" }
-    | { status: "error"; message: string };
+    /** What was thrown, for `describeError` to word. */
+    | { status: "error"; error: unknown };
+
+/** What a Check found, worded once for the notice and the Step 2 row:
+ *  "found — 12 docs.", "found — empty.", "created — empty.". */
+export function describeDbFound(r: Exclude<DbCheckResult, { status: "error" }>): string {
+    if (r.status === "created") return "created — empty.";
+    return r.docCount > 0 ? `found — ${r.docCount.toLocaleString()} docs.` : "found — empty.";
+}
 
 export class VaultRemoteOps {
     constructor(
@@ -44,12 +53,12 @@ export class VaultRemoteOps {
          * mutable setter and the Init/Clone vs sync-loop drift that
          * silently dropped the Compressing layer from Init pushes.
          */
-        private wrapClient: (raw: CouchClient) => ICouchClient,
+        private wrapClient: (raw: ICouchClient) => ICouchClient,
         /**
          * Vault chunk hasher (same instance the live sync loop uses, reading
          * the live cryptoProvider via closure). Threaded into `pullAll` so the
          * Clone / full-resync path verifies every chunk body against its
-         * content-addressed id — the authenticated fetch boundary (Invariant I)
+         * content-addressed id — the authenticated fetch boundary
          * that live sync already enforced but the one-shot path did not.
          *
          * Public so maintenance/repair commands (chunk-repair) can thread the
@@ -72,14 +81,9 @@ export class VaultRemoteOps {
         return remoteCouch.pullAll(this.localDb, this.makeDataClient(), this.chunkHasher, onProgress);
     }
 
-    /** Destroy the vault remote database (auto-recreated on next push). */
-    async destroyRemote(): Promise<void> {
-        await remoteCouch.destroyRemote(this.makeClient());
-    }
-
-    /** Create the vault remote database if it doesn't exist. */
-    async ensureRemoteDb(): Promise<void> {
-        await this.makeClient().ensureDb();
+    /** Destroy the vault remote database and create it empty. */
+    async recreateRemote(): Promise<void> {
+        await remoteCouch.recreateRemote(this.makeClient());
     }
 
     /**
@@ -134,16 +138,13 @@ export class VaultRemoteOps {
                     if (createErr?.status === 401 || createErr?.status === 403) {
                         this.auth.raise(createErr.status, createErr?.message);
                     }
-                    return {
-                        status: "error",
-                        message: createErr?.message || "Failed to create database",
-                    };
+                    return { status: "error", error: createErr };
                 }
             }
             if (e?.status === 401 || e?.status === 403) {
                 this.auth.raise(e.status, e?.message);
             }
-            return { status: "error", message: e?.message || "Connection failed" };
+            return { status: "error", error: e };
         }
     }
 
@@ -176,9 +177,18 @@ export class VaultRemoteOps {
      * ids are restored, chunk attachments are decrypted on read and
      * encrypted on write. This is the correct client for every file/chunk
      * diagnostic, repair, and bulk data operation. Transparent (== raw)
-     * when the vault is unencrypted and uncompressed.
+     * when the vault is unencrypted and uncompressed (apart from retry).
+     *
+     * One-shot ops get transport retry: idempotent reads survive a
+     * transient network/timeout/5xx failure instead of aborting the whole
+     * op (a Clone issues thousands of reads; one dropped chunk GET used to
+     * fail it). `RetryingCouchClient` sits innermost — codec(retry(raw)) —
+     * so only HTTP is retried and decode runs once. The live sync client
+     * (SyncEngine's clientFactory) intentionally does NOT get this layer:
+     * the session owns retry there, and a double retry would delay error
+     * surfacing by up to ~20s and skew stall detection.
      */
     makeDataClient(): ICouchClient {
-        return this.wrapClient(this.makeClient());
+        return this.wrapClient(new RetryingCouchClient(this.makeClient()));
     }
 }

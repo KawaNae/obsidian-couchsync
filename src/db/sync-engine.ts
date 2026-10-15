@@ -41,35 +41,43 @@ import { DbError } from "./write-transaction.ts";
 import { AuthGate } from "./sync/auth-gate.ts";
 import { SyncEvents } from "./sync/sync-events.ts";
 import { Checkpoints } from "./sync/checkpoints.ts";
+import { PendingApply, type EnsureChunksResult } from "./sync/pending-apply.ts";
 import { SyncSession } from "./sync/sync-session.ts";
 import { BackoffSchedule } from "./sync/backoff.ts";
 import { classifyError } from "./sync/errors.ts";
 import { BrowserVisibilityGate, ALWAYS_VISIBLE, type VisibilityGate } from "./visibility-gate.ts";
+import type { VaultMetaDoc } from "./vault-meta.ts";
 
 // ── Types ────────────────────────────────────────────────
 
-/** Residual availability after an ensure-chunks attempt (Invariant I/II).
- *  `stillMissing` lists chunk ids unavailable after the attempt; when
- *  `remoteConsulted` is true those are missing on the server too = broken
- *  (reconciler quarantines), when false the device was offline = transient. */
-export interface EnsureChunksResult {
-    stillMissing: string[];
-    remoteConsulted: boolean;
-}
+export type { EnsureChunksResult } from "./sync/pending-apply.ts";
 
 // ── Constants ────────────────────────────────────────────
 
+/**
+ * The vault setup's agreement with the remote DB, judged by its owner
+ * (`VaultBinding`). Both throw a terminal pause (`encryption-paused`) for a
+ * state the user has to act on.
+ */
+export interface RemoteAgreement {
+    /** Before every session's catchup. A transient failure is thrown as is
+     *  and retried by the supervisor. */
+    check(signal: AbortSignal): Promise<void>;
+    /** During a session, on a sign that the remote DB was re-created (see
+     *  `PullPipeline`). Throws nothing but the pause. */
+    recheckRoot(observed?: VaultMetaDoc | null): Promise<void>;
+}
+
 const HEALTH_CHECK_INTERVAL = 30000; // 30s
 
-/** Grace window for the pull-side transport-activity signal in
- *  `checkHealth()`. As long as the pull stream received at least one
- *  chunk within this window, stall detection is suppressed: the request
- *  is alive and we are simply waiting for the apply/persist cycle to
- *  finish. Symmetric with `BODY_STALE_MS` in `couch-client.ts` — past
- *  that threshold the per-chunk stale timer would already have aborted
- *  the request, so any further inactivity is the transport's problem,
- *  not the stall detector's. */
-const TRANSPORT_GRACE_MS = 30_000;
+/** Grace window for the pull-activity signal in `checkHealth()`
+ *  (`SyncSession.lastPullActivityAt`). As long as the pull moved within
+ *  this window — a body chunk arrived, or the writer finished a step of a
+ *  batch — stall detection is suppressed. Symmetric with `BODY_STALE_MS`
+ *  in `couch-client.ts`: past that threshold the per-chunk stale timer
+ *  would already have aborted a silent request, and a single doc's apply
+ *  taking this long is not a slow batch but a stuck one. */
+const PULL_ACTIVITY_GRACE_MS = 30_000;
 
 /** How long a transient error stays in `reconnecting` before escalating
  *  to a hard `error`. The live session may self-heal inside this window. */
@@ -85,8 +93,8 @@ const TRANSIENT_ESCALATION_MS = 10_000;
  *  - `app-resume` / `network-online` use a 15s budget because the mobile
  *    network stack often takes several seconds to come back after suspend.
  *    Slow revival is absorbed by *re-issuing short probes* across the
- *    budget — NOT by waiting out one long probe. (2026-06-14 main-vault
- *    iPad logs: the first post-resume `info()` rode a suspend-killed
+ *    budget — NOT by waiting out one long probe. (Observed in iPad
+ *    logs: the first post-resume `info()` rode a suspend-killed
  *    socket and hung the full 15s ceiling — err=aborted — while a fresh
  *    probe ~1s later returned in 28-311ms. A single long ceiling does not
  *    absorb revival; it just squats on a dead socket.)
@@ -224,6 +232,10 @@ export class SyncEngine {
     /** Persistent sync progress markers (remoteSeq, lastPushedSeq).
      *  Owned by SyncEngine because they survive across sessions. */
     private readonly checkpoints: Checkpoints;
+    /** Docs committed to LocalDB but not yet reflected in the vault. The
+     *  pull records and drains it every cycle; the Reconciler records and
+     *  drains it on every reconcile. */
+    readonly pendingApply: PendingApply;
 
     // ── Constructor ───────────────────────────────────────
 
@@ -235,7 +247,8 @@ export class SyncEngine {
         /** Apply a pulled FileDoc to the vault. The pull-writer awaits
          *  this inside its commit closure. Returns `WriteResult`:
          *  `applied:true` means vault now matches doc; `applied:false`
-         *  means writer declined (IME divergence etc.) and the LocalDB
+         *  means the write was declined (a vault change or an editor's
+         *  input not yet synced) and the LocalDB
          *  doc is now ahead of vault — pull-writer counts these as
          *  `skipCount` and emits `pull-skipped` so the supervisor
          *  schedules a reconciler retry. Throws are caught into
@@ -243,7 +256,7 @@ export class SyncEngine {
         private applyPullWrite: (doc: FileDoc) => Promise<WriteResult>,
         /** True if the vault has an unpushed local edit for `path`. The
          *  pull-writer's hard-delete path uses it to choose between durable
-         *  deletion apply and a delete-vs-edit conflict (#del-1/#err-10). */
+         *  deletion apply and a delete-vs-edit conflict. */
         private probeUnpushed: (path: string) => Promise<boolean>,
         /** True on Obsidian mobile (iOS + Android). Selects
          *  BrowserVisibilityGate so push/pull loops pause on
@@ -254,7 +267,9 @@ export class SyncEngine {
         private isMobile: boolean = false,
         auth?: AuthGate,
         clientFactory?: (s: CouchSyncSettings) => ICouchClient,
-        private preCatchupCheck?: (signal: AbortSignal) => Promise<void>,
+        /** The vault setup's agreement with the remote DB
+         *  (`VaultBinding`). Absent: sessions open unchecked (tests). */
+        private agreement?: RemoteAgreement,
         private stampVaultDrift?: () => Promise<void>,
     ) {
         this.auth = auth ?? new AuthGate();
@@ -262,6 +277,13 @@ export class SyncEngine {
             makeCouchClient(s.couchdbUri, s.couchdbDbName, s.couchdbUser, s.couchdbPassword)
         );
         this.checkpoints = new Checkpoints(localDb);
+        this.pendingApply = new PendingApply({
+            localDb,
+            ensureChunks: (doc) => this.ensureFileChunks(doc),
+            write: (doc) => this.applyPullWrite(doc),
+            onRecovered: (filePath) => this.events.emit("auto-resolve", { filePath }),
+            notify: (message) => notify(message, 8000),
+        });
         this.visibility = (isMobile && typeof document !== "undefined")
             ? new BrowserVisibilityGate(document)
             : ALWAYS_VISIBLE;
@@ -324,7 +346,7 @@ export class SyncEngine {
         fileDoc: FileDoc,
     ): Promise<EnsureChunksResult> {
         const existing = await this.localDb.getChunks(fileDoc.chunks);
-        // Availability (Invariant I): a chunk doc that exists but carries no
+        // Availability: a chunk doc that exists but carries no
         // content buffer is NOT usable — treat it as missing so it gets
         // re-fetched (the remote attachment re-materialises content) instead
         // of being trusted by id alone and later crashing reassembly.
@@ -339,7 +361,7 @@ export class SyncEngine {
                 `missing ${missing.length} chunk(s) for ${filePathFromId(fileDoc._id)} but no remote client`,
             );
             // No remote consulted → caller treats as transient (offline), not
-            // as broken (Invariant II): do not quarantine, retry when online.
+            // as broken: do not quarantine, retry when online.
             return { stillMissing: missing, remoteConsulted: false };
         }
 
@@ -349,7 +371,7 @@ export class SyncEngine {
 
         // Fetch + verify + classify via the shared chunk-fetch core, so the
         // vault and config boundaries cannot drift in how they treat a corrupt
-        // chunk (#4 — corrupt == isCorruptChunkError, incl. EnvelopeError).
+        // chunk (corrupt == isCorruptChunkError, incl. EnvelopeError).
         const { fetched, notFound, corrupt } = await fetchMissingChunks(missing, {
             getAttachment: (id, name, sig) => client.getAttachment(id, name, sig),
             hasher: this.chunkHasher,
@@ -470,7 +492,7 @@ export class SyncEngine {
      * is in flight, additional calls compare reasons by priority and
      * either drop (lower-or-equal) or queue exactly one follow-up
      * (higher). This absorbs the app-resume + retry-backoff race that
-     * produced the sess#1→sess#5 cascade observed in 2026-04-22 logs.
+     * produced a sess#1→sess#5 reconnect cascade observed in mobile logs.
      */
     async requestReconnect(reason: ReconnectReason): Promise<void> {
         if (this.reconnectInFlight) {
@@ -500,7 +522,7 @@ export class SyncEngine {
                 // starts, and so the caller never sees a recursive stack.
                 queueMicrotask(() => {
                     this.requestReconnect(next).catch((e: any) =>
-                        logError(`CouchSync: queued reconnect failed: ${e?.message ?? e}`),
+                        logError(`queued reconnect failed: ${e?.message ?? e}`),
                     );
                 });
             }
@@ -559,10 +581,10 @@ export class SyncEngine {
         if (detail.kind === "schema-mismatch" || detail.kind === "encryption-paused") {
             // Terminal, user-actionable. schema-mismatch = remote doc shape
             // this build can't read; encryption-paused = remote encryption
-            // state needs Init/Clone or a passphrase (#1c). Retrying loops
+            // state needs Init/Clone or a passphrase. Retrying loops
             // forever against the same remote, so halt retries and tear down.
             // The host surfaces the Notice via the "error" event emitted
-            // above — single notify authority (#1d). A fresh start() clears it.
+            // above — single notify authority. A fresh start() clears it.
             this.stopRetryTimer();
             void this.teardown();
             return;
@@ -596,12 +618,14 @@ export class SyncEngine {
             `transient error: kind=${detail.kind} code=${detail.code ?? "-"} msg=${detail.message}`,
         );
 
-        if (detail.kind === "auth" || detail.kind === "schema-mismatch") {
+        if (detail.kind === "auth" || detail.kind === "schema-mismatch"
+            || detail.kind === "encryption-paused") {
             // auth is user-gated; schema-mismatch (a doc shape this build can't
             // read, or a non-retriable EncryptionError = cipherVersion
-            // downgrade gate) is terminal. Both must halt immediately rather
+            // downgrade gate) and encryption-paused (the pull found the remote
+            // DB re-created) are terminal. All must halt immediately rather
             // than burn the 10s transient grace window — enterError handles
-            // each terminal class. (#enc-1)
+            // each terminal class.
             this.enterError(detail);
             return;
         }
@@ -636,7 +660,7 @@ export class SyncEngine {
             message: e.userMessage ?? "Local DB is no longer usable — restart Obsidian.",
         });
         this.events.emit("degraded", {
-            message: e.userMessage ?? "CouchSync: Local DB handle is no longer usable.",
+            message: e.userMessage ?? "Local DB handle is no longer usable.",
         });
         void this.teardown();
     }
@@ -653,7 +677,7 @@ export class SyncEngine {
             try {
                 await this.requestReconnect("retry-backoff");
             } catch (e: any) {
-                logError(`CouchSync: retry reconnect failed: ${e?.message ?? e}`);
+                logError(`retry reconnect failed: ${e?.message ?? e}`);
             }
         }, delay);
     }
@@ -754,7 +778,7 @@ export class SyncEngine {
         if (this.auth.isBlocked()) return;
         if (this.degraded) return;
 
-        // Encryption gate (#1c): unlock the vault crypto provider BEFORE
+        // Encryption gate: unlock the vault crypto provider BEFORE
         // building the vault client. `makeVaultClient` (wrapVaultClient)
         // refuses to build when the vault is encrypted but no provider is
         // unlocked, so the gate must precede it — otherwise a reconnect after
@@ -762,7 +786,8 @@ export class SyncEngine {
         // offline) throws uncaught here and strands the engine in
         // "reconnecting" with no retry. Running it inside openSession means a
         // transient fetch failure routes to enterError → retry and
-        // auto-recovers when the network returns (the #1 root cause); a
+        // auto-recovers when the network returns instead of leaving sync
+        // dead until a manual reload; a
         // user-actionable state pauses via the encryption-paused terminal
         // kind. The `openingSession` latch above dedupes across this await.
         //  `lifecycleGeneration` detects a stop()/teardown()/unload racing in
@@ -772,8 +797,8 @@ export class SyncEngine {
         const gen = this.lifecycleGeneration;
         this.openingSession = true;
         try {
-            if (this.preCatchupCheck) {
-                await this.preCatchupCheck(new AbortController().signal);
+            if (this.agreement) {
+                await this.agreement.check(new AbortController().signal);
             }
         } catch (e) {
             this.openingSession = false;
@@ -803,6 +828,7 @@ export class SyncEngine {
             return;
         }
         const epoch = ++this.sessionEpoch;
+        this.pendingApply.invalidate();
         const session = new SyncSession({
             epoch,
             client,
@@ -813,10 +839,12 @@ export class SyncEngine {
             // Pull-side ensureChunks only needs the side effect (fetch + persist);
             // discard the EnsureChunksResult to keep the session contract void.
             ensureChunks: async (doc) => { await this.ensureChunksInternal(client, doc); },
+            pendingApply: this.pendingApply,
             applyPullWrite: (doc) => this.applyPullWrite(doc),
             probeUnpushed: (path) => this.probeUnpushed(path),
             handleLocalDbError: (e, ctx) => this.handleLocalDbError(e, ctx),
             onTransientError: (err) => this.handleTransientError(err),
+            recheckRoot: async (observed) => { await this.agreement?.recheckRoot(observed); },
             visibility: this.visibility,
         });
         this.session = session;
@@ -860,7 +888,7 @@ export class SyncEngine {
         logDebug(`${tag}openSession: checkpoints.load done in ${Date.now() - checkpointsStart}ms`);
 
         // (Encryption gate already ran before the vault client was built — see
-        // the top of openSession. #1c)
+        // the top of openSession.)
 
         // Vault-drift stamp: detect offline edits (mtime/size drift from
         // lastSynced) and commit them to LocalDB BEFORE catchup pulls
@@ -914,8 +942,9 @@ export class SyncEngine {
         await session.warmup();
         if (session.disposed) return;
 
-        // One-time push-backfill sweep: re-enqueue docs the pre-2026-06-07
-        // cursor race skipped (permanently unpushed tombstones). Best-effort
+        // One-time push-backfill sweep: re-enqueue docs the push-cursor race
+        // of builds before v0.28.2 skipped (permanently unpushed
+        // tombstones). Best-effort
         // — a failure (offline mid-sweep, abort) leaves the flag unset and
         // the next session retries. Runs after catchup/warmup so the local
         // and remote FileDoc views are both fresh.
@@ -928,7 +957,7 @@ export class SyncEngine {
                 signal: session.signal,
             });
         } catch (e: any) {
-            logWarn(`CouchSync: push backfill failed (will retry next session): ${e?.message ?? e}`);
+            logWarn(`push backfill failed (will retry next session): ${e?.message ?? e}`);
         }
         if (session.disposed) return;
 
@@ -1011,7 +1040,7 @@ export class SyncEngine {
                 try {
                     await this.requestReconnect("periodic-tick");
                 } catch (e: any) {
-                    logError(`CouchSync: Health check error: ${e?.message ?? e}`);
+                    logError(`Health check error: ${e?.message ?? e}`);
                 }
             }
             return;
@@ -1021,7 +1050,7 @@ export class SyncEngine {
             try {
                 await this.requestReconnect("periodic-tick");
             } catch (e: any) {
-                logError(`CouchSync: Health check error: ${e?.message ?? e}`);
+                logError(`Health check error: ${e?.message ?? e}`);
             }
             return;
         }
@@ -1036,31 +1065,31 @@ export class SyncEngine {
             const remoteNum = SyncEngine.seqNumericPrefix(currentRemoteSeq);
             const consumedNum = SyncEngine.seqNumericPrefix(this.checkpoints.getRemoteSeq());
 
-            // Pull-side transport progress is a peer indicator alongside
-            // checkpoint advance. A multi-MB catchup over a slow link
-            // can keep `consumedNum` static for tens of seconds while
-            // bytes are still flowing on `_changes`/`_bulk_get`. Without
-            // this guard, the seq-mismatch predicate below would
-            // misclassify that as a stall and tear down the in-flight
-            // request, only to re-fetch the same delta. Longpoll
-            // heartbeats also keep this stamp fresh during idle, so a
-            // healthy live session never trips the predicate either.
-            const lastChunk = session.client.getLastPullBodyChunkAt();
-            if (lastChunk !== null && (Date.now() - lastChunk) < TRANSPORT_GRACE_MS) {
+            // The checkpoint advances once per batch, so `consumedNum`
+            // can sit behind the remote for minutes while the pull is
+            // working: bytes still flowing on `_changes`/`_bulk_get` over
+            // a slow link, or a batch of thousands of deletions landing
+            // one doc at a time. Either kind of movement is progress; the
+            // seq-mismatch predicate below would otherwise tear down a
+            // working session, only to re-fetch the same delta. Longpoll
+            // heartbeats also keep the transport stamp fresh during idle,
+            // so a healthy live session never trips the predicate either.
+            const lastActivity = session.lastPullActivityAt();
+            if (lastActivity !== null && (Date.now() - lastActivity) < PULL_ACTIVITY_GRACE_MS) {
                 // Hold `lastObservedRemoteSeq` so the next tick can still
                 // evaluate the 2-tick stable-remote backstop once the
-                // transport quiets down. Only update the healthy stamp.
+                // pull stops moving. Only update the healthy stamp.
                 this.lastHealthyAt = Date.now();
                 return;
             }
 
-            // Backstop: transport is quiet (`getLastPullBodyChunkAt()`
-            // is stale or null) and `consumedNum` lags behind a stable
-            // `remoteNum` for ≥2 ticks. The per-chunk stale timer in
-            // `couch-client.ts` already aborts genuinely-dead requests
-            // at 30s of silence, so anything reaching here is a
-            // non-transport deadlock (e.g. apply/persist hung) — force
-            // a session restart to recover.
+            // Backstop: the pull has not moved (no body chunk, no doc
+            // processed) within the grace window and `consumedNum` lags
+            // behind a stable `remoteNum` for ≥2 ticks. The per-chunk
+            // stale timer in `couch-client.ts` already aborts genuinely
+            // dead requests at 30s of silence, so anything reaching here
+            // is a non-transport deadlock (e.g. a vault write or the
+            // persist hung) — force a session restart to recover.
             if (remoteNum !== consumedNum
                 && remoteNum === SyncEngine.seqNumericPrefix(this.lastObservedRemoteSeq)) {
                 logDebug(`health: stall detected (remote=${remoteNum}, consumed=${consumedNum})`);
@@ -1103,7 +1132,7 @@ export class SyncEngine {
         const via = session ? "session-client" : "probe-client";
         // The probe client. Each info() issues a fresh fetch, so re-invoking
         // it escapes a suspend-killed socket that a single long probe would
-        // squat on (2026-06-14 iPad logs: first post-resume probe hung 15s,
+        // squat on (observed on iPad: first post-resume probe hung 15s,
         // a re-issued one returned in tens of ms).
         const client = session ? session.client : this.clientFactory(this.getSettings());
 
@@ -1151,7 +1180,7 @@ export class SyncEngine {
 
             const detail = classifyError({ message: err, name: errName, status: errStatus });
 
-            // Suspend-frozen verify (#6/#7): the probe was aborted, but this
+            // Suspend-frozen verify: the probe was aborted, but this
             // single attempt's wall-clock is far beyond what its own
             // per-attempt timer could have produced — the process was frozen
             // in mobile background and the OS tore the socket on resume. This
@@ -1200,7 +1229,7 @@ export class SyncEngine {
 
         // Budget exhausted without a reachable probe: genuinely unreachable.
         // Surface as network so the status bar shows it, but no toast (the
-        // host filters transient kinds). (#1d)
+        // host filters transient kinds).
         const detail = classifyError({ message: err ?? "timeout", name: errName, status: errStatus });
         if (detail.kind === "unknown" || detail.kind === "aborted") {
             detail.kind = "network";

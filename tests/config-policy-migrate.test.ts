@@ -47,6 +47,20 @@ describe("migrateSettings: configSyncPaths → configSyncPolicy", () => {
         expect(data.configSyncPolicyMigrated).toBe(true);
     });
 
+    it("gives a new install the default policy without the migration notice", () => {
+        const data: Record<string, any> = {};
+        migrateSettings(data);
+        expect(data.configSyncPolicy).toEqual(buildPolicyFromLegacyPaths([]));
+        expect(data.configSyncPolicyMigrated).toBeUndefined();
+    });
+
+    it("notifies a legacy empty list, which did have a filter to replace", () => {
+        const data: Record<string, any> = { configSyncPaths: [] };
+        migrateSettings(data);
+        expect(data.configSyncPaths).toBeUndefined();
+        expect(data.configSyncPolicyMigrated).toBe(true);
+    });
+
     it("is idempotent — second run keeps the policy and backfills units", () => {
         const data: Record<string, any> = { configSyncPaths: [".obsidian/"] };
         migrateSettings(data);
@@ -70,5 +84,22 @@ describe("migrateSettings: configSyncPaths → configSyncPolicy", () => {
         migrateSettings(data);
         expect(data.configSyncPolicy.unitDefaults["app-behavior"]).toBe(false); // preserved
         expect(data.configSyncPolicy.unitDefaults["theme-css"]).toBe(true); // backfilled
+    });
+
+    it("starts a policy without this device's own keys with none, and keeps existing ones", () => {
+        const older: Record<string, any> = {
+            configSyncPolicy: { schemaVersion: 1, unitDefaults: {}, overrides: {}, blockPluginCode: true },
+        };
+        migrateSettings(older);
+        expect(older.configSyncPolicy.deviceOnlyKeys).toEqual({});
+
+        const kept = { ".obsidian/app.json": ["/a"] };
+        const current: Record<string, any> = {
+            configSyncPolicy: {
+                schemaVersion: 1, unitDefaults: {}, overrides: {}, blockPluginCode: true, deviceOnlyKeys: kept,
+            },
+        };
+        migrateSettings(current);
+        expect(current.configSyncPolicy.deviceOnlyKeys).toEqual(kept);
     });
 });

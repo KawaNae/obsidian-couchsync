@@ -87,7 +87,7 @@ export class Checkpoints {
      * `pendingApplyAdd` carries the file-doc ids whose chunks are not yet
      * local (so their vault apply, attempted in `onCommit` AFTER this tx
      * durably commits, may fail). Recording them in the SAME tx as the
-     * `remoteSeq` advance is the load-bearing half of Invariant B: the
+     * `remoteSeq` advance is the load-bearing half of pull durability: the
      * cursor can never move past a file that isn't either applied or
      * remembered for retry. The caller removes the ids that apply cleanly
      * (post-commit), leaving only genuine misses in the set.
@@ -100,8 +100,8 @@ export class Checkpoints {
          *  pending-deletion → re-apply the deletion). */
         pendingApplyAdd?: Array<{ id: string; reason: PendingApplyReason }>;
         /** File-doc ids whose deletion-vs-edit conflict (either direction) must
-         *  be persisted in the SAME tx as the cursor advance (Invariant B for
-         *  the deletion-conflict class — see pending-conflict.ts). */
+         *  be persisted in the SAME tx as the cursor advance, so the cursor
+         *  never moves past an unresolved conflict — see pending-conflict.ts. */
         pendingConflictAdd?: Array<{ id: string; kind: PendingConflictKind }>;
         onCommit: () => Promise<void>;
     }): Promise<void> {
@@ -110,7 +110,7 @@ export class Checkpoints {
         ];
         const now = Date.now();
         for (const { id, reason } of params.pendingApplyAdd ?? []) {
-            const entry: PendingApplyEntry = { addedAt: now, reason, attempts: 0 };
+            const entry: PendingApplyEntry = { addedAt: now, reason };
             meta.push({ op: "put", key: pendingApplyKey(id), value: entry });
         }
         for (const { id, kind } of params.pendingConflictAdd ?? []) {
@@ -128,32 +128,6 @@ export class Checkpoints {
     }
 
     /**
-     * Add and/or remove pending-apply entries (Invariant B). Used by the
-     * post-commit cleanup (remove the ids that applied cleanly) and by the
-     * drain (remove resolved ids, re-add still-missing ones with a bumped
-     * attempt count). A standalone tx — not paired with a cursor advance,
-     * because by the time we know an apply outcome the cursor has already
-     * committed; the pre-record in `commitPullBatch` is what bounds the
-     * cursor. Removing an absent key is a harmless no-op.
-     */
-    async commitPendingApply(params: {
-        add?: Array<{ id: string; reason: PendingApplyReason; attempts: number }>;
-        remove?: string[];
-    }): Promise<void> {
-        const meta: MetaWrite[] = [];
-        for (const id of params.remove ?? []) {
-            meta.push({ op: "delete", key: pendingApplyKey(id) });
-        }
-        const now = Date.now();
-        for (const { id, reason, attempts } of params.add ?? []) {
-            const entry: PendingApplyEntry = { addedAt: now, reason, attempts };
-            meta.push({ op: "put", key: pendingApplyKey(id), value: entry });
-        }
-        if (meta.length === 0) return;
-        await this.localDb.runWriteTx({ meta });
-    }
-
-    /**
      * Advance the remote checkpoint for a batch that produced no accepted
      * docs (empty fetch, or every row skipped by echo/keep-local). Persists
      * both seqs so the on-disk cursor matches in-memory state.
@@ -162,7 +136,7 @@ export class Checkpoints {
         nextRemoteSeq: number | string,
         pendingConflictAdd?: Array<{ id: string; kind: PendingConflictKind }>,
     ): Promise<void> {
-        // No-op guard (symmetric to commitPendingApply): a cycle that
+        // No-op guard (symmetric to PendingApply.record): a cycle that
         // proves "cursor unchanged AND nothing to record" writes nothing.
         // Sound because the in-memory seq only moves via load() (disk
         // truth) or a committed tx's onCommit — memory == disk holds, so
@@ -176,7 +150,7 @@ export class Checkpoints {
         // A delete-only batch produces no accepted docs but may still carry a
         // deletion-vs-edit conflict (either direction). Persist it in the SAME
         // tx as the cursor advance so the conflict survives a missed modal /
-        // restart (Invariant B for the deletion-conflict class).
+        // restart.
         const now = Date.now();
         for (const { id, kind } of pendingConflictAdd ?? []) {
             const entry: PendingConflictEntry = { addedAt: now, kind };

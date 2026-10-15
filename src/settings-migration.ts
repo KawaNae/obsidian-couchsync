@@ -1,5 +1,8 @@
 import { buildPolicyFromLegacyPaths } from "./sync/config-policy/migrate.ts";
 import { normalizeUnitDefaults } from "./sync/config-policy/policy.ts";
+import Dexie from "dexie";
+import { configBindingKey } from "./sync/config-binding-record.ts";
+import type { ConfigBindingRecord } from "./settings.ts";
 
 /**
  * Migrate legacy settings shapes to the current schema.
@@ -48,20 +51,79 @@ export function migrateSettings(data: Record<string, any>): void {
     if (data.logRetentionDays === undefined) data.logRetentionDays = 7;
     if (data.logMaxStorageMB === undefined) data.logMaxStorageMB = 50;
 
-    // v0.26.2: config-setup atomicity flag (#err-9). Default false is also
-    // supplied by DEFAULT_SETTINGS; explicit migration keeps the schema obvious.
-    if (data.configSettingUp === undefined) data.configSettingUp = false;
+    // Config binding. What a device recorded about its config DB used to be
+    // GLOBAL (`configCodecApplied` / `configCipherVersion` /
+    // `configSettingUp`) and ignored which DB it belonged to. Now:
+    //   - attachment (codec, joined root) lives in the binding's local
+    //     store, which settings cannot reach — a recorded codec is dropped,
+    //     and the device is Unattached until it Joins once;
+    //   - the cipher floor, the Create-interrupted flag and the DB's
+    //     passphrase stay in settings, per binding
+    //     (`configBindings[configBindingKey(server, db)]`).
+    //
+    // Same result from every starting state (idempotent, and safe after a
+    // downgrade + upgrade, when an older build wrote the globals again next
+    // to an existing map):
+    //   1. normalise the map (or start one);
+    //   2. MERGE any global values into the entry of the config DB applied
+    //      now — the floor takes the higher value (a floor is never lowered
+    //      by a migration), the setup flag is kept if either side has it
+    //      (an interrupted Create must not be forgotten);
+    //   3. remove the globals.
+    // Entries written by a pre-release build of the binding also carried
+    // the attachment (`codecFingerprint`, `metaFingerprint`); those move to
+    // the store and cannot be carried over, so they are dropped. An entry
+    // left with nothing to keep is removed.
+    const bindings: Record<string, ConfigBindingRecord> = {};
+    if (data.configBindings && typeof data.configBindings === "object") {
+        for (const [key, rec] of Object.entries(data.configBindings as Record<string, any>)) {
+            if (!rec || typeof rec !== "object") continue;
+            const cipherFloor = typeof rec.cipherFloor === "number" ? rec.cipherFloor : undefined;
+            const settingUp = rec.settingUp === true;
+            const passphrase = typeof rec.passphrase === "string" && rec.passphrase !== ""
+                ? rec.passphrase : undefined;
+            if (cipherFloor === undefined && !settingUp && passphrase === undefined) continue;
+            bindings[key] = {
+                ...(cipherFloor !== undefined ? { cipherFloor } : {}),
+                settingUp,
+                ...(passphrase !== undefined ? { passphrase } : {}),
+            };
+        }
+    }
+    const legacyFloor = typeof data.configCipherVersion === "number"
+        ? data.configCipherVersion : undefined;
+    const legacySettingUp = data.configSettingUp === true;
+    const appliedDb = data.couchdbConfigDbName;
+    if ((legacyFloor !== undefined || legacySettingUp)
+        && typeof appliedDb === "string" && appliedDb !== "") {
+        const key = configBindingKey(String(data.couchdbUri ?? ""), appliedDb);
+        const prev = bindings[key];
+        const floors = [prev?.cipherFloor, legacyFloor].filter((v): v is number => v !== undefined);
+        bindings[key] = {
+            ...(floors.length > 0 ? { cipherFloor: Math.max(...floors) } : {}),
+            settingUp: (prev?.settingUp ?? false) || legacySettingUp,
+            ...(prev?.passphrase !== undefined ? { passphrase: prev.passphrase } : {}),
+        };
+    }
+    data.configBindings = bindings;
+    delete data.configCodecApplied;
+    delete data.configCipherVersion;
+    delete data.configSettingUp;
 
     // configSyncPaths (string[] receive-only allowlist) → configSyncPolicy
     // (meaning-unit policy, symmetric send/receive). Safe-side: plugin code
     // stops syncing (blockPluginCode forced true inside the builder). The host
-    // shows a one-time notice (configSyncPolicyMigrated) after this runs.
+    // shows a one-time notice (configSyncPolicyMigrated) after this runs,
+    // only when there was a legacy list to convert: every build that had
+    // configSyncPaths saved it with the rest of the settings, so data without
+    // it is a new install, which gets the default policy and nothing to be
+    // told of.
     if (data.configSyncPolicy === undefined) {
-        const legacy: string[] = Array.isArray(data.configSyncPaths)
-            ? data.configSyncPaths
-            : [];
-        data.configSyncPolicy = buildPolicyFromLegacyPaths(legacy);
-        data.configSyncPolicyMigrated = true;
+        const hadLegacy = Array.isArray(data.configSyncPaths);
+        data.configSyncPolicy = buildPolicyFromLegacyPaths(
+            hadLegacy ? data.configSyncPaths : [],
+        );
+        if (hadLegacy) data.configSyncPolicyMigrated = true;
         delete data.configSyncPaths;
     } else {
         // Forward-compat: backfill any unit added in a later build so an
@@ -75,5 +137,53 @@ export function migrateSettings(data: Record<string, any>): void {
         if (data.configSyncPolicy.overrides === undefined) {
             data.configSyncPolicy.overrides = {};
         }
+        if (data.configSyncPolicy.deviceOnlyKeys === undefined) {
+            data.configSyncPolicy.deviceOnlyKeys = {};
+        }
     }
+}
+
+// ── Legacy local config store ──────────────────────────
+
+/**
+ * Name of the local config store the layout before config bindings used
+ * for the config DB applied now: `couchsync-<vault>-config-<db>` (no hash
+ * suffix). Null when no config DB is applied.
+ *
+ * Deliberately ONE exact name derived from the settings, never a pattern
+ * over the device's IndexedDB names: a pattern cannot tell a legacy config
+ * store from another vault's own store (a vault named `<vault>-config-<x>`
+ * has its vault store at `couchsync-<vault>-config-<x>`). Stores of config
+ * DB names used earlier are left alone: a store of another DB name may
+ * still be the one a later Apply switches back to, and nothing here can tell
+ * an abandoned store from one that is merely not applied now.
+ */
+export function legacyConfigStoreName(vaultName: string, configDbName: string): string | null {
+    if (!configDbName) return null;
+    return `couchsync-${vaultName}-config-${configDbName}`;
+}
+
+/**
+ * Delete the legacy local config store of the applied config DB (see
+ * `legacyConfigStoreName`). Its contents can never be used again — stores
+ * are now named per (server, DB), and the old one holds no attachment —
+ * and every device Joins once after this update anyway.
+ *
+ * Runs on every plugin load, after `migrateSettings` (the settings side of
+ * the same migration) and before the config binding opens. Deleting a name
+ * that does not exist is a no-op success (IndexedDB `deleteDatabase`, and
+ * `Dexie.delete` over it), so no enumeration is needed and it is
+ * idempotent; it also removes a legacy store an older build re-created
+ * after a downgrade. Resolves with the name it deleted (or found absent),
+ * or null when no config DB is applied.
+ */
+export async function deleteLegacyConfigStore(
+    vaultName: string,
+    configDbName: string,
+    deleteDb: (name: string) => Promise<void> = (name) => Dexie.delete(name),
+): Promise<string | null> {
+    const name = legacyConfigStoreName(vaultName, configDbName);
+    if (name === null) return null;
+    await deleteDb(name);
+    return name;
 }

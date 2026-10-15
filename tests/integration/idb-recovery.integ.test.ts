@@ -1,11 +1,11 @@
 /**
  * Integration: IDB handle failure → HandleGuard transparent reopen.
  *
- * Reproduces the production scenario that motivated the Step 1-3 refactor:
+ * Reproduces the production scenario that motivated HandleGuard:
  * a browser silently invalidates the IndexedDB connection (OS suspend,
- * tab reclaim). Before the refactor this caused a 2s-interval infinite
+ * tab reclaim). Before HandleGuard this caused a 2s-interval infinite
  * retry storm — `checkpoint load error` + `catchup failed` in a tight
- * loop. After the refactor HandleGuard must absorb the failure inside
+ * loop. HandleGuard must absorb the failure inside
  * LocalDB so SyncEngine never sees it and catchup completes normally.
  */
 import "fake-indexeddb/auto";

@@ -1,10 +1,10 @@
-import { Notice } from "obsidian";
 import type CouchSyncPlugin from "./main.ts";
-import { ProgressNotice } from "./ui/notices.ts";
+import { ProgressNotice, showNotice } from "./ui/notices.ts";
+import { UserFacingError } from "./ui/describe-error.ts";
 import { ConsistencyReportModal } from "./ui/consistency-report-modal.ts";
 import { ChunkConsistencyReportModal } from "./ui/chunk-consistency-report-modal.ts";
 import { totalDiscrepancies } from "./sync/reconciler.ts";
-import { logError, logWarn, notify } from "./ui/log.ts";
+import { logWarn, notify } from "./ui/log.ts";
 import { analyzeChunkConsistency } from "./sync/chunk-consistency.ts";
 import { planFromReport, repairChunkDrift } from "./sync/chunk-repair.ts";
 import { gcOrphanConfigChunks } from "./db/chunk-gc.ts";
@@ -22,7 +22,7 @@ export function registerCommands(plugin: CouchSyncPlugin): void {
             if (file) {
                 plugin.showHistory(file.path);
             } else {
-                new Notice("No active file. Open a file to view its history.");
+                showNotice("No active file. Open a file to view its history.");
             }
         },
     });
@@ -44,7 +44,7 @@ export function registerCommands(plugin: CouchSyncPlugin): void {
                     try {
                         await plugin.remoteOps.pullAll();
                     } catch (e: any) {
-                        logWarn(`CouchSync: verify pull failed, continuing with local view: ${e?.message ?? e}`);
+                        logWarn(`verify pull failed, continuing with local view: ${e?.message ?? e}`);
                     }
                     // Push-backfill: re-enqueue docs a pre-fix push cursor
                     // skipped (permanently unpushed tombstones). Manual path
@@ -53,21 +53,27 @@ export function registerCommands(plugin: CouchSyncPlugin): void {
                     try {
                         const bf = await plugin.replicator.runPushBackfillNow();
                         if (bf && bf.enqueued > 0) {
-                            notify(`CouchSync: re-enqueued ${bf.enqueued} doc(s) the push cursor had skipped.`);
+                            notify(`re-enqueued ${bf.enqueued} doc(s) the push cursor had skipped.`);
                         }
                     } catch (e: any) {
-                        logWarn(`CouchSync: push backfill failed during verify: ${e?.message ?? e}`);
+                        logWarn(`push backfill failed during verify: ${e?.message ?? e}`);
                     }
                 }
                 progress.update("Reconciling...");
                 const report = await plugin.reconciler.reconcile("manual", { mode: "report" });
                 const total = totalDiscrepancies(report);
-                progress.done(`Verify: ${total} discrepancy(ies)`);
+                progress.done(`${total} discrepancy(ies)`);
                 new ConsistencyReportModal(plugin.app, report, async () => {
-                    await plugin.reconciler.reconcile("manual-repair");
+                    const repair = new ProgressNotice("Repair");
+                    try {
+                        const done = await plugin.reconciler.reconcile("manual-repair");
+                        repair.done(`${totalDiscrepancies(done)} discrepancy(ies) handled.`);
+                    } catch (e) {
+                        repair.fail(e);
+                    }
                 }).open();
-            } catch (e: any) {
-                progress.done(`Verify failed: ${e.message ?? e}`);
+            } catch (e) {
+                progress.fail(e);
             }
         },
     });
@@ -82,22 +88,28 @@ export function registerCommands(plugin: CouchSyncPlugin): void {
         id: "couchsync-config-chunk-gc",
         name: "Config: garbage-collect orphan chunks",
         callback: async () => {
+            // Runs under ConfigSync's op lock on the CURRENT binding's
+            // store: refused while a Push / Pull / Join / Create runs (the
+            // sweep would race its writes), and Apply cannot switch the
+            // store mid-sweep.
             if (!plugin.configLocalDb) {
-                notify("CouchSync: Config DB is not configured.", 5000);
+                notify("Config DB is not configured.", 5000);
                 return;
             }
-            const progress = new ProgressNotice("Config GC");
+            const label = "Config GC";
+            const progress = new ProgressNotice(label);
             try {
-                progress.update("Sweeping orphan chunks...");
-                const result = await gcOrphanConfigChunks(plugin.configLocalDb);
+                const result = await plugin.configSync.runExclusive(label, async (binding) => {
+                    progress.update("Sweeping orphan chunks...");
+                    return gcOrphanConfigChunks(binding.store);
+                });
                 progress.done(
-                    `Config GC: scanned ${result.scannedChunks}, ` +
+                    `scanned ${result.scannedChunks}, ` +
                     `referenced ${result.referencedChunks}, ` +
                     `deleted ${result.deletedChunks} orphan(s).`,
                 );
-            } catch (e: any) {
-                logError(`Config GC failed: ${e?.message ?? e}`);
-                progress.fail(`Config GC failed: ${e?.message ?? e}`);
+            } catch (e) {
+                progress.fail(e);
             }
         },
     });
@@ -107,22 +119,18 @@ export function registerCommands(plugin: CouchSyncPlugin): void {
         name: "Reconnect sync",
         callback: async () => {
             if (plugin.auth.isBlocked()) {
-                notify(
-                    "CouchSync: auth is blocked. Update credentials in " +
-                        "Vault Sync (Step 1) before reconnecting.",
-                    8000,
-                );
+                notify(plugin.auth.blockedError().userMessage, 8000);
                 return;
             }
             if (plugin.settings.connectionState !== "syncing") {
                 notify(
-                    "CouchSync: enable Live Sync in Vault Sync (Step 3) first.",
+                    "enable Live Sync in Vault Sync (Step 3) first.",
                     5000,
                 );
                 return;
             }
             await plugin.replicator.requestReconnect("manual");
-            notify("CouchSync: reconnect requested.", 3000);
+            notify("reconnect requested.", 3000);
         },
     });
 }
@@ -160,13 +168,13 @@ export async function runChunkConsistencyReport(
         if (result.state === "needs-convergence") {
             const d = result.divergence;
             progress.done(
-                `Chunk report — not converged: ${d.localOnly.length} pending push, ` +
+                `not converged: ${d.localOnly.length} pending push, ` +
                     `${d.remoteOnly.length} pending pull, ${d.differing.length} differing`,
             );
         } else {
             const r = result.report;
             progress.done(
-                `Chunk report — ${r.counts.localOnly} local-only, ` +
+                `${r.counts.localOnly} local-only, ` +
                     `${r.counts.remoteOnly} remote-only, ` +
                     `${r.counts.missingReferenced} broken, ` +
                     `${r.counts.orphanLocal + r.counts.orphanRemote} orphan(s)`,
@@ -178,45 +186,59 @@ export async function runChunkConsistencyReport(
             async (currentReport) => {
                 void currentReport; // the displayed snapshot is a preview only
                 const repairProgress = new ProgressNotice("Chunk repair");
-                // #4: re-analyze immediately before acting. The report shown in
+                // Re-analyze immediately before acting. The report shown in
                 // the modal may be stale (arbitrary user think-time), and acting
                 // on a stale snapshot can tombstone a chunk another device just
                 // re-referenced. A fresh analyze also re-checks the convergence
                 // gate; if the vault diverged meanwhile, abort rather than repair.
-                const fresh = await analyze();
-                if (fresh.state !== "converged") {
-                    repairProgress.fail(
-                        "Repair aborted — vault not converged. Let sync settle and retry.",
-                    );
-                    return fresh;
+                let repairResult: Awaited<ReturnType<typeof repairChunkDrift>>;
+                try {
+                    const fresh = await analyze();
+                    if (fresh.state !== "converged") {
+                        repairProgress.fail(new UserFacingError(
+                            "The vault is not converged, so nothing was repaired. Let sync settle and retry.",
+                        ));
+                        return fresh;
+                    }
+                    const plan = planFromReport(fresh.report);
+                    repairResult = await repairChunkDrift(plan, {
+                        localDb: plugin.localDb,
+                        remote,
+                        chunkHasher: plugin.remoteOps.chunkHasher,
+                        onProgress: (phase, current, total) =>
+                            repairProgress.update(`${phase}: ${current}/${total}`),
+                    });
+                } catch (e) {
+                    // Reported here; the modal only restores its button.
+                    repairProgress.fail(e);
+                    throw e;
                 }
-                const plan = planFromReport(fresh.report);
-                const repairResult = await repairChunkDrift(plan, {
-                    localDb: plugin.localDb,
-                    remote,
-                    chunkHasher: plugin.remoteOps.chunkHasher,
-                    onProgress: (phase, current, total) =>
-                        repairProgress.update(`${phase}: ${current}/${total}`),
-                });
                 const summary =
                     `pushed ${repairResult.pushed}, pulled ${repairResult.pulled}, ` +
                     `deleted-local ${repairResult.deletedLocal}, ` +
                     `deleted-remote ${repairResult.deletedRemote}`;
                 if (repairResult.failed.length === 0) {
-                    repairProgress.done(`Repair — ${summary}`);
+                    repairProgress.done(summary);
                 } else {
-                    repairProgress.fail(
-                        `Repair — ${summary}, ${repairResult.failed.length} failed`,
-                    );
+                    repairProgress.fail(new UserFacingError(
+                        `${summary}, ${repairResult.failed.length} failed (see the log).`,
+                    ));
                     logWarn(
-                        `CouchSync: chunk repair failures: ${
+                        `chunk repair failures: ${
                             repairResult.failed
                                 .map((f) => `${f.direction} ${f.id}: ${f.reason}`)
                                 .join("; ")
                         }`,
                     );
                 }
-                return await analyze();
+                try {
+                    return await analyze();
+                } catch (e) {
+                    // The repair itself was reported above; this is the
+                    // re-analysis that refreshes the modal.
+                    new ProgressNotice("Chunk consistency").fail(e);
+                    throw e;
+                }
             },
             async () => {
                 const pullProgress = new ProgressNotice("Pull & re-analyse");
@@ -226,16 +248,23 @@ export async function runChunkConsistencyReport(
                     );
                 } catch (e: any) {
                     logWarn(
-                        `CouchSync: chunk-consistency retry pull failed, continuing with whatever landed: ${e?.message ?? e}`,
+                        `chunk-consistency retry pull failed, continuing with whatever landed: ${e?.message ?? e}`,
                     );
                 }
                 pullProgress.update("re-analysing...");
-                const next = await analyze();
+                let next: Awaited<ReturnType<typeof analyze>>;
+                try {
+                    next = await analyze();
+                } catch (e) {
+                    // Reported here; the modal only restores its button.
+                    pullProgress.fail(e);
+                    throw e;
+                }
                 if (next.state === "converged") {
-                    pullProgress.done("Re-analyse — converged");
+                    pullProgress.done("converged");
                 } else {
                     pullProgress.done(
-                        `Re-analyse — still not converged (${
+                        `still not converged (${
                             next.divergence.localOnly.length +
                             next.divergence.remoteOnly.length +
                             next.divergence.differing.length
@@ -245,7 +274,7 @@ export async function runChunkConsistencyReport(
                 return next;
             },
         ).open();
-    } catch (e: any) {
-        progress.fail(`Chunk report failed: ${e?.message ?? e}`);
+    } catch (e) {
+        progress.fail(e);
     }
 }

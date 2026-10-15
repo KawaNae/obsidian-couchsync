@@ -1,5 +1,5 @@
 /**
- * PullPipeline integration tests — Phase 4 migration.
+ * PullPipeline integration tests.
  *
  * Drives PullPipeline against a real LocalDB + FakeCouchClient + real
  * PullWriter, and verifies observable side effects (docs in DB,
@@ -26,6 +26,10 @@ import { makeFileId } from "../../src/types/doc-id.ts";
 import type { FileDoc, CouchSyncDoc } from "../../src/types.ts";
 import { ALWAYS_VISIBLE } from "../../src/db/visibility-gate.ts";
 import { EncryptionError } from "../../src/db/codec-errors.ts";
+import { makePendingApply } from "../helpers/pending-apply.ts";
+import { buildInitialVaultMeta, pushVaultMeta, type VaultMetaDoc } from "../../src/db/vault-meta.ts";
+import { VaultEncryptionPausedError } from "../../src/sync/vault-binding.ts";
+import type { WriteResult } from "../../src/sync/vault-writer.ts";
 
 interface PipelineRig {
     pipeline: PullPipeline;
@@ -39,11 +43,19 @@ interface PipelineRig {
     dbErrorCalls: Array<{ err: unknown; ctx: string }>;
     /** Errors routed to onTransientError. */
     transientErrors: unknown[];
+    /** Arguments of every `recheckRoot` call (`"read"`: none passed). */
+    rechecks: Array<VaultMetaDoc | null | "read">;
 }
 
 function attachPullPipeline(opts: {
     device: DeviceHarness;
     couch: SyncHarness["couch"];
+    /** Stand-in for the vault setup's verdict; passes by default. */
+    recheckRoot?: (observed?: VaultMetaDoc | null) => Promise<void>;
+    /** Stand-in for the vault write of each pulled file doc. */
+    applyPullWrite?: (doc: FileDoc) => Promise<WriteResult>;
+    /** Stand-in for the session's backoff sleep; returns at once by default. */
+    delay?: (ms: number) => Promise<void>;
 }): PipelineRig {
     const events = new SyncEvents();
     const echoes = new EchoTracker();
@@ -51,6 +63,7 @@ function attachPullPipeline(opts: {
     const pausedCount = { value: 0 };
     events.on("paused", () => { pausedCount.value++; });
 
+    const pendingApply = makePendingApply(opts.device.db);
     const pullWriter = new PullWriter({
         localDb: opts.device.db,
         events,
@@ -58,16 +71,20 @@ function attachPullPipeline(opts: {
         checkpoints,
         getConflictResolver: () => opts.device.resolver,
         ensureChunks: async () => {},
+        pendingApply,
+        applyPullWrite: opts.applyPullWrite,
     });
 
     let cancelled = false;
     const controller = new AbortController();
     const dbErrorCalls: Array<{ err: unknown; ctx: string }> = [];
     const transientErrors: unknown[] = [];
+    const rechecks: Array<VaultMetaDoc | null | "read"> = [];
 
     const pipeline = new PullPipeline({
         client: opts.couch,
         pullWriter,
+        pendingApply,
         checkpoints,
         events,
         sessionEpoch: 1,
@@ -76,7 +93,11 @@ function attachPullPipeline(opts: {
         signal: controller.signal,
         handleLocalDbError: (err, ctx) => { dbErrorCalls.push({ err, ctx }); },
         onTransientError: (e) => { transientErrors.push(e); },
-        delay: async () => {},
+        recheckRoot: async (observed) => {
+            rechecks.push(observed === undefined ? "read" : observed);
+            await opts.recheckRoot?.(observed);
+        },
+        delay: opts.delay ?? (async () => {}),
     });
 
     return {
@@ -89,6 +110,7 @@ function attachPullPipeline(opts: {
         signal: controller.signal,
         dbErrorCalls,
         transientErrors,
+        rechecks,
     };
 }
 
@@ -109,6 +131,28 @@ async function seedRemote(
         ...(chunks as unknown as CouchSyncDoc[]),
     ]);
     return doc;
+}
+
+/** Put `count` files (with their chunks) on the remote in one bulkDocs,
+ *  so they sit there as one backlog of changes. */
+async function seedRemoteMany(
+    h: SyncHarness,
+    a: DeviceHarness,
+    count: number,
+): Promise<string[]> {
+    const paths: string[] = [];
+    const docs: CouchSyncDoc[] = [];
+    for (let i = 0; i < count; i++) {
+        const path = `bulk/f${i}.md`;
+        a.vault.addFile(path, `body ${i}`);
+        await a.vs.fileToDb(path);
+        const doc = (await a.db.get(makeFileId(path))) as FileDoc;
+        const chunks = await a.db.getChunks(doc.chunks);
+        docs.push(doc as unknown as CouchSyncDoc, ...(chunks as unknown as CouchSyncDoc[]));
+        paths.push(path);
+    }
+    await h.couch.bulkDocs(docs);
+    return paths;
 }
 
 describe("PullPipeline integration", () => {
@@ -136,6 +180,22 @@ describe("PullPipeline integration", () => {
             await expectDb(b.db).toHaveFileDoc("notes/two.md").withChunks(d2.chunks.length);
             // Checkpoint advanced past the seeded docs.
             expect(Number(rig.checkpoints.getRemoteSeq())).toBeGreaterThan(0);
+        });
+
+        it("drains a backlog larger than one batch in batches of 100, landing every doc", async () => {
+            h = createSyncHarness();
+            const a = h.addDevice("dev-A");
+            const b = h.addDevice("dev-B");
+            const paths = await seedRemoteMany(h, a, 120);
+            const rig = attachPullPipeline({ device: b, couch: h.couch });
+            const spy = vi.spyOn(h.couch, "changes");
+
+            await rig.pipeline.runCatchup();
+
+            for (const path of paths) await expectDb(b.db).toHaveFileDoc(path);
+            expect(rig.checkpoints.getRemoteSeq()).toBe((await h.couch.info()).update_seq);
+            expect(spy.mock.calls.every(([opts]) => opts.limit === 100)).toBe(true);
+            spy.mockRestore();
         });
 
         it("exits cleanly on empty remote (no docs, no errors)", async () => {
@@ -181,6 +241,76 @@ describe("PullPipeline integration", () => {
         });
     });
 
+    // ── Catchup idle timeout ─────────────────────────────
+
+    describe("catchup idle timeout counts the docs actually processed", () => {
+        // Only Date is faked: the pipeline reads the clock with Date.now(),
+        // and the in-memory DB still needs real timers to settle.
+        afterEach(() => { vi.useRealTimers(); });
+
+        /** A vault write that takes `ms` of the fake clock. */
+        const slowWrite = (ms: number) => async (): Promise<WriteResult> => {
+            vi.setSystemTime(Date.now() + ms);
+            return { applied: true };
+        };
+
+        it("a batch that takes longer than 60s in all is not cut off while its docs keep landing", async () => {
+            vi.useFakeTimers({ toFake: ["Date"] });
+            h = createSyncHarness();
+            const a = h.addDevice("dev-A");
+            const b = h.addDevice("dev-B");
+            await seedRemote(h, a, "words/one.md", "one");
+            await seedRemote(h, a, "words/two.md", "two");
+            await seedRemote(h, a, "words/three.md", "three");
+            const rig = attachPullPipeline({
+                device: b, couch: h.couch, applyPullWrite: slowWrite(30_000),
+            });
+
+            // One batch of three docs, 30s each: 90s for the batch.
+            await rig.pipeline.runCatchup();
+
+            await expectDb(b.db).toHaveFileDoc("words/one.md");
+            await expectDb(b.db).toHaveFileDoc("words/three.md");
+            expect(Number(rig.checkpoints.getRemoteSeq()))
+                .toBe(Number((await h.couch.info()).update_seq));
+        });
+
+        it("a catchup that processes nothing for more than 60s is cut off, counted from the last doc", async () => {
+            vi.useFakeTimers({ toFake: ["Date"] });
+            h = createSyncHarness();
+            const a = h.addDevice("dev-A");
+            const b = h.addDevice("dev-B");
+            await seedRemote(h, a, "words/one.md", "one");
+            await seedRemote(h, a, "words/two.md", "two");
+            let lastWriteAt = 0;
+            const rig = attachPullPipeline({
+                device: b, couch: h.couch,
+                applyPullWrite: async () => {
+                    vi.setSystemTime(Date.now() + 50_000);
+                    lastWriteAt = Date.now();
+                    return { applied: true };
+                },
+                delay: async (ms) => { vi.setSystemTime(Date.now() + ms); },
+            });
+
+            // The first fetch delivers the batch; every later one fails to
+            // decrypt, which the catchup retries with backoff.
+            const realChanges = h.couch.changes.bind(h.couch);
+            let calls = 0;
+            const spy = vi.spyOn(h.couch, "changes").mockImplementation(async (...args) => {
+                calls++;
+                if (calls === 1) return realChanges(...args);
+                throw new EncryptionError("Failed to decrypt doc x"); // retriable
+            });
+
+            await expect(rig.pipeline.runCatchup()).rejects.toThrow(/Catchup timed out/);
+
+            await expectDb(b.db).toHaveFileDoc("words/two.md");
+            expect(Date.now() - lastWriteAt).toBeGreaterThan(60_000);
+            spy.mockRestore();
+        });
+    });
+
     // ── runLongpoll ──────────────────────────────────────
 
     describe("runLongpoll", () => {
@@ -199,6 +329,92 @@ describe("PullPipeline integration", () => {
 
             await expectDb(b.db).toHaveFileDoc("live.md");
             expect(rig.pausedCount.value).toBeGreaterThanOrEqual(1);
+        });
+
+        it("pulls a backlog larger than one batch in batches of 100 and advances the checkpoint with each", async () => {
+            h = createSyncHarness();
+            const a = h.addDevice("dev-A");
+            const b = h.addDevice("dev-B");
+            const paths = await seedRemoteMany(h, a, 120);
+            const remoteSeq = (await h.couch.info()).update_seq;
+            // 120 file docs and their chunks: more than two batches, and the
+            // last one not full.
+            expect(Number(remoteSeq) % 100).not.toBe(0);
+            const batches = Math.ceil(Number(remoteSeq) / 100);
+            expect(batches).toBeGreaterThanOrEqual(3);
+            const rig = attachPullPipeline({ device: b, couch: h.couch });
+
+            const fetched: Array<{ limit?: number; rows: number }> = [];
+            const record = (fetch: (...args: any[]) => Promise<any>) =>
+                async (...args: any[]) => {
+                    const result = await fetch(...args);
+                    fetched.push({ limit: args[0].limit, rows: result.results.length });
+                    return result;
+                };
+            const realLongpoll = h.couch.changesLongpoll.bind(h.couch);
+            const realChanges = h.couch.changes.bind(h.couch);
+            const longpollSpy = vi.spyOn(h.couch, "changesLongpoll").mockImplementation(record(realLongpoll));
+            const changesSpy = vi.spyOn(h.couch, "changes").mockImplementation(record(realChanges));
+            // The checkpoint each batch leaves behind; stop once caught up.
+            const seqs: Array<number | string> = [];
+            rig.events.on("paused", () => {
+                seqs.push(rig.checkpoints.getRemoteSeq());
+                if (rig.checkpoints.getRemoteSeq() === remoteSeq) rig.cancel();
+            });
+
+            await rig.pipeline.runLongpoll();
+
+            for (const path of paths) await expectDb(b.db).toHaveFileDoc(path);
+            expect(fetched).toEqual([
+                ...Array.from({ length: batches - 1 }, () => ({ limit: 100, rows: 100 })),
+                { limit: 100, rows: Number(remoteSeq) % 100 },
+            ]);
+            // One checkpoint per batch, each 100 changes past the last.
+            expect(seqs).toEqual([
+                ...Array.from({ length: batches - 1 }, (_, i) => (i + 1) * 100),
+                remoteSeq,
+            ]);
+            expect(await b.db.getMeta("_sync/remote-seq")).toBe(remoteSeq);
+            longpollSpy.mockRestore();
+            changesSpy.mockRestore();
+        });
+
+        it("after a full batch fetches the rest without a longpoll wait, then goes back to the longpoll", async () => {
+            h = createSyncHarness();
+            const a = h.addDevice("dev-A");
+            const b = h.addDevice("dev-B");
+            await seedRemoteMany(h, a, 120);
+            const batches = Math.ceil(Number((await h.couch.info()).update_seq) / 100);
+            const rig = attachPullPipeline({ device: b, couch: h.couch });
+
+            const order: string[] = [];
+            const realLongpoll = h.couch.changesLongpoll.bind(h.couch);
+            const realChanges = h.couch.changes.bind(h.couch);
+            const longpollSpy = vi.spyOn(h.couch, "changesLongpoll")
+                .mockImplementation(async (...args: any[]) => {
+                    order.push("longpoll");
+                    if (order.filter((o) => o === "longpoll").length === 2) {
+                        // Caught up: this is where the loop would wait.
+                        rig.cancel();
+                        return { results: [], last_seq: args[0].since };
+                    }
+                    return realLongpoll(...(args as [any, any]));
+                });
+            const changesSpy = vi.spyOn(h.couch, "changes")
+                .mockImplementation(async (...args: any[]) => {
+                    order.push("changes");
+                    return realChanges(...(args as [any, any]));
+                });
+
+            await rig.pipeline.runLongpoll();
+
+            expect(order).toEqual([
+                "longpoll",
+                ...Array.from({ length: batches - 1 }, () => "changes"),
+                "longpoll",
+            ]);
+            longpollSpy.mockRestore();
+            changesSpy.mockRestore();
         });
 
         it("empty longpoll result emits no paused (no batch applied)", async () => {
@@ -375,7 +591,7 @@ describe("PullPipeline integration", () => {
         });
     });
 
-    // ── EncryptionError classification (#enc-1) ──────────
+    // ── EncryptionError classification ──────────
     describe("EncryptionError classification", () => {
         it("longpoll: non-retriable EncryptionError halts immediately (no backoff)", async () => {
             // cipherVersion downgrade gate: must terminate the loop on the
@@ -445,6 +661,121 @@ describe("PullPipeline integration", () => {
             // Does NOT throw — backs off and exits cleanly when cancelled.
             await rig.pipeline.runCatchup();
             expect(calls).toBeGreaterThan(1);
+            spy.mockRestore();
+        });
+    });
+    // ── Re-created remote DB ────────────────────
+    describe("a sign that the remote DB was re-created is re-checked before anything is applied", () => {
+        const recreated = async () => { throw new VaultEncryptionPausedError("root-changed"); };
+
+        it("catchup: a batch carrying vault:meta is re-checked with the pulled meta", async () => {
+            h = createSyncHarness();
+            const a = h.addDevice("dev-A");
+            const b = h.addDevice("dev-B");
+            const rig = attachPullPipeline({ device: b, couch: h.couch });
+            const { meta } = await buildInitialVaultMeta({ encryption: false, compression: false });
+            await pushVaultMeta(h.couch, meta);
+            await seedRemote(h, a, "notes/one.md", "one");
+
+            await rig.pipeline.runCatchup();
+
+            expect(rig.rechecks).toHaveLength(1);
+            expect(rig.rechecks[0]).toMatchObject({ _id: "vault:meta", generationId: meta.generationId });
+            await expectDb(b.db).toHaveFileDoc("notes/one.md");
+        });
+
+        it("catchup: a re-created DB throws the pause and applies nothing", async () => {
+            h = createSyncHarness();
+            const a = h.addDevice("dev-A");
+            const b = h.addDevice("dev-B");
+            const rig = attachPullPipeline({ device: b, couch: h.couch, recheckRoot: recreated });
+            const { meta } = await buildInitialVaultMeta({ encryption: false, compression: false });
+            await pushVaultMeta(h.couch, meta);
+            await seedRemote(h, a, "notes/one.md", "one");
+
+            await expect(rig.pipeline.runCatchup()).rejects.toMatchObject({ reason: "root-changed" });
+            await expectDb(b.db).toNotHaveFileDoc("notes/one.md");
+            expect(rig.checkpoints.getRemoteSeq()).toBe(0);
+        });
+
+        it("longpoll: a re-created DB halts the loop with the pause and applies nothing", async () => {
+            h = createSyncHarness();
+            const a = h.addDevice("dev-A");
+            const b = h.addDevice("dev-B");
+            const rig = attachPullPipeline({ device: b, couch: h.couch, recheckRoot: recreated });
+            const { meta } = await buildInitialVaultMeta({ encryption: false, compression: false });
+            await pushVaultMeta(h.couch, meta);
+            await seedRemote(h, a, "notes/one.md", "one");
+
+            await rig.pipeline.runLongpoll();
+
+            expect(rig.transientErrors).toHaveLength(1);
+            expect(rig.transientErrors[0]).toBeInstanceOf(VaultEncryptionPausedError);
+            await expectDb(b.db).toNotHaveFileDoc("notes/one.md");
+        });
+
+        it("a batch without vault:meta is not re-checked", async () => {
+            h = createSyncHarness();
+            const a = h.addDevice("dev-A");
+            const b = h.addDevice("dev-B");
+            const rig = attachPullPipeline({ device: b, couch: h.couch, recheckRoot: recreated });
+            await seedRemote(h, a, "notes/one.md", "one");
+
+            await rig.pipeline.runCatchup();
+
+            expect(rig.rechecks).toEqual([]);
+            await expectDb(b.db).toHaveFileDoc("notes/one.md");
+        });
+
+        it("a body that does not decrypt reads the server's meta; a re-created DB halts", async () => {
+            h = createSyncHarness();
+            const b = h.addDevice("dev-B");
+            const rig = attachPullPipeline({ device: b, couch: h.couch, recheckRoot: recreated });
+            let calls = 0;
+            const spy = vi.spyOn(h.couch, "changesLongpoll").mockImplementation(async () => {
+                calls++;
+                throw new EncryptionError("Failed to decrypt doc x");
+            });
+
+            await rig.pipeline.runLongpoll();
+
+            expect(calls).toBe(1);
+            expect(rig.rechecks).toEqual(["read"]);
+            expect(rig.transientErrors).toEqual([expect.any(VaultEncryptionPausedError)]);
+            spy.mockRestore();
+        });
+
+        it("catchup: a body that does not decrypt in a re-created DB throws the pause", async () => {
+            h = createSyncHarness();
+            const b = h.addDevice("dev-B");
+            const rig = attachPullPipeline({ device: b, couch: h.couch, recheckRoot: recreated });
+            const spy = vi.spyOn(h.couch, "changes").mockImplementation(async () => {
+                throw new EncryptionError("Failed to decrypt doc x");
+            });
+
+            await expect(rig.pipeline.runCatchup()).rejects.toMatchObject({ reason: "root-changed" });
+            expect(rig.rechecks).toEqual(["read"]);
+            spy.mockRestore();
+        });
+
+        it("a re-check that fails for another reason is not a verdict: the loop goes on", async () => {
+            h = createSyncHarness();
+            const b = h.addDevice("dev-B");
+            const rig = attachPullPipeline({
+                device: b, couch: h.couch,
+                recheckRoot: async () => { throw new TypeError("Failed to fetch"); },
+            });
+            let calls = 0;
+            const spy = vi.spyOn(h.couch, "changesLongpoll").mockImplementation(async () => {
+                calls++;
+                if (calls > 2) rig.cancel();
+                throw new EncryptionError("Failed to decrypt doc x");
+            });
+
+            await rig.pipeline.runLongpoll();
+
+            expect(calls).toBeGreaterThan(1);
+            expect(rig.transientErrors.every((e) => e instanceof EncryptionError)).toBe(true);
             spy.mockRestore();
         });
     });

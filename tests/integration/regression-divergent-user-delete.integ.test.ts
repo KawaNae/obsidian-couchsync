@@ -45,8 +45,9 @@ class ToggleVaultWriter implements VaultWriter {
         await this.io.writeBinary(path, content);
         return { applied: true };
     }
-    async applyRemoteDeletion(path: string): Promise<void> {
+    async applyRemoteDeletion(path: string): Promise<WriteResult> {
         if (await this.io.exists(path)) await this.io.delete(path);
+        return { applied: true };
     }
     async createFile(path: string, content: ArrayBuffer): Promise<void> {
         await this.io.createBinary(path, content);
@@ -165,7 +166,7 @@ describe("regression: divergent user-delete", () => {
         await vs.markDeleted(path);
 
         // markDeleted committed the tombstone and established the deleted
-        // baseline (Invariant 7: deletion is an integration event — the
+        // baseline (deletion is an integration event — the
         // baseline is kept, not erased, so a later recreate keeps its
         // causal anchor).
         const doc = await db.get(makeFileId(path)) as FileDoc;

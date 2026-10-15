@@ -1,4 +1,4 @@
-import { ItemView, Notice, WorkspaceLeaf, setIcon } from "obsidian";
+import { ItemView, WorkspaceLeaf, setIcon } from "obsidian";
 import {
     type LogLevel,
     type LogEntry,
@@ -7,6 +7,7 @@ import {
     onLogEntry,
 } from "./log.ts";
 import { formatTime } from "../utils/format.ts";
+import { showNotice } from "./notices.ts";
 
 export const VIEW_TYPE_LOG = "couchsync-log-view";
 
@@ -118,8 +119,8 @@ export class LogView extends ItemView {
             .map((e) => `${formatTime(e.timestamp)} [${e.level.toUpperCase()}] ${e.message}`)
             .join("\n");
         navigator.clipboard.writeText(text).then(
-            () => new Notice("Log copied to clipboard"),
-            () => new Notice("Failed to copy log"),
+            () => showNotice("Log copied to clipboard"),
+            () => showNotice("Failed to copy log"),
         );
     }
 

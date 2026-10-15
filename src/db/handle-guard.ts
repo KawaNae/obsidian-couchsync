@@ -75,14 +75,14 @@ export class HandleGuard<T> {
                     if (classifyDexieError(e) === "unknown" && !this.unknownKindCaptured) {
                         this.unknownKindCaptured = true;
                         logWarn(
-                            `CouchSync: [handle-guard] unclassified DB error in ${context} — ${debugDescribeError(e)}`,
+                            `[handle-guard] unclassified DB error in ${context} — ${debugDescribeError(e)}`,
                         );
                     }
                     throw e;
                 }
                 if (reopenAttempts >= this.maxReopen) {
                     logWarn(
-                        `CouchSync: [handle-guard] giving up after ${this.maxReopen} reopen attempts in ${context} — last trigger: ${debugDescribeError(e)}`,
+                        `[handle-guard] giving up after ${this.maxReopen} reopen attempts in ${context} — last trigger: ${debugDescribeError(e)}`,
                     );
                     throw new DbError(
                         "degraded",

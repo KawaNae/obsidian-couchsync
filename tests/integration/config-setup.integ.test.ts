@@ -1,8 +1,8 @@
 /**
  * ConfigSetupService integration tests — true clean-slate init.
  *
- * Drives ConfigSync.init() against a real ConfigLocalDB + FakeCouchClient
- * and verifies the new (PR5) semantics:
+ * Drives ConfigSync.create() (formerly init) against a real ConfigLocalDB + FakeCouchClient
+ * and verifies the clean-slate semantics:
  *
  *   - The local DB is destroyed (not just deleteByPrefix-d) — cache,
  *     checkpoints, and lastSynced all start fresh.
@@ -28,10 +28,10 @@ import { makeSettings } from "../helpers/settings-factory.ts";
 import { makeConfigId } from "../../src/types/doc-id.ts";
 import {
     META_CONFIG_PULL_SEQ,
-    META_CONFIG_PUSH_SEQ,
 } from "../../src/db/sync/config-checkpoints.ts";
 import { CONFIG_LAST_SYNCED_PREFIX } from "../../src/db/sync/config-last-synced.ts";
 import type { CouchClient } from "../../src/db/couch-client.ts";
+import { getAttachment, getEntry, putEntry } from "../helpers/config-attach.ts";
 
 let counter = 0;
 function uniqueName(): string {
@@ -43,7 +43,7 @@ function asCouchClient(fake: FakeCouchClient): CouchClient {
     return fake as unknown as CouchClient;
 }
 
-describe("ConfigSetupService — clean-slate init (PR5)", () => {
+describe("ConfigSetupService — clean-slate init", () => {
     let vault: FakeVaultIO;
     let modal: FakeModalPresenter;
     let db: ConfigLocalDB;
@@ -52,7 +52,7 @@ describe("ConfigSetupService — clean-slate init (PR5)", () => {
     let remote: FakeCouchClient;
     let cs: ConfigSync;
 
-    beforeEach(() => {
+    beforeEach(async () => {
         vault = new FakeVaultIO();
         modal = new FakeModalPresenter();
         db = new ConfigLocalDB(uniqueName());
@@ -67,18 +67,20 @@ describe("ConfigSetupService — clean-slate init (PR5)", () => {
         cs = new ConfigSync(
             vault,
             modal,
-            db,
+            "test-vault",
             auth,
             ALWAYS_VISIBLE,
             NoopReconnectBridge,
             () => settings,
             {
+                storeFactory: () => db,
                 clientFactory: () => asCouchClient(remote),
-                // Phase 2: raw client factory reuses the in-memory fake
+                // The raw client factory reuses the in-memory fake
                 // because the test has no real codec layer to bypass.
                 rawClientFactory: () => asCouchClient(remote),
             },
         );
+        await cs.rebind(settings.couchdbConfigDbName);
     });
 
     afterEach(async () => {
@@ -90,7 +92,7 @@ describe("ConfigSetupService — clean-slate init (PR5)", () => {
         const ensureSpy = vi.spyOn(remote, "ensureDb");
         vault.addFile(".obsidian/a.json", `{}`);
 
-        await cs.init({encryption:false,compression:false});
+        await cs.create();
 
         expect(destroySpy).toHaveBeenCalledTimes(1);
         expect(ensureSpy).toHaveBeenCalled();
@@ -112,7 +114,7 @@ describe("ConfigSetupService — clean-slate init (PR5)", () => {
         vault.addFile(".obsidian/a.json", `{}`);
 
         // Init is structural — it wipes, it does not seed.
-        await cs.init({encryption:false,compression:false});
+        await cs.create();
         expect(await db.get(makeConfigId(".obsidian/stale.json"))).toBeNull();
         expect(await db.get(makeConfigId(".obsidian/a.json"))).toBeNull();
 
@@ -122,22 +124,19 @@ describe("ConfigSetupService — clean-slate init (PR5)", () => {
         expect(await db.get(makeConfigId(".obsidian/a.json"))).not.toBeNull();
     });
 
-    it("init resets pullSeq / pushSeq meta (cursors start from 0 in the new DB)", async () => {
+    it("init resets the pull cursor (it starts from 0 in the new DB)", async () => {
         // Pre-seed lingering cursor values in meta.
         await db.runWriteTx({
             meta: [
                 { op: "put", key: META_CONFIG_PULL_SEQ, value: 999 },
-                { op: "put", key: META_CONFIG_PUSH_SEQ, value: 888 },
             ],
         });
         vault.addFile(".obsidian/a.json", `{}`);
 
-        await cs.init({encryption:false,compression:false});
+        await cs.create();
 
-        // After destroy + reopen, those meta entries no longer exist.
+        // After destroy + reopen, the cursor is gone.
         const pullSeq = await db.getMeta<number | string>(META_CONFIG_PULL_SEQ);
-        // After a fresh push of one doc the push-seq advances above 0; what
-        // matters is that the legacy 888 / 999 are gone.
         expect(pullSeq).not.toBe(999);
     });
 
@@ -152,7 +151,7 @@ describe("ConfigSetupService — clean-slate init (PR5)", () => {
         });
         vault.addFile(".obsidian/a.json", `{}`);
 
-        await cs.init({encryption:false,compression:false});
+        await cs.create();
 
         const stale = await db.getMeta(
             `${CONFIG_LAST_SYNCED_PREFIX}.obsidian/ghost.json`,
@@ -161,8 +160,8 @@ describe("ConfigSetupService — clean-slate init (PR5)", () => {
     });
 
     it("init produces fresh rev=1- on remote (no carry-over from previous tenant)", async () => {
-        // Simulate the audit-2026-05-08 phantom: previous tenant
-        // accumulated rev=N for `app.json`. After our PR5 init, the doc
+        // Simulate a previous tenant that accumulated rev=N for
+        // `app.json`. After a clean-slate init, the doc
         // must come back at a new rev tree (rev=1-).
         const id = makeConfigId(".obsidian/app.json");
         await remote.bulkDocs([{
@@ -178,7 +177,7 @@ describe("ConfigSetupService — clean-slate init (PR5)", () => {
         expect(phantom!._rev.startsWith("1-")).toBe(false); // sanity: rev > 1
 
         vault.addFile(".obsidian/app.json", `{"theme":"dark"}`);
-        await cs.init({encryption:false,compression:false});
+        await cs.create();
         await cs.push();
 
         const fresh = await remote.getDoc<any>(id);
@@ -196,16 +195,17 @@ describe("ConfigSetupService — clean-slate init (PR5)", () => {
     });
 });
 
-describe("ConfigSetupService — setup atomicity (#err-9)", () => {
+describe("ConfigSetupService — setup atomicity", () => {
     let vault: FakeVaultIO;
     let db: ConfigLocalDB;
     let auth: AuthGate;
     let settings: ReturnType<typeof makeSettings>;
     let remote: FakeCouchClient;
     let cs: ConfigSync;
-    let settingUpCalls: boolean[];
+    /** The settings entry's `settingUp` at every settings save. */
+    let settingUpCalls: (boolean | undefined)[];
 
-    beforeEach(() => {
+    beforeEach(async () => {
         vault = new FakeVaultIO();
         db = new ConfigLocalDB(uniqueName());
         db.open();
@@ -218,17 +218,18 @@ describe("ConfigSetupService — setup atomicity (#err-9)", () => {
         remote = new FakeCouchClient();
         settingUpCalls = [];
         cs = new ConfigSync(
-            vault, new FakeModalPresenter(), db, auth, ALWAYS_VISIBLE, NoopReconnectBridge,
+            vault, new FakeModalPresenter(), "test-vault", auth, ALWAYS_VISIBLE, NoopReconnectBridge,
             () => settings,
             {
+                storeFactory: () => db,
                 clientFactory: () => asCouchClient(remote),
                 rawClientFactory: () => asCouchClient(remote),
-                persistConfigSettingUp: async (active) => {
-                    settingUpCalls.push(active);
-                    settings.configSettingUp = active;
+                saveSettings: async () => {
+                    settingUpCalls.push(getEntry(settings)?.settingUp);
                 },
             },
         );
+        await cs.rebind(settings.couchdbConfigDbName);
     });
 
     afterEach(async () => {
@@ -237,9 +238,9 @@ describe("ConfigSetupService — setup atomicity (#err-9)", () => {
 
     it("marks settingUp true before the wipe and false only after success", async () => {
         vault.addFile(".obsidian/a.json", `{}`);
-        await cs.init({ encryption: false, compression: false });
+        await cs.create();
         expect(settingUpCalls).toEqual([true, false]);
-        expect(settings.configSettingUp).toBe(false);
+        expect(getEntry(settings)?.settingUp).toBe(false);
     });
 
     it("leaves settingUp true when init fails mid-flight (no false cleared)", async () => {
@@ -248,20 +249,20 @@ describe("ConfigSetupService — setup atomicity (#err-9)", () => {
         // before reaching the success markSettingUp(false).
         vi.spyOn(remote, "bulkDocs").mockRejectedValue(new Error("network down"));
 
-        await expect(cs.init({ encryption: false, compression: false })).rejects.toThrow();
+        await expect(cs.create()).rejects.toThrow();
 
         expect(settingUpCalls).toEqual([true]);   // false never reached
-        expect(settings.configSettingUp).toBe(true);
+        expect(getEntry(settings)?.settingUp).toBe(true);
     });
 
-    // ── M-2: init ordering & blast-radius minimisation ──
+    // ── init ordering & blast-radius minimisation ──
 
-    it("pushes config:meta as the first remote write after ensureDb, before any config doc (M-2)", async () => {
+    it("pushes config:meta as the first remote write after ensureDb, before any config doc", async () => {
         vault.addFile(".obsidian/app.json", `{}`);
         const ensureSpy = vi.spyOn(remote, "ensureDb");
         const bulkSpy = vi.spyOn(remote, "bulkDocs");
 
-        await cs.init({ encryption: false, compression: false });
+        await cs.create();
         // Init pins meta only; Push seeds the real config doc afterwards.
         await cs.push();
 
@@ -283,60 +284,75 @@ describe("ConfigSetupService — setup atomicity (#err-9)", () => {
         expect(appIdx).toBeGreaterThan(metaIdx);
     });
 
-    it("does not destroy the remote when the pre-destroy config check fails (pre-destructive, M-2)", async () => {
-        // An empty config DB name trips the build-phase guard, which now runs
+    it("does not destroy the remote when the pre-destroy config check fails (pre-destructive)", async () => {
+        // No config DB applied (unbound) trips the pre-check, which runs
         // BEFORE the crypto derivation and the destructive wipe. Nothing must
         // be destroyed and the setup latch must never be set.
         settings.couchdbConfigDbName = "";
+        await cs.rebind(null);
         const destroySpy = vi.spyOn(remote, "destroy");
 
-        await expect(cs.init({ encryption: false, compression: false })).rejects.toThrow();
+        await expect(cs.create()).rejects.toThrow();
 
         expect(destroySpy).not.toHaveBeenCalled();
         expect(settingUpCalls).toEqual([]); // latch never set — fully pre-destructive
     });
 
-    it("blocks push/pull/write while a prior init is unfinished (gating)", async () => {
-        settings.configSettingUp = true;
+    it("blocks push/pull while a prior init is unfinished (gating)", async () => {
+        putEntry(settings, { settingUp: true });
         await expect(cs.push()).rejects.toThrow(/interrupted/);
         await expect(cs.pull()).rejects.toThrow(/interrupted/);
-        await expect(cs.write()).rejects.toThrow(/interrupted/);
     });
 
-    it("first encrypted Config Init succeeds despite a fail-closed wrapped client (#config-init)", async () => {
+    it("first encrypted Create succeeds despite a fail-closed wrapped client (#config-init)", async () => {
         // wrapConfigClient is fail-closed: it throws when encryption is on but
         // no crypto provider is unlocked. The FIRST encrypted Config Init has no
         // provider yet, so Init must run its DB-level ops (destroy/ensureDb/
         // probe) on the raw client; the wrapped client is only used for the doc
         // push once the provider exists. Pre-fix this threw in
         // ConfigOperation.makeClient before Init could start.
-        let providerReady = false;
+        const wrapped = vi.fn((): never => {
+            throw new Error("refusing to build config client — no provider");
+        });
         const cs2 = new ConfigSync(
-            vault, new FakeModalPresenter(), db, auth, ALWAYS_VISIBLE, NoopReconnectBridge,
+            vault, new FakeModalPresenter(), "test-vault", auth, ALWAYS_VISIBLE, NoopReconnectBridge,
             () => settings,
             {
-                clientFactory: () => {
-                    if (!providerReady) {
-                        throw new Error("refusing to build config client — no provider");
-                    }
-                    return asCouchClient(remote);
-                },
+                storeFactory: () => db,
+                // Fail-closed: Create must never need the wrapped client.
+                clientFactory: wrapped,
                 rawClientFactory: () => asCouchClient(remote),
-                onConfigCryptoChange: () => { providerReady = true; },
             },
         );
+        await cs2.rebind(settings.couchdbConfigDbName);
         vault.addFile(".obsidian/a.json", "{}");
+        settings.configEncryptionEnabled = true;
+        settings.configEncryptionPassphrase = "test-pass-123";
+        settings.configCompressionEnabled = false;
 
-        await cs2.init({ encryption: true, passphrase: "test-pass-123", compression: false });
+        await cs2.create();
 
-        expect(providerReady).toBe(true);
+        expect(wrapped).not.toHaveBeenCalled();
+        // The passphrase Create used is kept on the binding (Step 1
+        // unchanged), and the device is joined with the new root and a
+        // floor.
+        expect(settings.configEncryptionPassphrase).toBe("test-pass-123");
+        expect(cs2.currentBinding()!.attachment).not.toBeNull();
+        expect(getEntry(settings)).toEqual({
+            cipherFloor: 3, settingUp: false, passphrase: "test-pass-123",
+        });
+        // The attachment (the new root's codec) is in the store.
+        expect(await getAttachment(db)).toMatchObject({
+            codec: { encryption: true, compression: false },
+        });
     });
 });
 
-// NOTE: The "fail-closed encrypting client (L-1)" describe block was removed
+// NOTE: The "fail-closed encrypting client" describe block was removed
 // when Init was split from Push. Init no longer pushes content, so it never
 // builds an encrypting client — there is no init-time plaintext-into-encrypted
 // branch left to guard. The equivalent protection now lives where the content
-// push actually happens: `wrapConfigClient` is fail-closed (encryption on +
-// no provider ⇒ throw) and `assertConfigReady` blocks push/pull when the codec
-// drifted from the Init-applied baseline (see config-sync.test.ts).
+// push actually happens: `ConfigBinding.wrapClient` is fail-closed (an
+// encrypted attachment + no key ⇒ key-missing), and Push / Pull always encode
+// with the attachment's codec, never the Step 1 settings (see
+// config-sync.test.ts).

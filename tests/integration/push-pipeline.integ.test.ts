@@ -1,5 +1,5 @@
 /**
- * PushPipeline integration tests — Phase 4 migration.
+ * PushPipeline integration tests.
  *
  * Drives PushPipeline against a real LocalDB + FakeCouchClient and
  * verifies observable side effects (docs landed in couch, echoes
@@ -509,14 +509,14 @@ describe("PushPipeline integration", () => {
         });
     });
 
-    // ── Invariant A: push order contract ─────────────────
+    // ── Push order contract ─────────────────
     //
     // A file doc may only become visible on remote after every chunk it
     // references is durably committed. pushDocs enforces this with a
     // two-phase transport: chunks first, then the files whose chunks all
     // landed. These tests pin the ordering and the durability gate.
 
-    describe("Invariant A — push order contract", () => {
+    describe("push order contract", () => {
         const chunkId = "chunk:x64:aaaaaaaaaaaaaaaa";
         const makeChunkDoc = () => ({
             _id: chunkId,
@@ -582,6 +582,26 @@ describe("PushPipeline integration", () => {
             fileSpy.mockRestore();
         });
 
+        it("does not re-send a chunk the remote already holds, and ships the file", async () => {
+            h = createSyncHarness();
+            const a = h.addDevice("dev-A");
+            const rig = attachPushPipeline({ device: a, couch: h.couch });
+
+            await rig.pipeline.pushDocs([makeChunkDoc()]);
+            const before = await h.couch.getDoc<CouchSyncDoc & { _rev: string }>(chunkId);
+
+            const attSpy = vi.spyOn(h.couch, "bulkDocsWithAttachments");
+            const fileId = makeFileId("note.md");
+            const result = await rig.pipeline.pushDocs([makeChunkDoc(), makeFileDoc("note.md")]);
+
+            expect(attSpy).not.toHaveBeenCalled();
+            const after = await h.couch.getDoc<CouchSyncDoc & { _rev: string }>(chunkId);
+            expect(after?._rev).toBe(before?._rev);
+            expect(result.pushed).toEqual(expect.arrayContaining([chunkId, fileId]));
+            expect(await h.couch.getDoc(fileId)).not.toBeNull();
+            attSpy.mockRestore();
+        });
+
         it("does NOT withhold a file when its chunk returns a 409 conflict (already durable)", async () => {
             h = createSyncHarness();
             const a = h.addDevice("dev-A");
@@ -610,14 +630,14 @@ describe("PushPipeline integration", () => {
         });
     });
 
-    describe("race-stale escalation (#sync-001)", () => {
+    describe("race-stale escalation", () => {
         it("emits concurrent with the real remote doc, not a local placeholder", async () => {
             h = createSyncHarness();
             const b = h.addDevice("dev-B");
 
             const id = makeFileId("note.md");
             // Local clock dominates remote, with DIFFERENT chunks so the
-            // #sync-005 churn guard doesn't skip it.
+            // churn guard doesn't skip it.
             const localDoc: FileDoc = {
                 _id: id, type: "file", chunks: ["chunk:localY"],
                 mtime: 2000, ctime: 1000, size: 10, vclock: { "dev-B": 2 },
@@ -654,7 +674,7 @@ describe("PushPipeline integration", () => {
         });
 
         it("equal vclock + chunks differ → divergent (concurrent), NOT silent equal-skip", async () => {
-            // Source-side of the 2026-06-14 bug: local has new content at the
+            // Source-side of the Init stale-collision bug: local has new content at the
             // SAME {dev-B:1} as a stale remote. The old equal-skip trusted the
             // vclock proxy and silently dropped the local content; it must now
             // surface as divergent. (Race-stale pre-seeded at the escalation
@@ -690,11 +710,11 @@ describe("PushPipeline integration", () => {
         });
     });
 
-    describe("tombstone churn guard (#sync-005)", () => {
+    describe("tombstone churn guard", () => {
         it("pushes a soft-delete tombstone even when chunks match the alive remote", async () => {
             // Root cause of "deletes don't propagate": markDeleted keeps the
             // doc's `chunks`, so a tombstone is chunk-equal to the alive remote
-            // and the #sync-005 churn guard wrongly skipped it. The guard must
+            // and the churn guard wrongly skipped it. The guard must
             // also compare the `deleted` flag.
             h = createSyncHarness();
             const a = h.addDevice("dev-A");

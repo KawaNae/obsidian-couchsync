@@ -1,4 +1,4 @@
-import { Notice, Platform, Setting } from "obsidian";
+import { Platform, Setting } from "obsidian";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { LocalDB } from "../db/local-db.ts";
 import type { ConfigLocalDB } from "../db/config-local-db.ts";
@@ -8,14 +8,25 @@ import type { IModalPresenter } from "../types/modal-presenter.ts";
 import type { LogManager } from "../log/log-manager.ts";
 import { DOC_ID } from "../types/doc-id.ts";
 import { logError } from "../ui/log.ts";
+import { ProgressNotice } from "../ui/notices.ts";
+import { BusyError } from "../ui/describe-error.ts";
+import type { VaultBinding } from "../sync/vault-binding.ts";
 
 interface MaintenanceTabDeps {
     getSettings: () => CouchSyncSettings;
     updateSettings: (patch: Partial<CouchSyncSettings>) => Promise<void>;
     localDb: LocalDB;
-    /** Null when config sync is not configured (`couchdbConfigDbName === ""`) */
-    configLocalDb: ConfigLocalDB | null;
+    /** The current config binding's store; null when config sync is not
+     *  configured. A getter because Apply can switch the store at runtime —
+     *  never hold on to a store read earlier. */
+    getConfigLocalDb: () => ConfigLocalDB | null;
+    /** Runs local config-store work, named `label` in a refusal, under
+     *  ConfigSync's op lock (refused while a config op runs; a rebind
+     *  cannot close the store mid-way). */
+    runConfigExclusive: <T>(label: string, fn: (store: ConfigLocalDB) => Promise<T>) => Promise<T>;
     replicator: SyncEngine;
+    /** Deleting the local vault DB is refused while Init or Clone runs. */
+    vault: Pick<VaultBinding, "changeBlocker">;
     statusBar: StatusBar;
     modalPresenter: IModalPresenter;
     logManager: LogManager;
@@ -143,15 +154,13 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
             btn.setButtonText("Export").onClick(async () => {
                 btn.setDisabled(true);
                 btn.setButtonText("Exporting...");
+                const progress = new ProgressNotice("Export logs");
                 try {
                     const result = await deps.logManager.exportToVault();
-                    new Notice(
-                        `CouchSync: exported ${result.count} log entries to ${result.path}`,
-                        8000,
-                    );
+                    progress.done(`${result.count} log entries written to ${result.path}.`, 8000);
                     await refreshLogStats();
-                } catch (e: any) {
-                    new Notice(`Log export failed: ${e?.message ?? e}`, 10000);
+                } catch (e) {
+                    progress.fail(e);
                 } finally {
                     btn.setButtonText("Export");
                     btn.setDisabled(false);
@@ -175,12 +184,13 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
                     );
                     if (!ok) return;
                     btn.setDisabled(true);
+                    const progress = new ProgressNotice("Clear stored logs");
                     try {
                         await deps.logManager.clearStoredLogs();
-                        new Notice("CouchSync: log buffer cleared.", 4000);
+                        progress.done("log buffer cleared.", 4000);
                         await refreshLogStats();
-                    } catch (e: any) {
-                        new Notice(`Clear failed: ${e?.message ?? e}`, 10000);
+                    } catch (e) {
+                        progress.fail(e);
                     } finally {
                         btn.setDisabled(false);
                     }
@@ -204,12 +214,13 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
                     );
                     if (!ok) return;
                     btn.setDisabled(true);
+                    const progress = new ProgressNotice("Delete local log database");
                     try {
                         await deps.logManager.deleteLogDatabase();
-                        new Notice("CouchSync: log database deleted.", 4000);
+                        progress.done("log database deleted.", 4000);
                         await refreshLogStats();
-                    } catch (e: any) {
-                        new Notice(`Delete failed: ${e?.message ?? e}`, 10000);
+                    } catch (e) {
+                        progress.fail(e);
                     } finally {
                         btn.setDisabled(false);
                     }
@@ -236,7 +247,7 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
                     "Clean up legacy configs",
                     "Delete all `config:*` documents from the vault database? " +
                         "This is a one-time migration step after the v0.11.0 config-DB split. " +
-                        "Make sure you've already run Config Init in the Config Sync tab so " +
+                        "Make sure you've already run Create and Push in the Config Sync tab so " +
                         "the new config DB has been seeded.",
                     "Clean up",
                     true,
@@ -244,15 +255,16 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
                 if (!ok) return;
                 btn.setButtonText("Cleaning...");
                 btn.setDisabled(true);
+                const progress = new ProgressNotice("Clean up legacy configs");
                 try {
                     const deleted = await deps.localDb.deleteAllByPrefix(DOC_ID.CONFIG);
-                    new Notice(
-                        `CouchSync: removed ${deleted.length} legacy config doc(s) from vault DB. ` +
+                    progress.done(
+                        `removed ${deleted.length} legacy config doc(s) from vault DB. ` +
                             "Replication will propagate the deletions to the remote shortly.",
                         10000,
                     );
-                } catch (e: any) {
-                    new Notice(`Cleanup failed: ${e?.message ?? e}`, 10000);
+                } catch (e) {
+                    progress.fail(e);
                 } finally {
                     btn.setButtonText("Clean up");
                     btn.setDisabled(false);
@@ -272,7 +284,7 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
             if (offending.startsWith("config:")) {
                 migrationSetting.setDesc(
                     `Found legacy config docs in the vault DB (e.g. ${offending}). ` +
-                        "Click to remove them after running Config Init in Config Sync.",
+                        "Click to remove them after running Create and Push in Config Sync.",
                 );
                 migrationBtnComponent?.setDisabled(false);
                 return;
@@ -288,7 +300,7 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
             );
         } catch (e) {
             migrationSetting.setDesc("Could not check for legacy configs (see console).");
-            logError(`CouchSync: legacy probe failed: ${e?.message ?? e}`);
+            logError(`legacy probe failed: ${e?.message ?? e}`);
         }
     })();
 
@@ -347,29 +359,42 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
                     const ok = await deps.modalPresenter.showConfirmModal(
                         "Delete local vault database",
                         "Destroy the entire local vault database on this device and " +
-                            "restart the plugin? Remote data is preserved — sync will " +
-                            "re-download from the remote on next start, which can take " +
-                            "minutes for large vaults. Local-only state (unpushed edits, " +
-                            "checkpoints) will be lost.",
+                            "restart the plugin? The remote and the files in this vault " +
+                            "are kept. Sync then downloads everything from the remote " +
+                            "again, which can take minutes for large vaults. A file here " +
+                            "whose content differs from the remote's version is offered " +
+                            "as a conflict, and a file the remote does not have is sent " +
+                            "to it. A deletion or rename not yet sent is lost: the " +
+                            "deleted file, or the file under its old name, comes back " +
+                            "from the remote.",
                         "Delete",
                         true,
                     );
                     if (!ok) return;
-                    deps.replicator.stop();
-                    await deps.localDb.destroy();
-                    new Notice("CouchSync: Local vault database deleted. Restarting...");
+                    const progress = new ProgressNotice("Delete local vault database");
+                    try {
+                        const blocked = deps.vault.changeBlocker();
+                        if (blocked) throw new BusyError(blocked);
+                        deps.replicator.stop();
+                        await deps.localDb.destroy();
+                    } catch (e) {
+                        progress.fail(e);
+                        return;
+                    }
+                    progress.done("deleted. Restarting...");
                     deps.onRestart();
                 })
         );
 
-    if (deps.configLocalDb) {
+    if (deps.getConfigLocalDb()) {
         const configDbName = settings.couchdbConfigDbName;
         new Setting(el)
             .setName("Delete local config database")
             .setDesc(
-                `Destroy the local config database (${configDbName}) and restart. ` +
-                    "Remote config data is preserved. Mostly useful for cleaning up unused " +
-                    "local stores left behind by past device-pool reconfigurations.",
+                `Delete this device's local store for config database "${configDbName}" ` +
+                    "and restart. The server and the .obsidian files are not touched. " +
+                    "The store holds this device's Join, so afterwards the device is " +
+                    "not joined: press Join in Config Sync (Step 3), then Pull.",
             )
             .addButton((btn) =>
                 btn
@@ -378,22 +403,29 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
                     .onClick(async () => {
                         const ok = await deps.modalPresenter.showConfirmModal(
                             "Delete local config database",
-                            `Destroy the local config database (${configDbName}) on this ` +
-                                "device and restart the plugin? Remote config data is " +
-                                "preserved — config will re-download on next start.",
+                            `Delete this device's local store for config database ` +
+                                `"${configDbName}" and restart the plugin? The server and ` +
+                                "the .obsidian files are not touched. This device will no " +
+                                "longer be joined: after the restart, press Join in Config " +
+                                "Sync (Step 3), then Pull to download the config again.",
                             "Delete",
                             true,
                         );
                         if (!ok) return;
+                        // The store is read under the op lock, after the
+                        // modal: the one shown when the tab rendered may
+                        // have been replaced since, and a running config op
+                        // must not have its store destroyed underneath it.
+                        const label = "Delete local config database";
+                        const progress = new ProgressNotice(label);
                         try {
-                            await deps.configLocalDb!.destroy();
-                            new Notice(
-                                "CouchSync: Local config database deleted. Restarting...",
-                            );
-                            deps.onRestart();
-                        } catch (e: any) {
-                            new Notice(`Delete failed: ${e?.message ?? e}`, 10000);
+                            await deps.runConfigExclusive(label, (store) => store.destroy());
+                        } catch (e) {
+                            progress.fail(e);
+                            return;
                         }
+                        progress.done("deleted. Restarting...");
+                        deps.onRestart();
                     })
             );
     }

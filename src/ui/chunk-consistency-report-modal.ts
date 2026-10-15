@@ -1,4 +1,4 @@
-import { App, Modal, Notice, Setting } from "obsidian";
+import { App, Modal, Setting } from "obsidian";
 import type { ChunkConsistencyResult } from "../sync/chunk-consistency.ts";
 import type { ChunkConsistencyReport } from "../sync/chunk-consistency.ts";
 import {
@@ -6,11 +6,13 @@ import {
     type ChunkConsistencyView,
     type ReportSection,
 } from "./chunk-consistency-view.ts";
+import { showNotice } from "./notices.ts";
 
 /**
  * Invoked by the repair button. Receives the currently displayed
  * report (so the caller derives the plan from fresh state), performs
- * the repair, and returns a freshly-generated post-repair result; the
+ * the repair, and returns a freshly-generated post-repair result. It
+ * reports its own failure (ProgressNotice) before throwing; the
  * Modal swaps its display in place so the user sees immediate
  * confirmation. The post-repair result may itself be either a new
  * converged report or a needs-convergence state, so the return type
@@ -22,7 +24,8 @@ export type ChunkRepairInvoker = (
 
 /**
  * Invoked by the "Wait for sync & retry" button in needs-convergence
- * state. Expected to run a one-shot pull + re-analyse. Returning a
+ * state. Expected to run a one-shot pull + re-analyse, reporting its own
+ * failure before throwing. Returning a
  * fresh `ChunkConsistencyResult` lets the Modal re-render without
  * needing to know how the retry was performed.
  */
@@ -103,8 +106,8 @@ export class ChunkConsistencyReportModal extends Modal {
                             const next = await this.onRepair!(this.result.report);
                             this.result = next;
                             this.render();
-                        } catch (e: any) {
-                            new Notice(`Repair failed: ${e?.message ?? e}`, 6000);
+                        } catch {
+                            // The invoker reported the failure.
                             btn.setDisabled(false);
                             btn.setButtonText(label);
                         }
@@ -144,8 +147,8 @@ export class ChunkConsistencyReportModal extends Modal {
                             const next = await this.onRetry!();
                             this.result = next;
                             this.render();
-                        } catch (e: any) {
-                            new Notice(`Retry failed: ${e?.message ?? e}`, 6000);
+                        } catch {
+                            // The invoker reported the failure.
                             btn.setDisabled(false);
                             btn.setButtonText("Wait for sync & retry");
                         }
@@ -165,9 +168,9 @@ export class ChunkConsistencyReportModal extends Modal {
                             await navigator.clipboard.writeText(
                                 JSON.stringify(this.result, null, 2),
                             );
-                            new Notice("Result copied to clipboard.");
+                            showNotice("Result copied to clipboard.");
                         } catch (e: any) {
-                            new Notice(`Copy failed: ${e?.message ?? e}`, 6000);
+                            showNotice(`Copy failed: ${e?.message ?? e}`, 6000);
                         }
                     }),
             )

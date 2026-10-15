@@ -73,7 +73,8 @@ describe("chunker roundtrip (text via binary path)", () => {
         expect(new Uint8Array(joinChunks(chunks))).toEqual(bytes);
     });
 
-    // Invariant I (G1): a content-less ChunkDoc must raise a typed, routable
+    // A chunk is usable only when its doc carries content: a content-less
+    // ChunkDoc must raise a typed, routable
     // error — NOT the opaque `TypeError: cannot read 'length' of undefined`
     // that crashed reconcile in the field (reproduced on real device).
     it("content-less chunk → ChunkContentMissingError (not opaque TypeError)", () => {
@@ -135,7 +136,7 @@ describe("chunker v2 binary representation", () => {
         const chunks = await splitIntoChunks(textToBuffer("inject"), hasher);
         expect(seen.length).toBe(1);
         expect(seen[0]).toEqual(enc.encode("inject"));
-        // Algorithm tag matches the hasher's declared identity (invariant 14).
+        // Algorithm tag matches the hasher's declared identity (chunk ids self-declare their algorithm).
         expect(chunks[0]._id).toBe("chunk:hmac:deterministic");
     });
 

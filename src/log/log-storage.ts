@@ -50,7 +50,7 @@ class LogDB extends Dexie {
             entries: "++id, timestamp",
         });
         // v2: add `_meta` table for application-level schema versioning
-        // (invariant 15). The log row shape itself is unchanged.
+        // (checked before any content read). The log row shape itself is unchanged.
         this.version(2).stores({
             entries: "++id, timestamp",
             _meta: "&key",

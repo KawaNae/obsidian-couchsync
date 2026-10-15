@@ -1,8 +1,8 @@
 /**
- * Regression: PR-B silent-loss race — pull-delete arrives during the
+ * Regression: silent-loss race — pull-delete arrives during the
  * ChangeTracker debounce window for a fresh user edit.
  *
- * Pre-PR-B `hasUnpushedChanges` compared `localDoc.vclock` against
+ * `hasUnpushedChanges` used to compare `localDoc.vclock` against
  * `lastSynced.vclock`. Those two are kept in lockstep by `fileToDb` /
  * `dbToFile`, so the function effectively always returned false. A user
  * edit landing on disk before the debounce fires (= LocalDB doc still
@@ -10,7 +10,7 @@
  * tombstone arriving during that window would silently delete the
  * vault file along with the user's unpushed work.
  *
- * Post-PR-B the check is chunks-aware (vault disk vs `lastSynced.chunks`)
+ * Now the check is chunks-aware (vault disk vs `lastSynced.chunks`)
  * AND consults the `IPendingProbe` for a debounced sync. Either signal
  * makes the pull-delete query return true, routing the deletion to the
  * concurrent-conflict modal instead of silently overwriting.
@@ -33,8 +33,9 @@ class PassthroughWriter implements VaultWriter {
         await this.io.writeBinary(path, content);
         return { applied: true };
     }
-    async applyRemoteDeletion(path: string): Promise<void> {
+    async applyRemoteDeletion(path: string): Promise<WriteResult> {
         if (await this.io.exists(path)) await this.io.delete(path);
+        return { applied: true };
     }
     async createFile(path: string, content: ArrayBuffer): Promise<void> {
         await this.io.createBinary(path, content);
@@ -42,7 +43,7 @@ class PassthroughWriter implements VaultWriter {
     flushAll(): void {}
 }
 
-describe("regression: PR-B pull-delete vs debounce silent loss", () => {
+describe("regression: pull-delete vs debounce silent loss", () => {
     let vault: FakeVaultIO;
     let db: LocalDB;
     let vs: VaultSync;
@@ -73,9 +74,9 @@ describe("regression: PR-B pull-delete vs debounce silent loss", () => {
 
         // User edits the vault. ChangeTracker would schedule a fileToDb
         // in `syncDebounceMs` ms but hasn't fired yet. LocalDB FileDoc
-        // still holds v0; lastSynced still holds v0. Pre-PR-B this
-        // looked like "no unpushed work" (vclock equal). Post-PR-B the
-        // chunks comparison catches it.
+        // still holds v0; lastSynced still holds v0. A vclock-only check
+        // saw "no unpushed work" (vclock equal); the chunks comparison
+        // catches it.
         vault.addFile(path, "v1 user just edited", { size: 19 });
 
         expect(await vs.hasUnpushedChanges(path)).toBe(true);
@@ -98,8 +99,9 @@ describe("regression: PR-B pull-delete vs debounce silent loss", () => {
     });
 
     it("end-to-end: pull-delete query returns true during a vault drift", async () => {
-        // Simulates the main.ts:217 query handler decision shape end to
-        // end. Wired directly here without SyncEngine to keep the test
+        // Simulates end to end the decision of the pull-side deletion
+        // probe (SyncEngine's `probeUnpushed`, which main.ts wires to
+        // `VaultSync.hasUnpushedChanges`). Wired directly here without SyncEngine to keep the test
         // focused on the VaultSync primitive.
         const path = "notes/contended.md";
         vault.addFile(path, "v0");
@@ -117,10 +119,10 @@ describe("regression: PR-B pull-delete vs debounce silent loss", () => {
         expect(queryResult).toBe(true);
     });
 
-    it("legacy lastSynced (chunks: undefined): divergent disk edit returns TRUE (#8, no silent delete)", async () => {
+    it("legacy lastSynced (chunks: undefined): divergent disk edit returns TRUE (no silent delete)", async () => {
         // A legacy entry pre-`{chunks,size}` extension can't run the lastSynced
         // chunks comparison. The old code returned false unconditionally, which
-        // let a remote deletion silently destroy a divergent on-disk edit (#8).
+        // let a remote deletion silently destroy a divergent on-disk edit.
         // The fix falls back to the LocalDB FileDoc as the baseline, so the
         // divergence is detected and the deletion surfaces a conflict instead.
         const path = "notes/legacy.md";

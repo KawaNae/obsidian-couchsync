@@ -13,10 +13,10 @@
  *      declines, so PullWriter can account skips and emit `pull-skipped`
  *      for the supervisor to schedule a reconcile retry.
  *
- * Production trigger: 2026-05-05 23:38 desktop edit of
+ * Production trigger: a desktop edit of
  * `Obsidian-task-viewer.md` (rev 196) was overwritten 12h later by iPad's
  * rev 197 (chunks matching rev 193, vclock dominating rev 196). Manual
- * reproduction on Android emulator + dev vault on 2026-05-06 confirmed
+ * reproduction on Android emulator + dev vault confirmed
  * the structural fingerprint:
  *
  *   - LocalDB.doc: { chunks: [h_new], vclock: V_new }     ← committed by pull
@@ -37,6 +37,7 @@ import { makeFileId } from "../../src/types/doc-id.ts";
 import { toPathKey } from "../../src/utils/path.ts";
 import type { FileDoc, CouchSyncDoc } from "../../src/types.ts";
 import { FILE_SCHEMA_VERSION } from "../../src/types.ts";
+import { makePendingApply } from "../helpers/pending-apply.ts";
 
 let counter = 0;
 function uniqueDbName() { return `phantom-test-${Date.now()}-${counter++}`; }
@@ -51,8 +52,9 @@ class ToggleVaultWriter implements VaultWriter {
         await this.io.writeBinary(path, content);
         return { applied: true };
     }
-    async applyRemoteDeletion(path: string): Promise<void> {
+    async applyRemoteDeletion(path: string): Promise<WriteResult> {
         if (await this.io.exists(path)) await this.io.delete(path);
+        return { applied: true };
     }
     async createFile(path: string, content: ArrayBuffer): Promise<void> {
         await this.io.createBinary(path, content);
@@ -232,7 +234,7 @@ describe("regression: pull-skipped event triggers reconcile schedule", () => {
      * the count, so the supervisor (main.ts) can fire reconcile.
      *
      * Without this trigger, idle longpoll persists divergent state
-     * indefinitely (verified 2026-05-06: 90s of idle yielded no
+     * indefinitely (verified on device: 90s of idle yielded no
      * spontaneous reconciler activity).
      */
     it("emits pull-skipped event when applyPullWrite returns applied:false", async () => {
@@ -257,6 +259,7 @@ describe("regression: pull-skipped event triggers reconcile schedule", () => {
             checkpoints,
             getConflictResolver: () => undefined,
             ensureChunks: async () => {},
+            pendingApply: makePendingApply(localDb),
             applyPullWrite: async () => ({ applied: false, reason: "test-skip" }),
         });
 
@@ -302,6 +305,7 @@ describe("regression: pull-skipped event triggers reconcile schedule", () => {
             checkpoints,
             getConflictResolver: () => undefined,
             ensureChunks: async () => {},
+            pendingApply: makePendingApply(localDb),
             applyPullWrite: async () => ({ applied: true }),
         });
 

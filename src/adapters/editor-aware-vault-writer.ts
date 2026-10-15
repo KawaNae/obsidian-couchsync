@@ -1,58 +1,87 @@
 /**
- * Production VaultWriter — applies remote content while preserving
- * open-editor session state.
+ * Production VaultWriter — applies remote content to the vault without
+ * losing what an open note holds.
  *
- * **Postcondition (PR1 invariant — disk-write truth):** when
- * `applyRemoteContent` returns `applied: true`, the bytes on disk equal
- * `content`. The CM dispatch is a UX overlay (cursor / scroll preservation),
- * never the system's persistence. This invariant lets `lastSynced.chunks`
- * always reflect the true vault state, which the classifier in
+ * **Postcondition (disk-write truth):** when a write returns
+ * `applied: true`, the disk holds the doc's version (the bytes of
+ * `content`, or no file). This invariant lets `lastSynced.chunks` always
+ * reflect the true vault state, which the classifier in
  * `src/sync/classify-sync-relation.ts` relies on.
  *
- * Strategy:
- *   1. Find every `MarkdownView` leaf with `path` open and grab their
- *      CodeMirror EditorView (`view.editor.cm`).
- *   2. If any has `composing === true`, defer through the
- *      CompositionGate. The deferred op re-runs the strategy on
- *      compositionend (or timeout).
- *   3. With no editors open, write straight to disk via `IVaultIO.writeBinary`.
- *      The modify event is suppressed via `ignoreNextModify` so the echo
- *      doesn't redundantly schedule a fileToDb (which would short-circuit
- *      anyway via `chunksEqual`, but suppressing saves the debounce timer
- *      and avoids history double-capture).
- *   4. With editors open and none composing, write disk first then dispatch
- *      a CodeMirror transaction on every pane. Disk and editor both end
- *      with the new content; the suppressed modify event keeps the push
- *      pipeline quiet.
+ * **The writer writes the disk only.** An open note shows the new version
+ * because Obsidian reloads it on the modify event: a pane with nothing
+ * unsaved takes the disk's text as it is, keeping the cursor and the
+ * scroll. Changing the editor's text from here would count as typing:
+ * Obsidian would mark the pane unsaved, and on the modify event merge
+ * that "typing" into the disk's text a second time. On a file with CRLF
+ * line breaks, where the editor's LF text never equals the disk's, the
+ * merge doubled every changed line.
  *
- * Editor-divergence guard: when an op is deferred, the pre-composition
- * doc is captured. At drain time, if the doc has diverged (user
- * committed text mid-IME), the op is skipped and the caller is told
- * `applied: false`. Reconciler picks up the divergence on its next
- * pass and routes it through the conflict orchestrator if needed.
+ * **Open notes.** Obsidian saves what is typed in a note about two
+ * seconds later. Until then the disk still matches what was last synced,
+ * so the caller's check (`VaultSync.unsyncedVaultChange`) cannot see the
+ * input, and Obsidian would merge it with the written version instead of
+ * the user choosing in the conflict dialog. So a write goes ahead only
+ * while every Markdown pane on the path holds what the disk holds (line
+ * endings and BOM aside; see `sameText`):
+ *   - A pane differs: it holds input not yet saved. The write is declined
+ *     (`UNSAVED_EDITOR_CHANGE`) and nothing is touched; after the save,
+ *     the reconcile offers the declined version as a conflict.
+ *   - A pane is in IME composition: Obsidian's reload would break the
+ *     composition, so the write waits in the CompositionGate and is
+ *     decided again on compositionend (or timeout). By then the disk must
+ *     still hold what it held when the write was first decided; a save in
+ *     between means the input was committed (`UNSYNCED_VAULT_CHANGE`).
+ *     A composition still going on then is declined like unsaved input.
+ *   - Otherwise the disk is written, and the modify event the write
+ *     causes is marked via `IWriteIgnore`. Input typed between the check
+ *     and the write is not lost: Obsidian merges it into the version it
+ *     reloads and saves the result, which is pushed as an edit. A deletion
+ *     detaches the panes right after the check, before anything is
+ *     awaited, so no input can reach them; the file is then removed.
+ *
+ * With no pane open on the path, the disk is written straight away.
  */
 
-import type { App, MarkdownView, WorkspaceLeaf } from "obsidian";
+import type { App, WorkspaceLeaf } from "obsidian";
 import type { IVaultIO } from "../types/vault-io.ts";
 import type { HistoryCapture } from "../history/history-capture.ts";
 import type { CompositionGate } from "../sync/composition-gate.ts";
-import type { VaultWriter, WriteResult } from "../sync/vault-writer.ts";
+import {
+    UNSAVED_EDITOR_CHANGE,
+    UNSYNCED_VAULT_CHANGE,
+    type VaultWriter,
+    type WriteResult,
+} from "../sync/vault-writer.ts";
 import type { IWriteIgnore } from "../sync/vault-sync.ts";
 import { logDebug } from "../ui/log.ts";
 
 /**
- * Structural type for the bits of CM6 EditorView we touch. Lets the
- * unit tests mock without pulling in @codemirror/view.
+ * The bits of a Markdown view the writer reads. `getViewData` is what the
+ * view would save: the editor's text, or in reading view the text it last
+ * rendered (the hidden editor is refreshed only when the user switches
+ * back). `editor.cm` is CodeMirror's EditorView, which Obsidian does not
+ * type; it tells whether an IME composition is going on.
  */
-export interface CMLike {
-    readonly composing: boolean;
-    readonly state: { readonly doc: { readonly length: number; toString(): string } };
-    dispatch(spec: { changes: { from: number; to: number; insert: string } }): void;
+export interface MarkdownPaneView {
+    readonly file: { readonly path: string } | null;
+    getViewData(): string;
+    readonly editor?: { readonly cm?: { readonly composing: boolean } };
 }
 
-interface EditorLeaf {
+interface Pane {
     leaf: WorkspaceLeaf;
-    cm: CMLike;
+    view: MarkdownPaneView;
+}
+
+/**
+ * Text as a pane and the disk can both hold it: CodeMirror keeps line
+ * breaks as LF and Obsidian drops a BOM, while the file keeps CRLF or a
+ * BOM. Comparing without them keeps a file with CRLF from being declined
+ * on every write while its pane holds nothing unsaved.
+ */
+function sameText(text: string): string {
+    return text.replace(/^﻿/, "").replace(/\r\n?/g, "\n");
 }
 
 export class EditorAwareVaultWriter implements VaultWriter {
@@ -75,42 +104,12 @@ export class EditorAwareVaultWriter implements VaultWriter {
     }
 
     async applyRemoteContent(path: string, content: ArrayBuffer): Promise<WriteResult> {
-        const editors = this.findEditors(path);
-
-        if (editors.length === 0) {
-            // No live editor session — write straight to disk. Suppress
-            // the resulting modify event so the echo doesn't roundtrip
-            // through ChangeTracker.
-            await this.capturePreSync(path);
-            this.writeIgnore?.ignoreNextModify(path);
-            await this.io.writeBinary(path, content);
-            await this.captureHistoryFromBytes(path, content);
-            return { applied: true };
-        }
-
-        const composing = editors.some((e) => e.cm.composing);
-        if (composing) {
-            logDebug(`VaultWriter: defer ${path} (composing, editors=${editors.length})`);
-            const expected = editors[0].cm.state.doc.toString();
-            return this.gate.defer(path, () =>
-                this.applyAfterDefer(path, content, expected),
-            );
-        }
-
-        return this.dispatchAndCapture(path, content, editors);
+        await this.capturePreSync(path);
+        return this.whilePanesHoldDisk(path, null, () => this.writeContent(path, content));
     }
 
-    async applyRemoteDeletion(path: string): Promise<void> {
-        // Detach any open leaves first so the editor doesn't outlive
-        // the file (otherwise Obsidian shows a stale buffer until the
-        // user clicks away).
-        for (const { leaf } of this.findEditors(path)) {
-            leaf.detach();
-        }
-        if (await this.io.exists(path)) {
-            this.writeIgnore?.ignoreDelete(path);
-            await this.io.delete(path);
-        }
+    applyRemoteDeletion(path: string): Promise<WriteResult> {
+        return this.whilePanesHoldDisk(path, null, (panes) => this.removeFile(path, panes));
     }
 
     async createFile(path: string, content: ArrayBuffer): Promise<void> {
@@ -125,80 +124,80 @@ export class EditorAwareVaultWriter implements VaultWriter {
 
     // ── internals ──────────────────────────────────────────
 
-    private async applyAfterDefer(
+    /**
+     * Run `apply` with the panes open on `path`, only while each holds what
+     * the disk holds and none is composing (see the module comment).
+     * `decidedDisk` is the disk text when the write was first decided; it is
+     * set when a composition deferred the write, and the disk must still
+     * hold it. `apply` is called right after the check, with no await in
+     * between.
+     */
+    private async whilePanesHoldDisk(
         path: string,
-        content: ArrayBuffer,
-        expectedDoc: string,
+        decidedDisk: string | null,
+        apply: (panes: Pane[]) => Promise<WriteResult>,
     ): Promise<WriteResult> {
-        const editors = this.findEditors(path);
-        if (editors.length === 0) {
-            // All editors closed during the defer window — fall back
-            // to disk write.
-            this.writeIgnore?.ignoreNextModify(path);
-            await this.io.writeBinary(path, content);
-            await this.captureHistoryFromBytes(path, content);
-            return { applied: true };
-        }
+        if (decidedDisk === null && this.findPanes(path).length === 0) return apply([]);
 
-        const currentDoc = editors[0].cm.state.doc.toString();
-        if (currentDoc !== expectedDoc) {
-            // The user committed text via IME during the deferral
-            // window. Abandon this remote application; Reconciler
-            // will pick up the divergence on its next pass and route
-            // through ConflictOrchestrator if needed.
-            logDebug(
-                `EditorAwareVaultWriter: skipped ${path} — local doc changed during composition`,
-            );
-            return { applied: false, reason: "local-changed-during-composition" };
+        const disk = await this.readDiskText(path);
+        if (decidedDisk !== null && disk !== decidedDisk) {
+            logDebug(`VaultWriter: skipped ${path} — the file changed while the write waited for composition`);
+            return { applied: false, reason: UNSYNCED_VAULT_CHANGE };
         }
+        // Nothing on disk to compare with: a deletion has nothing to
+        // remove, and a content write fails in the vault as before.
+        if (disk === null) return apply([]);
 
-        if (editors.some((e) => e.cm.composing)) {
-            logDebug(`VaultWriter: re-defer ${path} (composition resumed)`);
-            return this.gate.defer(path, () =>
-                this.applyAfterDefer(path, content, expectedDoc),
-            );
+        const panes = this.findPanes(path);
+        if (panes.some((p) => sameText(p.view.getViewData()) !== disk)) {
+            logDebug(`VaultWriter: skipped ${path} — an open note holds input not yet saved`);
+            return { applied: false, reason: UNSAVED_EDITOR_CHANGE };
         }
-
-        return this.dispatchAndCapture(path, content, editors);
+        if (panes.some((p) => p.view.editor?.cm?.composing === true)) {
+            // Waited once already: a composition that is still (or again)
+            // going on is input in progress, as unsaved text is. Waiting
+            // again could loop when the gate drains by timeout.
+            if (decidedDisk !== null) {
+                logDebug(`VaultWriter: skipped ${path} — composing again after the wait`);
+                return { applied: false, reason: UNSAVED_EDITOR_CHANGE };
+            }
+            logDebug(`VaultWriter: defer ${path} (composing, panes=${panes.length})`);
+            return this.gate.defer(path, () => this.whilePanesHoldDisk(path, disk, apply));
+        }
+        return apply(panes);
     }
 
-    private async dispatchAndCapture(
-        path: string,
-        content: ArrayBuffer,
-        editors: EditorLeaf[],
-    ): Promise<WriteResult> {
-        const text = new TextDecoder("utf-8").decode(content);
-        const anyComposing = editors.some((e) => e.cm.composing);
-        logDebug(`VaultWriter: dispatch ${path} (editors=${editors.length}, composing=${anyComposing})`);
-
-        await this.capturePreSync(path);
-        this.writeIgnore?.ignoreNextModify(path);
+    private async writeContent(path: string, content: ArrayBuffer): Promise<WriteResult> {
+        this.writeIgnore?.ignoreModifyTo(path, content);
         await this.io.writeBinary(path, content);
-
-        for (const { cm } of editors) {
-            cm.dispatch({
-                changes: { from: 0, to: cm.state.doc.length, insert: text },
-            });
-        }
-
-        await this.captureHistoryFromText(path, text);
+        await this.captureHistoryFromBytes(path, content);
         return { applied: true };
     }
 
-    /**
-     * Enumerate Markdown leaves whose view is showing `path` and
-     * whose underlying view exposes a CM6 EditorView.
-     */
-    private findEditors(path: string): EditorLeaf[] {
-        const out: EditorLeaf[] = [];
+    private async removeFile(path: string, panes: Pane[]): Promise<WriteResult> {
+        // Detach the panes first so a pane doesn't outlive the file
+        // (Obsidian would show a stale buffer until the user clicks away).
+        for (const { leaf } of panes) leaf.detach();
+        if (await this.io.exists(path)) {
+            this.writeIgnore?.ignoreDelete(path);
+            await this.io.delete(path);
+        }
+        return { applied: true };
+    }
+
+    /** The file's text as a pane would hold it, or null when it is gone. */
+    private async readDiskText(path: string): Promise<string | null> {
+        if (!(await this.io.exists(path))) return null;
+        return sameText(new TextDecoder("utf-8").decode(await this.io.readBinary(path)));
+    }
+
+    /** The Markdown panes showing `path`. */
+    private findPanes(path: string): Pane[] {
+        const out: Pane[] = [];
         for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
-            const view = leaf.view as MarkdownView | undefined;
-            const file = view?.file;
-            if (!file || file.path !== path) continue;
-            const cm = (view as unknown as { editor?: { cm?: CMLike } })
-                ?.editor?.cm;
-            if (!cm) continue;
-            out.push({ leaf, cm });
+            const view = leaf.view as unknown as MarkdownPaneView | undefined;
+            if (view?.file?.path !== path || typeof view.getViewData !== "function") continue;
+            out.push({ leaf, view });
         }
         return out;
     }
@@ -212,18 +211,13 @@ export class EditorAwareVaultWriter implements VaultWriter {
         }
     }
 
-    private async captureHistoryFromText(path: string, text: string): Promise<void> {
+    private async captureHistoryFromBytes(path: string, content: ArrayBuffer): Promise<void> {
         if (!this.historyCapture) return;
+        const text = new TextDecoder("utf-8").decode(content);
         try {
             await this.historyCapture.captureSyncWrite(path, text);
         } catch (e) {
             logDebug(`captureSyncWrite failed: ${path} ${(e as Error)?.message ?? e}`);
         }
     }
-
-    private async captureHistoryFromBytes(path: string, content: ArrayBuffer): Promise<void> {
-        if (!this.historyCapture) return;
-        return this.captureHistoryFromText(path, new TextDecoder("utf-8").decode(content));
-    }
 }
-

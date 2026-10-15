@@ -1,12 +1,12 @@
 /**
- * Tests for Phase 2 invariants 17 + 18 — per-DB crypto principals.
+ * Tests for per-DB crypto principals (v0.26).
  *
- * Invariant 17: each `*:meta` is a self-contained crypto root. Building
+ * Each `*:meta` is a self-contained crypto root. Building
  * a vault:meta and a config:meta from the SAME passphrase yields
  * DIFFERENT salts and DIFFERENT keys (because each Init mints a fresh
  * salt independently).
  *
- * Invariant 18: the vault DB and the config DB have independent
+ * The vault DB and the config DB have independent
  * `CryptoProvider` instances. Chunk ids minted by the vault hasher and
  * the config hasher live in disjoint id spaces even for the same input
  * bytes — the HMAC key differs.
@@ -26,7 +26,7 @@ import {
 
 const TEST_PASSPHRASE = "correct horse battery staple";
 
-describe("Phase 2 — per-DB crypto principals (invariants 17/18)", () => {
+describe("per-DB crypto principals", () => {
     it("same passphrase + different meta kinds → different salts", async () => {
         const vault = await buildInitialMeta({
             docId: VAULT_META_DOC_ID,
@@ -130,7 +130,7 @@ describe("Phase 2 — per-DB crypto principals (invariants 17/18)", () => {
         expect(unlocked).toBeNull();
     });
 
-    it("config:meta schemaVersion is 2 (Phase 2 — distinguishes from Phase 1 clone)", async () => {
+    it("config:meta schemaVersion is 2 (distinguishes from the vault:meta clone shape)", async () => {
         const config = await buildInitialMeta({
             docId: CONFIG_META_DOC_ID,
             docType: "config-meta",
@@ -139,9 +139,9 @@ describe("Phase 2 — per-DB crypto principals (invariants 17/18)", () => {
             compression: true,
         });
         expect(config.meta.schemaVersion).toBe(2);
-        // The schemaVersion bump is the migration signal: Phase 1
-        // in-progress installs have config:meta.schemaVersion === 1
-        // (cloned shape, no real crypto root). Phase 2 readers reject
+        // The schemaVersion bump is the migration signal: installs whose
+        // config:meta was cloned from vault:meta have schemaVersion === 1
+        // (no real crypto root of their own). Current readers reject
         // those and route the user to a re-Init.
     });
 

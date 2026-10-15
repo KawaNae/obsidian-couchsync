@@ -64,7 +64,7 @@ export class ConfigLocalDB implements IDocStore<CouchSyncDoc> {
 
     /** Stamp the application-level schema version on first open, or
      *  assert it matches the build's expected version on subsequent
-     *  opens. Invariant 15. */
+     *  opens, before any content read. */
     async ensureSchemaVersion(): Promise<void> {
         await this.runOp((s) => s.ensureSchemaVersion(), "ensureSchemaVersion");
     }
@@ -141,8 +141,8 @@ export class ConfigLocalDB implements IDocStore<CouchSyncDoc> {
     /**
      * Bulk-fetch chunks by id. Mirrors `LocalDB.getChunks` — the config
      * DB carries its own chunk store now (v0.26+), so config-side
-     * code paths (ConfigPullWriter ensureChunks, ConfigSync.write
-     * joinChunks) read through this method rather than reaching across
+     * code paths (ConfigPullWriter ensureChunks, the reconcile step's
+     * reads of the shared and base contents) read through this method rather than reaching across
      * to the vault DB. Rows whose body is absent (id not found) are
      * silently dropped; callers detect missing chunks by comparing the
      * returned length against the requested ids.
@@ -208,7 +208,7 @@ export class ConfigLocalDB implements IDocStore<CouchSyncDoc> {
      *   - **v2 ConfigDocs carrying a `data: string` field** (v0.25 and
      *     older). These cannot be read by the v3 chunker path; main.ts
      *     uses this signal to halt the ConfigSync replicator and route
-     *     the user to the Config Init flow.
+     *     the user to the Create / Join flow.
      *
      * Chunks (`chunk:*`) in the config DB are valid v3 content and
      * skipped. The check stops at the first legit v3 ConfigDoc — a

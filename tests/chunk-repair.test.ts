@@ -119,7 +119,7 @@ describe("planFromReport", () => {
         expect(planIsEmpty(plan)).toBe(true);
     });
 
-    // Invariant II (G2): broken chunks (missingReferenced) are owned by the
+    // Every discrepancy has one owner: broken chunks (missingReferenced) are owned by the
     // reconciler's quarantine path, NOT by repair — they can't be pushed,
     // pulled, or deleted into existence. The plan must exclude them entirely
     // (no silent delete-shortcut that would risk data another device holds).
@@ -217,7 +217,7 @@ describe("repairChunkDrift", () => {
         expect(rows[0]?.value?.deleted ?? true).toBe(true);
     });
 
-    it("does NOT tombstone an orphan chunk re-referenced by a remote FileDoc since the scan (#4 TOCTOU)", async () => {
+    it("does NOT tombstone an orphan chunk re-referenced by a remote FileDoc since the scan (TOCTOU)", async () => {
         // Chunk was orphan at scan time, so the plan says delete-remote...
         const chunk = await makeChunk("toctou");
         await seedRemoteChunk(remote, chunk);
@@ -246,13 +246,13 @@ describe("repairChunkDrift", () => {
         expect(rows[0]?.value?.deleted ?? false).toBe(false);
     });
 
-    it("does NOT delete an orphan-local chunk re-referenced by a local FileDoc since the scan (#9 TOCTOU)", async () => {
+    it("does NOT delete an orphan-local chunk re-referenced by a local FileDoc since the scan (TOCTOU, local side)", async () => {
         // Chunk was orphan-local at scan time, so the plan says delete-local...
         const chunk = await makeChunk("toctou-local");
         await putLocal(db, chunk);
         // ...but a concurrent pull landed a local FileDoc that references it
         // between scan and repair. The destructive boundary must re-check and
-        // skip it — symmetric with the #4 delete-remote guard above.
+        // skip it — symmetric with the delete-remote re-reference guard above.
         const referencingFile: CouchSyncDoc = {
             _id: makeFileId("re-referenced-local.md"),
             type: "file",

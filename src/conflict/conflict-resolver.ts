@@ -18,14 +18,14 @@ import { logDebug, logWarn } from "../ui/log.ts";
  *   - "concurrent": enqueue for human resolution via SyncEngine.onConcurrent
  *   - "silent-merge": chunks identical but vclocks drifted — caller must
  *     `mergeVC` and commit the remote doc with the merged clock; do NOT
- *     enqueue a concurrent event. Closes audit-2026-05-08 MEDIUM
- *     (false-positive concurrent on initial-sync devices).
+ *     enqueue a concurrent event. Otherwise initial-sync devices get
+ *     false-positive concurrent conflicts.
  *
  * **CLASSIFIER:** routes through `classifySyncRelation` (the single source
  * of truth). Do not duplicate the chunks/vclock matrix logic here.
  *
- * Two-instance pattern: one instance for vault DB (FileDoc), one for
- * config DB (ConfigDoc).
+ * Config sync does not use it: config Pull merges three-way instead
+ * (`config-reconcile.ts`).
  */
 
 /** A doc that ConflictResolver can process. Both kinds carry a vclock. */
@@ -34,30 +34,17 @@ type ResolvableDoc = FileDoc | ConfigDoc;
 /**
  * Result of a pull-time conflict check.
  *
- * **Invariant 5 (PullVerdict 完全網羅).** Every consumer of this type
+ * **PullVerdict 完全網羅.** Every consumer of this type
  * MUST handle all 4 verdicts explicitly. Trailing
  * `const _exhaustive: never = verdict;` is required at every call site
  * so future verdict additions become a compile error rather than a
- * silent regression. Fall-through dropped `silent-merge` was the
- * audit-2026-05-08 MEDIUM bug shape on the ConfigSync side.
+ * silent regression. On the ConfigSync side, a fall-through once dropped
+ * `silent-merge` and raised false-positive concurrent conflicts.
  *
- * Current consumers: `pull-writer.ts:classify`,
- * `config-pull-writer.ts:classify`.
+ * Current consumers: `pull-writer.ts:classify` and
+ * `conflict-orchestrator.ts:recheckStashed`.
  */
 export type PullVerdict = "take-remote" | "keep-local" | "concurrent" | "silent-merge";
-
-/**
- * Adapt a doc into the chunks/size fingerprint the classifier expects.
- * v0.26 unifies the shape: FileDoc and ConfigDoc both expose
- * `chunks: string[]` (content-addressed hash list). Pass through
- * directly. Tombstone fingerprints are NOT normalized (`markDeleted`
- * retains the deleted content's chunks); deleted-state comparison is
- * handled by the classifier's `leftDeleted`/`rightDeleted` axis
- * (Invariant 7), not by these chunks.
- */
-function asContent(doc: ResolvableDoc): { chunks: readonly string[]; size: number } {
-    return { chunks: doc.chunks, size: doc.size };
-}
 
 /**
  * Extract the user-facing path from a doc id. Throws for unknown id
@@ -86,33 +73,27 @@ export class ConflictResolver {
         // No local version — always take remote.
         if (!localDoc) return "take-remote";
 
-        const localContent = asContent(localDoc);
-        const remoteContent = asContent(remoteDoc);
         const localVC = localDoc.vclock ?? {};
         const remoteVC = remoteDoc.vclock ?? {};
 
         // CLASSIFIER: pure chunks×vclock matrix. Do not branch on
         // compareVC directly — the classifier already does that and
-        // additionally detects vclock-only-drift (= silent-merge),
-        // closing audit-2026-05-08 MEDIUM (false-positive concurrent
-        // on initial-sync devices).
+        // additionally detects vclock-only-drift (= silent-merge), so
+        // initial-sync devices get no false-positive concurrent conflict.
         const relation = classifySyncRelation({
             leftVC: localVC,
-            leftChunks: localContent.chunks,
-            leftSize: localContent.size,
+            leftChunks: localDoc.chunks,
             leftDeleted: localDoc.deleted === true,
             rightVC: remoteVC,
-            rightChunks: remoteContent.chunks,
-            rightSize: remoteContent.size,
+            rightChunks: remoteDoc.chunks,
             rightDeleted: remoteDoc.deleted === true,
             // Config seq-regression re-pull only: adopt the recreated remote
             // for vclock ties instead of surfacing them (see ClassifyInput).
             recreateAuthority: opts?.recreateAuthority === true,
             // No `lastSynced` — pull-side replication is independent of
-            // vault integration state. Without baseline the classifier
-            // never returns `legacy-skip` here.
+            // vault integration state.
             //
-            // Invariant 7 effects at this call site: deleted×deleted is
+            // The deleted axis at this call site: deleted×deleted is
             // content-equal regardless of (non-normalized) tombstone chunks,
             // so concurrent deletions converge silently; deleted×alive is
             // never content-equal, so a tombstone can no longer
@@ -160,17 +141,9 @@ export class ConflictResolver {
             case "true-divergent":
                 // Both sides changed concurrently — needs human judgment.
                 logWarn(
-                    `CouchSync: concurrent conflict on ${vaultPath} — enqueued for resolution.`,
+                    `concurrent conflict on ${vaultPath} — enqueued for resolution.`,
                 );
                 return "concurrent";
-
-            case "legacy-skip":
-                // Should not happen here (no lastSynced passed); fall back
-                // to keep-local for safety.
-                logDebug(
-                    `keep-local (legacy-skip fallback) for ${vaultPath}`,
-                );
-                return "keep-local";
         }
     }
 }

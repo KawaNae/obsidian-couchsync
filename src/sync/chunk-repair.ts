@@ -56,7 +56,7 @@ export interface ChunkRepairDeps {
     localDb: LocalDB;
     remote: ICouchClient;
     /** Verifies pulled chunk bodies against their content-addressed id —
-     *  the same authenticated fetch boundary the live loop uses (Invariant I).
+     *  the same authenticated fetch boundary the live loop uses.
      *  A `toPull` chunk whose body fails the check is skipped, not written. */
     chunkHasher: ChunkHasher;
     onProgress?: (
@@ -85,7 +85,7 @@ export interface ChunkRepairResult {
 /**
  * Map a consistency report to a repair plan.
  *
- * Discrepancy ownership (Invariant II) — every report category has exactly
+ * Discrepancy ownership — every report category has exactly
  * ONE terminal owner:
  *   - localOnly  (referenced) → toPush       \
  *   - remoteOnly (referenced) → toPull        | recoverable drift, owned by repair
@@ -94,7 +94,7 @@ export interface ChunkRepairResult {
  *   - orphan on BOTH sides    → chunk-gc (not here; not in localOnly/remoteOnly)
  *   - missingReferenced (broken) → NOT repairable here. A chunk absent on
  *     both sides cannot be pushed/pulled/deleted into existence; its owner is
- *     the reconciler, which quarantines the referencing FileDoc (Invariant II)
+ *     the reconciler, which quarantines the referencing FileDoc
  *     and recovers it if the chunk reappears. Deliberately excluded from the
  *     plan — see the totality test in tests/chunk-repair.test.ts. Do NOT add a
  *     delete-here shortcut: another device may still hold the chunk.
@@ -152,7 +152,7 @@ export async function repairChunkDrift(
             }),
     );
 
-    // #9: re-validate at the destructive LOCAL boundary, symmetric with the
+    // Re-validate at the destructive LOCAL boundary, symmetric with the
     // delete-remote guard below. `toDeleteLocal` came from a scan-time report;
     // a concurrent pull may have landed a FileDoc that re-references one of
     // these "orphan-local" chunks since. Re-enumerate the live local references
@@ -167,7 +167,7 @@ export async function repairChunkDrift(
         if (skipped > 0) {
             logWarn(
                 `chunk-repair: skipped deleting ${skipped} local chunk(s) that a local ` +
-                `FileDoc re-referenced since the report was generated (TOCTOU guard, #9)`,
+                `FileDoc re-referenced since the report was generated (TOCTOU guard)`,
             );
         }
     }
@@ -192,7 +192,7 @@ export async function repairChunkDrift(
         },
     );
 
-    // #4: re-validate at the destructive boundary. `toDeleteRemote` was
+    // Re-validate at the destructive boundary. `toDeleteRemote` was
     // derived from a report snapshot; between scan and now another device may
     // have pushed a FileDoc that re-references one of these "orphan" chunks.
     // Re-enumerate the live remote references and drop any chunk that is now
@@ -200,7 +200,7 @@ export async function repairChunkDrift(
     // addressing makes "don't delete" the safe side (a still-orphan chunk is
     // reclaimed by the next GC), so we never need to re-add anything here.
     //
-    // #16 (residual window, accepted): this is a non-transactional check-then-
+    // Residual window (accepted): this is a non-transactional check-then-
     // delete against CouchDB. A FileDoc pushed in the gap between this
     // enumeration and the deleteRemoteDocs bulkDocs below is not re-checked, so
     // a chunk it newly references could still be tombstoned. The window is one

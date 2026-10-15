@@ -40,16 +40,12 @@ function asCouchClient(fake: FakeCouchClient): CouchClient {
     return fake as unknown as CouchClient;
 }
 
-/** Phase 2: ConfigSync.init now takes an explicit codec policy. Tests
- *  here exercise the plumbing in plaintext mode (no envelope round-trip)
- *  to avoid pulling crypto into every fixture; the crypto path is
- *  covered in `multi-crypto-principal.test.ts`. */
-const PLAIN_INIT_OPTS = {
-    encryption: false,
-    compression: false,
-} as const;
+/** Create applies the settings' codec. Tests here exercise the plumbing
+ *  in plaintext mode (no envelope round-trip) to avoid pulling crypto into
+ *  every fixture; the crypto path is covered in
+ *  `multi-crypto-principal.test.ts` and the binding lifecycle test. */
 
-describe("ConfigSync.init() — wipe-and-replace remote", () => {
+describe("ConfigSync.create() — wipe-and-replace remote", () => {
     let vault: FakeVaultIO;
     let modal: FakeModalPresenter;
     let db: ConfigLocalDB;
@@ -58,7 +54,7 @@ describe("ConfigSync.init() — wipe-and-replace remote", () => {
     let remote: FakeCouchClient;
     let cs: ConfigSync;
 
-    beforeEach(() => {
+    beforeEach(async () => {
         vault = new FakeVaultIO();
         modal = new FakeModalPresenter();
         db = new ConfigLocalDB(uniqueName());
@@ -68,23 +64,27 @@ describe("ConfigSync.init() — wipe-and-replace remote", () => {
             deviceId: "dev-A",
             couchdbUri: "http://localhost:5984",
             couchdbConfigDbName: "config-test",
+            encryptionEnabled: false,
+            compressionEnabled: false,
         });
         remote = new FakeCouchClient();
         cs = new ConfigSync(
             vault,
             modal,
-            db,
+            "test-vault",
             auth,
             ALWAYS_VISIBLE,
             NoopReconnectBridge,
             () => settings,
             {
+                storeFactory: () => db,
                 clientFactory: () => asCouchClient(remote),
                 // Raw client factory: tests reuse the same in-memory remote
                 // since there's no actual codec to bypass.
                 rawClientFactory: () => asCouchClient(remote),
             },
         );
+        await cs.rebind(settings.couchdbConfigDbName);
     });
 
     afterEach(async () => {
@@ -95,7 +95,7 @@ describe("ConfigSync.init() — wipe-and-replace remote", () => {
         vault.addFile(".obsidian/app.json", `{"theme":"dark"}`);
         vault.addFile(".obsidian/hotkeys.json", `{}`);
 
-        await cs.init(PLAIN_INIT_OPTS);
+        await cs.create();
         const pushed = await cs.push();
 
         expect(pushed).toBe(2);
@@ -105,7 +105,7 @@ describe("ConfigSync.init() — wipe-and-replace remote", () => {
         });
         const liveIds = allRows.rows
             .filter((r) => !r.value?.deleted)
-            .filter((r) => r.id !== "config:meta")  // Phase 2: skip self-describing meta
+            .filter((r) => r.id !== "config:meta")  // skip the self-describing meta
             .map((r) => r.id);
         expect(liveIds.sort()).toEqual([
             makeConfigId(".obsidian/app.json"),
@@ -117,14 +117,14 @@ describe("ConfigSync.init() — wipe-and-replace remote", () => {
         // First init + push: 2 files on vault → both seeded.
         vault.addFile(".obsidian/app.json", `{}`);
         vault.addFile(".obsidian/hotkeys.json", `{}`);
-        await cs.init(PLAIN_INIT_OPTS);
+        await cs.create();
         await cs.push();
 
         // User removes hotkeys.json from .obsidian/.
         await vault.delete(".obsidian/hotkeys.json");
 
         // Second init wipes the remote; push re-seeds only the surviving file.
-        await cs.init(PLAIN_INIT_OPTS);
+        await cs.create();
         await cs.push();
 
         const allRows = await remote.allDocs<any>({
@@ -133,7 +133,7 @@ describe("ConfigSync.init() — wipe-and-replace remote", () => {
         });
         const liveIds = allRows.rows
             .filter((r) => !r.value?.deleted)
-            .filter((r) => r.id !== "config:meta")  // Phase 2: skip self-describing meta
+            .filter((r) => r.id !== "config:meta")  // skip the self-describing meta
             .map((r) => r.id);
         expect(liveIds).toEqual([makeConfigId(".obsidian/app.json")]);
     });
@@ -141,17 +141,17 @@ describe("ConfigSync.init() — wipe-and-replace remote", () => {
     it("re-init + push with same vault state is idempotent (remote unchanged)", async () => {
         vault.addFile(".obsidian/app.json", `{}`);
         vault.addFile(".obsidian/hotkeys.json", `{}`);
-        await cs.init(PLAIN_INIT_OPTS);
+        await cs.create();
         await cs.push();
         const before = (await remote.allDocs<any>({
             startkey: "config:",
             endkey: "config:￰",
         })).rows
             .filter((r) => !r.value?.deleted)
-            .filter((r) => r.id !== "config:meta")  // Phase 2: skip self-describing meta
+            .filter((r) => r.id !== "config:meta")  // skip the self-describing meta
             .map((r) => r.id).sort();
 
-        await cs.init(PLAIN_INIT_OPTS);
+        await cs.create();
         await cs.push();
 
         const after = (await remote.allDocs<any>({
@@ -159,7 +159,7 @@ describe("ConfigSync.init() — wipe-and-replace remote", () => {
             endkey: "config:￰",
         })).rows
             .filter((r) => !r.value?.deleted)
-            .filter((r) => r.id !== "config:meta")  // Phase 2: skip self-describing meta
+            .filter((r) => r.id !== "config:meta")  // skip the self-describing meta
             .map((r) => r.id).sort();
         expect(after).toEqual(before);
     });
@@ -179,7 +179,7 @@ describe("ConfigSync.init() — wipe-and-replace remote", () => {
 
         // Scan only sees app.json.
         vault.addFile(".obsidian/app.json", `{}`);
-        await cs.init(PLAIN_INIT_OPTS);
+        await cs.create();
         await cs.push();
 
         // After init's wipe + push's re-scan, local DB only has app.json.

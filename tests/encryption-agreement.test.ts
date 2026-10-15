@@ -26,7 +26,7 @@ async function seed(cipherVersion: 2 | 3): Promise<FakeCouchClient> {
 }
 
 describe("checkEncryptionAgreement — cipherVersion non-downgrade gate", () => {
-    it("flags a remote downgrade below the local floor (#1)", async () => {
+    it("flags a remote downgrade below the local floor", async () => {
         // Local device recorded floor 3; a curious server rewrote meta to v2.
         const client = await seed(2);
         const res = await checkEncryptionAgreement(client, true, VAULT_META_DOC_ID, 3);

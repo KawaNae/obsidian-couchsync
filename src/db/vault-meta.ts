@@ -18,7 +18,7 @@
  * - Replicated doc bodies carry `schemaVersion` for shape.
  * - Chunk ids carry the hash-algorithm tag (`chunk:<alg>:<hash>`).
  *
- * That separation (invariants 11-15) means a reader handed any single
+ * That separation means a reader handed any single
  * byte sequence can decode it without first fetching `vault:meta`.
  * The doc is for Clone-time stack assembly and human-facing settings
  * — not the per-blob decode path.
@@ -66,6 +66,10 @@ export async function verifyKeyCheck(
 export const VAULT_META_DOC_ID = "vault:meta";
 export const CONFIG_META_DOC_ID = "config:meta";
 
+/** cipherVersion this build writes into a new encrypted meta (Init /
+ *  Create). See `DbMetaDoc.encryption.cipherVersion`. */
+export const CURRENT_CIPHER_VERSION = 3 as const;
+
 /** Schema for the `vault:meta` doc in v2. */
 export interface VaultMetaDoc {
     _id: typeof VAULT_META_DOC_ID;
@@ -91,7 +95,7 @@ export interface VaultMetaDoc {
              *        (`encryptedPath`).
              *  - v3: file/config doc bodies are compressed-then-encrypted into a
              *        single `encBody`, GCM-bound to the `_id` (AAD). Attachment
-             *        framing is unchanged. (#2 — authenticated, confidential body.) */
+             *        framing is unchanged. (Authenticated, confidential body.) */
             cipherVersion: 2 | 3;
             salt: string; // base64
             keyCheck: string; // encrypted token
@@ -110,6 +114,20 @@ export interface VaultMetaDoc {
             /** Algorithm-revision marker. Currently 1 (vanilla DEFLATE/gzip). */
             version: 1;
         };
+
+    /** Random id minted by every build of a meta (vault Init, config
+     *  Create; 128 bits, hex). Identifies ONE incarnation of the DB, so a
+     *  device can tell that the DB was re-created elsewhere even when
+     *  nothing else in the meta differs — a plaintext root has no salt,
+     *  and two plaintext roots with the same compression flag were
+     *  otherwise identical (`metaFingerprint`).
+     *
+     *  Optional: metas written before it existed have none, and readers
+     *  fall back to the salt-based fingerprint. Additive and not part of
+     *  `schemaVersion` — older builds read the meta field by field
+     *  (`encryption`, `compression`, `schemaVersion`, `type`) and never
+     *  reject unknown fields. */
+    generationId?: string;
 }
 
 /** v1 -> v2 migration shim: `encryption:meta` documents written by
@@ -135,19 +153,19 @@ export async function fetchVaultMeta(
  * Schema for the `config:meta` doc — self-describing meta for the
  * separate config DB.
  *
- * **Phase 2 (v0.26) — independent crypto principal.** Each `<db>:meta`
+ * **Independent crypto principal (v0.26).** Each `<db>:meta`
  * is its own crypto root: own salt, own keyCheck. The
  * structural shape mirrors VaultMetaDoc so a single generic helper
  * (`buildInitialMeta` / `unlockMeta`) can build and unlock both, but
  * the crypto material is not shared — same passphrase + different salts
  * → different keys → vault HMAC and config HMAC live in disjoint id
- * spaces. Invariant 17 (this doc is authority for config DB codec
- * state) and invariant 18 (cryptoProvider is per-DB) hold simultaneously.
+ * spaces. This doc is the authority for the config DB's codec state, and
+ * the cryptoProvider is per-DB, at the same time.
  *
- * `schemaVersion: 2` — bumped from the Phase 1 in-progress shape (which
+ * `schemaVersion: 2` — bumped from the earlier in-progress shape (which
  * was a clone of vault:meta and therefore not a real crypto root).
- * Readers that see schemaVersion 1 surface "Config Init required" so the
- * Phase 1 → Phase 2 transition lands cleanly on a fresh own-salt write.
+ * Readers that see schemaVersion 1 surface `legacy-meta` (Create required) so the
+ * move to the independent root lands cleanly on a fresh own-salt write.
  */
 export interface ConfigMetaDoc {
     _id: typeof CONFIG_META_DOC_ID;
@@ -156,6 +174,8 @@ export interface ConfigMetaDoc {
     schemaVersion: 2;
     encryption: VaultMetaDoc["encryption"];
     compression: VaultMetaDoc["compression"];
+    /** See `VaultMetaDoc.generationId`; minted by every Create. */
+    generationId?: string;
 }
 
 /** Union of self-describing meta docs. Helpers below are generic over
@@ -173,11 +193,11 @@ export async function fetchConfigMeta(
  * Build an initial config:meta doc as a self-contained crypto root.
  * Mirrors `buildInitialVaultMeta`'s shape: fresh salt → derive keys →
  * compute keyCheck. The returned `crypto` is what the host pipes into
- * `wrapConfigClient` and `configChunkHasher`.
+ * `ConfigBinding.wrapClient` and its chunk hasher.
  *
- * Phase 2 signature change: previously this cloned from `vault:meta`
+ * Signature change in v0.26: previously this cloned from `vault:meta`
  * (`buildInitialConfigMeta(vaultMeta)`). That coupling broke
- * cross-vault config sharing (Android decrypt failure, 2026-05-29).
+ * cross-vault config sharing (an Android device failed to decrypt).
  * The new shape takes the same `{encryption, passphrase, compression}`
  * triple as the vault builder and produces a fully independent root.
  */
@@ -193,7 +213,7 @@ export async function buildInitialConfigMeta(opts: {
         passphrase: opts.passphrase,
         compression: opts.compression,
     });
-    return inner as { meta: ConfigMetaDoc; keys: EncryptionKeys | null; crypto: CryptoProvider | null };
+    return { meta: inner.meta as ConfigMetaDoc, keys: inner.keys, crypto: inner.crypto };
 }
 
 export async function pushConfigMeta(
@@ -260,7 +280,7 @@ export async function unlockVaultMeta(
     return unlockMeta(meta, passphrase);
 }
 
-// ── Generic meta helpers (Phase 2) ─────────────────────────
+// ── Generic meta helpers ───────────────────────────────────────
 
 /** Schema version stamped on freshly-built meta docs of each kind. */
 const META_SCHEMA_VERSION = {
@@ -291,7 +311,8 @@ interface BuildMetaResult<T extends DbMetaDoc> {
  *
  * Two metas built from the same passphrase but different `docId` produce
  * **different** salts (and therefore different keys) — that is the
- * structural mechanism of Phase 2's invariant 18.
+ * structural mechanism that keeps the cryptoProvider per-DB. Every call
+ * also mints a fresh `generationId`, encrypted or not.
  */
 export async function buildInitialMeta(opts: BuildMetaOpts): Promise<BuildMetaResult<DbMetaDoc>> {
     if (opts.encryption) {
@@ -311,13 +332,14 @@ export async function buildInitialMeta(opts: BuildMetaOpts): Promise<BuildMetaRe
             encryption: {
                 enabled: true,
                 kdfVersion: 1,
-                cipherVersion: 3,
+                cipherVersion: CURRENT_CIPHER_VERSION,
                 salt: saltB64,
                 keyCheck,
             },
             compression: opts.compression
                 ? { enabled: true, algorithm: "gzip", version: 1 }
                 : { enabled: false },
+            generationId: newGenerationId(),
         } as DbMetaDoc;
         return { meta, keys, crypto: createCryptoProvider(keys) };
     }
@@ -329,8 +351,57 @@ export async function buildInitialMeta(opts: BuildMetaOpts): Promise<BuildMetaRe
         compression: opts.compression
             ? { enabled: true, algorithm: "gzip", version: 1 }
             : { enabled: false },
+        generationId: newGenerationId(),
     } as DbMetaDoc;
     return { meta, keys: null, crypto: null };
+}
+
+/** 128 random bits as lowercase hex — a fresh `generationId`. */
+function newGenerationId(): string {
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * Fingerprint of a `*:meta` root, hashed (SHA-256, first 128 bits): the
+ * identity of one incarnation of the DB, which a device records when it
+ * sets the DB up (config Create / Join, vault Init / Clone) and compares
+ * the server's meta against afterwards.
+ *
+ * Building a meta mints a fresh `generationId` (and, when encrypted, a
+ * fresh salt and keyCheck), so re-creating the DB on another device
+ * changes the fingerprint — for plaintext DBs too.
+ *
+ *   - with `generationId`: the generation id plus the codec parts below
+ *   - without (a meta written before generation ids, by an older build):
+ *     encryption on/off, KDF version, salt, keyCheck and compression
+ *     on/off — exactly the pre-generation fingerprint of `config:meta`,
+ *     so config attachments anchored to such a meta keep matching it.
+ *     Limitation of this fallback: two plaintext roots with the same
+ *     compression flag are indistinguishable (no salt), so a plaintext
+ *     re-creation by an older build is not detected.
+ *
+ * cipherVersion is deliberately NOT part of it: a lowered cipherVersion is
+ * reported as a cipher downgrade, not as a re-creation.
+ */
+export async function metaFingerprint(meta: DbMetaDoc): Promise<string> {
+    const enc = meta.encryption;
+    const codec = enc.enabled
+        ? ["e", enc.kdfVersion, enc.salt, enc.keyCheck, meta.compression.enabled]
+        : ["p", meta.compression.enabled];
+    const canonical = JSON.stringify(
+        typeof meta.generationId === "string" && meta.generationId !== ""
+            ? ["g", meta.generationId, ...codec]
+            : codec,
+    );
+    const digest = await crypto.subtle.digest(
+        "SHA-256", new TextEncoder().encode(canonical),
+    );
+    const hex = Array.from(new Uint8Array(digest).slice(0, 16))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+    return `sha256:${hex}`;
 }
 
 /** Unlock any `*:meta` against a passphrase. Returns null on keyCheck
@@ -338,8 +409,8 @@ export async function buildInitialMeta(opts: BuildMetaOpts): Promise<BuildMetaRe
  *  passphrase, since the AES-GCM auth tag fails). keyCheck is the sole
  *  passphrase verifier: it is authenticated and costs a full PBKDF2
  *  derivation per guess, so there is no faster offline oracle. Symmetric
- *  for both vault and config DBs — invariant 17 means each meta carries
- *  everything needed to verify itself. */
+ *  for both vault and config DBs — each meta is a self-contained crypto
+ *  root and carries everything needed to verify itself. */
 export async function unlockMeta(
     meta: DbMetaDoc,
     passphrase: string,

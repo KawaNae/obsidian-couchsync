@@ -54,7 +54,6 @@ export interface VaultManifest {
 const SCAN_CURSOR_ID = "_local/scan-cursor";
 const VAULT_MANIFEST_ID = "_local/vault-manifest";
 const SKIPPED_FILES_ID = "_local/skipped-files";
-const QUARANTINED_FILES_ID = "_local/quarantined-files";
 const LAST_SYNCED_VCLOCKS_ID = "_local/last-synced-vclocks";
 
 /**
@@ -64,19 +63,6 @@ const LAST_SYNCED_VCLOCKS_ID = "_local/last-synced-vclocks";
  */
 export interface SkippedFilesDoc {
     files: Record<string, { sizeMB: number; skippedAt: number }>;
-}
-
-/**
- * Files whose FileDoc references chunks that are unavailable on BOTH local
- * and remote ("broken" / missingReferenced). Such a file cannot be restored
- * locally; reconcile quarantines it (Invariant II) to stop the restore
- * ping-pong, surfaces it, and clears the entry if the missing chunks later
- * arrive from another device. Distinct from `SkippedFilesDoc` (oversize =
- * deliberate exclusion): a quarantine clears on chunk arrival, a skip clears
- * only when the user raises the size limit.
- */
-export interface QuarantinedFilesDoc {
-    files: Record<string, { missingChunks: string[]; quarantinedAt: number }>;
 }
 
 /**
@@ -153,7 +139,7 @@ export class LocalDB implements IDocStore<CouchSyncDoc> {
 
     /** Stamp the application-level schema version on both stores (docs
      *  + meta) on first open, or assert it matches the build's expected
-     *  version on subsequent opens. Invariant 15. */
+     *  version on subsequent opens, before any content read. */
     async ensureSchemaVersion(): Promise<void> {
         await this.runDocsOp((s) => s.ensureSchemaVersion(), "ensureSchemaVersion-docs");
         await this.runMetaOp((s) => s.ensureSchemaVersion(), "ensureSchemaVersion-meta");
@@ -301,8 +287,9 @@ export class LocalDB implements IDocStore<CouchSyncDoc> {
      * sibling folder `scriptsX/…`. Tombstones are excluded.
      *
      * Used to desugar a folder-level delete into per-file `markDeleted`
-     * calls (invariant S1): on a folder delete the children are already
-     * gone from the vault FS, so the DB is the only enumeration source.
+     * calls (a folder has no doc of its own): on a folder delete the
+     * children are already gone from the vault FS, so the DB is the only
+     * enumeration source.
      * Operates on the LOCAL (plaintext) id space, so it is transparent to
      * encryption — the encrypting client only rewrites ids on the wire.
      */
@@ -383,17 +370,6 @@ export class LocalDB implements IDocStore<CouchSyncDoc> {
     async putSkippedFiles(doc: SkippedFilesDoc): Promise<void> {
         await this.runMetaWriteTx({
             meta: [{ op: "put", key: SKIPPED_FILES_ID, value: doc }],
-        });
-    }
-
-    async getQuarantinedFiles(): Promise<QuarantinedFilesDoc> {
-        const doc = await this.getMetaStoreValue<QuarantinedFilesDoc>(QUARANTINED_FILES_ID);
-        return { files: doc?.files ?? {} };
-    }
-
-    async putQuarantinedFiles(doc: QuarantinedFilesDoc): Promise<void> {
-        await this.runMetaWriteTx({
-            meta: [{ op: "put", key: QUARANTINED_FILES_ID, value: doc }],
         });
     }
 

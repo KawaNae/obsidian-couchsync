@@ -1,7 +1,7 @@
 /**
- * Tests for the Phase 2 ConflictResolver — resolveOnPull() API.
+ * Tests for the ConflictResolver — resolveOnPull() API.
  *
- * Phase 2 simplification: no PouchDB conflict trees, no getByRev/removeRev.
+ * No PouchDB conflict trees, no getByRev/removeRev.
  * Resolution is a direct two-document vclock comparison via resolveOnPull().
  */
 
@@ -22,7 +22,7 @@ function makeFile(path: string, vclock: Record<string, number>, data?: string): 
     };
 }
 
-describe("ConflictResolver — resolveOnPull (Phase 2)", () => {
+describe("ConflictResolver — resolveOnPull", () => {
     it("returns take-remote when no local doc exists", async () => {
         const resolver = new ConflictResolver();
         const remote = makeFile("new.md", { A: 1 });
@@ -88,11 +88,11 @@ describe("ConflictResolver — resolveOnPull (Phase 2)", () => {
         expect(verdict).toBe("concurrent");
     });
 
-    it("PR4: returns silent-merge when vclocks are incomparable but content is identical", async () => {
-        // audit-2026-05-08 MEDIUM: false-positive concurrent on initial-sync
-        // devices. Pre-PR4 this returned "concurrent" and triggered a modal;
-        // post-PR4 the classifier detects content equality and silently
-        // merges the vclocks.
+    it("returns silent-merge when vclocks are incomparable but content is identical", async () => {
+        // False-positive concurrent on initial-sync devices: comparing
+        // vclocks alone returned "concurrent" and triggered a modal; the
+        // classifier now detects content equality and silently merges the
+        // vclocks.
         const resolver = new ConflictResolver();
 
         const local = makeFile("concurrent.md", { A: 1 }, "shared-chunk");
@@ -102,8 +102,19 @@ describe("ConflictResolver — resolveOnPull (Phase 2)", () => {
         expect(verdict).toBe("silent-merge");
     });
 
-    it("PR4: returns silent-merge when local dominates but content is identical", async () => {
-        // Edge case from project_false_positive_concurrent.md: re-introduced
+    it("judges content by chunks: a doc whose size misstates the same chunks is not a conflict", async () => {
+        // A sender that took `size` from a stat before reading the file can
+        // record one save's size with the next save's chunks.
+        const resolver = new ConflictResolver();
+        const local = { ...makeFile("doc.md", { A: 1 }, "shared-chunk"), size: 339 };
+        const remote = { ...makeFile("doc.md", { B: 1 }, "shared-chunk"), size: 321 };
+
+        const verdict = await resolver.resolveOnPull(local, remote);
+        expect(verdict).toBe("silent-merge");
+    });
+
+    it("returns silent-merge when local dominates but content is identical", async () => {
+        // Edge case: a re-introduced
         // device with chunks-equal but vclock-divergent post sync.
         const resolver = new ConflictResolver();
         const local = makeFile("doc.md", { A: 5, B: 1 }, "shared-chunk");

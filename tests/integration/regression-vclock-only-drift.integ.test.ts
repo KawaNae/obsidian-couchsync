@@ -1,11 +1,11 @@
 /**
- * Regression: PR3 classifier-driven reconcile dispatch.
+ * Regression: classifier-driven reconcile dispatch.
  *
  * Two shapes covered:
  *
  * 1. **vclock-only-drift on vault scan** — vault content matches FileDoc
  *    content but the vclocks have drifted (e.g., another device pushed an
- *    identical-content rev with its own deviceId). Pre-PR3 the legacy
+ *    identical-content rev with its own deviceId). Before the shared classifier the legacy
  *    `compareFileToDoc` would have classified this as "identical" only
  *    when the chunks matched (size+chunk equality short-circuit), but
  *    the post-classifier branch now also exercises `adoptDocVclock`
@@ -15,7 +15,7 @@
  *
  * 2. **local-edit branch divergent guard** — historically the
  *    reconciler's "local-unpushed" branch had NO divergent guard (the
- *    guard lived on the "remote-pending" branch only). PR3's classifier
+ *    guard lived on the "remote-pending" branch only). The classifier
  *    folds the guard into `classifySyncRelation`, so a vault that
  *    diverged from baseline AND the FileDoc that diverged in a way the
  *    classifier reads as "right dominates" routes to true-divergent.
@@ -43,8 +43,9 @@ class PassthroughWriter implements VaultWriter {
         await this.io.writeBinary(path, content);
         return { applied: true };
     }
-    async applyRemoteDeletion(path: string): Promise<void> {
+    async applyRemoteDeletion(path: string): Promise<WriteResult> {
         if (await this.io.exists(path)) await this.io.delete(path);
+        return { applied: true };
     }
     async createFile(path: string, content: ArrayBuffer): Promise<void> {
         await this.io.createBinary(path, content);
@@ -70,7 +71,7 @@ function makeFakeOrchestrator() {
     };
 }
 
-describe("regression: PR3 classifier reconcile dispatch", () => {
+describe("regression: classifier reconcile dispatch", () => {
     let vault: FakeVaultIO;
     let db: LocalDB;
     let vs: VaultSync;
@@ -142,8 +143,8 @@ describe("regression: PR3 classifier reconcile dispatch", () => {
     });
 
     it("right-dominates-with-local-drift routes to conflict orchestrator (was: silent overwrite)", async () => {
-        // Pre-PR3 the reconciler's "remote-pending" branch had a divergent
-        // guard, but the "local-unpushed" branch did not. PR3 unifies via
+        // The reconciler's "remote-pending" branch used to have a divergent
+        // guard, but the "local-unpushed" branch did not. Reconcile now unifies via
         // the classifier so any drift-from-baseline + remote-dominate combo
         // surfaces as true-divergent.
         const path = "notes/contested.md";
@@ -190,7 +191,7 @@ describe("regression: PR3 classifier reconcile dispatch", () => {
 
     it("local-edit (vclock-equal + chunks differ) routes to fileToDb push", async () => {
         // Sanity: the classic "user edited locally, hasn't pushed yet" case
-        // still routes to push under PR3.
+        // still routes to push through the classifier.
         const path = "notes/local.md";
         vault.addFile(path, "v0");
         await vs.fileToDb(path);

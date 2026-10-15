@@ -9,6 +9,7 @@
  * `runWriteTx` straight into a ConfigLocalDB. */
 
 import { splitIntoChunks } from "../../src/db/chunker.ts";
+import { buildChunkAttachment } from "../../src/db/chunk-attachment.ts";
 import { makeConfigId } from "../../src/types/doc-id.ts";
 import {
     CONFIG_SCHEMA_VERSION,
@@ -70,4 +71,27 @@ export async function makeConfigFixture(
 async function defaultHash(data: Uint8Array): Promise<string> {
     const { computeHash } = await import("../../src/db/chunker.ts");
     return computeHash(data);
+}
+
+/** Put fixtures on a remote the way a Push does: the ConfigDocs, and their
+ *  chunks as attachment "c" envelopes. */
+export async function seedRemoteConfig(
+    remote: {
+        bulkDocs(docs: any[]): Promise<unknown>;
+        bulkDocsWithAttachments(items: any[]): Promise<unknown>;
+    },
+    fixtures: ConfigFixture[],
+): Promise<void> {
+    if (fixtures.length === 0) return;
+    await remote.bulkDocs(fixtures.map((f) => ({ ...f.doc })));
+    const seen = new Set<string>();
+    const items = [];
+    for (const f of fixtures) {
+        for (const c of f.chunks) {
+            if (seen.has(c._id)) continue;
+            seen.add(c._id);
+            items.push(buildChunkAttachment(c, { keepRev: false }));
+        }
+    }
+    if (items.length > 0) await remote.bulkDocsWithAttachments(items);
 }

@@ -1,6 +1,5 @@
 /**
- * Regression: case-only / NFC-variant renames permanently reverted
- * (2026-06-07 bug hunt, MEDIUM).
+ * Regression: case-only / NFC-variant renames permanently reverted.
  *
  * Old handleRename desugared into fileToDb(new) + markDeleted(old):
  *   1. fileToDb minted the new doc at {self:1} (old vclock discarded) and
@@ -38,8 +37,9 @@ class ApplyingVaultWriter implements VaultWriter {
         await this.io.writeBinary(path, content);
         return { applied: true };
     }
-    async applyRemoteDeletion(path: string): Promise<void> {
+    async applyRemoteDeletion(path: string): Promise<WriteResult> {
         if (await this.io.exists(path)) await this.io.delete(path);
+        return { applied: true };
     }
     async createFile(path: string, content: ArrayBuffer): Promise<void> {
         await this.io.createBinary(path, content);

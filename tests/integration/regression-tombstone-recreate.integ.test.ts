@@ -1,8 +1,8 @@
 /**
  * Regression: delete → recreate at the same path wedged the path unpushable
- * forever (incident 2026-06-07, `Periodic/WeeklyNotes/2026-W24.md`).
+ * forever (seen on `Periodic/WeeklyNotes/2026-W24.md`).
  *
- * Root cause (Invariant 7 — deletion is an integration event):
+ * Root cause (deletion is an integration event):
  *   - `markDeleted` ERASED the integration baseline (`lastSynced.delete`),
  *     destroying the causal record "I integrated this deletion".
  *   - On recreate, `fileToDb`'s divergent guard classified the LocalDB
@@ -47,8 +47,9 @@ class ApplyingVaultWriter implements VaultWriter {
         await this.io.writeBinary(path, content);
         return { applied: true };
     }
-    async applyRemoteDeletion(path: string): Promise<void> {
+    async applyRemoteDeletion(path: string): Promise<WriteResult> {
         if (await this.io.exists(path)) await this.io.delete(path);
+        return { applied: true };
     }
     async createFile(path: string, content: ArrayBuffer): Promise<void> {
         await this.io.createBinary(path, content);
@@ -58,7 +59,7 @@ class ApplyingVaultWriter implements VaultWriter {
 
 const DEV = "dev-A";
 
-describe("regression: tombstone recreate (incident 2026-06-07 W24)", () => {
+describe("regression: tombstone recreate", () => {
     let vault: FakeVaultIO;
     let db: LocalDB;
     let vs: VaultSync;
@@ -171,8 +172,8 @@ describe("regression: tombstone recreate (incident 2026-06-07 W24)", () => {
         expect(await vault.exists("w24.md")).toBe(true);
 
         // keep-local resolution (what the user picks to rescue the file):
-        // forceLocalEdit merges the tombstone vclock and commits alive.
-        await vs.forceLocalEdit("w24.md", doc.vclock ?? {});
+        // forceLocalEdit commits alive over the tombstone the dialog showed.
+        expect(await vs.forceLocalEdit("w24.md", doc.vclock)).toBe("written");
         doc = await db.get(makeFileId("w24.md")) as FileDoc;
         expect(doc.deleted ?? false).toBe(false);
         expect(doc.vclock).toEqual({ [DEV]: 3 });

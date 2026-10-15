@@ -113,7 +113,11 @@ describe("ConfigOperation", () => {
                 auth, visibility: ALWAYS_VISIBLE, reconnectBridge: bridge,
                 makeClient: () => client,
             });
-            await expect(op.run(async () => "never")).rejects.toThrow(/Auth blocked/);
+            const err = await op.run(async () => "never").catch((e) => e);
+            expect(err.name).toBe("AuthBlockedError");
+            // Credentials live in the CouchDB tab, and Test clears the latch.
+            expect(err.userMessage).toMatch(/CouchDB tab.*Test/);
+            expect(err.userMessage).toMatch(/\(401\)/);
             expect(client.info).not.toHaveBeenCalled();
         });
 

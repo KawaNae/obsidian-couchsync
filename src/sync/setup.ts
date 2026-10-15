@@ -23,6 +23,10 @@ function formatDocIdForProgress(id: string): string {
 }
 
 export interface SetupResult {
+    /** Init: vault files recorded in the local DB, and so pushed (files
+     *  kept out by the filters or over the size limit excluded). Clone:
+     *  vault files written from the remote (deletions and declined docs
+     *  excluded). */
     vaultFiles: number;
     totalDocs: number;
 }
@@ -36,8 +40,20 @@ export class SetupService {
         private reconciler: Reconciler,
     ) {}
 
-    /** Init: clean slate (local + remote) → scan vault → push */
-    async init(onProgress: (msg: string) => void): Promise<SetupResult> {
+    /**
+     * Init: clean slate (local + remote) → publish the new vault:meta → scan
+     * vault → push.
+     *
+     * `publishMeta` writes the new `vault:meta` into the re-created remote
+     * DB before anything else. A device still live-syncing with the DB this
+     * Init replaced tells the replacement by that meta (the pull wakes on
+     * it; the agreement check compares it), so the sooner it is there, the
+     * shorter the time that device can push into the new DB unnoticed.
+     */
+    async init(
+        onProgress: (msg: string) => void,
+        publishMeta: () => Promise<void>,
+    ): Promise<SetupResult> {
         return this.withWakeLock(async () => {
             onProgress("Initializing local database...");
             await this.localDb.destroy();
@@ -45,8 +61,9 @@ export class SetupService {
             await this.localDb.ensureSchemaVersion();
 
             onProgress("Initializing remote database...");
-            await this.remoteOps.destroyRemote();
-            await this.remoteOps.ensureRemoteDb();
+            await this.remoteOps.recreateRemote();
+            onProgress("Writing vault metadata...");
+            await publishMeta();
 
             onProgress("Scanning vault files...");
             const vaultFiles = await this.scanVaultToDb(onProgress);
@@ -77,17 +94,32 @@ export class SetupService {
                 onProgress(`Pulling: ${formatDocIdForProgress(docId)} (${n})`);
             });
 
+            // Every FileDoc goes through dbToFile, tombstones included (they
+            // establish the deleted baseline). The progress counts the alive
+            // docs this device's filters keep in: the files Clone writes.
+            // Only one that landed in the vault counts as a file written: a
+            // tombstone is a file deleted elsewhere, and a doc dbToFile
+            // declines (filtered, unsafe path, collision) or fails on is not
+            // in the vault.
             const allFiles = await this.localDb.allFileDocs();
-            onProgress(`Writing ${allFiles.length} vault files...`);
+            const toWrite = allFiles.filter(
+                (d) => !d.deleted && this.vaultSync.shouldSync(filePathFromId(d._id)),
+            ).length;
+            onProgress(`Writing ${toWrite} vault files...`);
             let vaultFiles = 0;
+            let done = 0;
             for (const fileDoc of allFiles) {
                 const vaultPath = filePathFromId(fileDoc._id);
                 try {
-                    onProgress(`Writing: ${vaultPath} (${vaultFiles + 1}/${allFiles.length})`);
-                    await this.vaultSync.dbToFile(fileDoc);
-                    vaultFiles++;
+                    if (!fileDoc.deleted && this.vaultSync.shouldSync(vaultPath)) {
+                        onProgress(`Writing: ${vaultPath} (${++done}/${toWrite})`);
+                    }
+                    // Clone replaces the vault's version of every path the server
+                    // has, as its confirmation tells the user.
+                    const result = await this.vaultSync.dbToFile(fileDoc, { overwriteVaultChange: true });
+                    if (!fileDoc.deleted && result.applied) vaultFiles++;
                 } catch (e) {
-                    logError(`CouchSync: Failed to write ${vaultPath}: ${e?.message ?? e}`);
+                    logError(`Failed to write ${vaultPath}: ${e?.message ?? e}`);
                 }
             }
 
@@ -117,18 +149,20 @@ export class SetupService {
         }
     }
 
-    /** Scan all vault files to local DB (no mtime check — clean start) */
+    /** Scan the vault files the filters keep in to local DB (no mtime
+     *  check — clean start); the progress counts those, as Clone's does.
+     *  Returns how many were recorded: a file fileToDb keeps out (size
+     *  limit) or fails on is not pushed. */
     private async scanVaultToDb(onProgress: (msg: string) => void): Promise<number> {
-        const files = this.vault.getFiles();
+        const files = this.vault.getFiles().filter((f) => this.vaultSync.shouldSync(f.path));
         let synced = 0;
         for (let i = 0; i < files.length; i++) {
             const file = files[i];
             try {
                 onProgress(`Scanning: ${file.path} (${i + 1}/${files.length})`);
-                await this.vaultSync.fileToDb(file.path);
-                synced++;
+                if (await this.vaultSync.fileToDb(file.path)) synced++;
             } catch (e) {
-                logError(`CouchSync: Failed to scan ${file.path}: ${e?.message ?? e}`);
+                logError(`Failed to scan ${file.path}: ${e?.message ?? e}`);
             }
         }
         return synced;

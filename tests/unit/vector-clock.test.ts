@@ -10,7 +10,7 @@ describe("latestDevice", () => {
         expect(latestDevice({})).toBeNull();
     });
 
-    // H-2 root: the result must be a pure function of the clock's CONTENT, not
+    // Cross-device tie-break root: the result must be a pure function of the clock's CONTENT, not
     // of its key insertion order. mergeVC can persist the same logical clock
     // with different key order on different devices; an order-dependent
     // latestDevice would then disagree across devices.
@@ -21,7 +21,7 @@ describe("latestDevice", () => {
     });
 });
 
-describe("mergeVC key-order (H-2 precondition)", () => {
+describe("mergeVC key-order (why tie-breaks must not depend on key order)", () => {
     it("yields the same logical clock with order depending on argument order", () => {
         const m1 = mergeVC({ A: 1 }, { C: 1 });
         const m2 = mergeVC({ C: 1 }, { A: 1 });

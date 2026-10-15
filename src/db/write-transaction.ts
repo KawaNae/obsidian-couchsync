@@ -48,9 +48,9 @@ export class DbError extends Error {
         this.recovery = opts?.recovery ?? ((kind === "quota" || kind === "degraded") ? "halt" : "fail");
         this.userMessage = opts?.userMessage ?? (
             kind === "quota"
-                ? "CouchSync: Local DB storage is full — run chunk GC from Settings → Maintenance."
+                ? "Local DB storage is full — run chunk GC from Settings → Maintenance."
                 : kind === "degraded"
-                    ? "CouchSync: Please restart Obsidian — the local DB handle is no longer usable."
+                    ? "Please restart Obsidian — the local DB handle is no longer usable."
                     : undefined
         );
     }
@@ -74,9 +74,10 @@ export type VclockUpdate =
          *  sender's FileDoc.mtime). See `LastSynced.mtime` for the trust
          *  model. Omitted when no fresh stat was at hand → cache miss. */
         mtime?: number;
-        /** Invariant 7: the integrated doc state was a tombstone (chunks/size
-         *  carry the normalized `[]`/0 fingerprint). `op: "delete"` is
-         *  reserved for "no doc exists at all". */
+        /** Deletion is an integration event: the integrated doc state was
+         *  a tombstone (chunks/size carry the normalized `[]`/0
+         *  fingerprint). `op: "delete"` is reserved for "no doc exists at
+         *  all". */
         deleted?: true;
     }
     | { path: string; op: "delete" };

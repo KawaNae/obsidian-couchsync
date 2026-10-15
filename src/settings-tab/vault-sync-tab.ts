@@ -6,14 +6,18 @@
  * filters. Server connection (URI / user / password) lives in the CouchDB
  * tab since v0.30.0 — this tab reads them from saved settings.
  */
-import { type App, Notice, Setting, type ButtonComponent } from "obsidian";
-import { MAX_PREVIOUS_DEVICE_IDS, type ConnectionState, type CouchSyncSettings } from "../settings.ts";
+import { type App, Setting, type ButtonComponent } from "obsidian";
+import type { ConnectionState, CouchSyncSettings } from "../settings.ts";
 import type { SyncEngine } from "../db/sync-engine.ts";
 import type { AuthGate } from "../db/sync/auth-gate.ts";
-import type { VaultRemoteOps, DbCheckResult } from "../db/sync/vault-remote-ops.ts";
+import { describeDbFound, type DbCheckResult } from "../db/sync/vault-remote-ops.ts";
 import type { LocalDB } from "../db/local-db.ts";
 import { validateDeviceName } from "../utils/device-name.ts";
 import { setupGating } from "./setup-gating.ts";
+import { reportError, showNotice } from "../ui/notices.ts";
+import { BusyError, describeError } from "../ui/describe-error.ts";
+import type { VaultBinding, VaultRelation } from "../sync/vault-binding.ts";
+import { cloneDescription, encryptionChangedElsewhere, vaultRelationView } from "./vault-relation-view.ts";
 
 export interface VaultSyncTabDeps {
     app: App;
@@ -21,14 +25,14 @@ export interface VaultSyncTabDeps {
     updateSettings: (patch: Partial<CouchSyncSettings>) => Promise<void>;
     replicator: SyncEngine;
     auth: AuthGate;
-    remoteOps: VaultRemoteOps;
     localDb: LocalDB;
-    initVault: () => Promise<void>;
-    cloneFromRemote: () => Promise<void>;
-    startSync: () => Promise<void>;
-    stopSync: () => void;
+    /** Owner of the vault setup: Init, Clone and every change of the setup
+     *  state go through it. */
+    vault: VaultBinding;
+    /** Why a config op keeps the device name from changing now (it runs,
+     *  and Config Push writes under the name), or null. */
+    configChangeBlocker: () => string | null;
     refresh: () => void;
-    encryptionMismatch?: { status: string };
 }
 
 interface Draft {
@@ -38,7 +42,6 @@ interface Draft {
 export class VaultSyncTab {
     private draft: Draft;
     private testPassed = false;
-    private dbCheckResult: DbCheckResult | null = null;
     private pencils = new Map<keyof Draft, HTMLSpanElement>();
     private applyBtn: ButtonComponent | null = null;
     private applyDesc: HTMLElement | null = null;
@@ -54,7 +57,6 @@ export class VaultSyncTab {
     resetDraft(): void {
         this.draft = this.savedToDraft();
         this.testPassed = false;
-        this.dbCheckResult = null;
     }
 
     private savedToDraft(): Draft {
@@ -86,6 +88,13 @@ export class VaultSyncTab {
         const state = settings.connectionState;
         const { locked, initEnabled, cloneEnabled, syncToggleEnabled } =
             setupGating(state, settings.serverTested);
+        const relation = this.deps.vault.relation();
+        // No Init, Clone or Check runs: the binding refuses each of them, and
+        // every change of what they read, while one does.
+        const idle = this.deps.vault.changeBlocker() === null;
+        // A config Pull reloads Obsidian when it writes files, which would
+        // stop an Init or Clone half-way.
+        const reloadFree = this.deps.vault.reloadConflict() === null;
 
         this.pencils.clear();
         this.applyBtn = null;
@@ -95,7 +104,7 @@ export class VaultSyncTab {
         this.renderDeviceIdentity(el, locked);
 
         // ── Step 1: Encryption ─────────────────────────────────
-        this.renderEncryptionStep(el, locked);
+        this.renderEncryptionStep(el, relation, idle);
 
         // ── Step 2: Database ───────────────────────────────────
         el.createEl("h3", { text: "Step 2: Database" });
@@ -122,13 +131,12 @@ export class VaultSyncTab {
             .addButton((btn) =>
                 btn
                     .setButtonText("Check")
-                    .setDisabled(!dbEditable)
+                    .setDisabled(!dbEditable || !idle)
                     .onClick(async () => this.handleCheck(btn))
             );
 
-        if (this.dbCheckResult) {
-            this.renderCheckResult(el);
-        }
+        const draftCheck = this.deps.vault.dbCheckFor(this.draft.db);
+        if (draftCheck) this.renderCheckResult(el, draftCheck.result);
 
         const applySetting = new Setting(el)
             .setName("Apply")
@@ -151,20 +159,14 @@ export class VaultSyncTab {
         // ── Step 3: Setup ───────────────────────────────────────
         el.createEl("h3", { text: "Step 3: Setup" });
 
-        const setupDesc =
-            !settings.serverTested
-                ? "Complete CouchDB tab and Step 2 first."
-                : state === "editing"
-                    ? "Complete Step 2 first."
-                    : state === "tested"
-                        ? "Choose how to initialize this vault."
-                        : state === "settingUp"
-                            ? "Setup did not finish — re-run Init or Clone. Sync stays disabled until it completes."
-                            : state === "setupDone"
-                                ? "Setup complete. You can re-run if needed."
-                                : "Disable sync to re-run setup.";
-
-        el.createEl("p", { text: setupDesc, cls: "setting-item-description" });
+        const auth = this.deps.auth;
+        const view = vaultRelationView(relation, auth.isBlocked() ? auth.blockedError() : null);
+        const stateLine = el.createEl("p", {
+            text: view.text,
+            cls: view.tone === "error" ? "setting-item-description mod-warning" : "setting-item-description",
+        });
+        stateLine.style.color = view.tone === "ok" ? "var(--text-success)"
+            : view.tone === "error" ? "var(--text-error)" : "";
 
         new Setting(el)
             .setName("Init")
@@ -172,44 +174,29 @@ export class VaultSyncTab {
             .addButton((btn) =>
                 btn
                     .setButtonText("Init")
-                    .setDisabled(!initEnabled)
+                    .setDisabled(!initEnabled || !idle || !reloadFree)
                     .onClick(async () => {
                         btn.setButtonText("Pushing...");
                         btn.setDisabled(true);
-                        try {
-                            await this.deps.initVault();
-                            this.deps.refresh();
-                        } catch {
-                            this.deps.refresh();
-                        }
+                        // The binding reports and records a failure, and
+                        // announces each change, which redraws the tab.
+                        await this.deps.vault.init().catch(() => {});
                     })
             );
 
-        const dbHasData = this.dbCheckResult?.status === "exists"
-            && this.dbCheckResult.docCount > 0;
-        const cloneDisabledReason = cloneEnabled && !dbHasData
-            ? "Database is empty — use Init to push your vault."
-            : null;
-
         new Setting(el)
             .setName("Clone")
-            .setDesc(
-                cloneDisabledReason
-                    ?? "Pull remote database to local vault (2nd+ device)"
-            )
+            .setDesc(cloneDescription(relation.dbCheck))
             .addButton((btn) =>
                 btn
                     .setButtonText("Clone")
-                    .setDisabled(!cloneEnabled || !dbHasData)
+                    .setDisabled(!cloneEnabled || !idle || !reloadFree)
                     .onClick(async () => {
                         btn.setButtonText("Pulling...");
                         btn.setDisabled(true);
-                        try {
-                            await this.deps.cloneFromRemote();
-                            this.deps.refresh();
-                        } catch {
-                            this.deps.refresh();
-                        }
+                        // The binding reports and records a failure, and
+                        // announces each change, which redraws the tab.
+                        await this.deps.vault.clone().catch(() => {});
                     })
             );
 
@@ -228,21 +215,14 @@ export class VaultSyncTab {
             .addToggle((toggle) =>
                 toggle
                     .setValue(state === "syncing")
-                    .setDisabled(!syncToggleEnabled)
+                    .setDisabled(!syncToggleEnabled || !idle)
                     .onChange(async (value) => {
-                        if (value) {
-                            await this.deps.updateSettings({ connectionState: "syncing" });
-                            await this.deps.startSync();
-                        } else {
-                            this.deps.stopSync();
-                            await this.deps.updateSettings({ connectionState: "setupDone" });
-                        }
-                        this.deps.refresh();
+                        await this.changeSetup("Live Sync change", () => this.deps.vault.setLiveSync(value));
                     })
             );
 
         // ── Filters (vault file inclusion / exclusion) ──────────
-        this.renderFilters(el, settings);
+        this.renderFilters(el, settings, idle);
     }
 
     // ── Step 2 helpers ────────────────────────────────────────────
@@ -270,7 +250,6 @@ export class VaultSyncTab {
                 .onChange((value) => {
                     this.draft[field] = value;
                     this.testPassed = false;
-                    this.dbCheckResult = null;
                     this.updateDirtyState();
                 });
             text.setDisabled(disabled);
@@ -280,67 +259,44 @@ export class VaultSyncTab {
     private async handleCheck(btn: ButtonComponent): Promise<void> {
         btn.setButtonText("Checking...");
         btn.setDisabled(true);
-
-        const settings = this.deps.getSettings();
-        const result = await this.deps.remoteOps.checkDatabaseWith(
-            settings.couchdbUri,
-            settings.couchdbUser,
-            settings.couchdbPassword,
-            this.draft.db,
-        );
-
-        this.dbCheckResult = result;
-
-        if (result.status === "error") {
+        try {
+            const result = await this.deps.vault.checkDatabase(this.draft.db);
+            this.testPassed = result.status !== "error";
+        } catch {
+            // Refused (Init or Clone runs); the binding reported it.
             this.testPassed = false;
-            new Notice(`Database check failed: ${result.message}`, 8000);
-        } else {
-            this.testPassed = true;
-            this.deps.auth.clear();
-            if (result.status === "created") {
-                new Notice(`Database "${this.draft.db}" created.`, 3000);
-            } else {
-                new Notice(
-                    `Database "${this.draft.db}" found — ${result.docCount.toLocaleString()} docs.`,
-                    3000,
-                );
-            }
         }
         this.deps.refresh();
     }
 
-    private renderCheckResult(el: HTMLElement): void {
-        const r = this.dbCheckResult!;
-        if (r.status === "exists") {
-            const desc = r.docCount > 0
-                ? `Database found — ${r.docCount.toLocaleString()} docs.`
-                : "Database found — empty.";
-            const p = el.createEl("p", {
-                text: desc,
-                cls: "setting-item-description",
-            });
-            p.style.color = "var(--text-success)";
-        } else if (r.status === "created") {
-            const p = el.createEl("p", {
-                text: "Database created — empty. Use Init to push your vault.",
-                cls: "setting-item-description",
-            });
-            p.style.color = "var(--text-success)";
-        } else {
-            const p = el.createEl("p", {
-                text: `Error: ${r.message}`,
-                cls: "setting-item-description mod-warning",
-            });
-            p.style.color = "var(--text-error)";
-        }
+    private renderCheckResult(el: HTMLElement, r: DbCheckResult): void {
+        // An empty DB's next step (Init) is on Clone's description.
+        const text = r.status === "error"
+            ? `Error: ${describeError(r.error).text}`
+            : `Database ${describeDbFound(r)}`;
+        const p = el.createEl("p", {
+            text,
+            cls: r.status === "error" ? "setting-item-description mod-warning" : "setting-item-description",
+        });
+        p.style.color = r.status === "error" ? "var(--text-error)" : "var(--text-success)";
     }
 
     private async handleApply(): Promise<void> {
-        await this.deps.updateSettings({
-            couchdbDbName: this.draft.db,
-            connectionState: "tested",
+        await this.changeSetup("Database change", async () => {
+            await this.deps.vault.applyDatabase(this.draft.db);
+            this.testPassed = false;
         });
-        this.testPassed = false;
+    }
+
+    /** Run `label`, a change of the vault setup; a refusal (Init or Clone
+     *  runs) or a failure is reported under `label`. The tab is redrawn
+     *  either way, which puts back the saved value of a refused change. */
+    private async changeSetup(label: string, change: () => Promise<void>): Promise<void> {
+        try {
+            await change();
+        } catch (e) {
+            reportError(label, e);
+        }
         this.deps.refresh();
     }
 
@@ -362,6 +318,12 @@ export class VaultSyncTab {
         let inputValue = isLegacy ? "" : settings.deviceId;
         let validationMsg: HTMLElement | null = null;
 
+        // Init, Clone and Check of the vault, and every config op (Config
+        // Push writes under the name), refuse a rename while they run.
+        const blocker = (): string | null =>
+            this.deps.vault.changeBlocker() ?? this.deps.configChangeBlocker();
+        const disabled = locked || blocker() !== null;
+
         const setting = new Setting(el).setName("Device name");
 
         setting.addText((text) => {
@@ -375,37 +337,34 @@ export class VaultSyncTab {
                         validationMsg.style.display = error ? "block" : "none";
                     }
                 });
-            text.setDisabled(locked);
+            text.setDisabled(disabled);
         });
 
         setting.addButton((btn) =>
             btn
                 .setButtonText("Apply")
                 .setCta()
-                .setDisabled(locked)
+                .setDisabled(disabled)
                 .onClick(async () => {
                     const error = validateDeviceName(inputValue);
                     if (error) {
-                        new Notice(error);
+                        showNotice(error);
                         return;
                     }
                     if (inputValue === settings.deviceId) {
-                        new Notice("Device name unchanged.");
+                        showNotice("Device name unchanged.");
                         return;
                     }
-                    if (settings.deviceId) {
-                        const prev = [...(settings.previousDeviceIds ?? [])];
-                        if (!prev.includes(settings.deviceId)) {
-                            prev.push(settings.deviceId);
-                        }
-                        await this.deps.updateSettings({
-                            deviceId: inputValue,
-                            previousDeviceIds: prev.slice(-MAX_PREVIOUS_DEVICE_IDS),
-                        });
-                    } else {
-                        await this.deps.updateSettings({ deviceId: inputValue });
+                    try {
+                        const blocked = this.deps.configChangeBlocker();
+                        if (blocked) throw new BusyError(blocked);
+                        await this.deps.vault.setDeviceName(inputValue);
+                    } catch (e) {
+                        reportError("Device name change", e);
+                        this.deps.refresh();
+                        return;
                     }
-                    new Notice(`Device name set to "${inputValue}". Restart sync to apply.`);
+                    showNotice(`Device name set to "${inputValue}". Restart sync to apply.`);
                     this.deps.refresh();
                 }),
         );
@@ -436,7 +395,7 @@ export class VaultSyncTab {
 
     // ── Step 1: Encryption ────────────────────────────────────────
 
-    private renderEncryptionStep(el: HTMLElement, _locked: boolean): void {
+    private renderEncryptionStep(el: HTMLElement, relation: VaultRelation, idle: boolean): void {
         const settings = this.deps.getSettings();
         const state = settings.connectionState;
         const editable = state !== "syncing";
@@ -448,7 +407,7 @@ export class VaultSyncTab {
             cls: "setting-item-description",
         });
 
-        if (this.deps.encryptionMismatch) {
+        if (encryptionChangedElsewhere(relation)) {
             const warn = el.createEl("p", {
                 text: "Encryption state was changed by another device. " +
                     "Adjust settings here, then re-run Init or Clone in Step 3.",
@@ -469,13 +428,11 @@ export class VaultSyncTab {
             .addToggle((toggle) =>
                 toggle
                     .setValue(settings.encryptionEnabled)
-                    .setDisabled(!editable)
+                    .setDisabled(!editable || !idle)
                     .onChange(async (value) => {
-                        const patch: Partial<CouchSyncSettings> = { encryptionEnabled: value };
-                        if (!value) patch.encryptionPassphrase = "";
-                        if (state === "setupDone") patch.connectionState = "tested";
-                        await this.deps.updateSettings(patch);
-                        this.deps.refresh();
+                        await this.changeSetup("Encryption change", () => this.deps.vault.changeCodecSetting(
+                            value ? { encryptionEnabled: true } : { encryptionEnabled: false, encryptionPassphrase: "" },
+                        ));
                     })
             );
 
@@ -491,10 +448,17 @@ export class VaultSyncTab {
                     text.setPlaceholder("Enter passphrase")
                         .setValue(settings.encryptionPassphrase)
                         .onChange(async (value) => {
-                            await this.deps.updateSettings({ encryptionPassphrase: value });
+                            // A saved keystroke is not redrawn, so the field
+                            // keeps the focus; a refused one is.
+                            try {
+                                await this.deps.vault.setPassphrase(value);
+                            } catch (e) {
+                                reportError("Passphrase change", e);
+                                this.deps.refresh();
+                            }
                         });
                     text.inputEl.type = "password";
-                    text.setDisabled(!editable);
+                    text.setDisabled(!editable || !idle);
                 });
             addPasswordToggle(passphraseSetting);
         }
@@ -514,19 +478,19 @@ export class VaultSyncTab {
             .addToggle((toggle) =>
                 toggle
                     .setValue(settings.compressionEnabled)
-                    .setDisabled(!editable)
+                    .setDisabled(!editable || !idle)
                     .onChange(async (value) => {
-                        const patch: Partial<CouchSyncSettings> = { compressionEnabled: value };
-                        if (state === "setupDone") patch.connectionState = "tested";
-                        await this.deps.updateSettings(patch);
-                        this.deps.refresh();
+                        await this.changeSetup("Compression change", () => this.deps.vault.changeCodecSetting({ compressionEnabled: value }));
                     })
             );
     }
 
     // ── Filters ───────────────────────────────────────────────────
 
-    private renderFilters(el: HTMLElement, settings: CouchSyncSettings): void {
+    /** The Filters save on each keystroke through `VaultBinding.setFilters`,
+     *  which refuses a change while Init, Clone or Check runs; the fields
+     *  are disabled then. */
+    private renderFilters(el: HTMLElement, settings: CouchSyncSettings, idle: boolean): void {
         el.createEl("h3", { text: "Filters" });
         el.createEl("p", {
             text:
@@ -542,9 +506,8 @@ export class VaultSyncTab {
                 text
                     .setPlaceholder(".*\\.md$")
                     .setValue(settings.syncFilter)
-                    .onChange(async (value) => {
-                        await this.deps.updateSettings({ syncFilter: value });
-                    })
+                    .setDisabled(!idle)
+                    .onChange((value) => this.setFilters({ syncFilter: value }))
             );
 
         new Setting(el)
@@ -554,9 +517,8 @@ export class VaultSyncTab {
                 text
                     .setPlaceholder("node_modules|^\\.trash")
                     .setValue(settings.syncIgnore)
-                    .onChange(async (value) => {
-                        await this.deps.updateSettings({ syncIgnore: value });
-                    })
+                    .setDisabled(!idle)
+                    .onChange((value) => this.setFilters({ syncIgnore: value }))
             );
 
         new Setting(el)
@@ -565,15 +527,27 @@ export class VaultSyncTab {
             .addText((text) =>
                 text
                     .setValue(String(settings.maxFileSizeMB))
+                    .setDisabled(!idle)
                     .onChange(async (value) => {
                         const num = parseFloat(value);
                         if (!isNaN(num) && num >= 0) {
-                            await this.deps.updateSettings({ maxFileSizeMB: num });
+                            await this.setFilters({ maxFileSizeMB: num });
                         }
                     })
             );
 
         renderSkippedFiles(el, this.deps);
+    }
+
+    /** Save a Filters field; a refusal is reported and the redraw shows
+     *  the saved value. */
+    private async setFilters(patch: Parameters<VaultBinding["setFilters"]>[0]): Promise<void> {
+        try {
+            await this.deps.vault.setFilters(patch);
+        } catch (e) {
+            reportError("Filter change", e);
+            this.deps.refresh();
+        }
     }
 }
 

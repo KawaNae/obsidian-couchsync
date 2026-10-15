@@ -23,9 +23,8 @@
  *   4. re-encodes the envelope and forwards
  *
  * On pull it does the inverse: decode, if compressed bit set then
- * gunzip and clear the bit, re-encode. This keeps invariant 12
- * (universality of attachment envelope) intact at every decorator
- * boundary.
+ * gunzip and clear the bit, re-encode. This keeps every attachment
+ * envelope-formatted at every decorator boundary.
  *
  * Only attachment bodies are touched. Doc bodies (JSON) and other
  * methods (info, getDoc, bulkGet, bulkDocs, allDocs, changes,
@@ -86,7 +85,7 @@ export class CompressingCouchClient implements ICouchClient {
                     continue;
                 }
                 if (env.bits.encrypted) {
-                    // Compress must happen before encrypt (invariant 10).
+                    // Compress must happen before encrypt.
                     // If we ever see encrypt-without-compress here it means
                     // the stack is wired in the wrong order.
                     throw new Error(

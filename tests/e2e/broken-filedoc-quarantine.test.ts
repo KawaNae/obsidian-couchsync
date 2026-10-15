@@ -1,8 +1,9 @@
 /**
- * E2E (G2): a FileDoc whose chunks are unavailable on this device AND the
+ * E2E: a FileDoc whose chunks are unavailable on this device AND the
  * server (broken / missingReferenced) must be QUARANTINED by the reconciler —
- * not restore-looped (the field ping-pong), not opaque-crashed (G1). Recovers
- * automatically once the chunk reappears.
+ * not restored again and failing on every reconcile, and not crashed with an
+ * opaque TypeError from a content-less chunk. Recovers automatically once the
+ * chunk reappears.
  *
  * Drives the real Reconciler + real engine.ensureFileChunks against real
  * CouchDB (getAttachment actually returns null for the absent chunk), so this
@@ -50,7 +51,7 @@ describe("E2E: broken FileDoc → quarantine, then recover (real engine + CouchD
         expect(r1.quarantined).toContain("broken.md");
         expect(r1.restored).toEqual([]);
         expect(await b.vault.exists("broken.md")).toBe(false);
-        expect(await b.vs.wasQuarantined("broken.md")).toBe(true);
+        expect(await b.engine.pendingApply.has(fileId)).toBe(true);
 
         // 2. Re-reconcile: stays quarantined, no ping-pong, no throw.
         const r2 = await b.reconciler.reconcile("manual");
@@ -69,6 +70,6 @@ describe("E2E: broken FileDoc → quarantine, then recover (real engine + CouchD
             { label: "B recovers broken.md once the chunk arrives", timeoutMs: 9000 },
         );
         expect(b.vault.readText("broken.md")).toBe("real content that lives only on A for now");
-        expect(await b.vs.wasQuarantined("broken.md")).toBe(false);
+        expect(await b.engine.pendingApply.has(fileId)).toBe(false);
     });
 });

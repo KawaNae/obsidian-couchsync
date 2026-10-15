@@ -3,6 +3,7 @@ import { SyncSession } from "../src/db/sync/sync-session.ts";
 import { SyncEvents } from "../src/db/sync/sync-events.ts";
 import { Checkpoints } from "../src/db/sync/checkpoints.ts";
 import type { ICouchClient } from "../src/db/interfaces.ts";
+import { makePendingApply } from "./helpers/pending-apply.ts";
 
 function makeClient(overrides: Partial<ICouchClient> = {}): ICouchClient {
     return {
@@ -41,6 +42,7 @@ function makeSession(client = makeClient()) {
         client, localDb, events, checkpoints,
         getConflictResolver: () => undefined,
         ensureChunks: async () => {},
+        pendingApply: makePendingApply(localDb),
         handleLocalDbError: () => {},
         onTransientError: () => {},
     });

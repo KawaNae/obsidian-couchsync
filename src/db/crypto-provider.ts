@@ -11,8 +11,8 @@
  * The provider exposes *primitives only* — IV + ciphertext as separate
  * Uint8Array values. Envelope framing (the `[codec-byte][IV?][body]`
  * format that lands on the wire) lives in `envelope.ts`; this module
- * is unaware of it. That separation keeps invariant 13 (encrypted
- * string envelope versioning) enforced structurally: there is no way
+ * is unaware of it. That separation keeps every encrypted string
+ * envelope-versioned by construction: there is no way
  * to call the provider directly and produce a non-versioned string
  * envelope.
  */

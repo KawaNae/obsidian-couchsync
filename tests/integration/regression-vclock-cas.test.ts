@@ -2,7 +2,7 @@
  * Regression: fileToDb の CAS retry が機能し、同一 path への並行書き込みで
  * vclock が正しく単調増加する。
  *
- * 仕組み (vault-sync.ts:117 付近):
+ * 仕組み (VaultSync.fileToDb):
  *   - fileToDb は runWriteBuilder に渡す closure で `expectedVclock` を指定
  *   - 別の書き込みが先に commit されると CAS 判定で miss → snapshot 再読込して再試行
  *   - maxAttempts = CAS_MAX_ATTEMPTS (= 4) までリトライ

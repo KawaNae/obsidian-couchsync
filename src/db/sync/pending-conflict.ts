@@ -3,7 +3,7 @@
  * collided with an unpushed local edit and is awaiting the user's choice.
  *
  * This is the pull-side mirror of `pending-apply.ts` for the OTHER class of
- * "the cursor advanced but the work isn't finished" (Invariant B). When a
+ * "the cursor advanced but the work isn't finished". When a
  * pulled deletion races a local edit, `PullWriter.handlePulledDeletion` raises
  * an in-memory `concurrent` event for the conflict modal — but the modal is
  * ephemeral. The pull cursor (`META_REMOTE_SEQ`) advances past the deletion's
@@ -33,7 +33,7 @@ export type PendingConflictKind =
      *  Re-presented by rebuilding a tombstone as the remote side. */
     | "pull-delete-vs-edit"
     /** The mirror: the local copy is a soft-delete tombstone and the pulled
-     *  remote doc is a concurrent ALIVE edit (#7). Re-presented by re-fetching
+     *  remote doc is a concurrent ALIVE edit. Re-presented by re-fetching
      *  the remote edit, since the surviving local side is the tombstone. */
     | "local-delete-vs-remote-edit"
     /** Both sides are concurrent ALIVE edits. Persisted so the user can DEFER
@@ -41,7 +41,7 @@ export type PendingConflictKind =
      *  advances past the remote rev without accepting it, so re-presentation
      *  re-fetches the remote doc (`getRemoteDoc`) and re-validates it.
      *  Pre-defer this was not persisted because keep-local kept the remote rev
-     *  retrievable; defer broke that assumption (2026-06-02 incident). */
+     *  retrievable; defer broke that assumption. */
     | "edit-vs-edit";
 
 export interface PendingConflictEntry {

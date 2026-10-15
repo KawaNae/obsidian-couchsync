@@ -43,7 +43,7 @@ describe("EncryptingCouchClient push (bulkDocs)", () => {
         expect(back.encBody).toBeUndefined();
     });
 
-    it("encrypts FileDoc body into encBody bound to the _id (#2)", async () => {
+    it("encrypts FileDoc body into encBody bound to the _id", async () => {
         const { inner, enc } = makeClient();
         const file = { _id: "file:note.md", type: "file", chunks: ["chunk:x64:abc"], vclock: { d: 1 }, mtime: 1, ctime: 1, size: 5, schemaVersion: 2 };
         await enc.bulkDocs([file]);
@@ -266,7 +266,7 @@ describe("EncryptingCouchClient passthrough", () => {
     });
 });
 
-describe("EncryptingCouchClient v3 encBody (#2: authenticated, confidential body)", () => {
+describe("EncryptingCouchClient v3 encBody (authenticated, confidential body)", () => {
     const te = new TextEncoder();
 
     it("binds encBody to the _id via AAD — moving a body onto another doc fails authentication", async () => {
@@ -369,7 +369,7 @@ describe("EncryptingCouchClient v3 encBody (#2: authenticated, confidential body
         expect(back.chunks).toEqual(["chunk:x64:legacy"]);
     });
 
-    it("cipherVersion-3 floor: REFUSES a legacy encryptedPath doc (downgrade, #1)", async () => {
+    it("cipherVersion-3 floor: REFUSES a legacy encryptedPath doc (downgrade)", async () => {
         const inner = new FakeCouchClient();
         // A re-init'd v3 vault must reject the unauthenticated legacy body a
         // curious server replays after dropping encBody.
@@ -379,7 +379,7 @@ describe("EncryptingCouchClient v3 encBody (#2: authenticated, confidential body
         await expect(enc.getDoc<any>("file:legacy.md")).rejects.toBeInstanceOf(EncryptionError);
     });
 
-    it("cipherVersion-3 floor: REFUSES a plaintext-injected file doc (#3)", async () => {
+    it("cipherVersion-3 floor: REFUSES a plaintext-injected file doc", async () => {
         const inner = new FakeCouchClient();
         const enc = new EncryptingCouchClient(inner, crypto, 3);
         // Server forges a plaintext file doc (no encBody, no encryptedPath) at

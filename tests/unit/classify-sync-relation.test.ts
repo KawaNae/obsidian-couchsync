@@ -1,7 +1,6 @@
 /**
  * Matrix tests for `classifySyncRelation` — the single sync-state
- * classifier that PR3/PR4 wire up to all four legacy classification
- * sites.
+ * classifier that replaced the four separate classification sites.
  */
 
 import { describe, it, expect } from "vitest";
@@ -18,10 +17,8 @@ function input(partial: Partial<ClassifyInput>): ClassifyInput {
     return {
         leftVC: VC({}),
         leftChunks: C("a"),
-        leftSize: 10,
         rightVC: VC({}),
         rightChunks: C("a"),
-        rightSize: 10,
         ...partial,
     };
 }
@@ -46,8 +43,6 @@ describe("classifySyncRelation", () => {
                 rightVC: VC({ a: 5, b: 3 }),
                 leftChunks: C("c1", "c2"),
                 rightChunks: C("c1", "c2"),
-                leftSize: 100,
-                rightSize: 100,
             }))).toBe("identical");
         });
     });
@@ -76,15 +71,13 @@ describe("classifySyncRelation", () => {
         });
 
         it("Pixel7a-style initial-sync false-positive resolves to vclock-only-drift", () => {
-            // From project_false_positive_concurrent.md: device pushed under
+            // A re-imported device pushed under
             // its own deviceId but content identical to remote.
             expect(classifySyncRelation(input({
                 leftVC: VC({ "melchior-main": 72, "ipadpro11gen4-main": 11 }),
                 rightVC: VC({ "melchior-main": 72, "ipadpro11gen4-main": 11, "pixel7a-main": 1 }),
                 leftChunks: C("hash"),
                 rightChunks: C("hash"),
-                leftSize: 200,
-                rightSize: 200,
             }))).toBe("vclock-only-drift");
         });
     });
@@ -97,8 +90,6 @@ describe("classifySyncRelation", () => {
                 rightVC: VC({ b: 1 }),
                 leftChunks: C("L"),
                 rightChunks: C("R"),
-                leftSize: 5,
-                rightSize: 5,
             }))).toBe("true-divergent");
         });
 
@@ -112,24 +103,44 @@ describe("classifySyncRelation", () => {
                 leftVC: VC({ a: 1 }),
                 rightVC: VC({ a: 2 }),
                 leftChunks: C("local-edit"),  // user edited stale
-                leftSize: 11,
+                leftVCAttributed: true,
                 rightChunks: C("remote-edit"),
-                rightSize: 11,
                 lastSynced,
+            }))).toBe("true-divergent");
+        });
+
+        it("vault site: chunks differ + right dominates + no baseline → true-divergent", () => {
+            // A file made here before its first push, or come into the
+            // filters: content this device never synced.
+            expect(classifySyncRelation(input({
+                leftVC: VC({}),
+                rightVC: VC({ b: 1 }),
+                leftChunks: C("mine"),
+                rightChunks: C("theirs"),
+                leftVCAttributed: true,
+            }))).toBe("true-divergent");
+        });
+
+        it("vault site: right dominates + baseline matching the disk but deleted → true-divergent", () => {
+            expect(classifySyncRelation(input({
+                leftVC: VC({ a: 1 }),
+                rightVC: VC({ a: 2 }),
+                leftChunks: C(),
+                rightChunks: C("new"),
+                leftVCAttributed: true,
+                lastSynced: { vclock: VC({ a: 1 }), chunks: [], size: 0, deleted: true },
             }))).toBe("true-divergent");
         });
     });
 
     // ── remote-edit ───────────────────────────────────────
     describe("remote-edit", () => {
-        it("chunks differ + right dominates + no baseline → remote-edit", () => {
+        it("pull site: chunks differ + right dominates → remote-edit (no baseline consulted)", () => {
             expect(classifySyncRelation(input({
                 leftVC: VC({ a: 1 }),
                 rightVC: VC({ a: 2 }),
                 leftChunks: C("old"),
                 rightChunks: C("new"),
-                leftSize: 3,
-                rightSize: 3,
             }))).toBe("remote-edit");
         });
 
@@ -143,9 +154,8 @@ describe("classifySyncRelation", () => {
                 leftVC: VC({ a: 1 }),
                 rightVC: VC({ a: 2 }),
                 leftChunks: C("base"),
-                leftSize: 4,
+                leftVCAttributed: true,
                 rightChunks: C("new"),
-                rightSize: 3,
                 lastSynced,
             }))).toBe("remote-edit");
         });
@@ -162,8 +172,6 @@ describe("classifySyncRelation", () => {
                 rightVC: VC({ a: 1 }),
                 leftChunks: C("user-edit"),
                 rightChunks: C("old"),
-                leftSize: 9,
-                rightSize: 3,
                 leftVCAttributed: true,
             }))).toBe("local-edit");
         });
@@ -174,8 +182,6 @@ describe("classifySyncRelation", () => {
                 rightVC: VC({ a: 1 }),
                 leftChunks: C("user-edit"),
                 rightChunks: C("old"),
-                leftSize: 9,
-                rightSize: 3,
             }))).toBe("local-edit");
         });
 
@@ -193,8 +199,6 @@ describe("classifySyncRelation", () => {
                 rightVC: VC({ a: 1 }),
                 leftChunks: C("user-edit"),
                 rightChunks: C("old"),
-                leftSize: 9,
-                rightSize: 3,
                 lastSynced,
                 leftVCAttributed: true,
             }))).toBe("local-edit");
@@ -204,9 +208,10 @@ describe("classifySyncRelation", () => {
     // ── true-divergent (pull-site vclock tie) ──────────────
     // A PULL call site compares two REAL doc vclocks (leftVCAttributed falsy).
     // An equal vclock with differing content cannot come from a legit local
-    // edit (that bumps the clock) — it is the Config-Init stale-collision
+    // edit (that bumps the clock) — it is the config-Create stale-collision
     // anomaly (zombie {device:1} vs a freshly-reset {device:1}). It must be
-    // surfaced, not silently kept (the 2026-06-14 non-propagation bug).
+    // surfaced, not silently kept (silently keeping it left the config
+    // change unpropagated).
     describe("true-divergent (pull-site vclock tie)", () => {
         it("chunks differ + vclock equal + pull-site (not attributed) → true-divergent", () => {
             expect(classifySyncRelation(input({
@@ -214,8 +219,6 @@ describe("classifySyncRelation", () => {
                 rightVC: VC({ a: 1 }),
                 leftChunks: C("zombie"),
                 rightChunks: C("fresh-build"),
-                leftSize: 6,
-                rightSize: 11,
             }))).toBe("true-divergent");
         });
 
@@ -225,8 +228,6 @@ describe("classifySyncRelation", () => {
                 rightVC: VC({ a: 1 }),
                 leftChunks: C("same"),
                 rightChunks: C("same"),
-                leftSize: 4,
-                rightSize: 4,
             }))).toBe("identical");
         });
 
@@ -238,8 +239,6 @@ describe("classifySyncRelation", () => {
                 rightVC: VC({ a: 1 }),
                 leftChunks: C("local-newer"),
                 rightChunks: C("old"),
-                leftSize: 11,
-                rightSize: 3,
             }))).toBe("local-edit");
         });
 
@@ -253,8 +252,6 @@ describe("classifySyncRelation", () => {
                 rightVC: VC({ a: 1 }),
                 leftChunks: C("old-key-id"),
                 rightChunks: C("new-key-id"),
-                leftSize: 6,
-                rightSize: 6,
                 recreateAuthority: true,
             }))).toBe("remote-edit");
         });
@@ -267,33 +264,30 @@ describe("classifySyncRelation", () => {
                 rightVC: VC({ a: 1 }),
                 leftChunks: C("disk-edit"),
                 rightChunks: C("doc"),
-                leftSize: 9,
-                rightSize: 3,
                 leftVCAttributed: true,
                 recreateAuthority: true,
             }))).toBe("local-edit");
         });
     });
 
-    // ── legacy-skip ───────────────────────────────────────
-    describe("legacy-skip", () => {
-        it("right dominates + lastSynced.chunks undefined → legacy-skip", () => {
+    // ── baseline without a fingerprint ────────────────────
+    describe("baseline without a fingerprint", () => {
+        it("vault site: right dominates + lastSynced.chunks undefined → true-divergent", () => {
             const lastSynced: LastSynced = { vclock: VC({ a: 1 }) };
             expect(classifySyncRelation(input({
                 leftVC: VC({ a: 1 }),
                 rightVC: VC({ a: 2 }),
                 leftChunks: C("L"),
                 rightChunks: C("R"),
-                leftSize: 1,
-                rightSize: 1,
+                leftVCAttributed: true,
                 lastSynced,
-            }))).toBe("legacy-skip");
+            }))).toBe("true-divergent");
         });
 
-        it("right dominates + lastSynced.size undefined → legacy-skip", () => {
+        it("vault site: right dominates + lastSynced.size undefined → true-divergent", () => {
             const lastSynced: LastSynced = {
                 vclock: VC({ a: 1 }),
-                chunks: ["base"],
+                chunks: ["L"],
                 // size missing
             };
             expect(classifySyncRelation(input({
@@ -301,21 +295,21 @@ describe("classifySyncRelation", () => {
                 rightVC: VC({ a: 2 }),
                 leftChunks: C("L"),
                 rightChunks: C("R"),
-                leftSize: 1,
-                rightSize: 1,
+                leftVCAttributed: true,
                 lastSynced,
-            }))).toBe("legacy-skip");
+            }))).toBe("true-divergent");
         });
 
-        it("legacy lastSynced does NOT affect identical / vclock-only-drift / local-edit", () => {
+        it("does NOT affect identical / vclock-only-drift / local-edit", () => {
             const lastSynced: LastSynced = { vclock: VC({}) };
             // identical
-            expect(classifySyncRelation(input({ lastSynced }))).toBe("identical");
-            // vclock-only-drift
+            expect(classifySyncRelation(input({ lastSynced, leftVCAttributed: true }))).toBe("identical");
+            // vclock-only-drift: equal content only aligns the baseline
             expect(classifySyncRelation(input({
                 leftVC: VC({ a: 1 }),
-                rightVC: VC({ b: 1 }),
+                rightVC: VC({ a: 2 }),
                 lastSynced,
+                leftVCAttributed: true,
             }))).toBe("vclock-only-drift");
             // local-edit (vcRel "equal", no baseline check needed) — vault-disk
             // call site (attributed); pull-site equal+differ is true-divergent.
@@ -329,21 +323,22 @@ describe("classifySyncRelation", () => {
     });
 
     // ── Today's Home.md repro shape ───────────────────────
-    describe("regression: 2026-05-10 Home.md silent loss shape", () => {
-        // After a successful PR1 dbToFile, lastSynced.vclock and FileDoc.vclock
-        // both equal `{melchior:12, fake-desktop:1}`. With PR1, disk is also
-        // the new content. classifier returns identical. With PR1 broken
-        // (= the bug), disk is OLD; classifier sees:
+    describe("regression: Home.md silent loss shape", () => {
+        // After a successful dbToFile, lastSynced.vclock and FileDoc.vclock
+        // both equal `{melchior:12, fake-desktop:1}`. When dbToFile writes to
+        // disk, disk is also the new content and the classifier returns
+        // identical. When the disk write is skipped (= the bug), disk is OLD; classifier sees:
         // - leftVC = lastSynced.vclock = {melchior:12, fake-desktop:1}
         // - rightVC = fileDoc.vclock = same
         // - leftChunks = OLD (disk), rightChunks = NEW (fileDoc)
         // - lastSynced.chunks = NEW (lying baseline)
         //
         // classifier returns "local-edit" because vclock equal + chunks differ.
-        // This means PR3 will route to push (which is what was happening) —
-        // but PR1 prevents the lie in the first place. PR5 adds defense in
-        // depth by detecting this shape and recovering.
-        it("PR1-broken state classifies as local-edit (push will happen but PR1 prevents the disk-stale state)", () => {
+        // This means reconcile routes to push (which is what was happening) —
+        // but always writing pulled content to disk prevents the lie in the
+        // first place. Stale-bookkeeping recovery adds defense in depth by
+        // detecting this shape and recovering.
+        it("skipped-disk-write state classifies as local-edit (push will happen but the disk write prevents the disk-stale state)", () => {
             const baseVC = VC({ "melchior-main": 12, "fake-desktop": 1 });
             const lastSynced: LastSynced = {
                 vclock: { ...baseVC },
@@ -354,9 +349,7 @@ describe("classifySyncRelation", () => {
                 leftVC: { ...baseVC },
                 rightVC: { ...baseVC },
                 leftChunks: C("OLD-chunk"),
-                leftSize: 24,
                 rightChunks: C("NEW-chunk"),
-                rightSize: 77,
                 lastSynced,
                 // Vault-disk classify (compareFileToDoc): leftVC is the
                 // attributed lastSynced.vclock, so equal+differ = disk edit
@@ -365,48 +358,46 @@ describe("classifySyncRelation", () => {
             }))).toBe("local-edit");
         });
 
-        it("with PR1 working, post-pull state classifies as identical", () => {
+        it("with the disk write done, post-pull state classifies as identical", () => {
             const baseVC = VC({ "melchior-main": 12, "fake-desktop": 1 });
             const lastSynced: LastSynced = {
                 vclock: { ...baseVC },
                 chunks: ["NEW-chunk"],
                 size: 77,
             };
-            // PR1 invariant: disk == content, so leftChunks reflects NEW.
+            // Disk-write truth: disk == content, so leftChunks reflects NEW.
             expect(classifySyncRelation(input({
                 leftVC: { ...baseVC },
                 rightVC: { ...baseVC },
                 leftChunks: C("NEW-chunk"),
-                leftSize: 77,
                 rightChunks: C("NEW-chunk"),
-                rightSize: 77,
                 lastSynced,
             }))).toBe("identical");
         });
     });
 
-    // ── Invariant 7: the deleted axis ───────────────────────
+    // ── Deletion is an integration event: the deleted axis ──
     // A tombstone's fingerprint is NOT normalized (markDeleted retains the
     // deleted content's chunks), so the deleted flag — not the chunks —
     // carries the deleted state.
-    describe("deleted axis (Invariant 7)", () => {
+    describe("deleted axis", () => {
         // The wild tombstone shape: retains the chunks it deleted.
-        const tomb = { rightDeleted: true, rightChunks: C("a"), rightSize: 10 };
+        const tomb = { rightDeleted: true, rightChunks: C("a") };
 
         it("deleted×deleted with differing retained chunks → identical (not conflict)", () => {
             // Local markDeleted-tombstone (chunks retained) vs pulled
             // buildAcceptedTombstone (chunks []) — same deletion state.
             expect(classifySyncRelation(input({
-                leftDeleted: true, leftChunks: C("a"), leftSize: 10,
-                rightDeleted: true, rightChunks: C(), rightSize: 0,
+                leftDeleted: true, leftChunks: C("a"),
+                rightDeleted: true, rightChunks: C(),
                 leftVC: VC({ a: 2 }), rightVC: VC({ a: 2 }),
             }))).toBe("identical");
         });
 
         it("deleted×deleted with vclock drift → vclock-only-drift (concurrent deletions converge)", () => {
             expect(classifySyncRelation(input({
-                leftDeleted: true, leftChunks: C("a"), leftSize: 10,
-                rightDeleted: true, rightChunks: C(), rightSize: 0,
+                leftDeleted: true, leftChunks: C("a"),
+                rightDeleted: true, rightChunks: C(),
                 leftVC: VC({ a: 2 }), rightVC: VC({ b: 2 }),
             }))).toBe("vclock-only-drift");
         });
@@ -416,9 +407,9 @@ describe("classifySyncRelation", () => {
             // chunks: must fall through to vclock comparison, never
             // vclock-only-drift → silent-merge.
             expect(classifySyncRelation(input({
-                leftDeleted: true, leftChunks: C("a"), leftSize: 10,
+                leftDeleted: true, leftChunks: C("a"),
                 leftVC: VC({ a: 1 }),
-                rightChunks: C("a"), rightSize: 10,
+                rightChunks: C("a"),
                 rightVC: VC({ a: 1, b: 1 }),
             }))).toBe("remote-edit"); // legitimate resurrection (pull site, real vclocks)
         });
@@ -430,17 +421,17 @@ describe("classifySyncRelation", () => {
                 ...tomb,
                 leftVCAttributed: true,
                 leftVC: VC({ m: 2 }), rightVC: VC({ m: 2 }),
-                leftChunks: C("new"), leftSize: 20,
+                leftChunks: C("new"),
                 lastSynced: { vclock: VC({ m: 2 }), chunks: [], size: 0, deleted: true },
             }))).toBe("local-edit");
         });
 
-        it("W24 shape: file over tombstone, NO baseline → true-divergent (was remote-edit = wedged)", () => {
+        it("recreate shape: file over tombstone, NO baseline → true-divergent (was remote-edit = wedged)", () => {
             expect(classifySyncRelation(input({
                 ...tomb,
                 leftVCAttributed: true,
                 leftVC: VC({}), rightVC: VC({ m: 2 }),
-                leftChunks: C("new"), leftSize: 20,
+                leftChunks: C("new"),
             }))).toBe("true-divergent");
         });
 
@@ -449,7 +440,7 @@ describe("classifySyncRelation", () => {
                 ...tomb,
                 leftVCAttributed: true,
                 leftVC: VC({ m: 1 }), rightVC: VC({ m: 2 }),
-                leftChunks: C("new"), leftSize: 20,
+                leftChunks: C("new"),
                 lastSynced: { vclock: VC({ m: 1 }) }, // no chunks/size
             }))).toBe("true-divergent");
         });
@@ -460,7 +451,7 @@ describe("classifySyncRelation", () => {
                 leftVCAttributed: true,
                 rightVC: VC({ m: 2, i: 1 }),
                 leftVC: VC({ m: 2 }),
-                leftChunks: C("new"), leftSize: 20,
+                leftChunks: C("new"),
                 lastSynced: { vclock: VC({ m: 2 }), chunks: [], size: 0, deleted: true },
             }))).toBe("true-divergent");
         });
@@ -470,7 +461,7 @@ describe("classifySyncRelation", () => {
                 ...tomb,
                 leftVCAttributed: true,
                 leftVC: VC({ m: 1 }), rightVC: VC({ m: 2 }),
-                leftChunks: C("a"), leftSize: 10,
+                leftChunks: C("a"),
                 lastSynced: { vclock: VC({ m: 1 }), chunks: C("a"), size: 10 },
             }))).toBe("remote-edit");
         });
@@ -480,7 +471,7 @@ describe("classifySyncRelation", () => {
                 ...tomb,
                 leftVCAttributed: true,
                 leftVC: VC({ m: 1 }), rightVC: VC({ m: 2 }),
-                leftChunks: C("edited"), leftSize: 30,
+                leftChunks: C("edited"),
                 lastSynced: { vclock: VC({ m: 1 }), chunks: C("a"), size: 10 },
             }))).toBe("true-divergent");
         });
@@ -489,17 +480,17 @@ describe("classifySyncRelation", () => {
             // resolveOnPull compares two real doc vclocks; a dominating
             // tombstone is a legitimate deletion to take, baseline or not.
             expect(classifySyncRelation(input({
-                rightDeleted: true, rightChunks: C(), rightSize: 0,
+                rightDeleted: true, rightChunks: C(),
                 leftVC: VC({ a: 1 }), rightVC: VC({ a: 2 }),
-                leftChunks: C("c"), leftSize: 10,
+                leftChunks: C("c"),
             }))).toBe("remote-edit");
         });
 
         it("pull site: alive doc concurrent with tombstone → true-divergent (delete-vs-edit modal)", () => {
             expect(classifySyncRelation(input({
-                rightDeleted: true, rightChunks: C(), rightSize: 0,
+                rightDeleted: true, rightChunks: C(),
                 leftVC: VC({ a: 1 }), rightVC: VC({ b: 2 }),
-                leftChunks: C("c"), leftSize: 10,
+                leftChunks: C("c"),
             }))).toBe("true-divergent");
         });
 

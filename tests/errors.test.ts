@@ -18,6 +18,13 @@ describe("classifyError", () => {
         expect(classifyError(new Error("Catchup timed out")).kind).toBe("timeout");
     });
 
+    it("stalled streamed body → timeout (not unknown)", () => {
+        // CouchClient's per-chunk stale timer: status 0, no timeout keyword.
+        const err: any = new Error("CouchDB body stale (no data for 30000ms)");
+        err.status = 0;
+        expect(classifyError(err).kind).toBe("timeout");
+    });
+
     it("network patterns → network", () => {
         expect(classifyError({ message: "ECONNREFUSED" }).kind).toBe("network");
         expect(classifyError({ message: "Failed to fetch" }).kind).toBe("network");
@@ -25,7 +32,7 @@ describe("classifyError", () => {
     });
 
     it("iOS/Safari 'Load failed' → network (not unknown)", () => {
-        // Observed in 2026-04-22 mobile log: WebKit reports fetch failure
+        // Observed in a mobile log: WebKit reports fetch failure
         // as "Load failed" rather than "Failed to fetch". Must still be
         // classified as a network error so the retry path runs.
         expect(classifyError({ message: "Load failed" }).kind).toBe("network");
@@ -57,7 +64,7 @@ describe("classifyError", () => {
         expect(d.message).toMatch(/oops/);
     });
 
-    it("non-retriable EncryptionError → schema-mismatch (terminal, #enc-1)", () => {
+    it("non-retriable EncryptionError → schema-mismatch (terminal)", () => {
         // cipherVersion downgrade gate / encBody HMAC mismatch are policy
         // violations: retrying never succeeds, so they must halt like a
         // schema mismatch rather than enter the transient backoff loop.
@@ -67,7 +74,7 @@ describe("classifyError", () => {
         expect(d.message).toMatch(/floor/);
     });
 
-    it("retriable EncryptionError → unknown (stays transient, #enc-1)", () => {
+    it("retriable EncryptionError → unknown (stays transient)", () => {
         // A decrypt failure (key not yet distributed) is transient — it must
         // NOT map to the terminal kind.
         expect(classifyError(new EncryptionError("Failed to decrypt doc x")).kind).toBe("unknown");
@@ -75,7 +82,7 @@ describe("classifyError", () => {
         expect(classifyError(new EncryptionError("boom", new Error("cause"))).kind).toBe("unknown");
     });
 
-    it("AbortError → aborted (inconclusive, not network) (#6)", () => {
+    it("AbortError → aborted (inconclusive, not network)", () => {
         // An abort proves nothing about reachability — it fires both for our
         // own verify timeout AND a mobile suspend-frozen request. Must NOT be
         // mislabeled network/unknown; verifyReachable disambiguates via elapsed.
@@ -86,7 +93,7 @@ describe("classifyError", () => {
         expect(classifyError(e).kind).toBe("aborted");
     });
 
-    it("encryptionPaused marker → encryption-paused (terminal, #1c)", () => {
+    it("encryptionPaused marker → encryption-paused (terminal)", () => {
         const e = Object.assign(new Error("Sync paused — wrong passphrase"), { encryptionPaused: true });
         const d = classifyError(e);
         expect(d.kind).toBe("encryption-paused");

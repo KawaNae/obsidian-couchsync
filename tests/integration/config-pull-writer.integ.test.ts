@@ -2,11 +2,9 @@
  * ConfigPullWriter integration tests.
  *
  * Drives the writer against a real ConfigLocalDB + FakeCouchClient and
- * asserts: cursor advancement, idempotent re-pulls, deletion handling,
- * concurrent (vclock-incomparable) classification, and lastSynced
- * meta atomicity.
- *
- * Replaces the snapshot-style pullByPrefix path in the diff-sync plan.
+ * asserts: cursor advancement, idempotent re-pulls, the remote doc always
+ * replacing the local copy (no classification), chunk fetching, deletion
+ * handling, and that lastSynced (the disk's base) is left to the merge.
  */
 import "fake-indexeddb/auto";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
@@ -20,7 +18,6 @@ import {
     configLastSyncedKey,
 } from "../../src/db/sync/config-last-synced.ts";
 import { ConfigPullWriter } from "../../src/db/sync/config-pull-writer.ts";
-import { ConflictResolver } from "../../src/conflict/conflict-resolver.ts";
 import { FakeCouchClient } from "../helpers/fake-couch-client.ts";
 import { configPathFromId } from "../../src/types/doc-id.ts";
 import { makeConfigFixture, type ConfigFixture } from "../helpers/config-fixture.ts";
@@ -88,24 +85,28 @@ function makeWriter(
     remote: FakeCouchClient,
     cps: ConfigCheckpoints,
     last: ConfigLastSynced,
-    resolver: ConflictResolver,
 ): ConfigPullWriter {
     return new ConfigPullWriter({
         db,
         client: remote as any,
         checkpoints: cps,
         lastSynced: last,
-        getConflictResolver: () => resolver,
         signal: new AbortController().signal,
     });
 }
 
-describe("ConfigPullWriter — incremental pull", () => {
+async function putLocal(db: ConfigLocalDB, f: ConfigFixture): Promise<void> {
+    await db.runWriteTx({
+        docs: [{ doc: f.doc as unknown as CouchSyncDoc }],
+        chunks: f.chunks as unknown as CouchSyncDoc[],
+    });
+}
+
+describe("ConfigPullWriter — copy the server's docs", () => {
     let db: ConfigLocalDB;
     let remote: FakeCouchClient;
     let cps: ConfigCheckpoints;
     let last: ConfigLastSynced;
-    let resolver: ConflictResolver;
     let writer: ConfigPullWriter;
 
     beforeEach(async () => {
@@ -114,71 +115,42 @@ describe("ConfigPullWriter — incremental pull", () => {
         remote = new FakeCouchClient();
         cps = new ConfigCheckpoints(db);
         last = new ConfigLastSynced(db);
-        resolver = new ConflictResolver();
         await cps.load();
-        writer = makeWriter(db, remote, cps, last, resolver);
+        writer = makeWriter(db, remote, cps, last);
     });
 
     afterEach(async () => {
         await db.destroy();
     });
 
-    it("from since=0, takes all remote docs and advances cursor", async () => {
+    it("from since=0, takes all remote docs with their chunks and advances cursor", async () => {
         const a = await makeConfigDoc(".obsidian/app.json", `{"v":1}`, { "dev-A": 1 });
         const b = await makeConfigDoc(".obsidian/hotkeys.json", `{"k":1}`, { "dev-A": 1 });
         await seedRemote(remote, [a, b]);
 
-        const result = await writer.run();
+        const stats = await writer.run();
 
-        expect(result.stats.accepted).toBe(2);
-        expect(result.stats.concurrent).toBe(0);
+        expect(stats).toEqual({ received: 2, deleted: 0 });
         expect(await db.get(a.doc._id)).not.toBeNull();
         expect(await db.get(b.doc._id)).not.toBeNull();
-        // pullSeq has advanced past last_seq=2.
+        expect((await db.getChunks(a.doc.chunks)).length).toBe(a.doc.chunks.length);
         expect(Number(cps.getPullSeq())).toBeGreaterThanOrEqual(2);
     });
 
-    it("self-heals on seq regression: remote recreated below cursor (#config-codec)", async () => {
-        // A Config Init on another device destroys + recreates the remote DB,
-        // resetting its update-seq below our cursor. Without regression
-        // detection the pull fetches nothing forever; the writer must reset its
-        // cursor to 0 and re-pull the whole DB.
+    it("self-heals on seq regression: remote recreated below cursor", async () => {
+        // A Config Create on another device destroys + recreates the remote
+        // DB, resetting its update-seq below our cursor. Without regression
+        // detection the pull fetches nothing forever; the writer must reset
+        // its cursor to 0 and re-pull the whole DB.
         const a = await makeConfigDoc(".obsidian/app.json", `{"v":1}`, { "dev-A": 1 });
         await seedRemote(remote, [a]);
-        // Stale cursor far ahead of the recreated remote's seq.
         cps.setPullSeq(99999);
 
-        const result = await writer.run();
+        const stats = await writer.run();
 
-        // Regression detected → cursor reset to 0 → full re-pull succeeds.
-        expect(result.stats.accepted).toBe(1);
+        expect(stats.received).toBe(1);
         expect(await db.get(a.doc._id)).not.toBeNull();
         expect(Number(cps.getPullSeq())).toBeLessThan(99999);
-    });
-
-    it("recreate re-pull adopts vclock ties (take-remote), NO concurrent flood (E)", async () => {
-        // After an Init recreates the remote, a peer's stale local doc collides
-        // with the fresh remote at the same {dev-A:1}. Across the Init's key
-        // rotation the chunk ids differ even for identical content, so the tie
-        // must be ADOPTED from the fresh authority (take-remote) — NOT surfaced
-        // as concurrent (the 2026-06-14 false-positive flood) and NOT silently
-        // kept (the non-propagation bug). Drives the real didSeqReset path.
-        const localF = await makeConfigDoc(".obsidian/app.json", "stale-old", { "dev-A": 1 });
-        await db.runWriteTx({
-            docs: [{ doc: localF.doc as unknown as CouchSyncDoc }],
-            chunks: localF.chunks as unknown as CouchSyncDoc[],
-        });
-        const remoteF = await makeConfigDoc(".obsidian/app.json", "fresh-new", { "dev-A": 1 });
-        await seedRemote(remote, [remoteF]);
-        // Stale cursor → run() detects the recreate and re-pulls (didSeqReset).
-        cps.setPullSeq(99999);
-
-        const result = await writer.run();
-
-        expect(result.stats.concurrent).toBe(0);   // no flood
-        expect(result.stats.accepted).toBe(1);      // tie adopted from remote
-        const adopted = (await db.get(localF.doc._id)) as ConfigDoc;
-        expect(adopted.chunks).toEqual(remoteF.doc.chunks);
     });
 
     it("second run returns empty when remote is unchanged (cursor sticks)", async () => {
@@ -188,144 +160,69 @@ describe("ConfigPullWriter — incremental pull", () => {
         await writer.run();
         const seq1 = cps.getPullSeq();
 
-        const result2 = await writer.run();
-        expect(result2.stats.accepted).toBe(0);
-        expect(result2.stats.deleted).toBe(0);
+        const stats = await writer.run();
+        expect(stats).toEqual({ received: 0, deleted: 0 });
         expect(cps.getPullSeq()).toBe(seq1);
     });
 
-    it("converged-skip: identical local doc is detected via vclock equality", async () => {
-        // Pre-seed local DB with exact same doc as remote.
-        const f = await makeConfigDoc(".obsidian/a.json", "x", { "dev-A": 5 });
-        await db.runWriteTx({
-            docs: [{ doc: f.doc as unknown as CouchSyncDoc }],
-            chunks: f.chunks as unknown as CouchSyncDoc[],
-        });
+    it.each([
+        ["remote newer", { "dev-A": 1 }, { "dev-A": 2 }],
+        ["local newer", { "dev-A": 2 }, { "dev-A": 1 }],
+        ["concurrent", { "dev-A": 1 }, { "dev-B": 1 }],
+        ["same vclock, other content", { "dev-A": 1 }, { "dev-A": 1 }],
+    ] as const)("the remote doc replaces the local copy (%s)", async (_label, localVc, remoteVc) => {
+        const localF = await makeConfigDoc(".obsidian/h.json", "L", { ...localVc });
+        await putLocal(db, localF);
+        const remoteF = await makeConfigDoc(".obsidian/h.json", "R", { ...remoteVc });
+        await seedRemote(remote, [remoteF]);
+
+        await writer.run();
+
+        const stored = (await db.get(localF.doc._id)) as ConfigDoc;
+        expect(stored.vclock).toEqual(remoteVc);
+        expect(stored.chunks).toEqual(remoteF.doc.chunks);
+    });
+
+    it("leaves lastSynced alone: the disk has not taken the doc in yet", async () => {
+        const f = await makeConfigDoc(".obsidian/atomic.json", "atomic", { "dev-A": 1 });
         await seedRemote(remote, [f]);
 
-        const result = await writer.run();
+        await writer.run();
 
-        expect(result.stats.convergedSkip).toBe(1);
-        expect(result.stats.accepted).toBe(0);
+        expect(await db.get(f.doc._id)).not.toBeNull();
+        const persistedSeq = await db.getMeta<number | string>(META_CONFIG_PULL_SEQ);
+        expect(persistedSeq).toBe(cps.getPullSeq());
+        expect(last.get(configPathFromId(f.doc._id))).toBeUndefined();
+        expect(await db.getMetaByPrefix(configLastSyncedKey(""))).toEqual([]);
     });
 
-    it("equal vclock but DIFFERENT content (Init stale-collision) → concurrent, NOT converged-skip", async () => {
-        // 2026-06-14 on-device bug: after a Config Init resets all vclocks, a
-        // stale local doc (old content) collides with a freshly-pushed remote
-        // doc at the SAME {dev:1}. Content differs, so the truthful verdict is
-        // concurrent (surface) — the old code trusted the vclock proxy and
-        // silently kept the stale local, so the new build never propagated.
-        const localF = await makeConfigDoc(".obsidian/a.json", "zombie-old", { "dev-A": 1 });
-        await db.runWriteTx({
-            docs: [{ doc: localF.doc as unknown as CouchSyncDoc }],
-            chunks: localF.chunks as unknown as CouchSyncDoc[],
-        });
-        const remoteF = await makeConfigDoc(".obsidian/a.json", "fresh-build", { "dev-A": 1 });
-        await seedRemote(remote, [remoteF]);
-
-        const result = await writer.run();
-
-        expect(result.stats.convergedSkip).toBe(0);
-        expect(result.stats.concurrent).toBe(1);
-        expect(result.stats.accepted).toBe(0);
-    });
-
-    it("concurrent (vclock-incomparable) classifies as concurrent and skips accept", async () => {
-        // Local says {dev-A:1}, remote says {dev-B:1} → incomparable.
-        const localF = await makeConfigDoc(".obsidian/h.json", "L", { "dev-A": 1 });
-        await db.runWriteTx({
-            docs: [{ doc: localF.doc as unknown as CouchSyncDoc }],
-            chunks: localF.chunks as unknown as CouchSyncDoc[],
-        });
-        const remoteF = await makeConfigDoc(".obsidian/h.json", "R", { "dev-B": 1 });
-        await seedRemote(remote, [remoteF]);
-
-        const result = await writer.run();
-
-        expect(result.stats.concurrent).toBe(1);
-        expect(result.stats.accepted).toBe(0);
-        // Local doc unchanged (the concurrent one was filtered out of accepted).
-        const stillLocal = (await db.get(localF.doc._id)) as ConfigDoc;
-        expect(stillLocal.vclock).toEqual({ "dev-A": 1 });
-        // Cursor still advanced — concurrent must not block subsequent batches.
-        expect(Number(cps.getPullSeq())).toBeGreaterThanOrEqual(1);
-    });
-
-    it("PR-C: silent-merge when vclocks divergent but data identical (audit MEDIUM, Config side)", async () => {
-        // Pre-PR-C this verdict fell through the if-chain into accepted.push
-        // without merging vclocks → local-only causality info was lost.
-        // Post-PR-C the writer mergeVCs and increments vclockOnlyDrift.
-        const sharedBody = "shared content";
-        const localF = await makeConfigDoc(".obsidian/shared.json", sharedBody, { "dev-B": 1 });
-        await db.runWriteTx({
-            docs: [{ doc: localF.doc as unknown as CouchSyncDoc }],
-            chunks: localF.chunks as unknown as CouchSyncDoc[],
-        });
-        const remoteF = await makeConfigDoc(".obsidian/shared.json", sharedBody, { "dev-A": 5 });
-        await seedRemote(remote, [remoteF]);
-
-        const result = await writer.run();
-
-        expect(result.stats.vclockOnlyDrift).toBe(1);
-        expect(result.stats.concurrent).toBe(0);
-        expect(result.stats.accepted).toBe(1); // mergedDoc landed in accepted
-
-        // Committed doc must carry the merged vclock so future causality
-        // checks see both sides as integrated.
-        const committed = (await db.get(localF.doc._id)) as ConfigDoc;
-        expect(committed.vclock).toEqual({ "dev-A": 5, "dev-B": 1 });
-    });
-
-    it("keep-local: local dominates remote → skip without surfacing as concurrent", async () => {
-        const localF = await makeConfigDoc(".obsidian/k.json", "v2", { "dev-A": 2 });
-        await db.runWriteTx({
-            docs: [{ doc: localF.doc as unknown as CouchSyncDoc }],
-            chunks: localF.chunks as unknown as CouchSyncDoc[],
-        });
-        const remoteF = await makeConfigDoc(".obsidian/k.json", "v1", { "dev-A": 1 });
-        await seedRemote(remote, [remoteF]);
-
-        const result = await writer.run();
-
-        expect(result.stats.keepLocal).toBe(1);
-        expect(result.stats.concurrent).toBe(0);
-        expect(result.stats.accepted).toBe(0);
-    });
-
-    it("deletion: remote tombstone removes local doc and clears lastSynced", async () => {
+    it("deletion: remote tombstone removes local doc and its lastSynced", async () => {
         const f = await makeConfigDoc(".obsidian/d.json", "1", { "dev-A": 1 });
         await seedRemote(remote, [f]);
-        await writer.run(); // initial accept
-        expect(await db.get(f.doc._id)).not.toBeNull();
+        await writer.run();
         const path = configPathFromId(f.doc._id);
-        expect(last.get(path)).toBeDefined();
+        const base = { vclock: f.doc.vclock, size: f.doc.size, chunks: f.doc.chunks };
+        await db.runWriteTx({ meta: [{ op: "put", key: configLastSyncedKey(path), value: base }] });
+        last.set(path, base);
 
         await deleteRemote(remote, [f.doc._id]);
-        const result = await writer.run();
+        const stats = await writer.run();
 
-        expect(result.stats.deleted).toBe(1);
+        expect(stats.deleted).toBe(1);
         expect(await db.get(f.doc._id)).toBeNull();
         expect(last.get(path)).toBeUndefined();
         const metaRows = await db.getMetaByPrefix(configLastSyncedKey(""));
         expect(metaRows.find((r) => r.key.endsWith(`/${path}`))).toBeUndefined();
     });
 
-    it("commit atomicity: pullSeq + lastSynced + docs land together", async () => {
-        const f = await makeConfigDoc(".obsidian/atomic.json", "atomic", { "dev-A": 1 });
+    it("ensureChunks fetches the chunks a stored doc still lacks", async () => {
+        const f = await makeConfigDoc(".obsidian/late.json", "late", { "dev-A": 1 });
         await seedRemote(remote, [f]);
+        await db.runWriteTx({ docs: [{ doc: f.doc as unknown as CouchSyncDoc }] });
+        expect(await db.getChunks(f.doc.chunks)).toEqual([]);
 
-        await writer.run();
+        await writer.ensureChunks(f.doc);
 
-        // All three side-effects observable post-commit:
-        const stored = await db.get(f.doc._id);
-        expect(stored).not.toBeNull();
-        const persistedSeq = await db.getMeta<number | string>(META_CONFIG_PULL_SEQ);
-        expect(persistedSeq).toBe(cps.getPullSeq());
-        const path = configPathFromId(f.doc._id);
-        const cached = last.get(path);
-        expect(cached).toBeDefined();
-        expect(cached!.size).toBe(f.doc.size);
-        // chunks fingerprint must equal the fixture's chunk-id list.
-        expect(cached!.chunks).toEqual(f.doc.chunks);
+        expect((await db.getChunks(f.doc.chunks)).length).toBe(f.doc.chunks.length);
     });
 });
