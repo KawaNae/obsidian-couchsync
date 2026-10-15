@@ -11,7 +11,9 @@
  * replaced without being shown.
  *
  * Keep Local now writes nothing when the doc is not the one the dialog
- * showed, and the conflict is offered again with the current doc.
+ * showed, and the conflict is offered again with the current doc. Take
+ * Remote follows the same rule: it wrote the doc shown to the vault over
+ * the user's change, though the doc had moved on.
  */
 import "fake-indexeddb/auto";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
@@ -69,6 +71,7 @@ const enc = new TextEncoder();
 const OLD = Date.now() - 60_000;
 const KEEP_LOCAL: ConflictModalResult = { choice: "keep-local", dismissed: false };
 const DEFER: ConflictModalResult = { choice: "defer", dismissed: false };
+const TAKE_REMOTE: ConflictModalResult = { choice: "take-remote", dismissed: false };
 
 describe("regression: Keep Local on a vault conflict keeps only over the version shown", () => {
     let vault: FakeVaultIO;
@@ -93,7 +96,6 @@ describe("regression: Keep Local on a vault conflict keeps only over the version
                 events: { on: () => {}, emit: () => {} },
             } as any,
             historyCapture: { saveConflict: async () => {} } as any,
-            dbToFile: (doc, opts) => vs.dbToFile(doc, opts),
             getSettings: () => settings,
             vault,
             vaultSync: vs,
@@ -160,6 +162,23 @@ describe("regression: Keep Local on a vault conflict keeps only over the version
             vault.addFile(PATH, "user edit\n");
             const { moved } = pullWhileOpen(shown, "pulled v2\n");
             modal.conflictResponses.push(KEEP_LOCAL, DEFER);
+
+            await reconciler.reconcile("manual");
+
+            const now = await moved;
+            expect((await docOf()).vclock).toEqual(now.vclock);
+            expect(vs.getLastSynced(PATH)?.vclock).toEqual(synced.vclock);
+            expect(vault.readText(PATH)).toBe("user edit\n");
+            await vi.waitFor(() => expect(modal.conflictCalls).toHaveLength(2));
+            expect(shownText(1, "local")).toBe("user edit\n");
+            expect(shownText(1, "remote")).toBe("pulled v2\n");
+        });
+
+        it("Take Remote writes nothing and asks again when a pull moved the doc while the dialog was open", async () => {
+            const { synced, shown } = await pulledOverSynced();
+            vault.addFile(PATH, "user edit\n");
+            const { moved } = pullWhileOpen(shown, "pulled v2\n");
+            modal.conflictResponses.push(TAKE_REMOTE, DEFER);
 
             await reconciler.reconcile("manual");
 
@@ -250,6 +269,19 @@ describe("regression: Keep Local on a vault conflict keeps only over the version
             expect(vs.getLastSynced(PATH)).toBeUndefined();
             await vi.waitFor(() => expect(modal.conflictCalls).toHaveLength(2));
             expect(shownText(1, "local")).toBe("made again\n");
+        });
+
+        it("Take Remote writes nothing and asks again when a pull moved the doc while the dialog was open", async () => {
+            const shown = await recreatedOverTombstone();
+            const { moved } = pullWhileOpen(shown, null);
+            modal.conflictResponses.push(TAKE_REMOTE, DEFER);
+
+            await reconciler.reconcile("manual");
+
+            const now = await moved;
+            expect((await docOf()).vclock).toEqual(now.vclock);
+            expect(vault.readText(PATH)).toBe("made again\n");
+            await vi.waitFor(() => expect(modal.conflictCalls).toHaveLength(2));
         });
 
         it("keeps the file over the tombstone shown", async () => {

@@ -72,7 +72,8 @@ export interface DbToFileOptions {
 
 type DeclinedWrite = Extract<WriteResult, { applied: false }>;
 
-/** Result of `forceLocalEdit` / `forceMarkDeleted` / `keepLocalDoc`.
+/** Result of `forceLocalEdit` / `forceMarkDeleted` / `keepLocalDoc` /
+ *  `takeRemoteDoc` / `takeDocToVault`.
  *  `stale`: the LocalDB doc no longer has the expected vclock, nothing was
  *  written. `no-file`: the vault file to commit is gone, nothing was written. */
 export type ForceWriteOutcome = "written" | "stale" | "no-file";
@@ -87,6 +88,14 @@ function matchesExpected(existing: FileDoc | null, expected: VectorClock | undef
 
 /** A baseline (`lastSynced`) entry as the store writes it. */
 type BaselineRow = Extract<VclockUpdate, { op: "set" }>;
+
+/** What `commitOverShown` writes: the doc with its final vclock, the chunks
+ *  to store with it, and the baseline row to move in the same write. */
+interface ShownReplacement {
+    doc: FileDoc;
+    chunks?: CouchSyncDoc[];
+    baseline: BaselineRow | null;
+}
 
 /**
  * The version a Keep Local commits, before it has its vclock: the doc's
@@ -1252,21 +1261,68 @@ export class VaultSync {
     }
 
     /**
+     * Take the remote version of a pull conflict: the user chose it, where
+     * the dialog compared the local DB doc (its vclock `expectedVclock`) with
+     * the remote one. `taken` is the doc to commit, with its vclock. One
+     * write commits it over the doc shown, then it goes to the vault through
+     * `dbToFile`, as a pulled version would: a vault change not yet synced is
+     * left there, and the reconcile offers it as a conflict.
+     *
+     * Returns "stale" and writes nothing when the doc is no longer the one
+     * the dialog showed, as `keepLocalDoc` does: a newer version (a pull, or
+     * an edit pushed from the vault) must not be replaced by the remote
+     * version the user chose against an older one. A `taken` vclock derived
+     * from the doc shown is therefore derived from the doc it replaces.
+     */
+    async takeRemoteDoc(
+        path: string,
+        expectedVclock: VectorClock,
+        taken: FileDoc,
+    ): Promise<ForceWriteOutcome> {
+        const committed = await this.commitOverShown(
+            path, `takeRemoteDoc ${path}`, expectedVclock, () => ({ doc: taken, baseline: null }),
+        );
+        if (committed === "stale") return "stale";
+        const written = await this.dbToFile(committed.doc);
+        if (written.applied === false) {
+            logWarn(`takeRemoteDoc: took ${path} in the local DB; vault write skipped (${written.reason})`);
+        }
+        return "written";
+    }
+
+    /**
+     * Write the local DB doc of `path` to the vault over a change there not
+     * synced: the user chose the doc in a conflict the reconcile found, where
+     * the dialog compared the vault's version with the doc (its vclock
+     * `expectedVclock`). The counterpart of `forceLocalEdit` and
+     * `forceMarkDeleted`, which keep the vault's side.
+     *
+     * Returns "stale" and writes nothing when the doc is no longer the one
+     * the dialog showed: the newer doc has not been shown against the
+     * vault's change, so it must not replace that change unseen.
+     */
+    async takeDocToVault(path: string, expectedVclock: VectorClock): Promise<ForceWriteOutcome> {
+        const doc = await this.db.get<FileDoc>(makeFileId(path));
+        if (!matchesExpected(doc, expectedVclock)) {
+            logInfo(`takeDocToVault ${path}: the doc changed since the conflict was shown — nothing written`);
+            return "stale";
+        }
+        const written = await this.dbToFile(doc!, { overwriteVaultChange: true });
+        if (written.applied === false) {
+            logWarn(`takeDocToVault: vault write of ${path} skipped (${written.reason})`);
+        }
+        return "written";
+    }
+
+    /**
      * The commit every way of keeping this device's version shares: in one
      * write, the kept version gets a vclock that dominates the doc it
      * replaces and `notKeptVclock` (the version not kept, when the local DB
      * does not hold it), and, when `keep` says what the vault holds as
      * synced, the baseline takes that vclock.
      *
-     * `expectedVclock` is the vclock of the doc the user decided against or
-     * chose to keep. When given, nothing is written unless the doc exists
-     * with exactly that vclock, and "stale" is returned. The check runs on
-     * the same read as the commit, so a pull that lands in between fails
-     * the CAS, the builder runs again and the check sees it. When omitted,
-     * the commit builds on whatever doc is there.
-     *
-     * `keep` sees the doc as committed and returns the kept version. It may
-     * run more than once, for the same reason.
+     * `expectedVclock` and the retry are those of `commitOverShown`. `keep`
+     * sees the doc as committed and returns the kept version.
      */
     private async commitKeptVersion(
         path: string,
@@ -1275,8 +1331,39 @@ export class VaultSync {
         notKeptVclock: VectorClock,
         keep: (existing: FileDoc | null) => KeptVersion,
     ): Promise<{ doc: FileDoc; baselineRecorded: boolean } | "stale"> {
-        const fileId = makeFileId(path);
         const deviceId = this.getSettings().deviceId;
+        return this.commitOverShown(path, context, expectedVclock, (existing) => {
+            const version = keep(existing);
+            const vclock = incrementVC(mergeVC(notKeptVclock, existing?.vclock ?? {}), deviceId);
+            return {
+                doc: { ...version.doc, vclock } as FileDoc,
+                ...(version.chunks ? { chunks: version.chunks } : {}),
+                baseline: version.baseline?.(vclock) ?? null,
+            };
+        });
+    }
+
+    /**
+     * Commit the doc of `path` that a conflict decision produced, over the
+     * doc the decision was made against.
+     *
+     * `expectedVclock` is the vclock of the doc the user decided against or
+     * chose to keep. When given, nothing is written unless the doc exists
+     * with exactly that vclock, and "stale" is returned. The check runs on
+     * the same read as the commit, so a pull that lands in between fails
+     * the CAS, the builder runs again and the check sees it. When omitted,
+     * the commit builds on whatever doc is there.
+     *
+     * `build` sees the doc as committed and returns what to write. It may
+     * run more than once, for the same reason.
+     */
+    private async commitOverShown(
+        path: string,
+        context: string,
+        expectedVclock: VectorClock | undefined,
+        build: (existing: FileDoc | null) => ShownReplacement,
+    ): Promise<{ doc: FileDoc; baselineRecorded: boolean } | "stale"> {
+        const fileId = makeFileId(path);
         const outcome: { committed: { doc: FileDoc; baselineRecorded: boolean } | "stale" } = {
             committed: "stale",
         };
@@ -1286,13 +1373,10 @@ export class VaultSync {
                     outcome.committed = "stale";
                     const existing = (await snap.get(fileId)) as FileDoc | null;
                     if (!matchesExpected(existing, expectedVclock)) return null;
-                    const version = keep(existing);
-                    const vclock = incrementVC(mergeVC(notKeptVclock, existing?.vclock ?? {}), deviceId);
-                    const doc = { ...version.doc, vclock } as FileDoc;
-                    const row = version.baseline?.(vclock) ?? null;
+                    const { doc, chunks, baseline: row } = build(existing);
                     const result = { doc, baselineRecorded: row !== null };
                     return {
-                        ...(version.chunks ? { chunks: version.chunks } : {}),
+                        ...(chunks ? { chunks } : {}),
                         docs: [{
                             doc: doc as unknown as CouchSyncDoc,
                             expectedVclock: existing?.vclock ?? {},

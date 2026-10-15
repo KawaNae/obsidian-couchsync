@@ -53,6 +53,8 @@ export class FakeModalPresenter implements IModalPresenter {
 
     /** Dismiss callbacks for currently open conflict modals. */
     private openDismiss = new Map<string, () => void>();
+    /** Answer callbacks for conflict modals left open (no queued response). */
+    private openAnswer = new Map<string, (choice: ConflictChoice) => void>();
 
     showConflictModal(
         filePath: string,
@@ -68,10 +70,16 @@ export class FakeModalPresenter implements IModalPresenter {
         const response = this.conflictResponses.shift();
         const dismiss = () => {
             this.openDismiss.delete(filePath);
+            this.openAnswer.delete(filePath);
             resolveFn({ choice: "keep-local", dismissed: true });
         };
 
         this.openDismiss.set(filePath, dismiss);
+        this.openAnswer.set(filePath, (choice) => {
+            this.openDismiss.delete(filePath);
+            this.openAnswer.delete(filePath);
+            resolveFn({ choice, dismissed: false });
+        });
 
         if (response && !response.dismissed) {
             // Resolve async to mimic real modal timing.
@@ -117,6 +125,13 @@ export class FakeModalPresenter implements IModalPresenter {
     async showConfigCreateModal(confirm: ConfigCreateConfirm): Promise<boolean> {
         this.createCalls.push(confirm);
         return this.createResponder(confirm);
+    }
+
+    /** Answer the open conflict modal for the given path with a choice. */
+    answerConflict(filePath: string, choice: ConflictChoice): void {
+        const answer = this.openAnswer.get(filePath);
+        if (!answer) throw new Error(`no open conflict modal for ${filePath}`);
+        answer(choice);
     }
 
     /** Dismiss the open conflict modal for the given path (simulates auto-resolve). */

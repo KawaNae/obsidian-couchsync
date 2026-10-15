@@ -12,6 +12,7 @@ import {
 } from "../src/db/sync/pending-conflict.ts";
 import type { FileDoc, CouchSyncDoc, ChunkDoc } from "../src/types.ts";
 import type { DbToFileOptions } from "../src/sync/vault-sync.ts";
+import { incrementVC, mergeVC } from "../src/sync/vector-clock.ts";
 
 /**
  * Serve the docs' chunks from memory. The orchestrator reads both sides'
@@ -61,15 +62,45 @@ describe("ConflictOrchestrator", () => {
     let db: LocalDB;
     let modal: FakeModalPresenter;
     let settings: ReturnType<typeof makeSettings>;
+    /** The docs the stubbed VaultSync wrote to the vault (its dbToFile
+     *  calls), and the options of each write. */
     let dbToFileCalls: FileDoc[];
     let dbToFileOpts: Array<DbToFileOptions | undefined>;
     let saveConflictCalls: any[];
     /** What the stubbed VaultSync.keepLocalDoc answers, and its calls. */
     let keepLocalAnswer: "written" | "stale";
     let keepLocalCalls: Array<[string, Record<string, number>, Record<string, number>]>;
+    /** Runs when the stubbed keepLocalDoc answers "written", to play the
+     *  commit VaultSync makes. */
+    let onKeepLocalWritten: ((path: string, seen: Record<string, number>, remote: Record<string, number>) => Promise<void>) | null;
+    /** What the stubbed take-remote writes of VaultSync answer, and their
+     *  expected vclocks. "written" plays the write: takeRemoteDoc commits
+     *  the doc and both write it to the vault. */
+    let takeRemoteAnswer: "written" | "stale";
+    let takeRemoteExpected: Array<Record<string, number>>;
     const vaultSyncStub = () => ({
+        takeRemoteDoc: async (_path: string, seen: Record<string, number>, taken: FileDoc) => {
+            takeRemoteExpected.push(seen);
+            if (takeRemoteAnswer === "written") {
+                await db.runWriteTx({ docs: [{ doc: taken as unknown as CouchSyncDoc }] });
+                dbToFileCalls.push(taken);
+                dbToFileOpts.push(undefined);
+            }
+            return takeRemoteAnswer;
+        },
+        takeDocToVault: async (path: string, seen: Record<string, number>) => {
+            takeRemoteExpected.push(seen);
+            if (takeRemoteAnswer === "written") {
+                dbToFileCalls.push((await db.get(makeFileId(path))) as FileDoc);
+                dbToFileOpts.push({ overwriteVaultChange: true });
+            }
+            return takeRemoteAnswer;
+        },
         keepLocalDoc: async (path: string, seen: Record<string, number>, remote: Record<string, number>) => {
             keepLocalCalls.push([path, seen, remote]);
+            if (keepLocalAnswer === "written" && onKeepLocalWritten) {
+                await onKeepLocalWritten(path, seen, remote);
+            }
             return keepLocalAnswer;
         },
     });
@@ -120,6 +151,9 @@ describe("ConflictOrchestrator", () => {
         saveConflictCalls = [];
         keepLocalAnswer = "written";
         keepLocalCalls = [];
+        onKeepLocalWritten = null;
+        takeRemoteAnswer = "written";
+        takeRemoteExpected = [];
     });
 
     afterEach(async () => {
@@ -141,11 +175,6 @@ describe("ConflictOrchestrator", () => {
             localDb: db as any,
             replicator: replicator as any,
             historyCapture: historyCapture as any,
-            dbToFile: async (doc: FileDoc, opts?: DbToFileOptions) => {
-                dbToFileCalls.push(doc);
-                dbToFileOpts.push(opts);
-                return { applied: true };
-            },
             vault: { readBinary: async () => vaultBytes.slice().buffer } as any,
             vaultSync: vaultSyncStub() as any,
             requestReconcile: () => {},
@@ -202,6 +231,127 @@ describe("ConflictOrchestrator", () => {
 
         await replicator.fireConcurrent("a.md", localDoc, remoteDoc);
 
+        expect(saveConflictCalls).toHaveLength(0);
+        expect(await loadAllPendingConflict(db as any)).toHaveLength(1);
+        await vi.waitFor(() => expect(modal.conflictCalls).toHaveLength(2));
+        expect(modal.conflictCalls[1].content).toEqual({
+            kind: "text", localText: "local edited", remoteText: "remote text",
+        });
+    });
+
+    describe("a remote version that arrives while its conflict is open", () => {
+        /** Commit the kept local content with the remote clock merged in,
+         *  as VaultSync does for Keep Local. */
+        function keepLocalCommits(content: string): void {
+            onKeepLocalWritten = async (path, seen, remote) => {
+                await seedFileDoc(db, path, content, incrementVC(mergeVC(remote, seen), "dev-A"));
+            };
+        }
+
+        /** Open the modal for (local, remote), deliver `arriving` while it is
+         *  open, answer `choice`, and let the re-check run. */
+        async function resolveWithArrival(
+            replicator: ReturnType<typeof makeReplicator>,
+            localDoc: FileDoc,
+            remoteDoc: FileDoc,
+            arriving: FileDoc,
+            choice: "keep-local" | "take-remote",
+        ): Promise<void> {
+            const first = replicator.fireConcurrent("a.md", localDoc, remoteDoc);
+            await vi.waitFor(() => expect(modal.conflictCalls).toHaveLength(1));
+            await replicator.fireConcurrent("a.md", localDoc, arriving);
+            modal.answerConflict("a.md", choice);
+            await first;
+            await new Promise((r) => setTimeout(r, 20));
+        }
+
+        it("is not offered again after Keep Local took the same remote in", async () => {
+            const replicator = makeReplicator();
+            createOrchestrator(replicator);
+            const remoteDoc = await seedFileDoc(db, "a.md", "remote text", { "dev-B": 1 });
+            const localDoc = await seedFileDoc(db, "a.md", "local text", { "dev-A": 2 });
+            keepLocalCommits("local text");
+
+            await resolveWithArrival(replicator, localDoc, remoteDoc, remoteDoc, "keep-local");
+
+            expect(modal.conflictCalls).toHaveLength(1);
+            expect(keepLocalCalls).toHaveLength(1);
+            expect(dbToFileCalls).toHaveLength(0);
+            expect(((await db.get(makeFileId("a.md"))) as FileDoc).vclock)
+                .toEqual({ "dev-A": 3, "dev-B": 1 });
+        });
+
+        it("is not offered again after Take Remote adopted it", async () => {
+            const replicator = makeReplicator();
+            createOrchestrator(replicator);
+            const remoteDoc = await seedFileDoc(db, "a.md", "remote text", { "dev-B": 1 });
+            const localDoc = await seedFileDoc(db, "a.md", "local text", { "dev-A": 2 });
+
+            await resolveWithArrival(replicator, localDoc, remoteDoc, remoteDoc, "take-remote");
+
+            expect(modal.conflictCalls).toHaveLength(1);
+            expect(dbToFileCalls).toHaveLength(1);
+        });
+
+        it("is offered again when it is newer than what Keep Local took in", async () => {
+            const replicator = makeReplicator();
+            createOrchestrator(replicator);
+            const remoteDoc = await seedFileDoc(db, "a.md", "remote text", { "dev-B": 1 });
+            const newerRemote = await seedFileDoc(db, "a.md", "remote newer", { "dev-B": 2 });
+            const localDoc = await seedFileDoc(db, "a.md", "local text", { "dev-A": 2 });
+            keepLocalCommits("local text");
+
+            await resolveWithArrival(replicator, localDoc, remoteDoc, newerRemote, "keep-local");
+
+            await vi.waitFor(() => expect(modal.conflictCalls).toHaveLength(2));
+            expect(modal.conflictCalls[1].content).toEqual({
+                kind: "text", localText: "local text", remoteText: "remote newer",
+            });
+        });
+
+        it("is offered again when it is a remote deletion and the local edit was kept", async () => {
+            // A pulled hard-deletion arrives as a tombstone with an empty
+            // vclock, which says nothing about what the deleting device saw.
+            const replicator = makeReplicator();
+            createOrchestrator(replicator);
+            const remoteDoc = await seedFileDoc(db, "a.md", "remote text", { "dev-B": 1 });
+            const localDoc = await seedFileDoc(db, "a.md", "local text", { "dev-A": 2 });
+            keepLocalCommits("local text");
+            const deletion: FileDoc = {
+                _id: localDoc._id, type: "file", chunks: [], mtime: localDoc.mtime,
+                ctime: localDoc.ctime, size: 0, deleted: true, vclock: {},
+            };
+
+            await resolveWithArrival(replicator, localDoc, remoteDoc, deletion, "keep-local");
+
+            await vi.waitFor(() => expect(modal.conflictCalls).toHaveLength(2));
+        });
+    });
+
+    it("take-remote of a version replaced meanwhile keeps the record and asks again", async () => {
+        const replicator = makeReplicator();
+        createOrchestrator(replicator);
+
+        const localDoc = await seedFileDoc(db, "a.md", "local text", { "dev-A": 2 });
+        const remoteDoc = await seedFileDoc(db, "a.md", "remote text", { "dev-B": 1 });
+        // The local DB doc moved past what the modal showed.
+        await seedFileDoc(db, "a.md", "local edited", { "dev-A": 3 });
+        await db.runWriteTx({
+            meta: [{
+                op: "put",
+                key: pendingConflictKey(makeFileId("a.md")),
+                value: { addedAt: Date.now(), kind: "edit-vs-edit" },
+            }],
+        });
+        takeRemoteAnswer = "stale";
+        modal.conflictResponses.push(
+            { choice: "take-remote", dismissed: false },
+            { choice: "defer", dismissed: false },
+        );
+
+        await replicator.fireConcurrent("a.md", localDoc, remoteDoc);
+
+        expect(takeRemoteExpected[0]).toEqual({ "dev-A": 2 });
         expect(saveConflictCalls).toHaveLength(0);
         expect(await loadAllPendingConflict(db as any)).toHaveLength(1);
         await vi.waitFor(() => expect(modal.conflictCalls).toHaveLength(2));
@@ -398,7 +548,7 @@ describe("ConflictOrchestrator", () => {
         const orch = new ConflictOrchestrator({
             modal, localDb: db as any, replicator: replicator as any,
             historyCapture: historyCapture as any,
-            dbToFile: async (doc: FileDoc) => { dbToFileCalls.push(doc); return { applied: true }; },
+            vaultSync: vaultSyncStub() as any,
             getSettings: () => settings,
             batchDebounceMs: 0,
             batchThreshold: 3,
@@ -440,7 +590,7 @@ describe("ConflictOrchestrator", () => {
         const orch = new ConflictOrchestrator({
             modal, localDb: db as any, replicator: replicator as any,
             historyCapture: historyCapture as any,
-            dbToFile: async (doc: FileDoc) => { dbToFileCalls.push(doc); return { applied: true }; },
+            vaultSync: vaultSyncStub() as any,
             getSettings: () => settings,
             batchDebounceMs: 0,
             batchThreshold: 3,
@@ -479,7 +629,7 @@ describe("ConflictOrchestrator", () => {
         const orch = new ConflictOrchestrator({
             modal, localDb: db as any, replicator: replicator as any,
             historyCapture: { saveConflict: async (...a: any[]) => { saveConflictCalls.push(a); } } as any,
-            dbToFile: async (doc: FileDoc) => { dbToFileCalls.push(doc); return { applied: true }; },
+            vaultSync: vaultSyncStub() as any,
             getSettings: () => settings,
             vault: {} as any,
             vaultSync: vaultSyncStub() as any,
@@ -552,7 +702,7 @@ describe("ConflictOrchestrator", () => {
             const orch = new ConflictOrchestrator({
                 modal, localDb: db as any, replicator: replicator as any,
                 historyCapture: { saveConflict: async () => {} } as any,
-                dbToFile: async (doc: FileDoc) => { dbToFileCalls.push(doc); return { applied: true }; },
+                vaultSync: vaultSyncStub() as any,
                 getSettings: () => settings,
                 batchDebounceMs: 0,
                 batchThreshold: 2,

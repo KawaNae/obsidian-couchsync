@@ -95,7 +95,6 @@ describe("regression: Keep Local on a pull conflict keeps the baseline in step",
             localDb: db,
             replicator: replicator as any,
             historyCapture: { saveConflict: async () => {} } as any,
-            dbToFile: (doc, opts) => vs.dbToFile(doc, opts),
             getSettings: () => settings,
             vault,
             vaultSync: vs,
@@ -267,6 +266,58 @@ describe("regression: Keep Local on a pull conflict keeps the baseline in step",
         await vi.waitFor(() => expect(modal.conflictCalls).toHaveLength(2));
         const again = modal.conflictCalls[1].content;
         expect(again.kind === "text" && again.localText).toBe("edit while the dialog is open\n");
+    });
+
+    describe("Take Remote over a local version that moved after the dialog showed it", () => {
+        it("writes nothing when a newer pull landed, and does not ask again", async () => {
+            const L = await synced(PATH, "local v1\n");
+            const R = await remote(L, PATH);
+            // A pull of a version that includes both lands while the dialog is open.
+            const newer = await version(L, "remote v2\n", { ...L.vclock, "dev-A": 2 });
+            await db.runWriteTx({ docs: [{ doc: newer as unknown as CouchSyncDoc }] });
+            await vs.dbToFile(newer);
+            modal.conflictResponses.push({ choice: "take-remote", dismissed: false });
+
+            await replicator.fireConcurrent(PATH, L, R);
+
+            expect((await docOf(PATH)).vclock).toEqual(newer.vclock);
+            expect(vault.readText(PATH)).toBe("remote v2\n");
+            expect(vs.getLastSynced(PATH)?.vclock).toEqual(newer.vclock);
+            await new Promise((r) => setTimeout(r, 50));
+            expect(modal.conflictCalls).toHaveLength(1);
+        });
+
+        it("writes nothing when an edit was pushed, and asks again", async () => {
+            const L = await synced(PATH, "local v1\n");
+            const R = await remote(L, PATH);
+            vault.addFile(PATH, "edit while the dialog is open\n");
+            expect(await vs.fileToDb(PATH)).toBe(true);
+            const moved = await docOf(PATH);
+            modal.conflictResponses.push(
+                { choice: "take-remote", dismissed: false },
+                { choice: "defer", dismissed: false },
+            );
+
+            await replicator.fireConcurrent(PATH, L, R);
+
+            expect((await docOf(PATH)).vclock).toEqual(moved.vclock);
+            expect(vault.readText(PATH)).toBe("edit while the dialog is open\n");
+            await vi.waitFor(() => expect(modal.conflictCalls).toHaveLength(2));
+            const again = modal.conflictCalls[1].content;
+            expect(again.kind === "text" && again.localText).toBe("edit while the dialog is open\n");
+        });
+
+        it("takes the remote version over the doc shown", async () => {
+            const L = await synced(PATH, "local v1\n");
+            const R = await remote(L, PATH);
+            modal.conflictResponses.push({ choice: "take-remote", dismissed: false });
+
+            await replicator.fireConcurrent(PATH, L, R);
+
+            expect((await docOf(PATH)).vclock).toEqual(R.vclock);
+            expect(vault.readText(PATH)).toBe(`remote of ${PATH}\n`);
+            expect(vs.getLastSynced(PATH)?.vclock).toEqual(R.vclock);
+        });
     });
 
     it("keeps a local deletion deleted, and pushes the file made again later", async () => {

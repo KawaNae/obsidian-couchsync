@@ -1136,6 +1136,41 @@ describe("PullWriter integration", () => {
             expect(reEmits).toEqual([{ filePath: "notes/rev.md", remoteDeleted: false }]);
         });
 
+        it("drops the record on drain when the local tombstone already includes the remote edit", async () => {
+            h = createSyncHarness();
+            const b = h.addDevice("dev-B");
+
+            const tomb = seedLocalTombstone(b, "notes/kept.md", { "dev-B": 1 });
+            await b.db.runWriteTx({ docs: [{ doc: tomb as unknown as CouchSyncDoc }] });
+            const remoteAlive = makeRemoteFileDoc(
+                "notes/kept.md", { "dev-A": 1 }, { chunks: [makeChunkId("ffff6666ffff6666")], size: 5 },
+            );
+            const rig = attachPullWriter({ device: b, withResolver: true });
+            const applied = await rig.writer.apply(makeChangesResult(
+                [{ id: remoteAlive._id, seq: "5", doc: remoteAlive }], "5",
+            ));
+            await rig.checkpoints.saveEmptyPullBatch(
+                applied.nextRemoteSeq, applied.pendingConflictAdd,
+            );
+            expect(await loadAllPendingConflict(b.db)).toHaveLength(1);
+
+            // The deletion was kept over the remote edit: the tombstone's
+            // clock now includes it.
+            const kept = seedLocalTombstone(b, "notes/kept.md", { "dev-B": 2, "dev-A": 1 });
+            await b.db.runWriteTx({ docs: [{ doc: kept as unknown as CouchSyncDoc }] });
+
+            const rig2 = attachPullWriter({
+                device: b, withResolver: true,
+                getRemoteDoc: async (id) => (id === remoteAlive._id ? remoteAlive : null),
+            });
+            const reEmits: string[] = [];
+            rig2.events.on("concurrent", ({ filePath }) => reEmits.push(filePath));
+            await rig2.writer.drainPendingConflict();
+
+            expect(reEmits).toEqual([]);
+            expect(await loadAllPendingConflict(b.db)).toEqual([]);
+        });
+
         it("dominated: does NOT record a conflict (legitimate resurrection)", async () => {
             h = createSyncHarness();
             const b = h.addDevice("dev-B");

@@ -456,38 +456,16 @@ export class PullWriter {
             const localDoc = await this.deps.localDb.get<FileDoc>(id);
             const path = filePathFromId(id);
 
-            if (entry.kind === "local-delete-vs-remote-edit") {
-                // The mirror direction: the surviving local side is the
-                // tombstone, and the thing to re-present is the REMOTE alive
-                // edit, which is not in LocalDB. The conflict is moot if the
-                // local doc is no longer a tombstone (a newer local edit
-                // superseded the deletion) — do NOT treat `localDoc.deleted`
-                // as moot, that is the EXPECTED state here.
-                if (!localDoc || !isFileDoc(localDoc) || !localDoc.deleted) {
-                    await clearPendingConflict(this.deps.localDb, id);
-                    continue;
-                }
-                const remoteDoc = await this.deps.getRemoteDoc(id);
-                if (!remoteDoc || !isFileDoc(remoteDoc) || remoteDoc.deleted) {
-                    // Remote edit gone / itself deleted → the divergence
-                    // resolved without us; nothing to surface.
-                    await clearPendingConflict(this.deps.localDb, id);
-                    continue;
-                }
-                this.emittedConflicts.add(id);
-                logDebug(`  ⚡ ${path} (pending-conflict re-presented: local-deleted vs remote-edit)`);
-                this.deps.events.emit("concurrent", { filePath: path, localDoc, remoteDoc });
-                continue;
-            }
-
-            if (entry.kind === "edit-vs-edit") {
-                // Both sides were concurrent ALIVE edits. The remote rev was
-                // NOT accepted into LocalDB (defer/keep-local leaves it remote-
-                // only), so re-fetch it to re-present. Moot if the local side
-                // vanished/deleted, the remote went away, or the divergence has
-                // since resolved (no longer concurrent — let the normal pull
-                // path converge it and drop the durable record).
-                if (!localDoc || !isFileDoc(localDoc) || localDoc.deleted) {
+            if (entry.kind === "local-delete-vs-remote-edit" || entry.kind === "edit-vs-edit") {
+                // The remote side is an ALIVE edit that was NOT accepted into
+                // LocalDB (defer / keep-local leaves it remote-only), so
+                // re-fetch it to re-present. The local side is a tombstone
+                // for local-delete-vs-remote-edit and an alive edit for
+                // edit-vs-edit; the conflict is moot once it is not (a newer
+                // local edit superseded the deletion, or the local edit is
+                // gone), or once the remote went away / was itself deleted.
+                const localDeleted = entry.kind === "local-delete-vs-remote-edit";
+                if (!localDoc || !isFileDoc(localDoc) || (localDoc.deleted === true) !== localDeleted) {
                     await clearPendingConflict(this.deps.localDb, id);
                     continue;
                 }
@@ -496,6 +474,11 @@ export class PullWriter {
                     await clearPendingConflict(this.deps.localDb, id);
                     continue;
                 }
+                // Both docs carry real clocks, so the pull's own judgment
+                // applies: a local doc that already includes the remote is no
+                // conflict, and a remote newer than local reaches us again as
+                // a new revision through the normal pull. Only a conflict
+                // that still stands is re-presented.
                 const resolver = this.deps.getConflictResolver();
                 const verdict = resolver
                     ? await resolver.resolveOnPull(localDoc, remoteDoc)
@@ -506,7 +489,7 @@ export class PullWriter {
                 }
                 await this.deps.ensureChunks(remoteDoc);
                 this.emittedConflicts.add(id);
-                logDebug(`  ⚡ ${path} (pending-conflict re-presented: edit-vs-edit)`);
+                logDebug(`  ⚡ ${path} (pending-conflict re-presented: ${entry.kind})`);
                 this.deps.events.emit("concurrent", { filePath: path, localDoc, remoteDoc });
                 continue;
             }

@@ -6,6 +6,25 @@ All notable changes to obsidian-couchsync.
 
 ### Fixed
 
+- **Take Remote no longer replaces a version newer than the one shown.**
+  When this device's version changed while a conflict dialog was open (a
+  newer version was pulled, or an edit in the vault was synced), Take Remote
+  still wrote the remote version the dialog showed, over the newer one. In a
+  conflict found in the vault, it wrote the version the dialog showed over
+  the vault's change. Take Remote now writes nothing in that case, as Keep
+  Local does: the conflict is offered again with the current versions, or
+  not at all when the current version already includes the remote one. This
+  holds for Take all remote in the dialog for many conflicts too.
+- **A conflict is not offered again after it was resolved.** When the same
+  version of another device arrived again while the conflict dialog was
+  open, Keep Local was followed by the same conflict once more. Choosing
+  Keep Local again then left this device's clock ahead of a version it did
+  not send, and the other device's next change showed up as a false
+  conflict. A version that arrives while the dialog is open is now compared
+  with the version kept: it is offered only when it is still a conflict, as
+  a newer version from the other device is. A conflict kept for later
+  between a deletion here and an edit on another device is likewise
+  dropped once this device's version already includes that edit.
 - **A pull no longer writes over a change in the vault that has not been
   synced.** When a file had been edited or deleted in the vault since this
   device last synced it, a newer version pulled from another device replaced
