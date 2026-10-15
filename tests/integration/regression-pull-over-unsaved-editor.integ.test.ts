@@ -25,7 +25,7 @@ import { Checkpoints } from "../../src/db/sync/checkpoints.ts";
 import { ConflictResolver } from "../../src/conflict/conflict-resolver.ts";
 import { FakeVaultIO } from "../helpers/fake-vault-io.ts";
 import { FakeCompositionTracker } from "../helpers/fake-composition-tracker.ts";
-import { makeFakeApp, makeLeaf, type FakeLeaf } from "../helpers/fake-editor.ts";
+import { makeFakeApp, makeLeaf, reloadOnModify, type FakeLeaf } from "../helpers/fake-editor.ts";
 import { makeSettings } from "../helpers/settings-factory.ts";
 import { makePendingApply } from "../helpers/pending-apply.ts";
 import { makeFileId } from "../../src/types/doc-id.ts";
@@ -54,6 +54,7 @@ describe("regression: pull over an editor's unsaved input", () => {
         db = new LocalDB(uniqueDbName());
         db.open();
         leaves = [];
+        reloadOnModify(vault, leaves);
         gate = new CompositionGate(new FakeCompositionTracker());
         gate.start();
         const writer = new EditorAwareVaultWriter(makeFakeApp(leaves), vault, gate, null, null);
@@ -87,9 +88,14 @@ describe("regression: pull over an editor's unsaved input", () => {
 
     /** Open a pane on PATH holding `text`. */
     function openPane(text: string): FakeLeaf {
-        const leaf = makeLeaf(PATH, text);
+        const leaf = makeLeaf(PATH, text, vault.readText(PATH));
         leaves.push(leaf);
         return leaf;
+    }
+
+    /** Obsidian has reloaded the panes after a write. */
+    async function reloaded(): Promise<void> {
+        await new Promise((r) => setTimeout(r, 0));
     }
 
     /** The editor saves what its pane holds; the modify event runs fileToDb. */
@@ -168,6 +174,7 @@ describe("regression: pull over an editor's unsaved input", () => {
 
         pane.view.editor.cm.type("v0\n");
         await reconciler.reconcile("paused");
+        await reloaded();
 
         expect(pane.view.editor.cm.text()).toBe("remote 1\n");
         expect(vault.readText(PATH)).toBe("remote 1\n");
@@ -182,6 +189,7 @@ describe("regression: pull over an editor's unsaved input", () => {
         const pane = openPane("v0\n");
 
         await pull(v0, "remote 1\n", { ...v0.vclock, "dev-A": 1 });
+        await reloaded();
 
         expect(pullSkipped).toBe(0);
         expect(pane.view.editor.cm.text()).toBe("remote 1\n");

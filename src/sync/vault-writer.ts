@@ -9,10 +9,9 @@
  *   - `FilesystemVaultWriter`: delegates straight to IVaultIO. Used in
  *     tests and any code path that doesn't need editor awareness.
  *   - `EditorAwareVaultWriter` (in adapters/): inspects the open
- *     editors for the path, declines while one holds input not yet
- *     saved, dispatches CodeMirror transactions instead of triggering
- *     Obsidian's external-edit reload, and defers writes while the path
- *     is in IME composition.
+ *     notes for the path, declines while one holds input not yet saved,
+ *     defers writes while the path is in IME composition, and otherwise
+ *     writes the disk only, leaving Obsidian to reload the open notes.
  */
 
 import type { IVaultIO } from "../types/vault-io.ts";

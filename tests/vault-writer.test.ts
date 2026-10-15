@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from "vitest";
 import { FilesystemVaultWriter } from "../src/sync/vault-writer.ts";
 import { FakeVaultIO } from "./helpers/fake-vault-io.ts";
 
@@ -65,7 +65,7 @@ import { EditorAwareVaultWriter } from "../src/adapters/editor-aware-vault-write
 import { CompositionGate } from "../src/sync/composition-gate.ts";
 import { UNSAVED_EDITOR_CHANGE, UNSYNCED_VAULT_CHANGE } from "../src/sync/vault-writer.ts";
 import { FakeCompositionTracker } from "./helpers/fake-composition-tracker.ts";
-import { makeFakeApp, makeLeaf, type FakeLeaf } from "./helpers/fake-editor.ts";
+import { makeFakeApp, makeLeaf, reloadOnModify, type FakeLeaf } from "./helpers/fake-editor.ts";
 
 const bytes = (text: string) => new TextEncoder().encode(text).buffer;
 
@@ -73,7 +73,10 @@ describe("EditorAwareVaultWriter", () => {
     let io: FakeVaultIO;
     let tracker: FakeCompositionTracker;
     let gate: CompositionGate;
-    let writeIgnore: { ignoreDelete: ReturnType<typeof vi.fn>; ignoreNextModify: ReturnType<typeof vi.fn> };
+    let writeIgnore: {
+        ignoreDelete: Mock<(path: string) => void>;
+        ignoreModifyTo: Mock<(path: string, content: ArrayBuffer) => void>;
+    };
 
     beforeEach(() => {
         vi.useFakeTimers();
@@ -81,7 +84,7 @@ describe("EditorAwareVaultWriter", () => {
         tracker = new FakeCompositionTracker();
         gate = new CompositionGate(tracker, { timeoutMs: 30_000 });
         gate.start();
-        writeIgnore = { ignoreDelete: vi.fn(), ignoreNextModify: vi.fn() };
+        writeIgnore = { ignoreDelete: vi.fn(), ignoreModifyTo: vi.fn() };
     });
 
     afterEach(() => {
@@ -111,9 +114,23 @@ describe("EditorAwareVaultWriter", () => {
     it("writes the disk when no editor has the file open", async () => {
         io.addFile("a.md", "old");
         const writer = makeWriter([]);
-        expect(await writer.applyRemoteContent("a.md", bytes("new"))).toEqual({ applied: true });
+        const content = bytes("new");
+        expect(await writer.applyRemoteContent("a.md", content)).toEqual({ applied: true });
         expect(io.readText("a.md")).toBe("new");
-        expect(writeIgnore.ignoreNextModify).toHaveBeenCalledWith("a.md");
+        expect(writeIgnore.ignoreModifyTo).toHaveBeenCalledWith("a.md", content);
+    });
+
+    it("marks the written bytes before the modify event the write causes", async () => {
+        io.addFile("a.md", "old");
+        const writer = makeWriter([]);
+        const marked: number[] = [];
+        const write = io.writeBinary.bind(io);
+        io.writeBinary = async (p, d) => {
+            marked.push(writeIgnore.ignoreModifyTo.mock.calls.length);
+            await write(p, d);
+        };
+        await writer.applyRemoteContent("a.md", bytes("new"));
+        expect(marked).toEqual([1]);
     });
 
     it("captures history for writes", async () => {
@@ -126,50 +143,113 @@ describe("EditorAwareVaultWriter", () => {
 
     // ── Panes that hold what the disk holds ───────────────
 
-    it("replaces a pane that holds the disk's text, and writes the disk", async () => {
+    it("writes the disk and leaves the pane's text to Obsidian's reload", async () => {
         io.addFile("a.md", "old");
         const leaf = makeLeaf("a.md", "old");
         const writer = makeWriter([leaf]);
         expect(await writer.applyRemoteContent("a.md", bytes("new"))).toEqual({ applied: true });
-        expect(leaf.view.editor.cm.text()).toBe("new");
         expect(io.readText("a.md")).toBe("new");
-        expect(writeIgnore.ignoreNextModify).toHaveBeenCalledWith("a.md");
+        expect(leaf.view.editor.cm.dispatchSpy).not.toHaveBeenCalled();
+        expect(leaf.view.editor.cm.text()).toBe("old");
+        expect(leaf.view.dirty).toBe(false);
     });
 
-    it("replaces every pane on the path and writes the disk once", async () => {
+    it("writes the disk once for several panes on the path", async () => {
         io.addFile("file.md", "old");
         const a = makeLeaf("file.md", "old");
         const b = makeLeaf("file.md", "old");
         const other = makeLeaf("other.md", "x");
         const writer = makeWriter([a, b, other]);
-        await writer.applyRemoteContent("file.md", bytes("new"));
-        expect(a.view.editor.cm.text()).toBe("new");
-        expect(b.view.editor.cm.text()).toBe("new");
-        expect(other.view.editor.cm.dispatchSpy).not.toHaveBeenCalled();
-        expect(io.readText("file.md")).toBe("new");
-    });
-
-    it("replaces the panes before the disk write, so later input lands on the new text", async () => {
-        io.addFile("a.md", "old");
-        const leaf = makeLeaf("a.md", "old");
-        const writer = makeWriter([leaf]);
-        const textAtDiskWrite: string[] = [];
+        const writes: string[] = [];
         const write = io.writeBinary.bind(io);
-        io.writeBinary = async (p, d) => {
-            textAtDiskWrite.push(leaf.view.editor.cm.text());
-            await write(p, d);
-        };
-        await writer.applyRemoteContent("a.md", bytes("new"));
-        expect(textAtDiskWrite).toEqual(["new"]);
+        io.writeBinary = async (p, d) => { writes.push(p); await write(p, d); };
+        await writer.applyRemoteContent("file.md", bytes("new"));
+        expect(writes).toEqual(["file.md"]);
+        for (const leaf of [a, b, other]) {
+            expect(leaf.view.editor.cm.dispatchSpy).not.toHaveBeenCalled();
+        }
     });
 
     it("treats CRLF and a BOM on disk as the pane's LF text", async () => {
         io.addFile("a.md", "﻿line 1\r\nline 2\r\n");
         const leaf = makeLeaf("a.md", "line 1\nline 2\n");
         const writer = makeWriter([leaf]);
-        expect(await writer.applyRemoteContent("a.md", bytes("new\n"))).toEqual({ applied: true });
-        expect(leaf.view.editor.cm.text()).toBe("new\n");
-        expect(io.readText("a.md")).toBe("new\n");
+        expect(await writer.applyRemoteContent("a.md", bytes("new\r\n"))).toEqual({ applied: true });
+        expect(io.readText("a.md")).toBe("new\r\n");
+    });
+
+    it("compares what a pane in reading view shows, not its hidden editor", async () => {
+        // Obsidian reloads only the mode on screen; the hidden editor gets
+        // the text when the user switches back to it.
+        io.addFile("a.md", "v1");
+        const leaf = makeLeaf("a.md", "v1");
+        leaf.view.mode = "preview";
+        leaf.view.editor.cm.load("v0");
+        const writer = makeWriter([leaf]);
+        expect(await writer.applyRemoteContent("a.md", bytes("v2"))).toEqual({ applied: true });
+        expect(io.readText("a.md")).toBe("v2");
+    });
+
+    // ── Obsidian's reload ─────────────────────────────────
+
+    describe("with Obsidian reloading the open note", () => {
+        it("shows a version written to a CRLF note once, and keeps its CRLF", async () => {
+            const disk = "line 1\r\nline 2\r\nline 3\r\n";
+            io.addFile("a.md", disk);
+            const leaf = makeLeaf("a.md", "line 1\nline 2\nline 3\n", disk);
+            const leaves = [leaf];
+            reloadOnModify(io, leaves);
+            const writer = makeWriter(leaves);
+
+            expect(await writer.applyRemoteContent("a.md", bytes("line 1 DEV\r\nline 2\r\nline 3\r\n")))
+                .toEqual({ applied: true });
+            await vi.advanceTimersByTimeAsync(5000);
+
+            expect(leaf.view.editor.cm.text()).toBe("line 1 DEV\nline 2\nline 3\n");
+            expect(leaf.view.merges).toBe(0);
+            expect(leaf.view.dirty).toBe(false);
+            expect(io.readText("a.md")).toBe("line 1 DEV\r\nline 2\r\nline 3\r\n");
+        });
+
+        it("shows a version written to a note with a BOM and CRLF once, and keeps both", async () => {
+            const disk = "﻿line 1\r\nline 2\r\n";
+            io.addFile("a.md", disk);
+            const leaf = makeLeaf("a.md", "line 1\nline 2\n", "line 1\r\nline 2\r\n");
+            const leaves = [leaf];
+            reloadOnModify(io, leaves);
+            const writer = makeWriter(leaves);
+
+            const written = "﻿line 1 DEV\r\nline 2\r\n";
+            expect(await writer.applyRemoteContent("a.md", bytes(written))).toEqual({ applied: true });
+            await vi.advanceTimersByTimeAsync(5000);
+
+            expect(leaf.view.editor.cm.text()).toBe("line 1 DEV\nline 2\n");
+            expect(leaf.view.merges).toBe(0);
+            // readText drops the BOM, as Obsidian does: compare the bytes.
+            expect(new Uint8Array(io.files.get("a.md")!.data)).toEqual(new Uint8Array(bytes(written)));
+        });
+
+        it("keeps input typed between the check and the write: Obsidian merges and saves it", async () => {
+            io.addFile("a.md", "a\nb\n");
+            const leaf = makeLeaf("a.md", "a\nb\n");
+            const leaves = [leaf];
+            reloadOnModify(io, leaves);
+            const writer = makeWriter(leaves);
+            let typed = false;
+            const write = io.writeBinary.bind(io);
+            io.writeBinary = async (p, d) => {
+                if (!typed) { typed = true; leaf.view.editor.cm.type("a\nb\nmine\n"); }
+                await write(p, d);
+            };
+
+            expect(await writer.applyRemoteContent("a.md", bytes("A\nb\n"))).toEqual({ applied: true });
+            await vi.advanceTimersByTimeAsync(0);
+            expect(leaf.view.editor.cm.text()).toBe("A\nb\nmine\n");
+            expect(leaf.view.merges).toBe(1);
+
+            await vi.advanceTimersByTimeAsync(2000);
+            expect(io.readText("a.md")).toBe("A\nb\nmine\n");
+        });
     });
 
     // ── Unsaved input ─────────────────────────────────────
@@ -181,10 +261,10 @@ describe("EditorAwareVaultWriter", () => {
         expect(await writer.applyRemoteContent("a.md", bytes("new"))).toEqual({
             applied: false, reason: UNSAVED_EDITOR_CHANGE,
         });
-        expect(leaf.view.editor.cm.dispatchSpy).not.toHaveBeenCalled();
+        expect(leaf.view.editor.cm.text()).toBe("old plus typing");
         expect(io.readText("a.md")).toBe("old");
         // No echo suppression: the editor's coming save is the user's change.
-        expect(writeIgnore.ignoreNextModify).not.toHaveBeenCalled();
+        expect(writeIgnore.ignoreModifyTo).not.toHaveBeenCalled();
     });
 
     it("declines when any one of several panes holds unsaved input", async () => {
@@ -194,8 +274,7 @@ describe("EditorAwareVaultWriter", () => {
         const writer = makeWriter([clean, typing]);
         const result = await writer.applyRemoteContent("a.md", bytes("new"));
         expect(result).toEqual({ applied: false, reason: UNSAVED_EDITOR_CHANGE });
-        expect(clean.view.editor.cm.dispatchSpy).not.toHaveBeenCalled();
-        expect(typing.view.editor.cm.dispatchSpy).not.toHaveBeenCalled();
+        expect(io.readText("a.md")).toBe("old");
     });
 
     it("declines unsaved input on a file with CRLF line breaks", async () => {
@@ -226,13 +305,12 @@ describe("EditorAwareVaultWriter", () => {
         const promise = writer.applyRemoteContent("a.md", bytes("new"));
         await vi.advanceTimersByTimeAsync(0);
         expect(gate.pendingCount("a.md")).toBe(1);
-        expect(leaf.view.editor.cm.dispatchSpy).not.toHaveBeenCalled();
         expect(io.readText("a.md")).toBe("old");
 
         endComposition(leaf);
         expect(await promise).toEqual({ applied: true });
-        expect(leaf.view.editor.cm.text()).toBe("new");
         expect(io.readText("a.md")).toBe("new");
+        expect(leaf.view.editor.cm.dispatchSpy).not.toHaveBeenCalled();
     });
 
     it("declines at once when the composing pane already holds input", async () => {
@@ -260,7 +338,7 @@ describe("EditorAwareVaultWriter", () => {
         endComposition(leaf);
 
         expect(await promise).toEqual({ applied: false, reason: UNSAVED_EDITOR_CHANGE });
-        expect(leaf.view.editor.cm.dispatchSpy).not.toHaveBeenCalled();
+        expect(leaf.view.editor.cm.text()).toBe("old 日本");
         expect(io.readText("a.md")).toBe("old");
     });
 
@@ -333,6 +411,23 @@ describe("EditorAwareVaultWriter", () => {
         expect(leaf.detach).toHaveBeenCalled();
         expect(writeIgnore.ignoreDelete).toHaveBeenCalledWith("a.md");
         expect(await io.exists("a.md")).toBe(false);
+    });
+
+    it("detaches the panes before anything is awaited", async () => {
+        io.addFile("a.md", "x");
+        const leaf = makeLeaf("a.md", "x");
+        const writer = makeWriter([leaf]);
+        const detachedAtExists: boolean[] = [];
+        const exists = io.exists.bind(io);
+        let checked = false;
+        io.exists = async (p) => {
+            // The first call is the check; the next one starts the removal.
+            if (checked) detachedAtExists.push(leaf.detach.mock.calls.length > 0);
+            checked = true;
+            return exists(p);
+        };
+        await writer.applyRemoteDeletion("a.md");
+        expect(detachedAtExists).toEqual([true]);
     });
 
     it("keeps the file and its panes while a pane holds unsaved input", async () => {

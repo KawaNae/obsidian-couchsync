@@ -316,7 +316,7 @@ export async function createE2EHarness(opts: CreateE2EHarnessOpts = {}): Promise
         // VaultSync を SyncEngine より先に構築 (production と同じ順序)。
         const writer = new FilesystemVaultWriter(vault);
         const vs = new VaultSync(vault, db, getSettings, writer, hasher);
-        const ct = new ChangeTracker(vaultEvents, vs, getSettings);
+        const ct = new ChangeTracker(vaultEvents, vault, vs, getSettings);
         const remoteOps = new VaultRemoteOps(db, getSettings, auth, wrapVaultClient, hasher);
 
         // The live session's agreement check, as production wires it. A codec

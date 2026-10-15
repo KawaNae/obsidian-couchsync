@@ -147,13 +147,10 @@ export class HistoryCapture {
 
     /**
      * Capture a history entry for a sync-driven write. Called by
-     * VaultWriter immediately after dispatching the remote content
-     * (CM transaction or disk write). When `content` is provided the
-     * capture skips the disk read — used by the editor-aware writer
-     * because Obsidian's autosave hasn't yet written the new content
-     * to disk at the time of capture (~2 s gap between CM dispatch
-     * and autosave). Bypasses debounce/rate-limit and tags the entry
-     * with source="sync".
+     * VaultWriter right after it writes the remote content. When
+     * `content` is provided (the text just written) the capture skips the
+     * disk read. Bypasses debounce/rate-limit and tags the entry with
+     * source="sync".
      */
     async captureSyncWrite(path: string, content?: string): Promise<void> {
         if (!this.isTargetPath(path)) return;
