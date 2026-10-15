@@ -7,7 +7,7 @@
  * a cancellation or a rejection of the credentials) and the notice words
  * the error.
  */
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { describeError } from "../src/ui/describe-error.ts";
 import {
     VaultBinding, VaultEncryptionPausedError, vaultTarget, type VaultBindingHost, type AskVaultPassphrase,
@@ -19,7 +19,7 @@ import {
 } from "../src/db/vault-meta.ts";
 import { FakeCouchClient } from "./helpers/fake-couch-client.ts";
 import { makeSettings } from "./helpers/settings-factory.ts";
-import type { CouchSyncSettings } from "../src/settings.ts";
+import { MAX_PREVIOUS_DEVICE_IDS, type CouchSyncSettings } from "../src/settings.ts";
 import type { ICouchClient } from "../src/db/interfaces.ts";
 import type { DbCheckResult } from "../src/db/sync/vault-remote-ops.ts";
 import type { VaultSetupPlan } from "../src/sync/vault-setup-confirm.ts";
@@ -48,6 +48,8 @@ interface Rig {
     confirmed: VaultSetupPlan[];
     /** The answer to the confirm dialog. */
     confirmAnswer: boolean;
+    /** When set, the confirm dialog stays open until it settles. */
+    confirmGate: Promise<void> | null;
     /** Each host call that asks the user, in order. */
     prompts: ("passphrase" | "confirm")[];
 }
@@ -69,7 +71,7 @@ function rig(opts: {
         settings, remote, auth: new AuthGate(),
         stops: 0, starts: 0, saves: [], stateAtSetup: null, failures: [], dones: [], setupError: null, setupGate: null, onSetup: () => {},
         dbCheckResult: { status: "exists", docCount: 5 }, checkGate: null,
-        confirmed: [], confirmAnswer: true, prompts: [],
+        confirmed: [], confirmAnswer: true, confirmGate: null, prompts: [],
     };
     const result = { vaultFiles: 3, totalDocs: 7 };
     const host: VaultBindingHost = {
@@ -112,6 +114,7 @@ function rig(opts: {
         confirmSetup: async (plan) => {
             r.prompts.push("confirm");
             r.confirmed.push(plan);
+            await r.confirmGate;
             return r.confirmAnswer;
         },
     };
@@ -293,7 +296,7 @@ describe("VaultBinding.init", () => {
         const r = rig();
         r.confirmAnswer = false;
         await expect(r.binding.init()).rejects.toMatchObject({
-            name: "AbortError", message: "Init cancelled — nothing was changed.",
+            name: "AbortError", userMessage: "Nothing was changed.",
         });
         expect(r.stops).toBe(0);
         expect(r.saves).toEqual([]);
@@ -452,7 +455,7 @@ describe("VaultBinding.clone", () => {
         await encryptedRemote(r.remote, "pw");
         r.confirmAnswer = false;
         await expect(r.binding.clone()).rejects.toMatchObject({
-            name: "AbortError", message: "Clone cancelled — nothing was changed.",
+            name: "AbortError", userMessage: "Nothing was changed.",
         });
         expect(r.stops).toBe(0);
         expect(r.saves).toEqual([]);
@@ -464,6 +467,25 @@ describe("VaultBinding.clone", () => {
         expect(r.binding.relation().lastOp).toBeNull();
         // The vault decorator stack is the persisted one again.
         expect(r.binding.chunkHasher.alg).toBe("x64");
+    });
+
+    it("while its confirmation is open, the Filters and the device name it writes by cannot change", async () => {
+        const r = rig({ settings: { deviceId: "desk", syncFilter: "", syncIgnore: "", maxFileSizeMB: 50 } });
+        await pushVaultMeta(r.remote, (await buildInitialVaultMeta({ encryption: false, compression: false })).meta);
+        let answer!: () => void;
+        r.confirmGate = new Promise<void>((res) => { answer = res; });
+        const cloning = r.binding.clone();
+        await vi.waitFor(() => expect(r.prompts).toEqual(["confirm"]));
+        const refused = { name: "BusyError", message: "Clone is running — wait for it to finish." };
+        await expect(r.binding.setFilters({ syncFilter: "\\.md$" })).rejects.toMatchObject(refused);
+        await expect(r.binding.setFilters({ syncIgnore: "x" })).rejects.toMatchObject(refused);
+        await expect(r.binding.setFilters({ maxFileSizeMB: 1 })).rejects.toMatchObject(refused);
+        await expect(r.binding.setDeviceName("phone")).rejects.toMatchObject(refused);
+        expect(r.settings).toMatchObject({ deviceId: "desk", syncFilter: "", syncIgnore: "", maxFileSizeMB: 50 });
+        answer();
+        await cloning;
+        await r.binding.setFilters({ syncFilter: "\\.md$" });
+        expect(r.settings.syncFilter).toBe("\\.md$");
     });
 
     it("an outcome about another vault DB is not shown", async () => {
@@ -785,6 +807,8 @@ describe("VaultBinding: the one writer of the setup state", () => {
         await expect(r.binding.changeCodecSetting({ compressionEnabled: false })).rejects.toMatchObject(refused);
         await expect(r.binding.applyServer({ couchdbUser: "x" }, true)).rejects.toMatchObject(refused);
         await expect(r.binding.setPassphrase("x")).rejects.toMatchObject(refused);
+        await expect(r.binding.setFilters({ syncFilter: "x" })).rejects.toMatchObject(refused);
+        await expect(r.binding.setDeviceName("other")).rejects.toMatchObject(refused);
         await expect(r.binding.checkDatabase("vault")).rejects.toMatchObject(refused);
         expect(r.settings.couchdbDbName).toBe("vault");
         release();
@@ -844,6 +868,8 @@ describe("VaultBinding — Step 2's Check takes the setup lock", () => {
         await expect(r.binding.checkDatabase("vault")).rejects.toMatchObject(refused);
         await expect(r.binding.setPassphrase("x")).rejects.toMatchObject(refused);
         await expect(r.binding.changeCodecSetting({ compressionEnabled: false })).rejects.toMatchObject(refused);
+        await expect(r.binding.setFilters({ maxFileSizeMB: 1 })).rejects.toMatchObject(refused);
+        await expect(r.binding.setDeviceName("other")).rejects.toMatchObject(refused);
         expect(r.stateAtSetup).toBeNull();
         expect(r.binding.relation().lastOp).toBeNull();
         release();
@@ -864,6 +890,26 @@ describe("VaultBinding — Step 2's Check takes the setup lock", () => {
         expect(r.auth.isBlocked()).toBe(true);
         release();
         await running;
+    });
+});
+
+describe("VaultBinding.setDeviceName", () => {
+    it("keeps the name it replaces as this device's, once and within the cap", async () => {
+        const r = rig({ settings: { deviceId: "desk", previousDeviceIds: ["old"] } });
+        await r.binding.setDeviceName("laptop");
+        expect(r.settings).toMatchObject({ deviceId: "laptop", previousDeviceIds: ["old", "desk"] });
+        await r.binding.setDeviceName("desk");
+        expect(r.settings).toMatchObject({ deviceId: "desk", previousDeviceIds: ["old", "desk", "laptop"] });
+        r.settings.previousDeviceIds = Array.from({ length: MAX_PREVIOUS_DEVICE_IDS }, (_, i) => `d${i}`);
+        await r.binding.setDeviceName("next");
+        expect(r.settings.previousDeviceIds).toHaveLength(MAX_PREVIOUS_DEVICE_IDS);
+        expect(r.settings.previousDeviceIds[MAX_PREVIOUS_DEVICE_IDS - 1]).toBe("desk");
+    });
+
+    it("a first name keeps no previous one", async () => {
+        const r = rig({ settings: { deviceId: "", previousDeviceIds: [] } });
+        await r.binding.setDeviceName("desk");
+        expect(r.settings).toMatchObject({ deviceId: "desk", previousDeviceIds: [] });
     });
 });
 

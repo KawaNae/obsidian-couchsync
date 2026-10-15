@@ -190,7 +190,7 @@ describe("ConfigSync — failures are surfaced, never swallowed", () => {
             // Not a failure: a warning, never an error.
             expect(errorLogs()).toEqual([]);
             expect(warnLogs()).toEqual([
-                expect.stringMatching(/^Config Push not started — Another config operation is already in progress/),
+                "Config Push not started — Config Pull is running — wait for it to finish.",
             ]);
             // The rejected op must not have released the running op's lock.
             expect(cs.isInflight()).toBe(true);

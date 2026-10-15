@@ -11,15 +11,10 @@ import { ProgressNotice, noticeText, reportError } from "../src/ui/notices.ts";
 import { clearLog, getLogEntries, initLog } from "../src/ui/log.ts";
 import { configNotReady } from "../src/sync/config-errors.ts";
 import { SchemaVersionMismatchError } from "../src/db/sync/schema-gate.ts";
-import { BusyError } from "../src/ui/describe-error.ts";
+import { BusyError, cancellation } from "../src/ui/describe-error.ts";
 import { AuthGate } from "../src/db/sync/auth-gate.ts";
 
-function abort(userMessage?: string): Error {
-    const e: any = new Error("The operation was aborted.");
-    e.name = "AbortError";
-    if (userMessage) e.userMessage = userMessage;
-    return e;
-}
+const abort = cancellation;
 
 describe("ProgressNotice", () => {
     let shown: string[];
@@ -64,11 +59,11 @@ describe("ProgressNotice", () => {
     });
 
     it("a cancellation is a warning, not an error notice", () => {
-        new ProgressNotice("Config Join").fail(abort("nothing was changed."));
+        new ProgressNotice("Config Join").fail(abort("Nothing was changed."));
         const entries = getLogEntries();
         expect(entries.filter((e) => e.level === "error")).toEqual([]);
         expect(entries.find((e) => e.level === "warn")?.message)
-            .toBe("Config Join cancelled — nothing was changed.");
+            .toBe("Config Join cancelled — Nothing was changed.");
         expect(shown).toEqual([]);
     });
 

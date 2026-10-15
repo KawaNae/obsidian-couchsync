@@ -7,7 +7,7 @@
  * `userMessage` wins over classification; a cancellation is not a failure.
  */
 import { describe, it, expect } from "vitest";
-import { BusyError, describeError, UserFacingError } from "../src/ui/describe-error.ts";
+import { BusyError, cancellation, describeError, UserFacingError } from "../src/ui/describe-error.ts";
 import { configNotReady, type ConfigNotReadyKind } from "../src/sync/config-errors.ts";
 import { AuthGate } from "../src/db/sync/auth-gate.ts";
 import { SchemaVersionMismatchError } from "../src/db/sync/schema-gate.ts";
@@ -18,12 +18,7 @@ function httpError(status: number, message: string): Error {
     return e;
 }
 
-function abort(userMessage?: string): Error {
-    const e: any = new Error("The operation was aborted.");
-    e.name = "AbortError";
-    if (userMessage) e.userMessage = userMessage;
-    return e;
-}
+const abort = cancellation;
 
 describe("describeError — classified transport failures", () => {
     it.each([
@@ -93,8 +88,8 @@ describe("describeError — cancellation", () => {
     });
 
     it("keeps what the cancel left behind", () => {
-        expect(describeError(abort("nothing was changed."))).toEqual({
-            text: "nothing was changed.", outcome: "cancelled",
+        expect(describeError(abort("Nothing was changed."))).toEqual({
+            text: "Nothing was changed.", outcome: "cancelled",
         });
     });
 });

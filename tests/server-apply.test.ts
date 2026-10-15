@@ -22,7 +22,7 @@ function configSwitch(refuse: string | null): ConfigServerSwitch & { switched: s
 
 describe("applyServerSettings", () => {
     it("a switch refused because a config op runs saves nothing", async () => {
-        const cfg = configSwitch("A config operation is running — Apply is available when it finishes.");
+        const cfg = configSwitch("Config Push is running — wait for it to finish.");
         let saves = 0;
         const result = await applyServerSettings({
             configBinding: cfg, oldUri: "a", newUri: "b", save: async () => { saves++; },

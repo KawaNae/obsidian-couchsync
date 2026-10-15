@@ -36,7 +36,7 @@
  * runner, the live-sync switch, the progress notice, the passphrase
  * prompt and the confirm dialog.
  */
-import type { CouchSyncSettings, ConnectionState, VaultPauseRecord } from "../settings.ts";
+import { MAX_PREVIOUS_DEVICE_IDS, type CouchSyncSettings, type ConnectionState, type VaultPauseRecord } from "../settings.ts";
 import type { DbInfo, ICouchClient } from "../db/interfaces.ts";
 import type { CryptoProvider } from "../db/crypto-provider.ts";
 import { AuthBlockedError, type AuthGate } from "../db/sync/auth-gate.ts";
@@ -55,7 +55,9 @@ import {
 } from "../db/vault-meta.ts";
 import { checkEncryptionAgreement } from "../db/encryption-agreement.ts";
 import { classifyError } from "../db/sync/errors.ts";
-import { BusyError, describeError, rawErrorMessage, UserFacingError } from "../ui/describe-error.ts";
+import {
+    BusyError, cancellation, describeError, NOTHING_CHANGED, rawErrorMessage, runningBlocker, UserFacingError,
+} from "../ui/describe-error.ts";
 import { logWarn } from "../ui/log.ts";
 import { OutcomeLedger, type OpOutcome } from "./op-outcome.ts";
 import { ReloadGuard } from "./reload-guard.ts";
@@ -324,8 +326,8 @@ export class VaultBinding {
      *  Check runs), or null. Init, Clone and Check are refused under the
      *  same condition. */
     changeBlocker(): string | null {
-        if (this.inflight) return `${OP_LABELS[this.inflight]} is running — wait for it to finish.`;
-        if (this.checking) return "Database check is running — wait for it to finish.";
+        if (this.inflight) return runningBlocker(OP_LABELS[this.inflight]);
+        if (this.checking) return runningBlocker("Database check");
         return null;
     }
 
@@ -399,6 +401,39 @@ export class VaultBinding {
     async setPassphrase(passphrase: string): Promise<void> {
         this.assertIdle();
         this.settings().encryptionPassphrase = passphrase;
+        await this.host.saveSettings();
+    }
+
+    /** The Filters changed (sync filter, ignore filter, max file size).
+     *  Init's scan and Clone's writes test each file against them as they
+     *  go, and the reconcile that ends both does too, so a change in the
+     *  middle would make one run follow two filters. Refused while Init,
+     *  Clone or Check runs, like every other change of what they read. Not
+     *  announced: the fields save on each keystroke. */
+    async setFilters(
+        patch: Partial<Pick<CouchSyncSettings, "syncFilter" | "syncIgnore" | "maxFileSizeMB">>,
+    ): Promise<void> {
+        this.assertIdle();
+        Object.assign(this.settings(), patch);
+        await this.host.saveSettings();
+    }
+
+    /** This device's name, the id it advances vclocks under. Init records
+     *  the vault under it, and the reconcile that ends Init and Clone tells
+     *  this device's writes by it, so it is refused while Init, Clone or
+     *  Check runs. The name it replaces stays known as this device's
+     *  (`previousDeviceIds`), so what was written under it is still told
+     *  apart. Config Push writes under it too; the caller refuses while a
+     *  config op runs. */
+    async setDeviceName(name: string): Promise<void> {
+        this.assertIdle();
+        const s = this.settings();
+        if (s.deviceId && s.deviceId !== name) {
+            const prev = [...(s.previousDeviceIds ?? [])];
+            if (!prev.includes(s.deviceId)) prev.push(s.deviceId);
+            s.previousDeviceIds = prev.slice(-MAX_PREVIOUS_DEVICE_IDS);
+        }
+        s.deviceId = name;
         await this.host.saveSettings();
     }
 
@@ -585,7 +620,7 @@ export class VaultBinding {
      */
     private async beginDestructive(progress: VaultProgress, plan: VaultSetupPlan): Promise<void> {
         progress.update("Waiting for confirmation...");
-        if (!(await this.host.confirmSetup(plan))) throw setupCancelled(plan.op);
+        if (!(await this.host.confirmSetup(plan))) throw cancellation(NOTHING_CHANGED);
         this.host.stopLive();
         await this.writeState("settingUp");
     }
@@ -766,7 +801,7 @@ export class VaultBinding {
             unlocked = { crypto: r.crypto, passphrase: p };
             return true;
         });
-        if (answer === null || unlocked === null) throw setupCancelled("clone");
+        if (answer === null || unlocked === null) throw cancellation(NOTHING_CHANGED);
         return unlocked;
     }
 
@@ -1045,12 +1080,3 @@ class VaultDbEmptyError extends UserFacingError {
     }
 }
 
-/** The user declined the confirmation of Init or Clone, or cancelled the
- *  passphrase prompt of Clone: a cancellation, not recorded as an outcome;
- *  the notice reads "<Init|Clone> cancelled — nothing was changed." */
-function setupCancelled(op: VaultOpName): Error {
-    const e: any = new Error(`${OP_LABELS[op]} cancelled — nothing was changed.`);
-    e.name = "AbortError";
-    e.userMessage = "nothing was changed.";
-    return e;
-}

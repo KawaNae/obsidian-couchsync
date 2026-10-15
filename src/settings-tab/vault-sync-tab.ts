@@ -7,7 +7,7 @@
  * tab since v0.30.0 — this tab reads them from saved settings.
  */
 import { type App, Setting, type ButtonComponent } from "obsidian";
-import { MAX_PREVIOUS_DEVICE_IDS, type ConnectionState, type CouchSyncSettings } from "../settings.ts";
+import type { ConnectionState, CouchSyncSettings } from "../settings.ts";
 import type { SyncEngine } from "../db/sync-engine.ts";
 import type { AuthGate } from "../db/sync/auth-gate.ts";
 import { describeDbFound, type DbCheckResult } from "../db/sync/vault-remote-ops.ts";
@@ -15,7 +15,7 @@ import type { LocalDB } from "../db/local-db.ts";
 import { validateDeviceName } from "../utils/device-name.ts";
 import { setupGating } from "./setup-gating.ts";
 import { reportError, showNotice } from "../ui/notices.ts";
-import { describeError } from "../ui/describe-error.ts";
+import { BusyError, describeError } from "../ui/describe-error.ts";
 import type { VaultBinding, VaultRelation } from "../sync/vault-binding.ts";
 import { cloneDescription, encryptionChangedElsewhere, vaultRelationView } from "./vault-relation-view.ts";
 
@@ -29,6 +29,9 @@ export interface VaultSyncTabDeps {
     /** Owner of the vault setup: Init, Clone and every change of the setup
      *  state go through it. */
     vault: VaultBinding;
+    /** Why a config op keeps the device name from changing now (it runs,
+     *  and Config Push writes under the name), or null. */
+    configChangeBlocker: () => string | null;
     refresh: () => void;
 }
 
@@ -219,7 +222,7 @@ export class VaultSyncTab {
             );
 
         // ── Filters (vault file inclusion / exclusion) ──────────
-        this.renderFilters(el, settings);
+        this.renderFilters(el, settings, idle);
     }
 
     // ── Step 2 helpers ────────────────────────────────────────────
@@ -315,6 +318,12 @@ export class VaultSyncTab {
         let inputValue = isLegacy ? "" : settings.deviceId;
         let validationMsg: HTMLElement | null = null;
 
+        // Init, Clone and Check of the vault, and every config op (Config
+        // Push writes under the name), refuse a rename while they run.
+        const blocker = (): string | null =>
+            this.deps.vault.changeBlocker() ?? this.deps.configChangeBlocker();
+        const disabled = locked || blocker() !== null;
+
         const setting = new Setting(el).setName("Device name");
 
         setting.addText((text) => {
@@ -328,14 +337,14 @@ export class VaultSyncTab {
                         validationMsg.style.display = error ? "block" : "none";
                     }
                 });
-            text.setDisabled(locked);
+            text.setDisabled(disabled);
         });
 
         setting.addButton((btn) =>
             btn
                 .setButtonText("Apply")
                 .setCta()
-                .setDisabled(locked)
+                .setDisabled(disabled)
                 .onClick(async () => {
                     const error = validateDeviceName(inputValue);
                     if (error) {
@@ -346,17 +355,14 @@ export class VaultSyncTab {
                         showNotice("Device name unchanged.");
                         return;
                     }
-                    if (settings.deviceId) {
-                        const prev = [...(settings.previousDeviceIds ?? [])];
-                        if (!prev.includes(settings.deviceId)) {
-                            prev.push(settings.deviceId);
-                        }
-                        await this.deps.updateSettings({
-                            deviceId: inputValue,
-                            previousDeviceIds: prev.slice(-MAX_PREVIOUS_DEVICE_IDS),
-                        });
-                    } else {
-                        await this.deps.updateSettings({ deviceId: inputValue });
+                    try {
+                        const blocked = this.deps.configChangeBlocker();
+                        if (blocked) throw new BusyError(blocked);
+                        await this.deps.vault.setDeviceName(inputValue);
+                    } catch (e) {
+                        reportError("Device name change", e);
+                        this.deps.refresh();
+                        return;
                     }
                     showNotice(`Device name set to "${inputValue}". Restart sync to apply.`);
                     this.deps.refresh();
@@ -481,7 +487,10 @@ export class VaultSyncTab {
 
     // ── Filters ───────────────────────────────────────────────────
 
-    private renderFilters(el: HTMLElement, settings: CouchSyncSettings): void {
+    /** The Filters save on each keystroke through `VaultBinding.setFilters`,
+     *  which refuses a change while Init, Clone or Check runs; the fields
+     *  are disabled then. */
+    private renderFilters(el: HTMLElement, settings: CouchSyncSettings, idle: boolean): void {
         el.createEl("h3", { text: "Filters" });
         el.createEl("p", {
             text:
@@ -497,9 +506,8 @@ export class VaultSyncTab {
                 text
                     .setPlaceholder(".*\\.md$")
                     .setValue(settings.syncFilter)
-                    .onChange(async (value) => {
-                        await this.deps.updateSettings({ syncFilter: value });
-                    })
+                    .setDisabled(!idle)
+                    .onChange((value) => this.setFilters({ syncFilter: value }))
             );
 
         new Setting(el)
@@ -509,9 +517,8 @@ export class VaultSyncTab {
                 text
                     .setPlaceholder("node_modules|^\\.trash")
                     .setValue(settings.syncIgnore)
-                    .onChange(async (value) => {
-                        await this.deps.updateSettings({ syncIgnore: value });
-                    })
+                    .setDisabled(!idle)
+                    .onChange((value) => this.setFilters({ syncIgnore: value }))
             );
 
         new Setting(el)
@@ -520,15 +527,27 @@ export class VaultSyncTab {
             .addText((text) =>
                 text
                     .setValue(String(settings.maxFileSizeMB))
+                    .setDisabled(!idle)
                     .onChange(async (value) => {
                         const num = parseFloat(value);
                         if (!isNaN(num) && num >= 0) {
-                            await this.deps.updateSettings({ maxFileSizeMB: num });
+                            await this.setFilters({ maxFileSizeMB: num });
                         }
                     })
             );
 
         renderSkippedFiles(el, this.deps);
+    }
+
+    /** Save a Filters field; a refusal is reported and the redraw shows
+     *  the saved value. */
+    private async setFilters(patch: Parameters<VaultBinding["setFilters"]>[0]): Promise<void> {
+        try {
+            await this.deps.vault.setFilters(patch);
+        } catch (e) {
+            reportError("Filter change", e);
+            this.deps.refresh();
+        }
     }
 }
 

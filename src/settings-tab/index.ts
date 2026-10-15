@@ -123,7 +123,7 @@ export class CouchSyncSettingTab extends PluginSettingTab {
             // (invariant on ConfigSync.rebind). Refused — nothing saved —
             // while a config op runs.
             configBinding: {
-                changeBlocker: () => this.plugin.configSync.bindingChangeBlocker(),
+                changeBlocker: () => this.plugin.configSync.changeBlocker(),
                 switchServer: (serverUri: string, commit: () => Promise<void>) => this.plugin.configSync.rebind(
                     this.plugin.settings.couchdbConfigDbName || null,
                     { serverUri, commit },
@@ -149,6 +149,7 @@ export class CouchSyncSettingTab extends PluginSettingTab {
             auth: this.plugin.auth,
             localDb: this.plugin.localDb,
             vault: this.plugin.vaultBinding,
+            configChangeBlocker: () => this.plugin.configSync.changeBlocker(),
             refresh: () => this.display(),
         };
         if (!this.vaultSyncTab) {
@@ -194,8 +195,8 @@ export class CouchSyncSettingTab extends PluginSettingTab {
                 ...settingsDeps,
                 localDb: this.plugin.localDb,
                 getConfigLocalDb: () => this.plugin.configLocalDb,
-                runConfigExclusive: (fn) =>
-                    this.plugin.configSync.runExclusive((binding) => fn(binding.store)),
+                runConfigExclusive: (label, fn) =>
+                    this.plugin.configSync.runExclusive(label, (binding) => fn(binding.store)),
                 replicator: this.plugin.replicator,
                 vault: this.plugin.vaultBinding,
                 statusBar: this.plugin.statusBar,

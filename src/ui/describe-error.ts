@@ -122,3 +122,26 @@ export class BusyError extends UserFacingError {
         this.name = "BusyError";
     }
 }
+
+/** Why something cannot start or change now: the operation `label` runs.
+ *  Every owner of an operation lock words its blocker with this, so a
+ *  refusal names what runs the same way on every side. */
+export function runningBlocker(label: string): string {
+    return `${label} is running — wait for it to finish.`;
+}
+
+/** The note of a cancellation that stopped before anything was changed. */
+export const NOTHING_CHANGED = "Nothing was changed.";
+
+/**
+ * A cancellation (`AbortError`). `note`, when given, says what the cancel
+ * left behind; the notice shows it after "<label> cancelled — ", so it is
+ * a sentence of its own, capitalized like the text after "failed — " and
+ * "not started — ".
+ */
+export function cancellation(note?: string): Error {
+    const e: any = new Error("The operation was aborted.");
+    e.name = "AbortError";
+    if (note) e.userMessage = note;
+    return e;
+}

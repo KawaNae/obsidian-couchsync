@@ -96,9 +96,10 @@ export function registerCommands(plugin: CouchSyncPlugin): void {
                 notify("Config DB is not configured.", 5000);
                 return;
             }
-            const progress = new ProgressNotice("Config GC");
+            const label = "Config GC";
+            const progress = new ProgressNotice(label);
             try {
-                const result = await plugin.configSync.runExclusive(async (binding) => {
+                const result = await plugin.configSync.runExclusive(label, async (binding) => {
                     progress.update("Sweeping orphan chunks...");
                     return gcOrphanConfigChunks(binding.store);
                 });

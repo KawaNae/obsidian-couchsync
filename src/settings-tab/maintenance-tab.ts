@@ -20,9 +20,10 @@ interface MaintenanceTabDeps {
      *  configured. A getter because Apply can switch the store at runtime —
      *  never hold on to a store read earlier. */
     getConfigLocalDb: () => ConfigLocalDB | null;
-    /** Runs local config-store work under ConfigSync's op lock (refused
-     *  while a config op runs; a rebind cannot close the store mid-way). */
-    runConfigExclusive: <T>(fn: (store: ConfigLocalDB) => Promise<T>) => Promise<T>;
+    /** Runs local config-store work, named `label` in a refusal, under
+     *  ConfigSync's op lock (refused while a config op runs; a rebind
+     *  cannot close the store mid-way). */
+    runConfigExclusive: <T>(label: string, fn: (store: ConfigLocalDB) => Promise<T>) => Promise<T>;
     replicator: SyncEngine;
     /** Deleting the local vault DB is refused while Init or Clone runs. */
     vault: Pick<VaultBinding, "changeBlocker">;
@@ -411,9 +412,10 @@ export function renderMaintenanceTab(el: HTMLElement, deps: MaintenanceTabDeps):
                         // modal: the one shown when the tab rendered may
                         // have been replaced since, and a running config op
                         // must not have its store destroyed underneath it.
-                        const progress = new ProgressNotice("Delete local config database");
+                        const label = "Delete local config database";
+                        const progress = new ProgressNotice(label);
                         try {
-                            await deps.runConfigExclusive((store) => store.destroy());
+                            await deps.runConfigExclusive(label, (store) => store.destroy());
                         } catch (e) {
                             progress.fail(e);
                             return;

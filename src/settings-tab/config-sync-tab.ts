@@ -156,8 +156,8 @@ export class ConfigSyncTab {
     private canApply(): boolean {
         // Apply rebinds the config DB (closes the current local store), which
         // ConfigSync refuses while an op runs — mirror that in the button.
-        // Same check as the CouchDB tab's Apply (`bindingChangeBlocker`).
-        if (this.deps.configSync.bindingChangeBlocker()) return false;
+        // Same check as the CouchDB tab's Apply (`changeBlocker`).
+        if (this.deps.configSync.changeBlocker()) return false;
         // Empty value is a valid Apply (means "disable config sync") and
         // doesn't require Test. Non-empty must be Tested first.
         if (this.draft.db.trim() === "") return true;
@@ -177,7 +177,7 @@ export class ConfigSyncTab {
      *  show it. The settings tab redraws when this changes
      *  (`ConfigSync.onChange`). */
     private idle(): boolean {
-        return this.deps.configSync.bindingChangeBlocker() === null;
+        return this.deps.configSync.changeBlocker() === null;
     }
 
     /** No operation outside config sync keeps `op` from starting: a vault
@@ -189,7 +189,7 @@ export class ConfigSyncTab {
     }
 
     private applyDescText(): string {
-        const blocked = this.deps.configSync.bindingChangeBlocker();
+        const blocked = this.deps.configSync.changeBlocker();
         if (blocked) return blocked;
         if (this.draft.db.trim() === "") {
             return "Apply with empty name to disable config sync.";
@@ -590,9 +590,15 @@ export class ConfigSyncTab {
 
     // ── Filter tree (meaning-unit policy) ───────────────
 
+    /** Change the Filter through `ConfigSync.changePolicy`, which refuses
+     *  it while a config op runs (the controls are disabled then). A
+     *  refusal is reported; the caller's redraw shows the saved policy. */
     private async updatePolicy(patch: Partial<ConfigSyncPolicy>): Promise<void> {
-        const cur = this.deps.getSettings().configSyncPolicy;
-        await this.deps.updateSettings({ configSyncPolicy: { ...cur, ...patch } });
+        try {
+            await this.deps.configSync.changePolicy(patch);
+        } catch (e) {
+            reportError("Filter change", e);
+        }
     }
 
     private renderFilterTree(el: HTMLElement, configEnabled: boolean): void {
@@ -784,7 +790,7 @@ export class ConfigSyncTab {
         )) {
             return { paths: cached.paths, ok: cached.ok, bindingKey: cached.bindingKey };
         }
-        const busyBefore = this.deps.configSync.bindingChangeBlocker() !== null;
+        const busyBefore = this.deps.configSync.changeBlocker() !== null;
         const listing = await this.deps.configSync.listRemoteConfigPathsQuiet();
         const current = this.deps.configSync.currentBinding()?.key ?? null;
         if (listing.bindingKey !== key || current !== key) return null;

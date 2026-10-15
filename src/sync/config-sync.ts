@@ -23,7 +23,7 @@ import type { ICouchClient } from "../db/interfaces.ts";
 import { makeCouchClient } from "../db/couch-client.ts";
 import { describeDbFound, type DbCheckResult } from "../db/sync/vault-remote-ops.ts";
 import { logError, logInfo, logWarn } from "../ui/log.ts";
-import { BusyError, describeError } from "../ui/describe-error.ts";
+import { BusyError, cancellation, describeError, NOTHING_CHANGED, runningBlocker } from "../ui/describe-error.ts";
 import { classifyConfigPath } from "./config-policy/classify.ts";
 import { participates, type DeviceContext } from "./config-policy/policy.ts";
 import { readLocalIsDesktopOnly } from "./config-policy/manifest.ts";
@@ -231,6 +231,11 @@ const OP_LABELS: Record<LockedConfigOp, string> = {
     create: "Config Create",
 };
 
+/** What a refusal names while `rebind` runs. */
+const REBIND_LABEL = "Config database change";
+/** Step 2's Check: its notice, and what a refusal names while it runs. */
+const CHECK_LABEL = "Database check";
+
 export class ConfigSync {
     private static readonly SKIP_DIRS = new Set(["node_modules", ".git"]);
     private static readonly SKIP_FILES = new Set(["workspace.json", "workspace-mobile.json"]);
@@ -259,12 +264,13 @@ export class ConfigSync {
     private readonly pluginDir: string;
     private static readonly MAX_CONFIG_SIZE = 5 * 1024 * 1024; // 5MB
 
-    /** In-flight op (a ConfigOperation, or a local `runExclusive` task),
-     *  or null. Concurrent ops are rejected. An op's confirmation dialogs
-     *  are shown inside it, so nothing else runs while one is open. */
-    private inflight: { cancel(): void } | null = null;
+    /** In-flight op (a ConfigOperation, Step 2's Check, or a local
+     *  `runExclusive` task) with the label a refusal names it by, or null.
+     *  Concurrent ops are rejected. An op's confirmation dialogs are shown
+     *  inside it, so nothing else runs while one is open. */
+    private inflight: { label: string; cancel(): void } | null = null;
 
-    /** Listeners of `bindingChangeBlocker()` (see `onChange`). */
+    /** Listeners of `changeBlocker()` (see `onChange`). */
     private readonly listeners = new Set<() => void>();
 
     /** The config DB this device is pointed at, with its store, cursors,
@@ -346,7 +352,7 @@ export class ConfigSync {
      *     change (ops and rebinds are refused while `rebinding` is set);
      *   - a rebind refused (`BusyError`: an op or another rebind running) runs
      *     no `commit`: settings and binding both stay as they were. The tabs
-     *     also disable Apply while `bindingChangeBlocker()` says so.
+     *     also disable Apply while `changeBlocker()` says so.
      * Because of it, the paths that read the binding WITHOUT the op lock
      * (the filter tree listing, Maintenance) see
      * the binding the settings name, and an op never has to re-align.
@@ -355,7 +361,7 @@ export class ConfigSync {
      * the old binding), `commit` still runs, and the error propagates.
      */
     async rebind(dbName: string | null, opts: ConfigRebindOptions = {}): Promise<void> {
-        const blocked = this.bindingChangeBlocker();
+        const blocked = this.changeBlocker();
         if (blocked) throw new BusyError(blocked);
         const serverUri = opts.serverUri ?? this.getSettings().couchdbUri;
         const target = dbName || null;
@@ -384,24 +390,13 @@ export class ConfigSync {
         }
     }
 
-    /** Why the binding cannot be changed right now (an op or a rebind is
-     *  running), or null. The settings tabs disable their Apply with this
-     *  text; `rebind` refuses (`BusyError`) with it under the same
-     *  condition. */
-    bindingChangeBlocker(): string | null {
-        return this.lockBlocker() === null
-            ? null
-            : "A config operation is running — Apply is available when it finishes.";
-    }
-
-    /** Why a config op or a change of what it reads cannot start now (an
-     *  op or a rebind is running), or null. */
-    private lockBlocker(): string | null {
-        if (this.inflight !== null || this.rebinding !== null) {
-            return "Another config operation is already in progress. " +
-                "Wait for it to finish or cancel it first.";
-        }
-        return null;
+    /** Why a config op, or a change of what one reads (the binding, Step
+     *  1, the Filter), cannot start now, or null: it names the op or the
+     *  rebind that runs. Each of them is refused (`BusyError`) with this
+     *  text; the settings tabs disable their controls with it. */
+    changeBlocker(): string | null {
+        const running = this.inflight?.label ?? (this.rebinding !== null ? REBIND_LABEL : null);
+        return running === null ? null : runningBlocker(running);
     }
 
     /**
@@ -418,9 +413,25 @@ export class ConfigSync {
             "configEncryptionEnabled" | "configEncryptionPassphrase" | "configCompressionEnabled"
         >>,
     ): Promise<void> {
-        const blocked = this.lockBlocker();
+        const blocked = this.changeBlocker();
         if (blocked) throw new BusyError(blocked);
         Object.assign(this.getSettings(), patch);
+        await this.saveSettings();
+    }
+
+    /**
+     * The Filter changed (what this device syncs, by meaning). Refused
+     * (`BusyError`) while an op or a rebind runs, its confirmation dialogs
+     * included: Push and Pull read the policy file by file as they go
+     * (`participation`), and Push builds its list from the policy it read
+     * when it started, so a change in between would make one run follow
+     * two policies.
+     */
+    async changePolicy(patch: Partial<CouchSyncSettings["configSyncPolicy"]>): Promise<void> {
+        const blocked = this.changeBlocker();
+        if (blocked) throw new BusyError(blocked);
+        const s = this.getSettings();
+        s.configSyncPolicy = { ...s.configSyncPolicy, ...patch };
         await this.saveSettings();
     }
 
@@ -433,7 +444,7 @@ export class ConfigSync {
         return role ? this.reloadGuard.blocker(role) : null;
     }
 
-    /** Subscribe to changes of `bindingChangeBlocker()`: an op or a rebind
+    /** Subscribe to changes of `changeBlocker()`: an op or a rebind
      *  starts or ends. A view that enables the ops redraws on it, so its
      *  buttons are disabled while one runs, not only after its own button
      *  resolves. Returns the unsubscribe function. */
@@ -452,7 +463,7 @@ export class ConfigSync {
         }
     }
 
-    private setInflight(op: { cancel(): void } | null): void {
+    private setInflight(op: { label: string; cancel(): void } | null): void {
         this.inflight = op;
         this.changed();
     }
@@ -581,7 +592,7 @@ export class ConfigSync {
         const label = opts.label ?? OP_LABELS[opName];
         const progress = new ProgressNotice(label);
         const role = RELOAD_ROLES[opName];
-        const busy = (role ? this.reloadGuard.blocker(role) : null) ?? this.lockBlocker();
+        const busy = (role ? this.reloadGuard.blocker(role) : null) ?? this.changeBlocker();
         if (busy !== null) {
             // Nothing was started — the running op (if any) keeps its lock.
             const e = new BusyError(busy);
@@ -594,12 +605,12 @@ export class ConfigSync {
         let binding: ConfigBinding | null = null;
         const lease: ReloadLease | null = role ? this.reloadGuard.enter(label, role) : null;
         let reload = false;
-        this.setInflight({ cancel: () => { cancelled = true; op?.cancel(); } });
+        this.setInflight({ label, cancel: () => { cancelled = true; op?.cancel(); } });
         try {
             const b = this.requireBinding();
             binding = b;
             opts.gate?.(b);
-            if (cancelled) throw abortError();
+            if (cancelled) throw cancellation();
             let keys: ConfigOpKeys | undefined;
             const sync = opName === "push" || opName === "pull";
             op = new ConfigOperation({
@@ -649,14 +660,14 @@ export class ConfigSync {
      * a failure is returned, a refusal thrown.
      */
     async checkDatabase(dbName: string): Promise<DbCheckResult> {
-        const progress = new ProgressNotice("Database check");
-        const blocked = this.lockBlocker();
+        const progress = new ProgressNotice(CHECK_LABEL);
+        const blocked = this.changeBlocker();
         if (blocked) {
             const e = new BusyError(blocked);
             progress.fail(e);
             throw e;
         }
-        this.setInflight({ cancel: () => {} });
+        this.setInflight({ label: CHECK_LABEL, cancel: () => {} });
         try {
             const result = await this.checkDb(dbName);
             if (result.status === "error") {
@@ -675,14 +686,15 @@ export class ConfigSync {
      * Run local-only work on the current binding's store under the op lock
      * (Maintenance "Delete local config database", the config GC command),
      * so it never runs under a live Push / Pull / Join / Create and a
-     * rebind cannot close the store mid-way. Throws `BusyError` /
-     * `not-configured` without running `fn`; the caller reports.
+     * rebind cannot close the store mid-way. `label` is what a refusal
+     * names while it runs. Throws `BusyError` / `not-configured` without
+     * running `fn`; the caller reports.
      */
-    async runExclusive<T>(fn: (binding: ConfigBinding) => Promise<T>): Promise<T> {
-        const blocked = this.lockBlocker();
+    async runExclusive<T>(label: string, fn: (binding: ConfigBinding) => Promise<T>): Promise<T> {
+        const blocked = this.changeBlocker();
         if (blocked) throw new BusyError(blocked);
         const binding = this.requireBinding();
-        this.setInflight({ cancel: () => {} });
+        this.setInflight({ label, cancel: () => {} });
         try {
             return await fn(binding);
         } finally {
@@ -744,7 +756,7 @@ export class ConfigSync {
                     ...(codec.encryption ? { cipherVersion: CURRENT_CIPHER_VERSION } : {}),
                 },
             });
-            if (!go) throw abortError("Nothing was changed.");
+            if (!go) throw cancellation(NOTHING_CHANGED);
             const setup = new ConfigSetupService(
                 () => this.settingsFor(binding),
                 {
@@ -854,10 +866,10 @@ export class ConfigSync {
                 const review = buildPushReview(entries, policy, held.length);
                 progress.update("Choose what to push...");
                 const chosen = await this.modal.showConfigPushModal(review);
-                if (chosen === null) throw abortError("Nothing was pushed.");
+                if (chosen === null) throw cancellation("Nothing was pushed.");
                 // Applied to the policy as it is now, as Share again and
-                // Pull & Overwrite do, so saving the declarations keeps a
-                // Filter change made since `policy` was read.
+                // Pull & Overwrite do. The Filter cannot change during the
+                // op (`changePolicy`), so it is the policy `entries` came from.
                 const applied = applyPushSelection(
                     entries, this.getSettings().configSyncPolicy, new Set(chosen),
                 );
@@ -1012,7 +1024,7 @@ export class ConfigSync {
                     shared: await readSharedAt(binding.store, take.path, take.pointer, deps.fetchChunks),
                     hideValue: hidesValues(take.path),
                 });
-                if (!go) throw abortError("Nothing was changed.");
+                if (!go) throw cancellation(NOTHING_CHANGED);
             }
 
             const plan = await planPull(
@@ -1145,7 +1157,7 @@ export class ConfigSync {
                 keptKeys,
                 skipped: plan.unavailable,
             });
-            if (!go) throw abortError("Nothing was changed.");
+            if (!go) throw cancellation(NOTHING_CHANGED);
 
             await this.backupPlan(plan, progress);
             if (keptKeys > 0) {
@@ -1617,11 +1629,3 @@ async function readCreatePreview(raw: ICouchClient): Promise<ConfigCreatePreview
     };
 }
 
-/** A cancellation. `userMessage`, when given, says what the cancel left
- *  behind; ProgressNotice shows it after "<label> cancelled". */
-function abortError(userMessage?: string): Error {
-    const e: any = new Error("The operation was aborted.");
-    e.name = "AbortError";
-    if (userMessage) e.userMessage = userMessage;
-    return e;
-}
