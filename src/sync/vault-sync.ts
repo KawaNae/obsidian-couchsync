@@ -57,6 +57,14 @@ export interface IPendingProbe {
     hasPending(path: string): boolean;
 }
 
+export interface DbToFileOptions {
+    /** Replace what the vault holds even when the user changed it since the
+     *  last sync. Only for a caller that holds the user's decision to replace
+     *  it: a conflict the user answered with the remote version, or Clone,
+     *  whose confirmation says it replaces the files at the same path. */
+    overwriteVaultChange?: boolean;
+}
+
 /** Max snapshot→commit retries inside runWrite when a concurrent pull lands
  *  between our read and our CAS check. Realistic worst case is 1. */
 const CAS_MAX_ATTEMPTS = 4;
@@ -335,7 +343,19 @@ export class VaultSync {
         }
     }
 
-    async dbToFile(fileDoc: FileDoc): Promise<WriteResult> {
+    /**
+     * Bring the vault in line with `fileDoc`: write its content, or apply its
+     * deletion. Every write from a doc to the vault goes through here.
+     *
+     * The vault is changed only while it still holds what this device last
+     * synced for the path (`lastSynced`); see `unsyncedVaultChange`. When the
+     * user changed the file since, the write is declined with
+     * `applied: false` and the bookkeeping is left as it is, so the
+     * reconcile finds the path diverged and the conflict orchestrator lets the
+     * user choose. `opts.overwriteVaultChange` lifts this for a caller that
+     * holds the user's decision to replace the vault's version.
+     */
+    async dbToFile(fileDoc: FileDoc, opts: DbToFileOptions = {}): Promise<WriteResult> {
         const vaultPath = filePathFromId(fileDoc._id);
 
         // Trust boundary: the path is server-controlled on a plaintext
@@ -371,6 +391,12 @@ export class VaultSync {
             // advances); only the disk side is skipped.
             const exactOnDisk = this.vault.getFiles().some((f) => f.path === vaultPath);
             if (exactOnDisk) {
+                if (!opts.overwriteVaultChange) {
+                    const stat = await this.vault.stat(vaultPath);
+                    if (stat && await this.unsyncedVaultChange(vaultPath, fileDoc, stat)) {
+                        return this.declineOverVaultChange(vaultPath);
+                    }
+                }
                 await this.vaultWriter.applyRemoteDeletion(vaultPath);
                 await this.pruneEmptyParents(vaultPath);
             } else {
@@ -394,10 +420,13 @@ export class VaultSync {
         }
 
         const existingStat = await this.vault.stat(vaultPath);
+        // The disk fingerprint serves both the already-on-disk check and the
+        // unsynced-change check below; read the file at most once.
+        let diskChunks: string[] | undefined;
 
         if (existingStat && existingStat.size === fileDoc.size) {
-            const ids = await this.diskChunkIds(vaultPath, existingStat);
-            if (chunkListsEqual(ids, fileDoc.chunks)) {
+            diskChunks = await this.diskChunkIds(vaultPath, existingStat);
+            if (chunkListsEqual(diskChunks, fileDoc.chunks)) {
                 // Content already on disk. Establish the integration baseline
                 // so a later reconcile classifies this path as identical and
                 // never re-pushes it with a self-vclock stamp. Skipping this
@@ -457,6 +486,10 @@ export class VaultSync {
         // vaultPath, but stat() needs the on-disk spelling.
         let writtenPath = vaultPath;
         if (existingStat) {
+            if (!opts.overwriteVaultChange
+                && await this.unsyncedVaultChange(vaultPath, fileDoc, existingStat, diskChunks)) {
+                return this.declineOverVaultChange(vaultPath);
+            }
             result = await this.vaultWriter.applyRemoteContent(vaultPath, content);
         } else {
             const collidingPath = this.findExistingByPathKey(vaultPath);
@@ -486,6 +519,10 @@ export class VaultSync {
                         `(a folder occupies this path) — declining create`,
                 );
                 return { applied: false, reason: "file-folder-collision" };
+            }
+            if (!opts.overwriteVaultChange
+                && await this.unsyncedVaultChange(vaultPath, fileDoc, null)) {
+                return this.declineOverVaultChange(vaultPath);
             }
             // Resolve the parent dir to an existing same-PathKey folder's
             // case so a case-sensitive FS does not gain a duplicate-case folder
@@ -665,6 +702,58 @@ export class VaultSync {
             rightDeleted: fileDoc.deleted === true,
             lastSynced,
         });
+    }
+
+    /**
+     * Whether the vault holds, at `path`, a change this device has not
+     * synced: the disk no longer holds what was last synced for the path
+     * (`lastSynced`), so writing `fileDoc` there would replace or remove the
+     * user's change.
+     *
+     * The question is about content only: the disk against the baseline's
+     * fingerprint, read through the same stat cache the reconcile uses
+     * (`diskChunkIds`). Each answer matches what the reconcile does with the
+     * path, so a declined version is not lost: it stays in the local DB, and
+     * the reconcile offers it through the conflict orchestrator, or pushes
+     * the vault's change when the doc is not newer than the baseline.
+     *
+     * - File on disk, live baseline: changed when the content differs from
+     *   the baseline.
+     * - File on disk, deleted baseline: the file was made after a synced
+     *   deletion, so it is changed.
+     * - File on disk, no baseline or one without a fingerprint: a deletion
+     *   would remove content never synced (the reconcile offers it as a
+     *   conflict); content is written, as the reconcile does for such a path.
+     * - No file on disk: a deletion has nothing to remove. Content written
+     *   there would undo the user's deletion when the baseline is a live
+     *   file; the reconcile offers or sends that deletion. With a deleted
+     *   baseline, or none, the vault has lost nothing.
+     */
+    private async unsyncedVaultChange(
+        path: string,
+        fileDoc: FileDoc,
+        stat: { mtime: number; size: number } | null,
+        diskChunks?: string[],
+    ): Promise<boolean> {
+        const ls = this.lastSynced.get(toPathKey(path));
+        if (!stat) {
+            return !fileDoc.deleted && ls !== undefined && ls.deleted !== true;
+        }
+        if (ls?.deleted) return true;
+        if (ls === undefined || ls.chunks === undefined || ls.size === undefined) {
+            return fileDoc.deleted === true;
+        }
+        if (stat.size !== ls.size) return true;
+        const disk = diskChunks ?? await this.diskChunkIds(path, stat);
+        return !chunkListsEqual(disk, ls.chunks);
+    }
+
+    private declineOverVaultChange(path: string): WriteResult {
+        logWarn(
+            `dbToFile: not writing ${path} — the vault changed since the last sync; ` +
+            `left for reconcile to offer as a conflict`,
+        );
+        return { applied: false, reason: "unsynced-vault-change" };
     }
 
     /**

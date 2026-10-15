@@ -496,9 +496,9 @@ export class Reconciler {
                     if (rel === "dominates") {
                         // A pull advanced the doc beyond our integration
                         // baseline while the file was locally gone: divergent
-                        // local-delete vs remote-edit → conflict (production
-                        // always wires the orchestrator; without it, fall back
-                        // to remote-wins restore, matching the Case A/B path).
+                        // local-delete vs remote-edit → conflict. Without an
+                        // orchestrator the path is left as it is: dbToFile
+                        // does not recreate a file deleted since the last sync.
                         if (this.conflictOrchestrator) {
                             if (await this.tryStep(displayPath, "conflict-delete",
                                 () => this.conflictOrchestrator!.handleDivergentLocalDelete(displayPath, doc),
@@ -506,9 +506,10 @@ export class Reconciler {
                                 report.deleted.push(displayPath);
                             }
                         } else {
-                            const r = await this.applyRemoteToVault(displayPath, doc, "restore", mode);
-                            if (r === "applied") report.restored.push(displayPath);
-                            else if (r === "quarantined") report.quarantined.push(displayPath);
+                            logWarn(
+                                `divergent local delete on ${displayPath} — no conflict ` +
+                                `orchestrator wired; leaving untouched (re-detected next reconcile).`,
+                            );
                         }
                     } else {
                         // equal/dominated: we integrated this content and the
@@ -602,13 +603,13 @@ export class Reconciler {
                                 report.remoteWins.push(displayPath);
                             }
                         } else {
-                            // No orchestrator wired (e.g., test harness pre-
-                            // ConflictOrchestrator) — fall back to pull. The
-                            // divergent local edit is lost in this fallback;
-                            // production main.ts always wires the orchestrator.
-                            const r = await this.applyRemoteToVault(displayPath, doc, "pull", mode);
-                            if (r === "applied") report.remoteWins.push(displayPath);
-                            else if (r === "quarantined") report.quarantined.push(displayPath);
+                            // No orchestrator wired (test harness): leave the
+                            // edit. dbToFile would decline the pull anyway,
+                            // since the vault changed since the last sync.
+                            logWarn(
+                                `divergent edit on ${displayPath} — no conflict ` +
+                                `orchestrator wired; leaving untouched (re-detected next reconcile).`,
+                            );
                         }
                         break;
                 }

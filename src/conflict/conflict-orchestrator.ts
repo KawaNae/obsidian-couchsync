@@ -4,7 +4,7 @@ import { ConflictResolver } from "./conflict-resolver.ts";
 import type { HistoryCapture } from "../history/history-capture.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { WriteResult } from "../sync/vault-writer.ts";
-import type { VaultSync } from "../sync/vault-sync.ts";
+import type { VaultSync, DbToFileOptions } from "../sync/vault-sync.ts";
 import type { IVaultIO } from "../types/vault-io.ts";
 import type { FileDoc, CouchSyncDoc } from "../types.ts";
 import type { IModalPresenter, ConflictBatchItem } from "../types/modal-presenter.ts";
@@ -22,7 +22,7 @@ export interface ConflictOrchestratorDeps {
     localDb: LocalDB;
     replicator: SyncEngine;
     historyCapture: HistoryCapture;
-    dbToFile: (doc: FileDoc) => Promise<WriteResult>;
+    dbToFile: (doc: FileDoc, opts?: DbToFileOptions) => Promise<WriteResult>;
     getSettings: () => CouchSyncSettings;
     vault: IVaultIO;
     vaultSync: VaultSync;
@@ -36,6 +36,10 @@ export interface ConflictOrchestratorDeps {
 }
 
 const EMPTY_BUF = new ArrayBuffer(0);
+
+/** A divergent-vault conflict answered with the remote version: the modal
+ *  showed the vault's version, and the user chose to replace it. */
+const USER_CHOSE_REMOTE: DbToFileOptions = { overwriteVaultChange: true };
 
 /**
  * The result of surfacing a conflict to the user.
@@ -414,7 +418,7 @@ export class ConflictOrchestrator {
             localBuf,
             remoteBuf,
             applyTakeRemote: async () => {
-                const writeResult = await this.deps.dbToFile(remoteDoc);
+                const writeResult = await this.deps.dbToFile(remoteDoc, USER_CHOSE_REMOTE);
                 if (writeResult.applied === false) {
                     logWarn(
                         `Divergent-edit take-remote: vault write skipped: ` +
@@ -456,7 +460,7 @@ export class ConflictOrchestrator {
             localBuf: EMPTY_BUF,
             remoteBuf,
             applyTakeRemote: async () => {
-                const writeResult = await this.deps.dbToFile(remoteDoc);
+                const writeResult = await this.deps.dbToFile(remoteDoc, USER_CHOSE_REMOTE);
                 if (writeResult.applied === false) {
                     logWarn(
                         `Divergent-delete take-remote: vault write skipped: ` +
@@ -509,7 +513,7 @@ export class ConflictOrchestrator {
             applyTakeRemote: async () => {
                 // Accept the deletion: remove the recreated file from disk and
                 // establish the deleted baseline (dbToFile tombstone branch).
-                const writeResult = await this.deps.dbToFile(tombstoneDoc);
+                const writeResult = await this.deps.dbToFile(tombstoneDoc, USER_CHOSE_REMOTE);
                 if (writeResult.applied === false) {
                     logWarn(
                         `Divergent-recreate take-remote: vault write skipped: ` +
@@ -699,6 +703,10 @@ export class ConflictOrchestrator {
                 docs: [{ doc: stripRev(updated) as CouchSyncDoc }],
             });
             await replicator.ensureFileChunks(updated as FileDoc);
+            // No overwrite of a vault change: the choice was made between
+            // the local DB doc and the remote, not the vault's version. If
+            // the vault changed since the last sync, dbToFile keeps it and
+            // the reconcile offers it against this doc.
             const writeResult = await this.deps.dbToFile(updated as FileDoc);
             if (writeResult.applied === false) {
                 logWarn(

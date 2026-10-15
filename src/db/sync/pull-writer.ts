@@ -75,10 +75,11 @@ export interface PullWriterDeps {
     getRemoteDoc: (id: string) => Promise<FileDoc | null>;
     /** Apply a pulled FileDoc to the vault. Called inside the post-
      *  commit closure. Returns `WriteResult`: `applied:true` means the
-     *  vault now matches the doc; `applied:false` means the writer
-     *  declined (e.g., IME composition divergence) and the LocalDB doc
-     *  is now ahead of the vault — a divergent state that the pull-
-     *  skipped → reconcile schedule path retries on the next cycle.
+     *  vault now matches the doc; `applied:false` means the write was
+     *  declined (IME composition divergence, or a vault change not yet
+     *  synced) and the LocalDB doc is now ahead of the vault — a state the
+     *  pull-skipped → reconcile path takes up on the next cycle: it writes
+     *  the doc, or offers the vault's change as a conflict.
      *
      *  Throws are caught into `writeFailCount` so the
      *  `Pull: ... applied/skipped/failed` log reflects reality. Replaces

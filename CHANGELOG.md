@@ -6,6 +6,15 @@ All notable changes to obsidian-couchsync.
 
 ### Fixed
 
+- **A pull no longer writes over a change in the vault that has not been
+  synced.** When a file had been edited or deleted in the vault since this
+  device last synced it, a newer version pulled from another device replaced
+  the edit, or brought the deleted file back, without asking. This happened
+  when the pull arrived before the edit was pushed, and also while a conflict
+  about that edit was still waiting for an answer. The pull now leaves the
+  file as it is and keeps the pulled version in the local database; the
+  conflict dialog then shows both, and the chosen one is written. Clone still
+  replaces the files at the same path, as its confirmation says.
 - **A new install no longer shows the notice that config sync filtering was
   upgraded.** The notice is for settings that had the old path list to
   convert; a first start, with no settings saved, was taken for one.

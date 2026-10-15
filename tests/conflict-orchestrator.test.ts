@@ -11,6 +11,7 @@ import {
     loadAllPendingConflict,
 } from "../src/db/sync/pending-conflict.ts";
 import type { FileDoc, CouchSyncDoc, ChunkDoc } from "../src/types.ts";
+import type { DbToFileOptions } from "../src/sync/vault-sync.ts";
 
 /**
  * Serve the docs' chunks from memory. The orchestrator reads both sides'
@@ -60,6 +61,7 @@ describe("ConflictOrchestrator", () => {
     let modal: FakeModalPresenter;
     let settings: ReturnType<typeof makeSettings>;
     let dbToFileCalls: FileDoc[];
+    let dbToFileOpts: Array<DbToFileOptions | undefined>;
     let saveConflictCalls: any[];
 
     /** Minimal SyncEngine stub */
@@ -104,6 +106,7 @@ describe("ConflictOrchestrator", () => {
         modal = new FakeModalPresenter();
         settings = makeSettings({ deviceId: "dev-A" });
         dbToFileCalls = [];
+        dbToFileOpts = [];
         saveConflictCalls = [];
     });
 
@@ -111,7 +114,10 @@ describe("ConflictOrchestrator", () => {
         await db.destroy();
     });
 
-    function createOrchestrator(replicator: ReturnType<typeof makeReplicator>) {
+    function createOrchestrator(
+        replicator: ReturnType<typeof makeReplicator>,
+        vaultText = "",
+    ) {
         const historyCapture = {
             saveConflict: async (...args: any[]) => { saveConflictCalls.push(args); },
         };
@@ -120,7 +126,13 @@ describe("ConflictOrchestrator", () => {
             localDb: db as any,
             replicator: replicator as any,
             historyCapture: historyCapture as any,
-            dbToFile: async (doc: FileDoc) => { dbToFileCalls.push(doc); return { applied: true }; },
+            dbToFile: async (doc: FileDoc, opts?: DbToFileOptions) => {
+                dbToFileCalls.push(doc);
+                dbToFileOpts.push(opts);
+                return { applied: true };
+            },
+            vault: { readBinary: async () => new TextEncoder().encode(vaultText).buffer } as any,
+            vaultSync: {} as any,
             getSettings: () => settings,
             // Drain on the next macrotask so single-conflict tests don't wait
             // the production debounce; a synchronous burst still coalesces.
@@ -174,6 +186,60 @@ describe("ConflictOrchestrator", () => {
         // History recorded
         expect(saveConflictCalls).toHaveLength(1);
         expect(saveConflictCalls[0][3]).toBe("remote"); // winner
+    });
+
+    it("take-remote of a pull conflict does not replace a vault change", async () => {
+        // The modal compared the local DB doc with the remote, not the
+        // vault's version: dbToFile keeps a vault change and the reconcile
+        // offers it.
+        const replicator = makeReplicator();
+        createOrchestrator(replicator);
+        const localDoc = await seedFileDoc(db, "a.md", "local text", { "dev-A": 1 });
+        const remoteDoc = await seedFileDoc(db, "a.md", "remote text", { "dev-B": 1 });
+        modal.conflictResponses.push({ choice: "take-remote", dismissed: false });
+
+        await replicator.fireConcurrent("a.md", localDoc, remoteDoc);
+
+        expect(dbToFileCalls).toHaveLength(1);
+        expect(dbToFileOpts[0]?.overwriteVaultChange).toBeUndefined();
+    });
+
+    describe("take-remote of a conflict with the vault's version", () => {
+        async function answerTakeRemote(run: () => Promise<void>): Promise<void> {
+            modal.conflictResponses.push({ choice: "take-remote", dismissed: false });
+            await run();
+        }
+
+        it("replaces the vault's edit (divergent edit)", async () => {
+            const orch = createOrchestrator(makeReplicator(), "my edit");
+            const remoteDoc = await seedFileDoc(db, "a.md", "remote text", { "dev-B": 1 });
+
+            await answerTakeRemote(() => orch.handleDivergentLocalEdit("a.md", remoteDoc));
+
+            expect(dbToFileCalls.map((d) => d._id)).toEqual([remoteDoc._id]);
+            expect(dbToFileOpts[0]).toEqual({ overwriteVaultChange: true });
+        });
+
+        it("restores over the vault's deletion (divergent delete)", async () => {
+            const orch = createOrchestrator(makeReplicator());
+            const remoteDoc = await seedFileDoc(db, "a.md", "remote text", { "dev-B": 1 });
+
+            await answerTakeRemote(() => orch.handleDivergentLocalDelete("a.md", remoteDoc));
+
+            expect(dbToFileOpts[0]).toEqual({ overwriteVaultChange: true });
+        });
+
+        it("deletes the vault's recreated file (divergent recreate)", async () => {
+            const orch = createOrchestrator(makeReplicator(), "made again");
+            const tombstone = {
+                ...(await seedFileDoc(db, "a.md", "old", { "dev-B": 1 })),
+                deleted: true,
+            } as FileDoc;
+
+            await answerTakeRemote(() => orch.handleDivergentRecreate("a.md", tombstone));
+
+            expect(dbToFileOpts[0]).toEqual({ overwriteVaultChange: true });
+        });
     });
 
     it("suppresses a duplicate concurrent modal while one is already in flight (re-emit dedup)", async () => {
