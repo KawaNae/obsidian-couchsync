@@ -220,46 +220,62 @@ describe("regression: divergent user-edit", () => {
         expect(vs.getLastSynced(path)?.vclock).toEqual(remoteDoc.vclock);
     });
 
-    it("legacy lastSynced (pre-extension, no chunks) skips the divergent guard", async () => {
-        // Legacy entries on disk have raw VectorClock value (no chunks/size).
-        // Reconciler should NOT route them to conflict — fall back to
-        // legacy dbToFile behavior until the next push/pull rewrites the
-        // entry in full shape.
-        const path = "legacy.md";
-        vault.addFile(path, "v_user-content\n");
-        // Seed a legacy lastSynced entry directly (raw VectorClock value).
+    /** Seed a baseline written before baselines carried a fingerprint
+     *  (raw VectorClock value, no chunks/size). */
+    async function seedLegacyBaseline(path: string, vclock: Record<string, number>) {
         await db.runWriteTx({
             meta: [{
                 op: "put",
                 key: "_local/vclock/" + toPathKey(path),
-                value: { "dev-B": 1 } as any,
+                value: vclock as any,
             }],
         });
         await vs.loadLastSyncedVclocks();
+    }
 
-        // Synthesize a remote doc dominating the legacy vclock, with chunks
-        // matching the vault's CURRENT content (so the size fast-path
-        // wouldn't catch divergence even if it ran).
-        const remoteContent = "v_remote\n";
-        const remoteBuf = new TextEncoder().encode(remoteContent).buffer;
-        const remoteChunks = await splitIntoChunks(remoteBuf);
-        const remoteDoc: FileDoc = {
+    async function commitDoc(path: string, content: string, vclock: Record<string, number>) {
+        const buf = new TextEncoder().encode(content).buffer;
+        const chunks = await splitIntoChunks(buf);
+        const doc: FileDoc = {
             _id: makeFileId(path),
             type: "file",
-            chunks: remoteChunks.map((c) => c._id),
+            chunks: chunks.map((c) => c._id),
             mtime: Date.now(),
             ctime: Date.now(),
-            size: remoteBuf.byteLength,
-            vclock: { "dev-B": 1, "dev-A": 1 },
+            size: buf.byteLength,
+            vclock,
         };
         await db.runWriteTx({
-            chunks: remoteChunks as unknown as CouchSyncDoc[],
-            docs: [{ doc: remoteDoc as unknown as CouchSyncDoc }],
+            chunks: chunks as unknown as CouchSyncDoc[],
+            docs: [{ doc: doc as unknown as CouchSyncDoc }],
         });
+        return doc;
+    }
+
+    it("a baseline without a fingerprint cannot explain differing disk content: conflict, vault kept", async () => {
+        const path = "legacy.md";
+        vault.addFile(path, "v_user-content\n");
+        await seedLegacyBaseline(path, { "dev-B": 1 });
+        await commitDoc(path, "v_remote\n", { "dev-B": 1, "dev-A": 1 });
 
         await reconciler.reconcile("paused");
 
-        // Legacy entry → no conflict routing, legacy dbToFile runs.
+        expect(orchCalls.edit.map((c) => c.path)).toEqual([path]);
+        expect(vault.readText(path)).toBe("v_user-content\n");
+    });
+
+    it("a baseline without a fingerprint over equal content is upgraded, no conflict", async () => {
+        const path = "legacy-same.md";
+        vault.addFile(path, "same\n");
+        await seedLegacyBaseline(path, { "dev-B": 1 });
+        const doc = await commitDoc(path, "same\n", { "dev-B": 1, "dev-A": 1 });
+
+        await reconciler.reconcile("paused");
+
         expect(orchCalls.edit).toHaveLength(0);
+        const ls = vs.getLastSynced(path);
+        expect(ls?.vclock).toEqual(doc.vclock);
+        expect(ls?.chunks).toEqual(doc.chunks);
+        expect(ls?.size).toBe(doc.size);
     });
 });

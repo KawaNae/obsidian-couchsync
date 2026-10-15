@@ -10,6 +10,7 @@ import type { FileDoc, CouchSyncDoc } from "../../src/types.ts";
 import { FILE_SCHEMA_VERSION } from "../../src/types.ts";
 import { splitIntoChunks } from "../../src/db/chunker.ts";
 import { RACY_MTIME_WINDOW_MS } from "../../src/sync/last-synced.ts";
+import { toPathKey } from "../../src/utils/path.ts";
 
 let counter = 0;
 function uniqueDbName() { return `vault-sync-test-${Date.now()}-${counter++}`; }
@@ -296,15 +297,51 @@ describe("VaultSync", () => {
                 expect(vs.getLastSynced("a.md")?.deleted).toBe(true);
             });
 
-            it("writes content where the file has no baseline, as the reconcile does", async () => {
-                // No baseline: the classifier calls this remote-edit and the
-                // reconcile writes it, so a declined write would never be offered.
+            it("keeps a file with no baseline whose content differs", async () => {
+                // Made here before its first push, or come into the filters:
+                // the reconcile offers it as a conflict.
                 vault.addFile("a.md", "never synced");
                 const doc = await remoteDoc("a.md", "theirs", { "dev-B": 1 });
 
-                expect(await vs.dbToFile(doc)).toEqual({ applied: true });
-                expect(vault.readText("a.md")).toBe("theirs");
+                expect(await vs.dbToFile(doc)).toEqual(DECLINED);
+                expect(vault.readText("a.md")).toBe("never synced");
+                expect(vs.getLastSynced("a.md")).toBeUndefined();
+                const stat = (await vault.stat("a.md"))!;
+                expect(await vs.classifyFileVsDoc(doc, "a.md", stat)).toBe("true-divergent");
             });
+
+            it("declines a file with no baseline and another size without reading it", async () => {
+                vault.addFile("a.md", "never synced");
+                const doc = await remoteDoc("a.md", "theirs", { "dev-B": 1 });
+                const read = vi.spyOn(vault, "readBinary");
+
+                expect(await vs.dbToFile(doc)).toEqual(DECLINED);
+                expect(read).not.toHaveBeenCalled();
+            });
+
+            it("takes the baseline where a file with no baseline already holds the content", async () => {
+                vault.addFile("a.md", "same", { mtime: 1000 });
+                const doc = await remoteDoc("a.md", "same", { "dev-B": 1 });
+
+                expect(await vs.dbToFile(doc)).toEqual({ applied: true });
+                expect((await vault.stat("a.md"))?.mtime).toBe(1000);
+                const ls = vs.getLastSynced("a.md");
+                expect(ls?.chunks).toEqual(doc.chunks);
+                expect(ls?.vclock).toEqual(doc.vclock);
+            });
+
+            it("keeps a file whose baseline has no fingerprint when the content differs", async () => {
+                vault.addFile("a.md", "mine");
+                await db.runWriteTx({
+                    meta: [{ op: "put", key: "_local/vclock/" + toPathKey("a.md"), value: { "dev-A": 1 } as any }],
+                });
+                await vs.loadLastSyncedVclocks();
+                const doc = await remoteDoc("a.md", "theirs", { "dev-A": 1, "dev-B": 1 });
+
+                expect(await vs.dbToFile(doc)).toEqual(DECLINED);
+                expect(vault.readText("a.md")).toBe("mine");
+            });
+
         });
 
         it("rejects a remote path that escapes the vault (traversal)", async () => {

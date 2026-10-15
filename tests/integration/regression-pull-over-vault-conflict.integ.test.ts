@@ -18,6 +18,11 @@
  * The other cases are the same rule on the other ways a pull reaches the
  * vault: a deletion, a recreate over the user's deletion, a change still in
  * the push debounce window, and the PendingApply retry.
+ *
+ * A file this device has no baseline for (made here before its first push,
+ * or come into the filters) holds content never synced: a pulled version
+ * with other content is offered as a conflict, the same content only
+ * records the baseline.
  */
 import "fake-indexeddb/auto";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
@@ -37,6 +42,7 @@ import { makePendingApply } from "../helpers/pending-apply.ts";
 import { makeFileId } from "../../src/types/doc-id.ts";
 import { splitIntoChunks } from "../../src/db/chunker.ts";
 import type { FileDoc, CouchSyncDoc } from "../../src/types.ts";
+import { FILE_SCHEMA_VERSION } from "../../src/types.ts";
 
 let counter = 0;
 function uniqueDbName() { return `pull-over-vault-conflict-${Date.now()}-${counter++}`; }
@@ -69,17 +75,19 @@ describe("regression: pull over a vault change not yet synced", () => {
     let writer: ToggleVaultWriter;
     let reported: { edit: string[]; delete: string[]; recreate: string[] };
     let reconciler: Reconciler;
+    let settings: ReturnType<typeof makeSettings>;
 
     beforeEach(() => {
         vault = new FakeVaultIO();
         db = new LocalDB(uniqueDbName());
         db.open();
         writer = new ToggleVaultWriter(vault);
-        vs = new VaultSync(vault, db, () => makeSettings({ deviceId: "dev-B" }), writer);
+        settings = makeSettings({ deviceId: "dev-B" });
+        vs = new VaultSync(vault, db, () => settings, writer);
         reported = { edit: [], delete: [], recreate: [] };
         reconciler = new Reconciler(
             { getFiles: () => vault.getFiles() } as any,
-            db, vs, () => makeSettings({ deviceId: "dev-B" }),
+            db, vs, () => settings,
         );
         reconciler.setConflictOrchestrator({
             async handleDivergentLocalEdit(p: string) { reported.edit.push(p); },
@@ -252,5 +260,84 @@ describe("regression: pull over a vault change not yet synced", () => {
 
         expect(dec.decode(await vault.readBinary(PATH))).toBe("remote 2\n");
         expect(vs.getLastSynced(PATH)?.chunks).toEqual(r2.doc.chunks);
+    });
+
+    describe("a file this device has no baseline for", () => {
+        /** Another device's version of `path`, never seen here. */
+        async function foreignDoc(path: string, text: string) {
+            const base: FileDoc = {
+                _id: makeFileId(path), schemaVersion: FILE_SCHEMA_VERSION, type: "file",
+                chunks: [], mtime: 1, ctime: 1, size: 0, vclock: {},
+            };
+            return remoteVersion(base, text, { "dev-A": 1 });
+        }
+
+        it("keeps a file made here before its first push and offers it against the pulled one", async () => {
+            vault.addFile(PATH, "made here\n");
+            const theirs = await foreignDoc(PATH, "made there\n");
+            await db.runWriteTx({ chunks: theirs.chunks });
+
+            await pull(theirs.doc, "1");
+
+            expect(dec.decode(await vault.readBinary(PATH))).toBe("made here\n");
+            expect(vs.getLastSynced(PATH)).toBeUndefined();
+            // The debounced push then declines; the reconcile offers it.
+            expect(await vs.fileToDb(PATH)).toBe(false);
+            await reconciler.reconcile("manual");
+            expect(reported.edit).toEqual([PATH]);
+            expect(dec.decode(await vault.readBinary(PATH))).toBe("made here\n");
+        });
+
+        it("records the baseline when the pulled version has the same content", async () => {
+            vault.addFile(PATH, "same\n");
+            const theirs = await foreignDoc(PATH, "same\n");
+            await db.runWriteTx({ chunks: theirs.chunks });
+
+            await pull(theirs.doc, "1");
+
+            expect(vs.getLastSynced(PATH)?.vclock).toEqual(theirs.doc.vclock);
+            expect(await vs.fileToDb(PATH)).toBe(false);
+            const report = await reconciler.reconcile("manual");
+            expect(reported).toEqual({ edit: [], delete: [], recreate: [] });
+            expect(report.inSync).toBe(1);
+            expect(((await db.get(makeFileId(PATH))) as FileDoc).vclock).toEqual(theirs.doc.vclock);
+        });
+
+        it("asks nothing about filtered paths, and asks only about differing content once they come in", async () => {
+            settings.syncFilter = "^notes/";
+            const paths = {
+                differs: "inbox/differs.md",
+                same: "inbox/same.md",
+                remoteOnly: "inbox/remote-only.md",
+                localOnly: "inbox/local-only.md",
+            };
+            vault.addFile(paths.differs, "mine\n");
+            vault.addFile(paths.same, "same\n");
+            vault.addFile(paths.localOnly, "only here\n");
+            const docs = [
+                await foreignDoc(paths.differs, "theirs\n"),
+                await foreignDoc(paths.same, "same\n"),
+                await foreignDoc(paths.remoteOnly, "only there\n"),
+            ];
+            for (const [i, d] of docs.entries()) {
+                await db.runWriteTx({ chunks: d.chunks });
+                await pull(d.doc, String(i + 1));
+            }
+
+            // Filtered: the pull wrote nothing and the reconcile asks nothing.
+            await reconciler.reconcile("manual");
+            expect(reported).toEqual({ edit: [], delete: [], recreate: [] });
+            expect(vault.readText(paths.differs)).toBe("mine\n");
+            expect(vault.files.has(paths.remoteOnly)).toBe(false);
+
+            // The filter widens: only the differing file is a conflict.
+            settings.syncFilter = "";
+            await reconciler.reconcile("manual");
+            expect(reported).toEqual({ edit: [paths.differs], delete: [], recreate: [] });
+            expect(vault.readText(paths.differs)).toBe("mine\n");
+            expect(vs.getLastSynced(paths.same)?.vclock).toEqual(docs[1].doc.vclock);
+            expect(vault.readText(paths.remoteOnly)).toBe("only there\n");
+            expect(((await db.get(makeFileId(paths.localOnly))) as FileDoc).vclock).toEqual({ "dev-B": 1 });
+        });
     });
 });

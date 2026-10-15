@@ -87,9 +87,10 @@ export class VaultSync {
      * Loaded once via `loadLastSyncedVclocks()` at plugin init; the on-disk
      * representation is per-path meta entries (`_local/vclock/<path>`).
      * Entries written before the chunks/size extension carry only the
-     * vclock (`chunks`/`size` undefined); they are treated as "legacy
-     * skip" by the divergent-edit guard until the next push/pull
-     * rewrites them in full shape.
+     * vclock (`chunks`/`size` undefined). They cannot tell whether the disk
+     * still holds the synced content, so the guards treat them as no
+     * baseline for that question until the next push/pull, or an identical
+     * reconcile, rewrites them in full shape.
      */
     private lastSynced = new LastSyncedCache();
 
@@ -253,9 +254,9 @@ export class VaultSync {
                     // pull-integration check, and the user-edited-stale
                     // check all share one matrix. Skip when the local
                     // disk lags the LocalDB doc (= remote-edit pending
-                    // integration) or both sides have drifted
-                    // (= true-divergent). Push only when the classifier
-                    // confirms `local-edit`.
+                    // integration) or the disk holds content the doc's
+                    // history does not explain (= true-divergent, which
+                    // the reconcile offers as a conflict).
                     if (existing) {
                         const existingVC = existing.vclock ?? {};
                         const lastSynced = this.lastSynced.get(toPathKey(path));
@@ -277,22 +278,6 @@ export class VaultSync {
                                 `integrated=${lastSynced ? JSON.stringify(lastSynced.vclock) : "null"})`,
                             );
                             return null;
-                        }
-                        if (relation === "legacy-skip") {
-                            // Pre-extension lastSynced — fall back to the
-                            // legacy vclock-only check until the startup
-                            // legacy-lastSynced sweep upgrades the entry to the {chunks,size}
-                            // shape.
-                            const isDivergent = lastSynced
-                                ? compareVC(existingVC, lastSynced.vclock) === "dominates"
-                                : Object.keys(existingVC).length > 0;
-                            if (isDivergent) {
-                                logWarn(
-                                    `fileToDb: skipping push for ${path} — legacy-skip divergent ` +
-                                    `(observed=${JSON.stringify(existingVC)})`,
-                                );
-                                return null;
-                            }
                         }
                         // identical / local-edit / vclock-only-drift fall
                         // through to push. (vclock-only-drift requires
@@ -705,25 +690,22 @@ export class VaultSync {
     }
 
     /**
-     * Whether the vault holds, at `path`, a change this device has not
-     * synced: the disk no longer holds what was last synced for the path
-     * (`lastSynced`), so writing `fileDoc` there would replace or remove the
-     * user's change.
+     * Whether the vault holds, at `path`, content this device has not
+     * synced, so writing `fileDoc` there would replace or remove it.
      *
-     * The question is about content only: the disk against the baseline's
-     * fingerprint, read through the same stat cache the reconcile uses
-     * (`diskChunkIds`). Each answer matches what the reconcile does with the
-     * path, so a declined version is not lost: it stays in the local DB, and
-     * the reconcile offers it through the conflict orchestrator, or pushes
-     * the vault's change when the doc is not newer than the baseline.
+     * The disk holds only synced content when it matches an alive baseline
+     * (`lastSynced`) with a fingerprint; the comparison reads through the
+     * same stat cache the reconcile uses (`diskChunkIds`). This is the
+     * classifier's rule for replacing the disk (`refineRemoteEdit`), so a
+     * declined version is not lost: it stays in the local DB, and the
+     * reconcile offers it through the conflict orchestrator, or pushes the
+     * vault's change when the doc is not newer than the baseline.
      *
-     * - File on disk, live baseline: changed when the content differs from
-     *   the baseline.
-     * - File on disk, deleted baseline: the file was made after a synced
-     *   deletion, so it is changed.
-     * - File on disk, no baseline or one without a fingerprint: a deletion
-     *   would remove content never synced (the reconcile offers it as a
-     *   conflict); content is written, as the reconcile does for such a path.
+     * - File on disk: unsynced unless it matches an alive, fingerprinted
+     *   baseline. With no such baseline the file was made here before its
+     *   first push, came into the filters, or was recreated after a synced
+     *   deletion. dbToFile asks only after finding that the disk differs
+     *   from `fileDoc`; equal content takes the baseline instead.
      * - No file on disk: a deletion has nothing to remove. Content written
      *   there would undo the user's deletion when the baseline is a live
      *   file; the reconcile offers or sends that deletion. With a deleted
@@ -739,9 +721,9 @@ export class VaultSync {
         if (!stat) {
             return !fileDoc.deleted && ls !== undefined && ls.deleted !== true;
         }
-        if (ls?.deleted) return true;
-        if (ls === undefined || ls.chunks === undefined || ls.size === undefined) {
-            return fileDoc.deleted === true;
+        if (ls === undefined || ls.deleted === true
+            || ls.chunks === undefined || ls.size === undefined) {
+            return true;
         }
         if (stat.size !== ls.size) return true;
         const disk = diskChunks ?? await this.diskChunkIds(path, stat);

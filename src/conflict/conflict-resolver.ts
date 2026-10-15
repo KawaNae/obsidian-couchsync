@@ -107,8 +107,7 @@ export class ConflictResolver {
             // for vclock ties instead of surfacing them (see ClassifyInput).
             recreateAuthority: opts?.recreateAuthority === true,
             // No `lastSynced` — pull-side replication is independent of
-            // vault integration state. Without baseline the classifier
-            // never returns `legacy-skip` here.
+            // vault integration state.
             //
             // The deleted axis at this call site: deleted×deleted is
             // content-equal regardless of (non-normalized) tombstone chunks,
@@ -161,14 +160,6 @@ export class ConflictResolver {
                     `concurrent conflict on ${vaultPath} — enqueued for resolution.`,
                 );
                 return "concurrent";
-
-            case "legacy-skip":
-                // Should not happen here (no lastSynced passed); fall back
-                // to keep-local for safety.
-                logDebug(
-                    `keep-local (legacy-skip fallback) for ${vaultPath}`,
-                );
-                return "keep-local";
         }
     }
 }

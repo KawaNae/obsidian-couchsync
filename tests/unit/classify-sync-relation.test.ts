@@ -112,16 +112,44 @@ describe("classifySyncRelation", () => {
                 rightVC: VC({ a: 2 }),
                 leftChunks: C("local-edit"),  // user edited stale
                 leftSize: 11,
+                leftVCAttributed: true,
                 rightChunks: C("remote-edit"),
                 rightSize: 11,
                 lastSynced,
+            }))).toBe("true-divergent");
+        });
+
+        it("vault site: chunks differ + right dominates + no baseline → true-divergent", () => {
+            // A file made here before its first push, or come into the
+            // filters: content this device never synced.
+            expect(classifySyncRelation(input({
+                leftVC: VC({}),
+                rightVC: VC({ b: 1 }),
+                leftChunks: C("mine"),
+                rightChunks: C("theirs"),
+                leftSize: 4,
+                rightSize: 6,
+                leftVCAttributed: true,
+            }))).toBe("true-divergent");
+        });
+
+        it("vault site: right dominates + baseline matching the disk but deleted → true-divergent", () => {
+            expect(classifySyncRelation(input({
+                leftVC: VC({ a: 1 }),
+                rightVC: VC({ a: 2 }),
+                leftChunks: C(),
+                rightChunks: C("new"),
+                leftSize: 0,
+                rightSize: 3,
+                leftVCAttributed: true,
+                lastSynced: { vclock: VC({ a: 1 }), chunks: [], size: 0, deleted: true },
             }))).toBe("true-divergent");
         });
     });
 
     // ── remote-edit ───────────────────────────────────────
     describe("remote-edit", () => {
-        it("chunks differ + right dominates + no baseline → remote-edit", () => {
+        it("pull site: chunks differ + right dominates → remote-edit (no baseline consulted)", () => {
             expect(classifySyncRelation(input({
                 leftVC: VC({ a: 1 }),
                 rightVC: VC({ a: 2 }),
@@ -143,6 +171,7 @@ describe("classifySyncRelation", () => {
                 rightVC: VC({ a: 2 }),
                 leftChunks: C("base"),
                 leftSize: 4,
+                leftVCAttributed: true,
                 rightChunks: C("new"),
                 rightSize: 3,
                 lastSynced,
@@ -275,9 +304,9 @@ describe("classifySyncRelation", () => {
         });
     });
 
-    // ── legacy-skip ───────────────────────────────────────
-    describe("legacy-skip", () => {
-        it("right dominates + lastSynced.chunks undefined → legacy-skip", () => {
+    // ── baseline without a fingerprint ────────────────────
+    describe("baseline without a fingerprint", () => {
+        it("vault site: right dominates + lastSynced.chunks undefined → true-divergent", () => {
             const lastSynced: LastSynced = { vclock: VC({ a: 1 }) };
             expect(classifySyncRelation(input({
                 leftVC: VC({ a: 1 }),
@@ -286,14 +315,15 @@ describe("classifySyncRelation", () => {
                 rightChunks: C("R"),
                 leftSize: 1,
                 rightSize: 1,
+                leftVCAttributed: true,
                 lastSynced,
-            }))).toBe("legacy-skip");
+            }))).toBe("true-divergent");
         });
 
-        it("right dominates + lastSynced.size undefined → legacy-skip", () => {
+        it("vault site: right dominates + lastSynced.size undefined → true-divergent", () => {
             const lastSynced: LastSynced = {
                 vclock: VC({ a: 1 }),
-                chunks: ["base"],
+                chunks: ["L"],
                 // size missing
             };
             expect(classifySyncRelation(input({
@@ -303,19 +333,21 @@ describe("classifySyncRelation", () => {
                 rightChunks: C("R"),
                 leftSize: 1,
                 rightSize: 1,
+                leftVCAttributed: true,
                 lastSynced,
-            }))).toBe("legacy-skip");
+            }))).toBe("true-divergent");
         });
 
-        it("legacy lastSynced does NOT affect identical / vclock-only-drift / local-edit", () => {
+        it("does NOT affect identical / vclock-only-drift / local-edit", () => {
             const lastSynced: LastSynced = { vclock: VC({}) };
             // identical
-            expect(classifySyncRelation(input({ lastSynced }))).toBe("identical");
-            // vclock-only-drift
+            expect(classifySyncRelation(input({ lastSynced, leftVCAttributed: true }))).toBe("identical");
+            // vclock-only-drift: equal content only aligns the baseline
             expect(classifySyncRelation(input({
                 leftVC: VC({ a: 1 }),
-                rightVC: VC({ b: 1 }),
+                rightVC: VC({ a: 2 }),
                 lastSynced,
+                leftVCAttributed: true,
             }))).toBe("vclock-only-drift");
             // local-edit (vcRel "equal", no baseline check needed) — vault-disk
             // call site (attributed); pull-site equal+differ is true-divergent.

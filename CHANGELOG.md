@@ -11,10 +11,15 @@ All notable changes to obsidian-couchsync.
   device last synced it, a newer version pulled from another device replaced
   the edit, or brought the deleted file back, without asking. This happened
   when the pull arrived before the edit was pushed, and also while a conflict
-  about that edit was still waiting for an answer. The pull now leaves the
-  file as it is and keeps the pulled version in the local database; the
-  conflict dialog then shows both, and the chosen one is written. Clone still
-  replaces the files at the same path, as its confirmation says.
+  about that edit was still waiting for an answer. The same happened to a
+  file this device had never synced — one made here and not yet pushed, or
+  one that came into the filters when they were widened — when another
+  device had a file at the same path. The pull now leaves the file as it is
+  and keeps the pulled version in the local database; the conflict dialog
+  then shows both, and the chosen one is written. A never-synced file with
+  the same content as the pulled version is not a conflict: the device only
+  records it as synced. Files the filters keep out are not offered. Clone
+  still replaces the files at the same path, as its confirmation says.
 - **A new install no longer shows the notice that config sync filtering was
   upgraded.** The notice is for settings that had the old path list to
   convert; a first start, with no settings saved, was taken for one.
