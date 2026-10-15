@@ -612,9 +612,10 @@ export class ConfigSyncTab {
             cls: "setting-item-description",
         });
         el.createEl("p", {
-            text: "The tree lists config present on THIS device; the per-unit " +
-                "defaults also govern plugins, themes and snippets that arrive " +
-                "from other devices.",
+            text: "The tree lists config on this device and on the server " +
+                "(this device only, when the server cannot be reached); the " +
+                "per-unit defaults also govern plugins, themes and snippets " +
+                "that arrive later from other devices.",
             cls: "setting-item-description",
         });
         if (Platform.isMobile) {

@@ -54,8 +54,10 @@ export function configBindingKey(serverUri: string, dbName: string): string {
  * The vault name keeps two vaults on one device apart, as before.
  *
  * `couchsync-<vault>-config-<db>-<hash16>`. Stores named by the previous
- * layout (`couchsync-<vault>-config-<db>`) are no longer opened; they stay
- * on disk (cleaning unused stores is out of scope).
+ * layout (`couchsync-<vault>-config-<db>`) are no longer opened; on plugin
+ * load the one for the applied config DB name is deleted
+ * (`deleteLegacyConfigStore`). Those of config DB names not applied now
+ * stay on disk.
  */
 export async function configStoreName(
     vaultName: string,

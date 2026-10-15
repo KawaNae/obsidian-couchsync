@@ -15,8 +15,8 @@ Simplified CouchDB-only vault sync for Obsidian. Fork of [Self-hosted LiveSync](
   iterations) key derivation. When enabled, note contents **and file paths**
   are encrypted before leaving the device. Off by default; the passphrase is
   set at Init. See [SECURITY.md](SECURITY.md).
-- **Four codec modes** — `raw`, `gzip`, `encrypt`, `gzip+encrypt`, chosen at
-  Init and recorded server-side. `gzip+encrypt` is recommended for untrusted
+- **Four codec modes** — `raw`, `gzip`, `encrypt`, `gzip-encrypt`, chosen at
+  Init and recorded server-side. `gzip-encrypt` is recommended for untrusted
   servers.
 - **Conflict handling** — Sync relations are classified by vector clock +
   content-addressed chunks. Identical content with diverged clocks reconciles

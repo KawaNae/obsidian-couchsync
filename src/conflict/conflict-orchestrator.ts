@@ -360,7 +360,10 @@ export class ConflictOrchestrator {
                 const ok = await this.deps.modal.showConfirmModal(
                     "Take remote for all conflicts?",
                     `This replaces your local version of ${items.length} file(s) with ` +
-                        `the remote version. This cannot be undone.`,
+                        `the remote version shown. A file whose version changed after ` +
+                        `the conflict dialog opened is not written; its conflict is shown ` +
+                        `again with the current versions. Only text files keep the ` +
+                        `replaced local version, in the file history.`,
                     "Take all remote",
                     true,
                 );

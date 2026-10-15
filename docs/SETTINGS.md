@@ -91,7 +91,7 @@ The main tab, organized as steps.
   Live Sync.
 
   Encryption × compression gives the four codec modes: `raw`, `gzip`,
-  `encrypt`, `gzip+encrypt`. The mode is fixed at **Init** and recorded in the
+  `encrypt`, `gzip-encrypt`. The mode is fixed at **Init** and recorded in the
   server's `vault:meta`; Clone adopts whatever the server declares.
 
 **Step 2: Database** (needs the CouchDB tab's Test + Apply)
@@ -334,7 +334,7 @@ the cause and the fix, e.g. `CouchSync: Config Pull failed — …`.
 
 - **Codec modes** = `encryptionEnabled` × `compressionEnabled`, chosen at
   **Init**, recorded in `vault:meta`. On Clone, the **server's** declared mode
-  wins. `gzip+encrypt` is recommended for untrusted servers. The config
+  wins. `gzip-encrypt` is recommended for untrusted servers. The config
   database's codec is chosen at **Create** and recorded in `config:meta`;
   Join adopts it.
 - **Auth** is HTTP Basic only — there is no JWT, Cloudant API-key, or
