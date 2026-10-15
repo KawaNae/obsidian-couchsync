@@ -20,6 +20,16 @@ All notable changes to obsidian-couchsync.
   the same content as the pulled version is not a conflict: the device only
   records it as synced. Files the filters keep out are not offered. Clone
   still replaces the files at the same path, as its confirmation says.
+- **A pull no longer replaces what was just typed in an open note.**
+  Obsidian saves typing about two seconds later; a version pulled in that
+  time replaced the editor's text, and the typing was lost. A pulled
+  version, or a pulled deletion, now leaves the note and its editor as they
+  are while any open editor on it holds text not yet saved. Once the editor
+  saves, the conflict dialog shows the saved text and the pulled version.
+  If the typing was undone before a save, the pulled version is written at
+  the next sync check. A file with Windows line breaks (CRLF) or a BOM is
+  not taken for unsaved typing. An IME composition that commits text is
+  handled the same way.
 - **A conflict on a binary file, such as an image or a PDF, is asked about
   like one on a note.** The device kept its own version without asking, so
   the vault's copy of an attachment could replace a newer one from another

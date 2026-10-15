@@ -3,7 +3,12 @@ import type { LocalDB } from "../db/local-db.ts";
 import type { FileDoc, ChunkDoc, CouchSyncDoc } from "../types.ts";
 import { FILE_SCHEMA_VERSION } from "../types.ts";
 import type { CouchSyncSettings } from "../settings.ts";
-import type { VaultWriter, WriteResult } from "./vault-writer.ts";
+import {
+    UNSAVED_EDITOR_CHANGE,
+    UNSYNCED_VAULT_CHANGE,
+    type VaultWriter,
+    type WriteResult,
+} from "./vault-writer.ts";
 import { splitIntoChunks, joinChunks, type ChunkHasher } from "../db/chunker.ts";
 import { notify } from "../ui/log.ts";
 import { compareVC, incrementVC, mergeVC } from "./vector-clock.ts";
@@ -65,6 +70,8 @@ export interface DbToFileOptions {
     overwriteVaultChange?: boolean;
 }
 
+type DeclinedWrite = Extract<WriteResult, { applied: false }>;
+
 /** Max snapshot→commit retries inside runWrite when a concurrent pull lands
  *  between our read and our CAS check. Realistic worst case is 1. */
 const CAS_MAX_ATTEMPTS = 4;
@@ -111,6 +118,20 @@ export class VaultSync {
      */
     private pendingProbe: IPendingProbe | null = null;
 
+    /**
+     * Paths whose doc-to-vault write the writer declined because an open
+     * editor held input not yet saved (`UNSAVED_EDITOR_CHANGE`). The
+     * declined version waits in the local DB, and the reconcile that
+     * follows the decline still sees the disk as last synced. Once the
+     * editor saves, the vault records the input as a change (`fileToDb`, or
+     * `markDeleted` when the file went), and the reconcile must look at the
+     * path again: it offers the declined version against the saved input
+     * as a conflict, or writes it when the input was undone. Integrating a
+     * version (`establishBaseline`) ends the wait.
+     */
+    private awaitingEditorSave = new Set<PathKey>();
+    private onEditorSaved: (() => void) | null = null;
+
     private readonly hasher?: ChunkHasher;
 
     constructor(
@@ -133,6 +154,22 @@ export class VaultSync {
      */
     setPendingProbe(probe: IPendingProbe): void {
         this.pendingProbe = probe;
+    }
+
+    /**
+     * Wire what runs when the vault records a change on a path whose write
+     * was declined for an editor's unsaved input (see `awaitingEditorSave`).
+     * `main.ts` schedules a reconcile, as it does after a pull skips a
+     * write.
+     */
+    setOnEditorSaved(cb: () => void): void {
+        this.onEditorSaved = cb;
+    }
+
+    /** The vault is recording a change on `path`: if a write there waited
+     *  for the editor to save, let the reconcile take the path up. */
+    private endEditorWait(path: string): void {
+        if (this.awaitingEditorSave.delete(toPathKey(path))) this.onEditorSaved?.();
     }
 
     /**
@@ -210,6 +247,7 @@ export class VaultSync {
      * a remote edit not yet integrated).
      */
     async fileToDb(path: string): Promise<boolean> {
+        this.endEditorWait(path);
         const settings = this.getSettings();
         const fileStat = await this.vault.stat(path);
         if (!fileStat) return false; // file disappeared before we could read it
@@ -382,7 +420,8 @@ export class VaultSync {
                         return this.declineOverVaultChange(vaultPath);
                     }
                 }
-                await this.vaultWriter.applyRemoteDeletion(vaultPath);
+                const removed = await this.vaultWriter.applyRemoteDeletion(vaultPath);
+                if (removed.applied === false) return this.declinedByWriter(vaultPath, removed);
                 await this.pruneEmptyParents(vaultPath);
             } else {
                 const sibling = this.findExistingByPathKey(vaultPath);
@@ -522,16 +561,7 @@ export class VaultSync {
             result = { applied: true };
         }
 
-        if (result.applied === false) {
-            // VaultWriter declined to apply (e.g., the local doc diverged
-            // during IME composition). Leave lastSyncedVclock untouched so
-            // the divergent state is detectable: the LocalDB doc has been
-            // advanced to fileDoc.vclock by PullWriter, but vault content
-            // is stale. fileToDb's divergent guard refuses any push from
-            // this state; the pull-skipped → reconcile schedule path
-            // re-attempts dbToFile on the next cycle.
-            return result;
-        }
+        if (result.applied === false) return this.declinedByWriter(vaultPath, result);
 
         // Persist the integration point in the docs store's meta so it
         // lives in the same IDB as the FileDoc itself. The post-write stat
@@ -574,6 +604,7 @@ export class VaultSync {
         diskStat?: { mtime: number; size: number },
     ): Promise<void> {
         const key = toPathKey(path);
+        this.awaitingEditorSave.delete(key);
         const prev = this.lastSynced.get(key);
         const docVC = fileDoc.vclock ?? {};
         if (fileDoc.deleted) {
@@ -735,7 +766,25 @@ export class VaultSync {
             `dbToFile: not writing ${path} — the vault changed since the last sync; ` +
             `left for reconcile to offer as a conflict`,
         );
-        return { applied: false, reason: "unsynced-vault-change" };
+        return { applied: false, reason: UNSYNCED_VAULT_CHANGE };
+    }
+
+    /**
+     * The writer declined, leaving the vault as it was (an open editor's
+     * input, or a file changed while the write waited for an IME
+     * composition). The bookkeeping stays as it is, so the path stays
+     * detectable: the local DB doc is ahead of the vault, fileToDb's guard
+     * refuses to push from this state, and the reconcile writes the doc
+     * later or offers the vault's change as a conflict. Input still in the
+     * editor reaches the vault only when the editor saves, so the path
+     * waits for that (`awaitingEditorSave`).
+     */
+    private declinedByWriter(path: string, result: DeclinedWrite): WriteResult {
+        if (result.reason === UNSAVED_EDITOR_CHANGE) {
+            this.awaitingEditorSave.add(toPathKey(path));
+        }
+        logInfo(`dbToFile: not writing ${path} — ${result.reason}`);
+        return result;
     }
 
     /**
@@ -898,6 +947,7 @@ export class VaultSync {
     }
 
     async markDeleted(path: string): Promise<void> {
+        this.endEditorWait(path);
         const fileId = makeFileId(path);
         const deviceId = this.getSettings().deviceId;
         try {
@@ -977,7 +1027,13 @@ export class VaultSync {
     }
 
     async applyRemoteDeletion(path: string): Promise<void> {
-        await this.vaultWriter.applyRemoteDeletion(path);
+        const removed = await this.vaultWriter.applyRemoteDeletion(path);
+        if (removed.applied === false) {
+            // The file stays, so its doc must not become a tombstone. The
+            // next reconcile meets the same paths again.
+            this.declinedByWriter(path, removed);
+            return;
+        }
         await this.pruneEmptyParents(path);
         await this.markDeleted(path);
     }
