@@ -86,7 +86,9 @@ export class VaultSyncTab {
         const { locked, initEnabled, cloneEnabled, syncToggleEnabled } =
             setupGating(state, settings.serverTested);
         const relation = this.deps.vault.relation();
-        const idle = relation.busy === null;
+        // No Init, Clone or Check runs: the binding refuses each of them, and
+        // every change of what they read, while one does.
+        const idle = this.deps.vault.changeBlocker() === null;
         // A config Pull reloads Obsidian when it writes files, which would
         // stop an Init or Clone half-way.
         const reloadFree = this.deps.vault.reloadConflict() === null;
@@ -99,7 +101,7 @@ export class VaultSyncTab {
         this.renderDeviceIdentity(el, locked);
 
         // ── Step 1: Encryption ─────────────────────────────────
-        this.renderEncryptionStep(el, relation);
+        this.renderEncryptionStep(el, relation, idle);
 
         // ── Step 2: Database ───────────────────────────────────
         el.createEl("h3", { text: "Step 2: Database" });
@@ -126,7 +128,7 @@ export class VaultSyncTab {
             .addButton((btn) =>
                 btn
                     .setButtonText("Check")
-                    .setDisabled(!dbEditable)
+                    .setDisabled(!dbEditable || !idle)
                     .onClick(async () => this.handleCheck(btn))
             );
 
@@ -254,8 +256,13 @@ export class VaultSyncTab {
     private async handleCheck(btn: ButtonComponent): Promise<void> {
         btn.setButtonText("Checking...");
         btn.setDisabled(true);
-        const result = await this.deps.vault.checkDatabase(this.draft.db);
-        this.testPassed = result.status !== "error";
+        try {
+            const result = await this.deps.vault.checkDatabase(this.draft.db);
+            this.testPassed = result.status !== "error";
+        } catch {
+            // Refused (Init or Clone runs); the binding reported it.
+            this.testPassed = false;
+        }
         this.deps.refresh();
     }
 
@@ -382,7 +389,7 @@ export class VaultSyncTab {
 
     // ── Step 1: Encryption ────────────────────────────────────────
 
-    private renderEncryptionStep(el: HTMLElement, relation: VaultRelation): void {
+    private renderEncryptionStep(el: HTMLElement, relation: VaultRelation, idle: boolean): void {
         const settings = this.deps.getSettings();
         const state = settings.connectionState;
         const editable = state !== "syncing";
@@ -415,7 +422,7 @@ export class VaultSyncTab {
             .addToggle((toggle) =>
                 toggle
                     .setValue(settings.encryptionEnabled)
-                    .setDisabled(!editable)
+                    .setDisabled(!editable || !idle)
                     .onChange(async (value) => {
                         await this.changeSetup("Encryption change", () => this.deps.vault.changeCodecSetting(
                             value ? { encryptionEnabled: true } : { encryptionEnabled: false, encryptionPassphrase: "" },
@@ -435,10 +442,17 @@ export class VaultSyncTab {
                     text.setPlaceholder("Enter passphrase")
                         .setValue(settings.encryptionPassphrase)
                         .onChange(async (value) => {
-                            await this.deps.updateSettings({ encryptionPassphrase: value });
+                            // A saved keystroke is not redrawn, so the field
+                            // keeps the focus; a refused one is.
+                            try {
+                                await this.deps.vault.setPassphrase(value);
+                            } catch (e) {
+                                reportError("Passphrase change", e);
+                                this.deps.refresh();
+                            }
                         });
                     text.inputEl.type = "password";
-                    text.setDisabled(!editable);
+                    text.setDisabled(!editable || !idle);
                 });
             addPasswordToggle(passphraseSetting);
         }
@@ -458,7 +472,7 @@ export class VaultSyncTab {
             .addToggle((toggle) =>
                 toggle
                     .setValue(settings.compressionEnabled)
-                    .setDisabled(!editable)
+                    .setDisabled(!editable || !idle)
                     .onChange(async (value) => {
                         await this.changeSetup("Compression change", () => this.deps.vault.changeCodecSetting({ compressionEnabled: value }));
                     })

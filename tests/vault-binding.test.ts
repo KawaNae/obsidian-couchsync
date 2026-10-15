@@ -42,6 +42,8 @@ interface Rig {
     /** When set, the destructive step waits for it. */
     setupGate: Promise<void> | null;
     dbCheckResult: DbCheckResult;
+    /** When set, Step 2's Check waits for it. */
+    checkGate: Promise<void> | null;
     /** The plans the confirm dialog was shown, in order. */
     confirmed: VaultSetupPlan[];
     /** The answer to the confirm dialog. */
@@ -66,7 +68,7 @@ function rig(opts: {
         binding: null as unknown as VaultBinding,
         settings, remote, auth: new AuthGate(),
         stops: 0, starts: 0, saves: [], stateAtSetup: null, failures: [], dones: [], setupError: null, setupGate: null, onSetup: () => {},
-        dbCheckResult: { status: "exists", docCount: 5 },
+        dbCheckResult: { status: "exists", docCount: 5 }, checkGate: null,
         confirmed: [], confirmAnswer: true, prompts: [],
     };
     const result = { vaultFiles: 3, totalDocs: 7 };
@@ -94,7 +96,10 @@ function rig(opts: {
         }),
         stopLive: () => { r.stops++; },
         startLive: async () => { r.starts++; },
-        checkDatabase: async () => r.dbCheckResult,
+        checkDatabase: async () => {
+            await r.checkGate;
+            return r.dbCheckResult;
+        },
         openProgress: () => ({
             update: () => {},
             done: (s) => { r.dones.push(s); },
@@ -779,6 +784,8 @@ describe("VaultBinding: the one writer of the setup state", () => {
         await expect(r.binding.applyDatabase("x")).rejects.toMatchObject(refused);
         await expect(r.binding.changeCodecSetting({ compressionEnabled: false })).rejects.toMatchObject(refused);
         await expect(r.binding.applyServer({ couchdbUser: "x" }, true)).rejects.toMatchObject(refused);
+        await expect(r.binding.setPassphrase("x")).rejects.toMatchObject(refused);
+        await expect(r.binding.checkDatabase("vault")).rejects.toMatchObject(refused);
         expect(r.settings.couchdbDbName).toBe("vault");
         release();
         await running;
@@ -821,5 +828,50 @@ describe("VaultBinding.checkDatabase", () => {
         r.dbCheckResult = { status: "error", error: err };
         await r.binding.checkDatabase("vault");
         expect(r.failures).toEqual([err]);
+    });
+});
+
+describe("VaultBinding — Step 2's Check takes the setup lock", () => {
+    it("while a Check runs, Init, Clone and every writer are refused, and its pass does not clear a latch it did not see", async () => {
+        const r = rig();
+        let release!: () => void;
+        r.checkGate = new Promise<void>((res) => { release = res; });
+        const checking = r.binding.checkDatabase("vault");
+        expect(r.binding.changeBlocker()).toBe("Database check is running — wait for it to finish.");
+        const refused = { name: "BusyError", message: "Database check is running — wait for it to finish." };
+        await expect(r.binding.init()).rejects.toMatchObject(refused);
+        await expect(r.binding.clone()).rejects.toMatchObject(refused);
+        await expect(r.binding.checkDatabase("vault")).rejects.toMatchObject(refused);
+        await expect(r.binding.setPassphrase("x")).rejects.toMatchObject(refused);
+        await expect(r.binding.changeCodecSetting({ compressionEnabled: false })).rejects.toMatchObject(refused);
+        expect(r.stateAtSetup).toBeNull();
+        expect(r.binding.relation().lastOp).toBeNull();
+        release();
+        await expect(checking).resolves.toEqual({ status: "exists", docCount: 5 });
+        expect(r.binding.changeBlocker()).toBeNull();
+        await r.binding.init();
+        expect(r.binding.relation().lastOp).toMatchObject({ op: "init", error: null });
+    });
+
+    it("a Check refused while Init runs leaves the auth latch as it was", async () => {
+        const r = rig();
+        let release!: () => void;
+        r.setupGate = new Promise<void>((res) => { release = res; });
+        const running = r.binding.init();
+        await new Promise((res) => setTimeout(res, 0));
+        r.auth.raise(401, "nope");
+        await expect(r.binding.checkDatabase("vault")).rejects.toMatchObject({ name: "BusyError" });
+        expect(r.auth.isBlocked()).toBe(true);
+        release();
+        await running;
+    });
+});
+
+describe("VaultBinding.setPassphrase", () => {
+    it("keeps a finished setup: the passphrase unlocks the vault, it does not define it", async () => {
+        const r = rig({ settings: { encryptionEnabled: true, encryptionPassphrase: "old" } });
+        await r.binding.setPassphrase("new");
+        expect(r.settings).toMatchObject({ encryptionPassphrase: "new", connectionState: "setupDone" });
+        expect(r.saves).toEqual(["setupDone"]);
     });
 });

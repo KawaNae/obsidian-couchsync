@@ -187,6 +187,11 @@ export class VaultBinding {
      *  commits `settings.vaultCipherVersion`. Undefined at all other times. */
     private cipherVersionOverride?: number;
     private inflight: VaultOpName | null = null;
+    /** Step 2's Check runs. It takes the same lock as Init and Clone: a
+     *  Check that passes clears the auth latch, which must not happen
+     *  under a run that raised it, and nothing it reads may change under
+     *  it. */
+    private checking = false;
     /** Init and Clone only; the agreement check's conclusion is the
      *  persisted pause (`settings.vaultPause`). */
     private readonly outcomes = new OutcomeLedger<VaultOpName>(() => false);
@@ -315,12 +320,13 @@ export class VaultBinding {
         return this.inflight;
     }
 
-    /** Why the vault setup cannot be changed now (Init or Clone runs), or
-     *  null. */
+    /** Why the vault setup cannot be changed now (Init, Clone or Step 2's
+     *  Check runs), or null. Init, Clone and Check are refused under the
+     *  same condition. */
     changeBlocker(): string | null {
-        return this.inflight
-            ? `${OP_LABELS[this.inflight]} is running — wait for it to finish.`
-            : null;
+        if (this.inflight) return `${OP_LABELS[this.inflight]} is running — wait for it to finish.`;
+        if (this.checking) return "Database check is running — wait for it to finish.";
+        return null;
     }
 
     /** Why Init and Clone cannot start now because of an operation outside
@@ -369,9 +375,10 @@ export class VaultBinding {
         this.changed();
     }
 
-    /** A Step 1 codec setting changed (encryption, compression). The vault
-     *  on the server was set up with the old one, so a finished setup no
-     *  longer holds: `setupDone` drops to `tested` (Init or Clone again). */
+    /** A Step 1 codec setting changed (encryption, compression; turning
+     *  encryption off also clears the passphrase). The vault on the server
+     *  was set up with the old one, so a finished setup no longer holds:
+     *  `setupDone` drops to `tested` (Init or Clone again). */
     async changeCodecSetting(
         patch: Partial<Pick<CouchSyncSettings, "encryptionEnabled" | "encryptionPassphrase" | "compressionEnabled">>,
     ): Promise<void> {
@@ -381,6 +388,18 @@ export class VaultBinding {
         if (s.connectionState === "setupDone") s.connectionState = "tested";
         await this.host.saveSettings();
         this.changed();
+    }
+
+    /** Step 1's passphrase changed. It is not part of the codec: the vault
+     *  on the server keeps its key, and the passphrase only unlocks it (the
+     *  startup unlock, the agreement check, Clone) or encrypts the next
+     *  Init. So a finished setup still holds and the state is kept. Refused
+     *  while Init, Clone or Check runs, like every other change of what
+     *  they read. Not announced: the tab is not redrawn on each keystroke. */
+    async setPassphrase(passphrase: string): Promise<void> {
+        this.assertIdle();
+        this.settings().encryptionPassphrase = passphrase;
+        await this.host.saveSettings();
     }
 
     /** The CouchDB tab's Apply. New credentials (or server) send the vault
@@ -444,21 +463,36 @@ export class VaultBinding {
      * how many documents it holds; a missing DB is created. Kept so Step 3
      * can tell whether Clone has something to pull. A failure is reported
      * on the notice, worded by `describeError`; a success clears the auth
-     * latch (the credentials were accepted).
+     * latch (the credentials were accepted). Refused (`BusyError`, thrown
+     * after the notice says so) while Init, Clone or another Check runs;
+     * Init, Clone and the changes of the setup are refused while it runs.
      */
     async checkDatabase(dbName: string): Promise<DbCheckResult> {
         const at = Date.now();
         const against = vaultTarget({ couchdbUri: this.settings().couchdbUri, couchdbDbName: dbName });
         const progress = this.host.openProgress("Database check");
-        const result = await this.host.checkDatabase(dbName);
-        this.recordDbCheck({ at, against, result });
-        if (result.status === "error") {
-            progress.fail(result.error);
-        } else {
-            this.host.auth.clear();
-            progress.done(`"${dbName}" ${describeDbFound(result)}`);
+        const blocked = this.changeBlocker();
+        if (blocked) {
+            const e = new BusyError(blocked);
+            progress.fail(e);
+            throw e;
         }
-        return result;
+        this.checking = true;
+        this.changed();
+        try {
+            const result = await this.host.checkDatabase(dbName);
+            this.recordDbCheck({ at, against, result });
+            if (result.status === "error") {
+                progress.fail(result.error);
+            } else {
+                this.host.auth.clear();
+                progress.done(`"${dbName}" ${describeDbFound(result)}`);
+            }
+            return result;
+        } finally {
+            this.checking = false;
+            this.changed();
+        }
     }
 
     // ── Init / Clone ───────────────────────────────────

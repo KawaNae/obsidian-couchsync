@@ -27,7 +27,6 @@ import type { CouchSyncSettings } from "../settings.ts";
 import type { ConfigSync, RemoteConfigListing } from "../sync/config-sync.ts";
 import type { SyncEngine } from "../db/sync-engine.ts";
 import type { AuthGate } from "../db/sync/auth-gate.ts";
-import { describeDbFound, type VaultRemoteOps } from "../db/sync/vault-remote-ops.ts";
 import { addPasswordToggle } from "./vault-sync-tab.ts";
 import { configRelationView } from "./config-relation-view.ts";
 import {
@@ -64,7 +63,7 @@ import {
     isInheritingConfigCompression,
 } from "../sync/config-codec-policy.ts";
 import { describeCodec, sameCodec } from "../sync/config-binding-record.ts";
-import { ProgressNotice, reportError, showNotice } from "../ui/notices.ts";
+import { reportError, showNotice } from "../ui/notices.ts";
 import { BusyError } from "../ui/describe-error.ts";
 
 export interface ConfigSyncTabDeps {
@@ -74,7 +73,6 @@ export interface ConfigSyncTabDeps {
     configSync: ConfigSync;
     replicator: SyncEngine;
     auth: AuthGate;
-    remoteOps: VaultRemoteOps;
     refresh: () => void;
 }
 
@@ -167,8 +165,8 @@ export class ConfigSyncTab {
     }
 
     /** Check is allowed once a non-empty draft DB name is typed, and not
-     *  while a config op runs: a Check that passes clears the auth latch,
-     *  which the running op may have raised. */
+     *  while a config op runs: ConfigSync runs it under the op lock, since
+     *  a Check that passes clears the auth latch. */
     private canCheck(): boolean {
         return this.draft.db.trim() !== "" && this.idle();
     }
@@ -909,21 +907,12 @@ export class ConfigSyncTab {
             return;
         }
 
-        const progress = new ProgressNotice("Database check");
-        const result = await this.deps.remoteOps.checkDatabaseWith(
-            settings.couchdbUri,
-            settings.couchdbUser,
-            settings.couchdbPassword,
-            this.draft.db,
-        );
-
-        if (result.status === "error") {
+        try {
+            const result = await this.deps.configSync.checkDatabase(this.draft.db);
+            this.testPassed = result.status !== "error";
+        } catch {
+            // Refused (a config op runs); ConfigSync reported it.
             this.testPassed = false;
-            progress.fail(result.error);
-        } else {
-            this.testPassed = true;
-            this.deps.auth.clear();
-            progress.done(`"${this.draft.db}" ${describeDbFound(result)}`);
         }
         this.deps.refresh();
     }

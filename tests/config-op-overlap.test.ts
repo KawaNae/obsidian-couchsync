@@ -15,6 +15,7 @@ import { ALWAYS_VISIBLE } from "../src/db/visibility-gate.ts";
 import type { ReconnectBridge } from "../src/sync/reconnect-bridge.ts";
 import type { ConfigCreateConfirm } from "../src/sync/config-create-preview.ts";
 import type { PushReview } from "../src/sync/config-push-review.ts";
+import type { DbCheckResult } from "../src/db/sync/vault-remote-ops.ts";
 import { DOC_ID } from "../src/types/doc-id.ts";
 import { FakeCouchClient } from "./helpers/fake-couch-client.ts";
 import { FakeVaultIO } from "./helpers/fake-vault-io.ts";
@@ -60,6 +61,8 @@ describe("config ops never overlap, their confirmation dialogs included", () => 
     let modal: HeldModalPresenter;
     let settings: ReturnType<typeof makeSettings>;
     let cs: ConfigSync;
+    let auth: AuthGate;
+    let check: Dialog<DbCheckResult> | null;
 
     beforeEach(async () => {
         vi.spyOn(console, "error").mockImplementation(() => {});
@@ -76,10 +79,15 @@ describe("config ops never overlap, their confirmation dialogs included", () => 
             compressionEnabled: false,
         });
         const bridge: ReconnectBridge = { notifyTransient: () => {} };
+        auth = new AuthGate();
+        check = null;
         cs = new ConfigSync(
-            vault, modal, "test-vault", new AuthGate(), ALWAYS_VISIBLE, bridge,
+            vault, modal, "test-vault", auth, ALWAYS_VISIBLE, bridge,
             () => settings,
-            { storeFactory: () => db, clientFactory: () => remote, rawClientFactory: () => remote },
+            {
+                storeFactory: () => db, clientFactory: () => remote, rawClientFactory: () => remote,
+                checkDatabase: async () => check ? check.show() : { status: "exists", docCount: 0 },
+            },
         );
         await cs.rebind("config-test");
     });
@@ -103,6 +111,7 @@ describe("config ops never overlap, their confirmation dialogs included", () => 
             () => cs.runExclusive(async () => {}),
             () => cs.rebind(null),
             () => cs.changeCodecSetting({ configCompressionEnabled: true }),
+            () => cs.checkDatabase("config-other"),
         ]) {
             await expect(other()).rejects.toMatchObject({ name: "BusyError" });
         }
@@ -194,6 +203,34 @@ describe("config ops never overlap, their confirmation dialogs included", () => 
 
         await cs.changeCodecSetting({ configCompressionEnabled: true });
         expect(settings.configCompressionEnabled).toBe(true);
+    });
+
+    it("Step 2's Check runs under the op lock: nothing else runs beside it, and a refused Check leaves the auth latch alone", async () => {
+        await attachPlain(settings, remote, db);
+        vault.addFile(".obsidian/app.json", `{"theme":"dark"}`);
+        check = new Dialog<DbCheckResult>();
+        const checking = cs.checkDatabase("config-other");
+        await vi.waitFor(() => expect(check!.open).toBe(true));
+
+        await expectAllRefused();
+
+        check.close({ status: "exists", docCount: 3 });
+        await expect(checking).resolves.toEqual({ status: "exists", docCount: 3 });
+        expect(cs.bindingChangeBlocker()).toBeNull();
+
+        // A Check refused under a running op does not clear the latch.
+        check = null;
+        const pushing = cs.push();
+        await vi.waitFor(() => expect(modal.push.open).toBe(true));
+        auth.raise(401, "nope");
+        await expect(cs.checkDatabase("config-other")).rejects.toMatchObject({ name: "BusyError" });
+        expect(auth.isBlocked()).toBe(true);
+        modal.push.close(null);
+        await pushing.catch(() => {});
+
+        // An idle Check that passes does.
+        await cs.checkDatabase("config-other");
+        expect(auth.isBlocked()).toBe(false);
     });
 
     it("announces when an op starts and when it ends", async () => {

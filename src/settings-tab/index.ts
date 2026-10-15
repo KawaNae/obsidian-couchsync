@@ -168,7 +168,6 @@ export class CouchSyncSettingTab extends PluginSettingTab {
             configSync: this.plugin.configSync,
             replicator: this.plugin.replicator,
             auth: this.plugin.auth,
-            remoteOps: this.plugin.remoteOps,
             refresh: () => this.display(),
         };
         if (!this.configSyncTab) {

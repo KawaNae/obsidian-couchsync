@@ -21,6 +21,7 @@ import type { CouchSyncSettings } from "../settings.ts";
 import { ProgressNotice } from "../ui/notices.ts";
 import type { ICouchClient } from "../db/interfaces.ts";
 import { makeCouchClient } from "../db/couch-client.ts";
+import { describeDbFound, type DbCheckResult } from "../db/sync/vault-remote-ops.ts";
 import { logError, logInfo, logWarn } from "../ui/log.ts";
 import { BusyError, describeError } from "../ui/describe-error.ts";
 import { classifyConfigPath } from "./config-policy/classify.ts";
@@ -162,6 +163,11 @@ export interface ConfigSyncOptions {
      *  PassphraseModal, which re-asks on a wrong answer. Omitted → Join
      *  stops with `passphrase-missing` / `passphrase-mismatch`. */
     askPassphrase?: AskConfigPassphrase;
+    /** Step 2's Check: read the info of the config DB `dbName` on the
+     *  saved server with the saved credentials, creating the DB when it is
+     *  missing. Production passes `VaultRemoteOps.checkDatabaseWith`.
+     *  Omitted → Check fails (tests that do not check). */
+    checkDatabase?: (dbName: string) => Promise<DbCheckResult>;
     /** Is this device mobile? Drives the receive-side desktop-only gate
      *  (Pull). Production passes `() => Platform.isMobile`; tests inject a
      *  fake. Omitted → treated as desktop (gate never fires). */
@@ -282,6 +288,7 @@ export class ConfigSync {
     private readonly saveSettings: () => Promise<void>;
     private readonly askPassphrase?: AskConfigPassphrase;
     private readonly getIsMobile: () => boolean;
+    private readonly checkDb: (dbName: string) => Promise<DbCheckResult>;
 
     constructor(
         private vault: IVaultIO,
@@ -303,6 +310,8 @@ export class ConfigSync {
         this.saveSettings = opts.saveSettings ?? (async () => {});
         this.askPassphrase = opts.askPassphrase;
         this.getIsMobile = opts.getIsMobile ?? (() => false);
+        this.checkDb = opts.checkDatabase
+            ?? (async () => ({ status: "error", error: new Error("ConfigSync: no database check wired") }));
         const pluginDir = opts.pluginDir ?? ConfigSync.DEFAULT_PLUGIN_DIR;
         this.pluginDir = pluginDir;
         this.ownDataPath = `${pluginDir}/data.json`;
@@ -627,6 +636,38 @@ export class ConfigSync {
             } else {
                 lease?.release();
             }
+        }
+    }
+
+    /**
+     * Step 2's Check of `dbName` (typed, not yet applied): whether it
+     * exists and how many documents it holds; a missing DB is created.
+     * Runs under the op lock like the ops, so no op runs beside it: a
+     * Check that passes clears the auth latch (the credentials were
+     * accepted), which must not happen under an op that raised it. Refused
+     * (`BusyError`) while an op or a rebind runs. Reported on its notice;
+     * a failure is returned, a refusal thrown.
+     */
+    async checkDatabase(dbName: string): Promise<DbCheckResult> {
+        const progress = new ProgressNotice("Database check");
+        const blocked = this.lockBlocker();
+        if (blocked) {
+            const e = new BusyError(blocked);
+            progress.fail(e);
+            throw e;
+        }
+        this.setInflight({ cancel: () => {} });
+        try {
+            const result = await this.checkDb(dbName);
+            if (result.status === "error") {
+                progress.fail(result.error);
+            } else {
+                this.auth.clear();
+                progress.done(`"${dbName}" ${describeDbFound(result)}`);
+            }
+            return result;
+        } finally {
+            this.setInflight(null);
         }
     }
 
