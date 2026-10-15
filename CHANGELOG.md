@@ -20,6 +20,18 @@ All notable changes to obsidian-couchsync.
   the same content as the pulled version is not a conflict: the device only
   records it as synced. Files the filters keep out are not offered. Clone
   still replaces the files at the same path, as its confirmation says.
+- **An edit or deletion right after choosing Keep Local is synced.** After
+  Keep Local in a conflict with another device's version, the device still
+  compared the file with the version from before the conflict. An edit made
+  before the next sync check was not sent, and the check then showed a
+  conflict with this device's own earlier version; a deletion was not sent
+  either. Keep Local now records the kept version as the vault's synced
+  state. When the vault does not hold the kept version yet, it is written
+  to the vault, unless the file was changed there since the last sync: then
+  the conflict dialog shows that change. Keep Local of a local deletion
+  works the same way. If the local version changed while the dialog was
+  open, Keep Local writes nothing and the dialog asks again with the
+  current version; before, the version the dialog showed replaced it.
 - **A pull no longer replaces what was just typed in an open note.**
   Obsidian saves typing about two seconds later; a version pulled in that
   time replaced the editor's text, and the typing was lost. A pulled

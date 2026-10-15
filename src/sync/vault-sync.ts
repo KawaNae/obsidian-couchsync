@@ -72,6 +72,44 @@ export interface DbToFileOptions {
 
 type DeclinedWrite = Extract<WriteResult, { applied: false }>;
 
+/** A baseline (`lastSynced`) entry as the store writes it. */
+type BaselineRow = Extract<VclockUpdate, { op: "set" }>;
+
+/**
+ * The version a Keep Local commits, before it has its vclock: the doc's
+ * content, the chunks to store with it, and, when the vault holds that
+ * content as synced, the baseline row for a given vclock.
+ */
+interface KeptVersion {
+    doc: Omit<FileDoc, "vclock">;
+    chunks?: CouchSyncDoc[];
+    baseline: ((vclock: VectorClock) => BaselineRow) | null;
+}
+
+/** The cache entry that mirrors a committed baseline row. */
+function lastSyncedOfRow(row: BaselineRow): LastSynced {
+    return {
+        vclock: { ...row.clock },
+        chunks: row.chunks,
+        size: row.size,
+        ...(row.mtime !== undefined ? { mtime: row.mtime } : {}),
+        ...(row.deleted ? { deleted: true as const } : {}),
+    };
+}
+
+/**
+ * Whether the baseline records `doc`'s content as what the vault holds: a
+ * deleted baseline for a tombstone, a live one with the same fingerprint
+ * for a live doc. A baseline without a fingerprint cannot tell.
+ */
+function baselineHoldsContent(ls: LastSynced, doc: FileDoc): boolean {
+    if (doc.deleted) return ls.deleted === true;
+    return ls.deleted !== true
+        && ls.chunks !== undefined
+        && ls.size === doc.size
+        && chunkListsEqual(ls.chunks, doc.chunks);
+}
+
 /** Max snapshot→commit retries inside runWrite when a concurrent pull lands
  *  between our read and our CAS check. Realistic worst case is 1. */
 const CAS_MAX_ATTEMPTS = 4;
@@ -672,7 +710,7 @@ export class VaultSync {
     /** The VclockUpdate row of a deleted baseline — composable into larger
      *  transactions (handleRename writes it alongside the new path's alive
      *  baseline in ONE tx). */
-    private static deletedBaselineRow(path: string, tombstoneVC: VectorClock): VclockUpdate {
+    private static deletedBaselineRow(path: string, tombstoneVC: VectorClock): BaselineRow {
         return {
             path, op: "set", clock: { ...tombstoneVC }, chunks: [], size: 0, deleted: true,
         };
@@ -1082,64 +1120,148 @@ export class VaultSync {
      * guard. Used by ConflictOrchestrator when the user picks keep-local
      * in the divergent-edit modal — at that point the divergent state IS
      * the resolution, and the user's content must reach the LocalDB so
-     * the push loop carries it to remote.
+     * the push loop carries it to remote — and by restoring a version from
+     * the history.
      */
     async forceLocalEdit(path: string, baselineVclock: VectorClock): Promise<void> {
-        const settings = this.getSettings();
         const fileStat = await this.vault.stat(path);
         if (!fileStat) return;
         const content = await this.vault.readBinary(path);
         const chunks = await splitIntoChunks(content, this.hasher);
         const chunkIds = chunks.map((c) => c._id);
         const fileId = makeFileId(path);
-        const deviceId = settings.deviceId;
+        await this.commitKeptVersion(path, `forceLocalEdit ${path}`, baselineVclock, () => ({
+            doc: {
+                _id: fileId,
+                schemaVersion: FILE_SCHEMA_VERSION,
+                type: "file",
+                chunks: chunkIds,
+                mtime: fileStat.mtime,
+                ctime: fileStat.ctime,
+                size: fileStat.size,
+            },
+            chunks: chunks as unknown as CouchSyncDoc[],
+            // The vault holds the kept content. mtime from the pre-read
+            // stat: if the file changed between stat and readBinary, the
+            // recorded mtime is older than the content → next stat differs
+            // → cache miss → re-hash. Always the safe direction.
+            baseline: (clock) => ({
+                path, op: "set", clock,
+                chunks: chunkIds, size: fileStat.size, mtime: fileStat.mtime,
+            }),
+        }));
+    }
+
+    /**
+     * Keep the local DB doc of `path` over a concurrent remote version: the
+     * user chose it in a pull conflict, where the dialog compared that doc
+     * (its vclock `seenVclock`) with the remote one (`remoteVclock`). The
+     * counterpart of `forceLocalEdit`, whose kept content is the vault's.
+     *
+     * One write commits the doc again with a vclock that dominates both
+     * sides. When the vault holds the kept content (the baseline's
+     * fingerprint matches the doc's), the same write moves the baseline to
+     * the new vclock, so the next vault edit or deletion is judged against
+     * the version kept. A baseline left at the old vclock made fileToDb and
+     * markDeleted take the newer doc for a pull not yet integrated.
+     *
+     * When the vault does not hold it (a pulled version whose vault write is
+     * still to come), the kept version goes to the vault after the commit
+     * through `dbToFile`, as a pulled one would: a vault change not yet
+     * synced is left there, and the reconcile offers it as a conflict.
+     *
+     * Returns "stale" and writes nothing when the doc is no longer the one
+     * the dialog showed: the choice was made about a version that has been
+     * replaced since.
+     */
+    async keepLocalDoc(
+        path: string,
+        seenVclock: VectorClock,
+        remoteVclock: VectorClock,
+    ): Promise<"kept" | "stale"> {
+        const kept = await this.commitKeptVersion(path, `keepLocalDoc ${path}`, remoteVclock, (existing) => {
+            if (!existing || compareVC(existing.vclock ?? {}, seenVclock) !== "equal") return null;
+            const ls = this.lastSynced.get(toPathKey(path));
+            const { vclock: _replaced, ...doc } = existing;
+            return {
+                doc,
+                baseline: ls && baselineHoldsContent(ls, existing)
+                    ? (clock) => existing.deleted
+                        ? VaultSync.deletedBaselineRow(path, clock)
+                        : {
+                            path, op: "set", clock,
+                            chunks: existing.chunks, size: existing.size,
+                            ...(ls.mtime !== undefined ? { mtime: ls.mtime } : {}),
+                        }
+                    : null,
+            };
+        });
+        if (!kept) {
+            logInfo(`keepLocalDoc: ${path} changed since the conflict was shown — nothing kept`);
+            return "stale";
+        }
+        if (!kept.baselineRecorded) {
+            const written = await this.dbToFile(kept.doc);
+            if (written.applied === false) {
+                logWarn(`keepLocalDoc: kept ${path} in the local DB; vault write skipped (${written.reason})`);
+            }
+        }
+        return "kept";
+    }
+
+    /**
+     * The commit both ways of keeping this device's version share: in one
+     * write, the kept version gets a vclock that dominates the doc it
+     * replaces and `otherVclock` (the version not kept), and, when `keep`
+     * says what the vault holds as synced, the baseline takes that vclock.
+     *
+     * `keep` sees the doc as committed and returns the kept version, or
+     * null to write nothing. It may run more than once: a concurrent write
+     * between its read and the commit fails the CAS and the write is
+     * rebuilt from a fresh read.
+     */
+    private async commitKeptVersion(
+        path: string,
+        context: string,
+        otherVclock: VectorClock,
+        keep: (existing: FileDoc | null) => KeptVersion | null,
+    ): Promise<{ doc: FileDoc; baselineRecorded: boolean } | null> {
+        const fileId = makeFileId(path);
+        const deviceId = this.getSettings().deviceId;
+        const outcome: { committed: { doc: FileDoc; baselineRecorded: boolean } | null } = {
+            committed: null,
+        };
         try {
             await this.db.runWriteBuilder(
                 async (snap) => {
+                    outcome.committed = null;
                     const existing = (await snap.get(fileId)) as FileDoc | null;
-                    const merged = mergeVC(baselineVclock, existing?.vclock ?? {});
-                    const newVclock = incrementVC(merged, deviceId);
-                    const newDoc: FileDoc = {
-                        _id: fileId,
-                        schemaVersion: FILE_SCHEMA_VERSION,
-                        type: "file",
-                        chunks: chunkIds,
-                        mtime: fileStat.mtime,
-                        ctime: fileStat.ctime,
-                        size: fileStat.size,
-                        vclock: newVclock,
-                    };
+                    const version = keep(existing);
+                    if (!version) return null;
+                    const vclock = incrementVC(mergeVC(otherVclock, existing?.vclock ?? {}), deviceId);
+                    const doc = { ...version.doc, vclock } as FileDoc;
+                    const row = version.baseline?.(vclock) ?? null;
+                    const result = { doc, baselineRecorded: row !== null };
                     return {
-                        chunks: chunks as unknown as CouchSyncDoc[],
+                        ...(version.chunks ? { chunks: version.chunks } : {}),
                         docs: [{
-                            doc: newDoc as unknown as CouchSyncDoc,
+                            doc: doc as unknown as CouchSyncDoc,
                             expectedVclock: existing?.vclock ?? {},
                         }],
-                        // mtime from the pre-read stat: if the file changed
-                        // between stat and readBinary, the recorded mtime is
-                        // older than the content → next stat differs → cache
-                        // miss → re-hash. Always the safe direction.
-                        vclocks: [{
-                            path, op: "set", clock: newVclock,
-                            chunks: chunkIds, size: fileStat.size,
-                            mtime: fileStat.mtime,
-                        }],
+                        ...(row ? { vclocks: [row] } : {}),
                         onCommit: () => {
-                            this.lastSynced.set(toPathKey(path), {
-                                vclock: newVclock,
-                                chunks: chunkIds,
-                                size: fileStat.size,
-                                mtime: fileStat.mtime,
-                            });
+                            if (row) this.lastSynced.set(toPathKey(path), lastSyncedOfRow(row));
+                            outcome.committed = result;
                         },
                     };
                 },
                 { maxAttempts: CAS_MAX_ATTEMPTS },
             );
         } catch (e) {
-            this.surfaceWriteError(e, `forceLocalEdit ${path}`);
+            this.surfaceWriteError(e, context);
             throw e;
         }
+        return outcome.committed;
     }
 
     /**
