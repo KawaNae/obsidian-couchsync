@@ -26,12 +26,23 @@ accordingly:
 
 Vault sync is **continuous** once Live Sync is on. **Init**, **Clone**, and
 config-sync operations are the manual, full-DB actions.
-A config **Pull & Reload**, **Pull & Overwrite** or **Share again** that
-writes files reloads Obsidian, which would stop an Init or Clone half-way.
-So these three and Init / Clone never run together: while one side runs,
-the other's buttons are disabled and a start is refused with a notice
-naming what to wait for. After a Pull that reloads, Init, Clone and Config
-**Create** and **Join** stay refused until Obsidian has restarted.
+
+## Operations that cannot run together
+
+- Vault **Init**, **Clone** and Step 2's **Check** run one at a time. While
+  one runs, Init, Clone, Check, Live Sync, the database name, Step 1, the
+  Filters and the device name are disabled. Step 2's Apply, the CouchDB
+  tab's Apply and **Delete local vault database** are refused.
+- Config operations run one at a time; see the Config Sync tab below.
+- A config **Pull & Reload**, **Pull & Overwrite** or **Share again** that
+  writes files reloads Obsidian, which would stop an Init or Clone
+  half-way. So these three never run beside a vault Init or Clone, or a
+  config Create or Join: while one side runs, the other's buttons are
+  disabled. After a Pull that reloads Obsidian, Init, Clone, Create and
+  Join stay refused until Obsidian has restarted. Config **Push** runs
+  beside an Init or Clone.
+- A refused start changes nothing. Its notice reads
+  `CouchSync: <operation> not started — …` and names what to wait for.
 
 ---
 
@@ -94,9 +105,9 @@ The main tab, organized as steps.
   database from this vault and seeds it. Every other device has to Clone
   again; a device that notices the re-created database stops its live sync.
 - **Clone** (subsequent devices) — pulls the whole remote into a fresh local
-  DB and writes the vault files; prompts for the passphrase if the vault is
-  encrypted. It reads the database before changing anything and refuses an
-  empty one. A database found empty (by Step 2's Check or an earlier Init or
+  DB and writes the vault files. For an encrypted vault it asks for the
+  passphrase when Step 1's is missing or does not unlock it. It reads the
+  database before changing anything and refuses an empty one. A database found empty (by Step 2's Check or an earlier Init or
   Clone) does not disable it; the description then points to Init.
 - Both first check what they can without changing anything (the server
   answers, the passphrase, for Clone a database that is not empty), then
@@ -111,8 +122,8 @@ The main tab, organized as steps.
 **Filters** (device-local; other devices may use different filters)
 - **Sync filter (RegExp)** (`syncFilter`) / **Ignore filter (RegExp)**
   (`syncIgnore`) — include/exclude patterns for vault paths.
-- **Max file size (MB)** (`maxFileSizeMB`, default **50**; `0` = skip all
-  files).
+- **Max file size (MB)** (`maxFileSizeMB`, default **50**; `0` = skip
+  every file that is not empty).
 - **Skipped large files** — files skipped for exceeding the size limit.
   **Forget** removes one from the list without syncing it.
 
@@ -181,9 +192,10 @@ current database, the step says so.
   unfinished Create, the last failure (e.g. `Last Join: …`), `Not joined
   yet`, then that the device is joined and ready.
 
-Config operations (Create, Join, Push, both Pulls, Share again) run one at
-a time. While one runs, its confirmation dialog included, the buttons that
-start another, the Filter and Apply are disabled.
+Config operations (Create, Join, Push, both Pulls, Share again) and Step
+2's Check run one at a time. While one runs, its confirmation dialog
+included, the buttons that start another, the Filter, Step 1, Check, Apply
+(here and in the CouchDB tab) and the device name are disabled.
 
 **Step 4: Sync**
 - **Filter** — what this device syncs, by meaning. The same selection
@@ -215,8 +227,10 @@ start another, the Filter and Apply are disabled.
   lists it is unchecked and marked `kept on this device`; checking it sends
   it and shares it again); an unchecked file stops syncing on this device
   (an override in the tree above, where it can be turned back on). Cancel
-  sends nothing. A file the server changed since this device's last Pull is
-  held: the notice asks to run Pull & Reload, then Push again.
+  sends nothing. A file the server changed since this device's last Pull,
+  or whose server copy this device has not taken in yet, is held: the
+  notice asks to run Pull & Reload, then Push again. With nothing to send,
+  Push shows `No local changes to push.` and no list.
 - **Kept on this device** (`configSyncPolicy.deviceOnlyKeys`, shown when
   there are any) — the keys left out of a Push, per file. **Share again**
   makes one take the shared value through a Pull & Reload. After the Pull
@@ -304,9 +318,15 @@ the cause and the fix, e.g. `CouchSync: Config Pull failed — …`.
   remote chunk inventories; the result offers a repair action.
 - **Recovery** — **Restart sync**.
 - **Reset** — **Delete local vault database** and **Delete local config
-  database** (local only; the remote is not touched). After deleting the
-  local config database the device is no longer joined: press Join in
-  Config Sync, then Pull.
+  database** (local only; the remote is not touched).
+  - After deleting the local vault database, sync downloads everything
+    from the remote again. The vault's files are kept: a file whose content
+    differs from the remote's version is offered as a conflict, and a file
+    the remote does not have is sent to it. A deletion or rename not yet
+    sent is lost: the deleted file, or the file under its old name, comes
+    back from the remote.
+  - After deleting the local config database the device is no longer
+    joined: press Join in Config Sync, then Pull.
 
 ---
 

@@ -4,406 +4,18 @@ All notable changes to obsidian-couchsync.
 
 ## Unreleased
 
-### Fixed
+Sync no longer replaces a change it has not seen: a pull leaves alone a file
+edited in the vault but not yet synced and a note with unsaved typing, binary
+files are asked about like notes, and Keep Local and Take Remote write
+nothing when the version shown is no longer current. Vault Init and Clone
+ask before they change anything, and a device stops syncing with a vault
+database that another device re-created. Config sync merges on Pull, lists
+its changes on Push and can keep keys on one device. Operations that cannot
+run together refuse to start and say what they wait for. Config sync needs
+one Join per device after updating (see Migration).
 
-- **A note being typed on another device no longer stops updating and
-  turns into a false conflict.** The sending device recorded a version's
-  size from the file's state before reading it. When the editor saved the
-  note again in between, the version carried the earlier save's size with
-  the later save's content. The receiving device wrote that content but
-  recorded the earlier size, so it took the note for one changed locally:
-  it stopped writing the next versions and offered a conflict between two
-  versions from the same device. A device now records the size of the
-  content it read or wrote, and compares content by its chunks only, so a
-  version already sent with a wrong size no longer holds anything back.
-- **A long pull is no longer cut off while it is still applying changes.**
-  Receiving a large deletion from another device (thousands of files)
-  could take one to two and a half minutes per batch of 100 changes. The
-  catchup counted each batch from the moment it started, so a batch longer
-  than 60 seconds ended with "Catchup timed out (no progress for 60s)" right
-  after it finished, and the session started over. The health check could
-  likewise take a long batch for a stalled pull and reconnect. Both now
-  measure progress by each change the pull processes rather than by whole
-  batches, so a slow batch keeps going and only a pull that stops
-  processing changes is cut off.
-- **A large change from another device no longer holds up sending.**
-  While connected, the pull received everything another device had changed
-  in one response and applied it as one batch, which the session cannot
-  stop partway. A deletion of 6,820 files on another device became one such
-  batch: a reconnect waited 26 minutes for it to finish, and this device
-  sent nothing in that time. The live pull now receives at most 100 changes
-  at a time, as the catchup does, and fetches the rest right away without
-  waiting, so a reconnect waits for one batch at most.
-- **Take Remote no longer replaces a version newer than the one shown.**
-  When this device's version changed while a conflict dialog was open (a
-  newer version was pulled, or an edit in the vault was synced), Take Remote
-  still wrote the remote version the dialog showed, over the newer one. In a
-  conflict found in the vault, it wrote the version the dialog showed over
-  the vault's change. Take Remote now writes nothing in that case, as Keep
-  Local does: the conflict is offered again with the current versions, or
-  not at all when the current version already includes the remote one. This
-  holds for Take all remote in the dialog for many conflicts too.
-- **A conflict is not offered again after it was resolved.** When the same
-  version of another device arrived again while the conflict dialog was
-  open, Keep Local was followed by the same conflict once more. Choosing
-  Keep Local again then left this device's clock ahead of a version it did
-  not send, and the other device's next change showed up as a false
-  conflict. A version that arrives while the dialog is open is now compared
-  with the version kept: it is offered only when it is still a conflict, as
-  a newer version from the other device is. A conflict kept for later
-  between a deletion here and an edit on another device is likewise
-  dropped once this device's version already includes that edit.
-- **A pull no longer writes over a change in the vault that has not been
-  synced.** When a file had been edited or deleted in the vault since this
-  device last synced it, a newer version pulled from another device replaced
-  the edit, or brought the deleted file back, without asking. This happened
-  when the pull arrived before the edit was pushed, and also while a conflict
-  about that edit was still waiting for an answer. The same happened to a
-  file this device had never synced — one made here and not yet pushed, or
-  one that came into the filters when they were widened — when another
-  device had a file at the same path. The pull now leaves the file as it is
-  and keeps the pulled version in the local database; the conflict dialog
-  then shows both, and the chosen one is written. If another version is
-  pulled while that dialog is open, Keep Local writes nothing and the
-  dialog asks again with the newer version, instead of replacing it unseen.
-  A never-synced file with
-  the same content as the pulled version is not a conflict: the device only
-  records it as synced. Files the filters keep out are not offered. Clone
-  still replaces the files at the same path, as its confirmation says.
-- **An edit or deletion right after choosing Keep Local is synced.** After
-  Keep Local in a conflict with another device's version, the device still
-  compared the file with the version from before the conflict. An edit made
-  before the next sync check was not sent, and the check then showed a
-  conflict with this device's own earlier version; a deletion was not sent
-  either. Keep Local now records the kept version as the vault's synced
-  state. When the vault does not hold the kept version yet, it is written
-  to the vault, unless the file was changed there since the last sync: then
-  the conflict dialog shows that change. Keep Local of a local deletion
-  works the same way. If the local version changed while the dialog was
-  open, Keep Local writes nothing and the dialog asks again with the
-  current version; before, the version the dialog showed replaced it.
-- **A pull no longer replaces what was just typed in an open note.**
-  Obsidian saves typing about two seconds later; a version pulled in that
-  time replaced the editor's text, and the typing was lost. A pulled
-  version, or a pulled deletion, now leaves the note and its editor as they
-  are while any open editor on it holds text not yet saved. Once the editor
-  saves, the conflict dialog shows the saved text and the pulled version.
-  If the typing was undone before a save, the pulled version is written at
-  the next sync check. A file with Windows line breaks (CRLF) or a BOM is
-  not taken for unsaved typing. An IME composition that commits text is
-  handled the same way.
-- **A version pulled into an open note with Windows line breaks (CRLF) is
-  no longer doubled.** The pulled text was set into the open editor as well
-  as written to the file, and Obsidian took that for typing: it merged the
-  change into the new file a second time, so each changed line appeared
-  twice, and saved the result with LF line breaks (a BOM was dropped too).
-  The pulled version is now written to the file only, and Obsidian shows
-  it in the open note the way it shows any change made outside the editor;
-  the cursor stays where it was. If something is typed just as the version
-  arrives, Obsidian merges the typing into it and saves; that save is now
-  sent to the other devices at once, where before a save within 5 seconds
-  of a pull was held back until the next sync check.
-- **The confirmation of Delete local vault database says what happens to
-  the vault's files.** It said that unpushed edits would be lost. Edits in
-  the vault's files are kept: after the restart, a file whose content
-  differs from the remote's version is offered as a conflict, and a file the
-  remote does not have is sent to it. What is lost is a deletion or rename
-  not yet sent: the deleted file, or the file under its old name, comes back
-  from the remote.
-- **A conflict on a binary file, such as an image or a PDF, is asked about
-  like one on a note.** The device kept its own version without asking, so
-  the vault's copy of an attachment could replace a newer one from another
-  device. The conflict dialog now shows the file, says that the two versions
-  cannot be compared, and gives each version's size; the user keeps one, or
-  chooses later. In the dialog for many conflicts, clicking a binary file
-  shows the same.
-- **A new install no longer shows the notice that config sync filtering was
-  upgraded.** The notice is for settings that had the old path list to
-  convert; a first start, with no settings saved, was taken for one.
-- **The mobile status indicator stays visible while the on-screen keyboard
-  is open.** It kept its distance from the bottom of the screen, behind the
-  keyboard. It now rises by the keyboard's height, never below the top of
-  Obsidian's editing toolbar nor above the system's status bar, and goes back
-  down when the keyboard closes.
-- **Vault Init and Clone failures are always reported, and a failure before
-  anything is changed leaves the setup as it was.** A Clone that failed while
-  reading `vault:meta` or unlocking the vault (an unreachable server, a
-  wrong passphrase) showed nothing — no notice, no log line. Init and Clone
-  now show their notice from the first step and word every failure with its
-  cause and fix. Both first check that the server answers and prepare
-  everything that needs no change (the metadata, the key); only then do they
-  stop live sync and mark the setup unfinished. Before, Init did that before
-  checking the passphrase, so a missing passphrase disabled Live Sync
-  although nothing had been touched. A second Init or Clone while one runs,
-  and a run while the server rejects the credentials, are refused.
-- **A device stops syncing with a vault database that another device's Init
-  re-created.** A device still set up against the old database kept its live
-  sync running and could pull the new database's documents into its own
-  vault, or push its documents into the new one — encrypted with the old key,
-  which no other device can read. Each Init now writes a new generation id
-  into `vault:meta`, first, right after re-creating the database. Every
-  device remembers the `vault:meta` its last Init or Clone was set up with
-  and compares it when sync starts, and during live sync whenever the pull
-  sees `vault:meta` change, a document that does not decrypt, or the
-  database's sequence go backwards. On a difference, sync pauses before
-  anything of the new database is applied, and Vault Sync (Step 3) says to
-  run Clone. Existing setups need no action: a device set up before this
-  release takes the server's `vault:meta` as its own the first time sync
-  starts. Init and Config Create also wait until the re-created database
-  answers, instead of failing when CouchDB was still removing the old one.
-- **A same-size rewrite right after a sync is no longer missed.** To skip
-  reading unchanged files, the startup scan and reconcile trust a file whose
-  modification time and size match what was recorded when it last synced.
-  On a filesystem that records modification times coarsely (2 s on FAT32,
-  1 s on HFS+ and ext3, some network shares), a file rewritten with the same
-  size just after it was recorded kept the same time, so the rewrite was
-  neither pushed nor overwritten by a pulled version. A modification time
-  less than 3 seconds older than the moment of recording is no longer
-  trusted: such a file is read again on the next check, and recorded once
-  its time is old enough.
-- **Clone of an encrypted vault works when Step 1 has encryption off.** Step 1
-  says the remote's encryption is detected on Clone, but the pull applied the
-  decrypt layer only when Step 1's switch was on, so such a Clone failed
-  ("cannot decompress still-encrypted body"). Clone now pulls with the
-  cloned vault's encryption, like its compression, and saves both only when
-  it succeeds.
-- **A quarantined file recovers when its chunks reach the server again.**
-  A file whose chunks were missing here and on the server stayed missing
-  after another device pushed the chunks, because a reconcile that saw no
-  change in the local database skipped it. The same held for a file whose
-  restore was skipped while offline and for a file cloned without its
-  chunks. Such files are now recorded with the pulled files that could not
-  be written yet, and both live sync and every reconcile retry that record,
-  without rescanning the vault.
-- **Init encrypts the new vault with the Step 1 passphrase.** When the vault
-  key was already unlocked in the session, Init kept the previous
-  `vault:meta`'s salt and key, so a passphrase changed in Step 1 was ignored
-  and sync paused with a passphrase mismatch on the next start. Init now
-  builds `vault:meta` from Step 1 alone, with a fresh salt, as Config Create
-  does. Other devices Clone the new vault as before.
-- **Clone asks for the passphrase the way Config Join does.** When the Step 1
-  passphrase is missing or does not unlock the vault, Clone asks for it,
-  saying which of the two it is; a wrong answer keeps the prompt open with an
-  error. Cancelling ends with "Clone cancelled — nothing was changed." The
-  prompt that live sync shows when an encrypted vault has no stored
-  passphrase also stays open on a wrong answer.
-- **Vault Sync's Step 3 shows what last went wrong.** The status line now
-  says why sync paused on encryption (e.g. "Last encryption check: Sync
-  paused — another device turned vault encryption on. …") instead of "Choose
-  how to initialize this vault.", and shows the last failed Init or Clone.
-  The pause reason is saved with the setup state, so it is still shown
-  after Obsidian restarts, until the encryption check passes or an Init or
-  Clone succeeds. Rejected credentials are shown while requests are on hold
-  and no longer after a Test clears the hold. The open settings tab redraws
-  when Init or Clone starts and ends and when sync pauses. While Init or
-  Clone runs, Init, Clone and Live Sync are disabled, and Step 2 Apply, the
-  Step 1 switches and the CouchDB tab's Apply are refused.
-- **Clone no longer needs a Check first.** After reopening the settings or
-  restarting Obsidian, Clone said "Database is empty — use Init" and stayed
-  disabled until Step 2's Check was pressed again, although the notice of a
-  paused sync only says to run Clone. Clone now reads the database itself
-  before it changes anything: it is enabled without a Check, and refuses an
-  empty database with "The database is empty — use Init to push your
-  vault." What Check, Clone and Init last found in each database is kept
-  until Obsidian restarts, so checking another name does not drop the
-  applied database's. That finding no longer disables Clone either: a device
-  that found the database empty kept Clone disabled after another device's
-  Init filled it, until Check was pressed again. For a database found empty,
-  Clone's description now points to Init, and Clone reads the database
-  again when pressed. Init reads its database back and Clone records what
-  it read, so the document count shown after either is current.
-- **Init and Clone count the files they send or write.** "Clone — N files
-  written." counted every file document in the database, including files
-  deleted on another device and files this device's filters keep out, so it
-  could say 10 for a vault that received 2. It now counts only the files
-  written to the vault, and Clone's "Writing N vault files..." only the
-  files the filters let in. Init's "N files, M docs pushed" no longer counts
-  files the filters keep out or that exceed the size limit, and its
-  "Scanning (n/N)" counts only the files the filters let in. A reconcile's
-  "N pushed" in the log counts only the files it recorded for sending.
-- **Live sync no longer re-sends chunks the server already holds.** The first
-  live sync after an Init or Clone wrote every chunk to the server again as
-  a new revision of the same content, which advanced the database's
-  sequence and woke every other device's pull. A chunk the server holds is
-  now skipped.
-- **More failures are worded with their cause and fix.** Step 2's Check (in
-  Vault Sync and Config Sync), the CouchDB tab's Test and database delete,
-  Verify's Repair, the chunk repair and its retry, and the Maintenance
-  actions (legacy config cleanup, deleting the local vault, config and log
-  databases, log export and clear) now report through the same notice as
-  Init and Clone. A chunk repair or retry that fails no longer leaves its
-  progress notice on screen, and deleting the local vault database is
-  refused while Init or Clone runs. Deleting a server database without
-  admin rights says so instead of pausing sync for rejected credentials.
+### Added
 
-- **Clone no longer aborts on a single transient network failure.** A Clone
-  issues thousands of read requests (paginated `_all_docs` plus one GET per
-  chunk attachment); one dropped request (`Failed to fetch`, a request
-  timeout, a 5xx) failed the whole Clone, and a re-run started over from an
-  empty local DB. Vault one-shot operations (Clone, repair, chunk
-  consistency) now retry each idempotent read with Fibonacci backoff (up to
-  6 retries, ≈20s) before giving up with the original error. Auth, 404 and
-  codec errors still fail immediately. Writes are never retried (a re-send
-  after an unknown outcome would conflict), and live sync is unchanged — its
-  session already owns retry.
-- **A stalled response body is classified as a timeout.** `CouchDB body
-  stale (no data for …ms)` was reported as an unknown error; it is now a
-  timeout, so the one-shot retry above covers it and live sync labels it
-  accordingly.
-- **A config database set after startup can now be pulled.** When the config
-  database name was applied after Obsidian had started (or changed while it
-  was running), Pull did nothing — no notice, no log line — and after a
-  reload it failed with "refusing to build config client … Re-run Config
-  Init". Following that advice wiped the config shared by every device. The
-  config database's local store, sync cursors and encryption key now belong
-  to the server and database name and are rebuilt on Apply (in either the
-  CouchDB or the Config Sync tab), so the change takes effect without a
-  reload and nothing of the previous database is used against the new one.
-  Both Apply buttons are disabled while a config operation runs, and a change
-  refused then saves nothing — so Create's confirmation, Create itself and
-  the filter tree always use the server and database the settings name —
-  switching servers back and forth no longer skips changes or writes the
-  other server's config. The config key no longer depends on Vault Sync
-  being connected.
-- **Config sync failures are always reported, with the cause and the fix.**
-  Every config Push, Pull, Join and Create failure now shows a notice and a
-  log line naming the cause (not joined, missing or wrong passphrase, the
-  database re-created on another device, …) with its fix. A server that
-  cannot be reached, a timeout, rejected credentials or a server error is
-  worded the same way ("The server could not be reached — check the network
-  connection and the server URI in the CouchDB tab.") instead of the bare
-  `Failed to fetch`; the raw error follows in parentheses. Key and
-  passphrase problems never suggest Create. Rejected credentials now point
-  to the CouchDB tab (and its Test button), not Vault Sync.
-- **Config Sync's Step 3 shows what last went wrong.** The status line
-  follows this device's relation to the config database: rejected
-  credentials, an unfinished Create, then the last Push, Pull, Join, Create
-  or check that failed (e.g. "Last Join: The passphrase this device has does
-  not unlock …"), then "Not joined yet", then ready — so a failed Join says
-  why even before this device has joined. A failed Push, Pull, Join or
-  Create stays until one of them succeeds — the filter tree's read-only
-  check succeeding does not clear it. A result about a database root this
-  device no longer uses is not shown. The filter tree's
-  listing of the server counts as a check; when it cannot list the server it
-  says "Showing this device's config only — see Step 3." It does not contact
-  the server while a config operation runs, before this device has joined,
-  or while a Create is unfinished.
-- **Notices of one-shot operations read once.** Init, Clone, Verify, the
-  chunk report and every config operation now end with
-  `CouchSync: <operation> failed — <cause and fix>` or
-  `<operation> cancelled`, instead of
-  `CouchSync: CouchSync: Config Pull — Config Pull failed: …`. Vault Init,
-  Clone and Verify failures use the same wording as config sync, and a
-  failed Verify is reported as a failure. A cancelled operation is logged as
-  a warning, not an error.
-- **Every notice and console line carries the `CouchSync:` prefix once.**
-  Many notices and log lines read `CouchSync: CouchSync: …`, while notices
-  shown directly from the settings tabs and some console lines had no prefix
-  at all. The prefix is now added once where a line leaves the plugin (the
-  notice and the console); the Log View keeps the bare text. The startup
-  line reads `CouchSync: Starting v… — built …, commit …`. A completed
-  operation's notice no longer repeats its name, e.g.
-  `Verify — 3 discrepancy(ies)` instead of
-  `Verify — Verify: 3 discrepancy(ies)`.
-- **A config Pull with nothing new no longer rewrites every config file.**
-  Each Pull wrote every config file it receives, even when the disk already
-  matched, so all of them got a new modification time. Obsidian re-reads
-  `app.json`, `appearance.json` and plugins' `data.json` on that, which could
-  undo a setting just changed in the settings window. Pull now writes only
-  the files whose content changes. When there are none, Pull & Reload does
-  not reload Obsidian and its one notice says
-  `No config files changed; no reload needed.`
-- **A config Pull no longer undoes edits that were not pushed yet.** A Pull
-  wrote the last synced version of every config file over the disk, so a
-  setting changed on this device but not pushed went back to its old value,
-  with no warning. See "Config Pull merges" below.
-- **A config Push no longer overwrites what other devices changed.** Push
-  sent whole files, so a desktop pushing `app.json` put back an old value of
-  a key only the phone had changed, after a confirmation that did not say
-  which keys. See "Config Push sends this device's changes" below.
-- **Changing a codec setting no longer stops config sync.** Push and Pull
-  now use the encryption and compression of the config database this device
-  created or joined. Step 1 in Config Sync is what the next Create builds a
-  database with; when it differs from the current database the tab says so,
-  and sync carries on. Before, toggling Step 1 — or a Vault Clone that
-  changed the vault codec Step 1 inherits — stopped config sync as "codec
-  changed" and suggested Create.
-- **An encrypted config database that becomes unencrypted is refused.** If
-  a device joined a config database encrypted and its `config:meta` is now
-  plaintext, sync stops and asks to verify the server; it is not treated as
-  an ordinary re-creation. Join asks for confirmation before adopting an
-  unencrypted database or an older cipher version for a database this device
-  knew as encrypted.
-- **Re-creating a plaintext config database is detected.** `config:meta` now
-  carries a random generation id minted by every Create, so a device notices
-  that another device re-created the database — encrypted or not — and asks
-  it to Join again instead of mixing in stale data. Metas written by older
-  builds have no generation id and are compared as before.
-- **Clearing the config passphrase is no longer a codec change.** It used to
-  be reported as a codec change that recommended Create; it is now reported
-  as a missing passphrase.
-- **A config Pull no longer stops a vault Init or Clone half-way.** A Pull
-  that writes files reloads Obsidian, which stopped an Init or Clone running
-  at the time: an Init left the server's vault database sent only in part,
-  and every other device stopped on it. Pull & Reload, Pull & Overwrite and
-  Share again are now refused while an Init or Clone runs, and Init and
-  Clone while one of them runs; the notice says which one to wait for, and
-  the buttons are disabled until it ends. After a Pull that reloads, Init,
-  Clone, Config Create and Join stay refused until Obsidian has restarted. Push
-  and Join still run beside an Init or Clone.
-
-### Changed
-
-- **Vault Init and Clone ask before they change anything.** Init deletes the
-  vault database on the server and creates it again; Clone rebuilds this
-  device's local vault database from the server and writes the server's
-  files into the vault. Both used to start on the button press. Each now
-  first checks what it can (the server answers, the passphrase, a database
-  that is not empty), then shows what it is about to do: the database name,
-  how many documents it holds and the encryption and compression of the
-  vault. Init also says that every other device must Clone again, and that
-  a device that notices the re-created database stops its live sync until
-  then. The dialog opens with the focus on Cancel. Cancel changes nothing:
-  live sync keeps running and the setup state stays as it was. Clone asks
-  for a missing passphrase before this dialog.
-- **Config Sync's buttons are disabled while a config operation runs.**
-  Config operations never ran at the same time: a second one was refused
-  with a notice. But while one ran, including while its confirmation
-  (the Push list, Pull & Overwrite's or Share again's) was open, the other
-  buttons stayed enabled, and the Filter could be changed under it. Now
-  Create, Join, Push, Pull & Reload, Pull & Overwrite, Share again, the
-  Filter and Apply are disabled until it ends, as Init and Clone are in
-  Vault Sync. Create's confirmation is now part of the operation too, so
-  no other config operation can start while it is open.
-- **Config Pull merges.** Pull compares each config file the server changed
-  with the version this device last took in and with the disk. In
-  `app.json`, `appearance.json`, `hotkeys.json`, the other `.obsidian/*.json`
-  files and plugins' `data.json`, every key is compared on its own: a key
-  only the server changed takes the server's value, a key only this device
-  changed keeps this device's value. `community-plugins.json` is merged as a
-  set of plugin ids. Other files (snippets, themes, plugin code) and files
-  that are not valid JSON are compared as a whole. Where both sides changed
-  the same key (or file) differently, this device's value stays; the notice
-  counts such files and the log names each file and key (never the value),
-  and the next Push sends this device's value. Without a version taken in
-  before (after Join), the server's values win and keys only this device
-  has stay. Before writing, Pull copies the files it is about to overwrite
-  to `backups/config/<date_time>/` in the plugin's folder and keeps the
-  newest 10 of these backups; they are never pushed. Written files keep
-  their indentation and key order. Pull & Reload shows one notice and
-  reloads Obsidian only when it wrote a file. The notice's "Received" counts
-  the changes this device did not have yet; its own pushed files are not
-  counted.
-- **Config Push sends this device's changes.** Push sends the config files
-  that changed on this device since it last pushed or pulled them. A file
-  whose server copy changed since this device last pulled, or whose server
-  copy this device has not taken in, is not sent: the notice counts such
-  files by that reason and asks to run Pull & Reload, then Push again (the
-  log names each file with the same reason). The confirmation that offered to overwrite the server
-  copy is gone. A file this device's Pull would not write is not sent
-  either: a plugin's `data.json` on a device where the plugin is not
-  installed, or a desktop-only plugin's files on mobile, stay this device's
-  own.
 - **Config Push lists its changes and lets you keep some on this device.**
   Before sending, Push lists every change: each key of a JSON settings
   file (each plugin enabled or disabled in `community-plugins.json`), or a
@@ -414,16 +26,16 @@ All notable changes to obsidian-couchsync.
   own: later Pushes do not send it and Pulls do not change it, and neither
   reports it as a conflict. An unchecked file stops syncing on this device,
   as if turned off in the Filter. These choices are device settings and
-  are not synced. A key is shared again in one of two ways. Checking it in
-  a later Push list sends this device's value. "Share again" under "Kept on
-  this device" in the Config Sync tab takes the shared value instead: it
-  runs Pull & Reload, shows the shared value once the server is taken in,
-  and on confirmation writes that value
-  for the key (removes the key, or disables the plugin, where the shared
-  config has none) while every other key and file is pulled as usual. When
-  the disk already has the shared value, it only stops keeping the key and
-  does not reload. A Push whose only changes are keys kept on this device
+  are not synced. A Push whose only changes are keys kept on this device
   shows no list.
+- **Share again.** A key kept on this device is listed under "Kept on this
+  device" in the Config Sync tab. Checking it in a later Push list sends
+  this device's value. "Share again" takes the shared value instead: it
+  runs Pull & Reload, shows the shared value once the server is taken in,
+  and on confirmation writes that value for the key (removes the key, or
+  disables the plugin, where the shared config has none) while every other
+  key and file is pulled as usual. When the disk already has the shared
+  value, it only stops keeping the key and does not reload.
 - **Pull & Overwrite makes this device's config the shared config.** A new
   button in the Config Sync tab, next to Pull & Reload. It does not merge:
   every selected file the server has is written as the server has it,
@@ -433,11 +45,84 @@ All notable changes to obsidian-couchsync.
   desktop-only plugin's files on mobile, the workspace layout and the
   CouchSync plugin's own folder are not touched; per-file choices in the
   Filter stay. A confirmation lists the files it deletes and writes; Cancel
-  changes nothing. The files are backed up to `backups/config/` first, as
-  with Pull & Reload, and Obsidian reloads. When the server has no config
-  for this device's selection, nothing is deleted. Pull & Reload and Pull &
-  Overwrite stop a community plugin before writing or deleting its files,
-  so it cannot save its settings over them before the reload.
+  changes nothing. The files are backed up first, as with Pull & Reload,
+  and Obsidian reloads. When the server has no config for this device's
+  selection, nothing is deleted.
+
+### Changed
+
+- **Vault Init and Clone ask before they change anything.** Init deletes the
+  vault database on the server and creates it again; Clone rebuilds this
+  device's local vault database from the server and writes the server's
+  files into the vault. Both used to start on the button press. Each now
+  first checks what it can (the server answers, the passphrase, a database
+  that is not empty), then shows what it is about to do: the database name,
+  how many documents it holds and the encryption and compression of the
+  vault. Init also says that every other device must Clone again. The
+  dialog opens with the focus on Cancel. Cancel changes nothing: live sync
+  keeps running and the setup state stays as it was.
+- **Operations that cannot run together refuse to start, and their controls
+  are disabled.**
+  - Vault Init, Clone and Step 2's Check run one at a time. While one runs,
+    Init, Clone, Check, Live Sync, the database name, Step 1, the Filters
+    and the device name are disabled; Step 2's Apply, the CouchDB tab's
+    Apply and Delete local vault database are refused.
+  - Config Create, Join, Push, both Pulls, Share again and Step 2's Check
+    run one at a time. While one runs, its confirmation included, the
+    buttons that start another, the Filter, Step 1, Check, the device name
+    and Apply (in both the Config Sync and the CouchDB tab) are disabled.
+  - A config Pull that writes files reloads Obsidian, which would stop a
+    vault Init or Clone half-way and leave the server's vault database
+    sent only in part. Pull & Reload, Pull & Overwrite and Share again are
+    therefore refused while an Init, Clone, Config Create or Join runs, and
+    those four while a Pull runs. After a Pull that reloads Obsidian, Init,
+    Clone, Create and Join stay refused until Obsidian has restarted. Push
+    still runs beside an Init or Clone, and so do Create and Join.
+  - A refused operation changes nothing. Its notice reads
+    `CouchSync: <operation> not started — …` and names what to wait for,
+    e.g. `Clone is running — wait for it to finish.`
+- **Config Pull merges.** Pull used to write the last synced version of
+  every config file over the disk, so a setting changed on this device but
+  not pushed went back to its old value. Pull now compares each config
+  file the server changed with the version this device last took in and
+  with the disk. In `app.json`, `appearance.json`, `hotkeys.json`, the other
+  `.obsidian/*.json` files and plugins' `data.json`, every key is compared
+  on its own: a key only the server changed takes the server's value, a
+  key only this device changed keeps this device's value.
+  `community-plugins.json` is merged as a set of plugin ids. Other files
+  (snippets, themes, plugin code) and files that are not valid JSON are
+  compared as a whole. Where both sides changed the same key (or file)
+  differently, this device's value stays; the notice counts such files and
+  the log names each file and key (never the value), and the next Push
+  sends this device's value. Without a version taken in before (after
+  Join), the server's values win and keys only this device has stay.
+  - Before writing, Pull copies the files it is about to overwrite to
+    `backups/config/<date_time>/` in the plugin's folder and keeps the
+    newest 10 of these backups; they are never pushed.
+  - Pull writes only the files whose content changes, and written files
+    keep their indentation and key order. Before, every Pull rewrote every
+    file, and Obsidian re-read `app.json`, `appearance.json` and plugins'
+    `data.json`, which could undo a setting just changed in the settings
+    window.
+  - Pull & Reload shows one notice and reloads Obsidian only when it wrote
+    a file; otherwise it says `No config files changed; no reload needed.`
+    The notice's "Received" counts the changes this device did not have
+    yet; its own pushed files are not counted.
+  - Pull & Reload and Pull & Overwrite stop a community plugin before
+    writing or deleting its files, so it cannot save its settings over them
+    before the reload.
+- **Config Push sends this device's changes.** Push used to send whole
+  files, so a desktop pushing `app.json` put back an old value of a key
+  only the phone had changed, after a confirmation that did not say which
+  keys. Push now sends the config files that changed on this device since
+  it last pushed or pulled them. A file whose server copy changed since
+  this device last pulled, or whose server copy this device has not taken
+  in, is not sent: the notice counts such files by that reason and asks to
+  run Pull & Reload, then Push again (the log names each file with the same
+  reason). The confirmation that offered to overwrite the server copy is
+  gone. A file this device's Pull would not write is not sent either: a
+  plugin's `data.json` on a device where the plugin is not installed, or a
+  desktop-only plugin's files on mobile, stay this device's own.
 - **Coming back to a config database merges as after a Join.** When another
   config database's Pull wrote this vault's config since this database was
   last used, the next Push or Pull here no longer treats those values as
@@ -451,10 +136,9 @@ All notable changes to obsidian-couchsync.
   database's encryption and compression and unlock it with its passphrase;
   the server is not changed, then Pull). Push and Pull on a device that has
   not joined stop and ask it to Join. Join does not change the Step 1
-  settings.
-  Create first checks that the server answers; a server that cannot be
-  read fails Create before it asks. Its confirmation shows how many
-  documents the server holds and whether `config:meta` exists, the
+  settings. Create first checks that the server answers; a server that
+  cannot be read fails Create before it asks. Its confirmation shows how
+  many documents the server holds and whether `config:meta` exists, the
   encryption, compression and cipher version it will build (highlighted
   when that is weaker than the database's current one, e.g. encrypted →
   unencrypted), and that every other device must Join again.
@@ -462,31 +146,276 @@ All notable changes to obsidian-couchsync.
   Create and Join keep the passphrase of an encrypted config database with
   that database (per server and database name, in settings). Push and Pull
   unlock it with that value alone, so neither Step 1, turning Vault Sync
-  encryption off nor a new vault passphrase stops config sync, and two config
-  databases with different passphrases each keep their own. A plaintext
-  database keeps none.
-- **Step 1's passphrase is only what the next Create encrypts with.** Left
-  empty, it inherits the Vault Sync passphrase. It is shown only while Step 1
-  encryption is on, and Create and Join do not write to it. An encrypting
-  Create with no passphrase at all stops before anything is deleted and
-  points to Step 1.
-- **Join asks for the passphrase only when it has none that works.** It
-  tries the passphrase it kept for the database, then Step 1's, then the
-  Vault Sync passphrase, and asks only when none unlocks the database. The
-  prompt says whether no passphrase was set or none matched, checks the
-  answer, and stays open on a wrong one. Cancelling it ends the Join with
-  "Join cancelled — nothing was changed."
+  encryption off nor a new vault passphrase stops config sync, and two
+  config databases with different passphrases each keep their own. A
+  plaintext database keeps none.
+  - Step 1's passphrase is only what the next Create encrypts with. Left
+    empty, it inherits the Vault Sync passphrase. It is shown only while
+    Step 1 encryption is on, and Create and Join do not write to it. An
+    encrypting Create with no passphrase at all stops before anything is
+    deleted and points to Step 1.
+  - Join tries the passphrase it kept for the database, then Step 1's,
+    then the Vault Sync passphrase, and asks only when none unlocks the
+    database. The prompt says whether no passphrase was set or none
+    matched, checks the answer, and stays open on a wrong one. Cancelling
+    it ends the Join with `Config Join cancelled — Nothing was changed.`
+
+### Fixed
+
+- **A pull no longer writes over a change in the vault that has not been
+  synced.** When a file had been edited or deleted in the vault since this
+  device last synced it, a newer version pulled from another device
+  replaced the edit, or brought the deleted file back, without asking. This
+  happened when the pull arrived before the edit was pushed, and also while
+  a conflict about that edit was still waiting for an answer. The same
+  happened to a file this device had never synced (one made here and not
+  yet pushed, or one that came into the filters when they were widened)
+  when another device had a file at the same path. The pull now leaves the
+  file as it is and keeps the pulled version in the local database; the
+  conflict dialog then shows both, and the chosen one is written. A
+  never-synced file with the same content as the pulled version is not a
+  conflict: the device only records it as synced. Clone still replaces the
+  files at the same path, as its confirmation says.
+- **A pull no longer replaces what was just typed in an open note.**
+  Obsidian saves typing about two seconds later; a version pulled in that
+  time replaced the editor's text, and the typing was lost. A pulled
+  version, or a pulled deletion, now leaves the note and its editor as they
+  are while any open editor on it holds text not yet saved. Once the editor
+  saves, the conflict dialog shows the saved text and the pulled version.
+  If the typing was undone before a save, the pulled version is written at
+  the next sync check. A file with Windows line breaks (CRLF) or a BOM is
+  not taken for unsaved typing. While an IME composition is in progress,
+  the pulled version waits until the composition ends (at most 30
+  seconds) and is then handled the same way.
+- **A version pulled into an open note with Windows line breaks (CRLF) is
+  no longer doubled.** The pulled text was set into the open editor as well
+  as written to the file, and Obsidian took that for typing: it merged the
+  change into the new file a second time, so each changed line appeared
+  twice, and saved the result with LF line breaks (a BOM was dropped too).
+  The pulled version is now written to the file only, and Obsidian shows
+  it in the open note the way it shows any change made outside the editor;
+  the cursor stays where it was. If something is typed just as the version
+  arrives, Obsidian merges the typing into it and saves; that save is now
+  sent to the other devices like any edit, where before a save within 5
+  seconds of a pull was held back until the next sync check.
+- **A conflict on a binary file, such as an image or a PDF, is asked about
+  like one on a note.** The device kept its own version without asking, so
+  the vault's copy of an attachment could replace a newer one from another
+  device. The conflict dialog now shows the file, says that the two versions
+  cannot be compared, and gives each version's size; the user keeps one, or
+  chooses later. In the dialog for many conflicts, clicking a binary file
+  shows the same.
+- **Keep Local and Take Remote no longer replace a version newer than the
+  one shown.** When this device's version changed while a conflict dialog
+  was open (a newer version was pulled, or an edit in the vault was
+  synced), either choice still wrote the version the dialog showed over
+  the newer one. Both now write nothing in that case: the conflict is
+  offered again with the current versions, or not at all when the current
+  version already includes the remote one. This holds for Keep all local
+  and Take all remote in the dialog for many conflicts too.
+- **A conflict is not offered again after it was resolved.** When the same
+  version of another device arrived again while the conflict dialog was
+  open, Keep Local was followed by the same conflict once more. Choosing
+  Keep Local again then left this device's clock ahead of a version it did
+  not send, and the other device's next change showed up as a false
+  conflict. A version that arrives while the dialog is open is now compared
+  with this device's current version: it is offered only when it is still
+  a conflict, and taken in without asking when it is newer. A conflict kept
+  for later between a deletion here and an edit on another device is
+  likewise dropped once this device's version already includes that edit.
+- **An edit or deletion right after choosing Keep Local is synced.** After
+  Keep Local in a conflict with another device's version, the device still
+  compared the file with the version from before the conflict. An edit made
+  before the next sync check was not sent, and the check then showed a
+  conflict with this device's own earlier version; a deletion was not sent
+  either. Keep Local now records the kept version as the vault's synced
+  state. When the vault does not hold the kept version yet, it is written
+  to the vault, unless the file was changed there since the last sync: then
+  the conflict dialog shows that change. Keep Local of a local deletion
+  works the same way.
+- **A note being typed on another device no longer stops updating and
+  turns into a false conflict.** The sending device recorded a version's
+  size from the file's state before reading it. When the editor saved the
+  note again in between, the version carried the earlier save's size with
+  the later save's content. The receiving device took the note for one
+  changed locally: it stopped writing the next versions and offered a
+  conflict between two versions from the same device. A device now records
+  the size of the content it read or wrote, and compares content by its
+  chunks only, so a version already sent with a wrong size no longer holds
+  anything back.
+- **A same-size rewrite right after a sync is no longer missed.** To skip
+  reading unchanged files, the startup scan and reconcile trust a file whose
+  modification time and size match what was recorded when it last synced.
+  On a filesystem that records modification times coarsely (2 s on FAT32,
+  1 s on HFS+ and ext3, some network shares), a file rewritten with the same
+  size just after it was recorded kept the same time, so the rewrite was
+  neither pushed nor overwritten by a pulled version. A modification time
+  less than 3 seconds older than the moment of recording is no longer
+  trusted: such a file is read again on the next check.
+- **A quarantined file recovers when its chunks reach the server again.**
+  A file whose chunks were missing here and on the server stayed missing
+  after another device pushed the chunks, because a reconcile that saw no
+  change in the local database skipped it. The same held for a file whose
+  restore was skipped while offline and for a file cloned without its
+  chunks. Both live sync and every reconcile now retry such files.
+
+- **A long pull is no longer cut off while it is still applying changes.**
+  Receiving a large deletion from another device (thousands of files)
+  could take one to two and a half minutes per batch of 100 changes. Such
+  a batch ended with "Catchup timed out (no progress for 60s)" right after
+  it finished, and the session started over; the health check could
+  likewise take it for a stalled pull and reconnect. Both now measure
+  progress by each change the pull processes, so only a pull that stops
+  processing changes is cut off.
+- **A large change from another device no longer holds up sending.**
+  While connected, the pull received everything another device had changed
+  in one response and applied it as one batch, which the session cannot
+  stop partway. A deletion of 6,820 files on another device became one such
+  batch: a reconnect waited 26 minutes for it to finish, and this device
+  sent nothing in that time. The live pull now receives at most 100 changes
+  at a time, as the catchup does, and fetches the rest right away, so a
+  reconnect waits for one batch at most.
+- **Push no longer re-sends chunks the server already holds.** The first
+  live sync after an Init or Clone wrote every chunk to the server again,
+  which woke every other device's pull.
+- **Clone no longer aborts on a single transient network failure.** One
+  dropped request (`Failed to fetch`, a request timeout, a stalled
+  response, a 5xx) among the thousands a Clone makes failed the whole
+  Clone, and a re-run started over. Clone, repair and the chunk
+  consistency check now retry each read up to 6 times (about 20 seconds in
+  all) before giving up. Rejected credentials, a missing document and a
+  decoding error still fail at once, writes are never retried, and live
+  sync keeps its own retry.
+
+- **A device stops syncing with a vault database that another device's Init
+  re-created.** A device still set up against the old database kept its live
+  sync running and could pull the new database's documents into its own
+  vault, or push its documents into the new one, encrypted with the old key,
+  which no other device can read. Each Init now marks `vault:meta` with a
+  new generation. A device compares it with the one its last Init or Clone
+  was set up with when sync starts and while live sync runs. On a
+  difference, sync pauses before anything of the new database is applied,
+  and Vault Sync (Step 3) says to run Clone. Init and Config Create also wait until the re-created database
+  answers, instead of failing when CouchDB was still removing the old one.
+- **Init encrypts the new vault with the Step 1 passphrase.** When the vault
+  key was already unlocked in the session, Init kept the previous key, so a
+  passphrase changed in Step 1 was ignored and sync paused with a
+  passphrase mismatch on the next start. Init now builds `vault:meta` from
+  Step 1 alone, with a fresh salt, as Config Create does.
+- **Clone of an encrypted vault works when Step 1 has encryption off.** Step 1
+  says the remote's encryption is detected on Clone, but such a Clone failed
+  ("cannot decompress still-encrypted body"). Clone now pulls with the
+  cloned vault's encryption and compression, and saves both only when it
+  succeeds.
+- **Clone no longer needs a Check first.** After reopening the settings or
+  restarting Obsidian, Clone stayed disabled until Step 2's Check was
+  pressed again, and a device that found the database empty kept Clone
+  disabled after another device's Init filled it. Clone now reads the
+  database itself before it changes anything, and refuses an empty
+  database with "The database is empty — use Init to push your vault."
+  For a database found empty, Clone's description points to Init.
+- **Clone asks for the passphrase the way Config Join does.** When the Step 1
+  passphrase is missing or does not unlock the vault, Clone asks for it
+  before its confirmation, saying which of the two it is; a wrong answer
+  keeps the prompt open with an error. Cancelling ends with
+  `Clone cancelled — Nothing was changed.` The prompt that live sync shows
+  when an encrypted vault has no stored passphrase also stays open on a
+  wrong answer.
+- **Init and Clone count the files they send or write.** "Clone — N files
+  written." counted every file document in the database, including files
+  deleted on another device and files this device's filters keep out, so it
+  could say 10 for a vault that received 2. Clone's counts, Init's "N files,
+  M docs pushed" and its "Scanning (n/N)" now count only the files the
+  filters let in and that are actually written or sent.
+- **A failed Init or Clone leaves the setup as it was when nothing was
+  changed.** Init used to stop live sync and mark the setup unfinished
+  before checking the passphrase, so a missing passphrase disabled Live
+  Sync although nothing had been touched. Both now check the server and
+  prepare everything that needs no change (the metadata, the key) first.
+
+- **A config database set after startup can now be pulled.** When the config
+  database name was applied after Obsidian had started (or changed while it
+  was running), Pull did nothing, and after a reload it failed with
+  "refusing to build config client … Re-run Config Init". Following that
+  advice wiped the config shared by every device. Apply (in either the
+  CouchDB or the Config Sync tab) now switches config sync to the new
+  server and database without a reload, and nothing of the previous
+  database is used against the new one; switching servers back and forth
+  no longer skips changes or writes the other server's config. The config
+  key no longer depends on Vault Sync being connected.
+- **Changing a codec setting no longer stops config sync.** Push and Pull
+  now use the encryption and compression of the config database this device
+  created or joined. Step 1 in Config Sync is what the next Create builds a
+  database with; when it differs from the current database the tab says so,
+  and sync carries on. Before, toggling Step 1, clearing its passphrase, or
+  a Vault Clone that changed the vault codec Step 1 inherits stopped config
+  sync as "codec changed" and suggested Create.
+- **An encrypted config database that becomes unencrypted is refused.** If
+  a device joined a config database encrypted and its `config:meta` is now
+  plaintext, sync stops and asks to verify the server; it is not treated as
+  an ordinary re-creation. Join asks for confirmation before adopting an
+  unencrypted database or an older cipher version for a database this device
+  knew as encrypted.
+- **Re-creating a plaintext config database is detected.** Every Create
+  marks `config:meta` with a new generation, so a device notices that
+  another device re-created the database, encrypted or not, and asks it to
+  Join again instead of mixing in stale data.
+- **A new install no longer shows the notice that config sync filtering was
+  upgraded.** The notice is for settings that had the old path list to
+  convert; a first start, with no settings saved, was taken for one.
+
+- **Every failure is reported, with its cause and fix.** A Clone that
+  failed while reading `vault:meta` or unlocking the vault, and a config
+  Pull on a database set after startup, showed nothing. Every vault and
+  config operation, Step 2's Check, the CouchDB tab's Test and database
+  delete, Verify and its Repair, the chunk repair, and the Maintenance
+  actions now end with one notice and log line in one of three forms:
+  `CouchSync: <operation> failed — <cause and fix>`, `<operation> cancelled`,
+  or `<operation> not started — <reason>`. A server that cannot be reached,
+  a timeout, rejected credentials or a server error is worded the same way
+  everywhere ("The server could not be reached — check the network
+  connection and the server URI in the CouchDB tab.") instead of the bare
+  `Failed to fetch`; the raw error follows in parentheses. Config key and
+  passphrase problems never suggest Create, and rejected credentials point
+  to the CouchDB tab. Deleting a server database without admin rights says
+  so instead of pausing sync for rejected credentials. A failed Verify is
+  reported as a failure, and a cancelled operation is logged as a warning.
+  A chunk repair that fails no longer leaves its progress notice on screen.
+- **Every notice and console line carries the `CouchSync:` prefix once.**
+  Notices read `CouchSync: CouchSync: Config Pull — Config Pull failed: …`,
+  while some had no prefix at all. The Log View keeps the bare text. A
+  completed operation's notice no longer repeats its name, e.g.
+  `Verify — 3 discrepancy(ies)`.
+- **Step 3 of Vault Sync and of Config Sync shows what last went wrong.**
+  - Vault Sync's status line says why sync paused (e.g. "Last encryption
+    check: Sync paused — another device turned vault encryption on. …")
+    and shows the last failed Init or Clone. The pause reason is kept
+    across restarts, until the check passes or an Init or Clone succeeds.
+    Rejected credentials are shown while requests are on hold.
+  - Config Sync's status line shows, in this order, rejected credentials,
+    an unfinished Create, the last Push, Pull, Join, Create or check that
+    failed (e.g. "Last Join: The passphrase this device has does not unlock
+    …"), "Not joined yet", then ready. A failed operation stays until one
+    succeeds; a successful check does not clear it. When the filter tree
+    cannot list the server it says "Showing this device's config only — see
+    Step 3."
+  - The open settings tab redraws when an operation starts and ends and
+    when sync pauses.
+- **The confirmation of Delete local vault database says what happens to
+  the vault's files.** It said that unpushed edits would be lost. Edits in
+  the vault's files are kept: after the restart, a file whose content
+  differs from the remote's version is offered as a conflict, and a file the
+  remote does not have is sent to it. What is lost is a deletion or rename
+  not yet sent: the deleted file, or the file under its old name, comes back
+  from the remote.
+- **The mobile status indicator stays visible while the on-screen keyboard
+  is open.** It kept its distance from the bottom of the screen, behind the
+  keyboard. It now rises by the keyboard's height, above Obsidian's editing
+  toolbar, and goes back down when the keyboard closes. It is never placed
+  above the system's status bar.
 
 ### Migration
 
-- **Config sync state moves to the new merge by itself.** The first config
-  Push or Pull after updating compares each file this device knows with the
-  server copy once. Edits that were never pushed are kept as this device's
-  changes: where the server also changed the same file since, the keys that
-  differ keep this device's value and are reported like a conflict. If a
-  plugin was installed after the last Pull, its default settings look like
-  this device's changes; the first Push lists them (keys the shared version
-  lacks are marked "new key"), so they can be left out.
 - **Existing devices Join once.** Whether a device has joined a config
   database, and with which codec, is now recorded inside that database's
   local store, which is also renamed to include the server. The previous
@@ -499,6 +428,16 @@ All notable changes to obsidian-couchsync.
   Step 1 is not asked for it. The previous local config store of the
   config database applied now (`couchsync-<vault>-config-<db>`) is deleted on
   start; stores of config database names used earlier stay on disk.
+- **Config sync state moves to the new merge by itself.** The first config
+  Push or Pull after updating compares each file this device knows with the
+  server copy once. Edits that were never pushed are kept as this device's
+  changes: where the server also changed the same file since, the keys that
+  differ keep this device's value and are reported like a conflict. If a
+  plugin was installed after the last Pull, its default settings look like
+  this device's changes; the first Push lists them (keys the shared version
+  lacks are marked "new key"), so they can be left out.
+- **Vault setups need no action.** A device set up before this release
+  takes the server's `vault:meta` as its own the first time sync starts.
 
 ## 0.29.0
 

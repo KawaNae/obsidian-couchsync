@@ -21,8 +21,14 @@ Simplified CouchDB-only vault sync for Obsidian. Fork of [Self-hosted LiveSync](
 - **Conflict handling** — Sync relations are classified by vector clock +
   content-addressed chunks. Identical content with diverged clocks reconciles
   silently; genuinely concurrent, divergent edits open a side-by-side dialog
-  where you choose **keep local** or **take remote**. There is no text-level
-  auto-merge.
+  where you choose **Keep Local**, **Take Remote** or **Later**. A binary
+  file (an image, a PDF) is asked about the same way, with each version's
+  size. There is no text-level auto-merge. A pull never overwrites a change
+  that has not been synced: a file edited or deleted in the vault since its
+  last sync, or an open note with unsaved typing, is left as it is and
+  offered as a conflict instead. If the local version changes while the
+  dialog is open, the choice writes nothing and the conflict is offered
+  again with the current versions.
 - **Config sync (optional, manual)** — Replicate `.obsidian/` settings,
   snippets and themes through a separate CouchDB database. Button-driven
   (Create on the first device, Join on the others, then Push / Pull &
@@ -93,12 +99,12 @@ URI, username, and password, then **Test** → **Apply**. Then open the
 2. **Encryption (optional)** — enable end-to-end encryption and set a
    passphrase, and/or toggle gzip compression (on by default).
 3. **Database** — enter the vault database name, then **Check** → **Apply**.
-4. **Init or Clone:**
+4. **Init or Clone** (each shows what it will change and asks first):
    - On the **first** device, run **Init**. ⚠️ This is **destructive** to the
      remote database — it recreates it from this vault. The codec mode
      (encryption/compression) is fixed here.
-   - On **every other** device, run **Clone** (it prompts for the passphrase
-     if the vault is encrypted).
+   - On **every other** device, run **Clone** (for an encrypted vault it asks
+     for the passphrase unless Step 1 already has the right one).
 5. **Enable Live Sync** to start continuous syncing.
 
 Encrypted vaults need the **same passphrase on every device**. The codec mode

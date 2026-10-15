@@ -41,7 +41,11 @@ The vault database and the config database each have their own mode,
 recorded in their own meta document:
 
 - **Vault database**: set at Init and recorded in `vault:meta`. Clone
-  adopts it.
+  adopts it. Each Init marks `vault:meta` with a new generation, and every
+  device remembers the `vault:meta` its last Init or Clone used. A device
+  that finds a different one pauses sync before applying anything from the
+  database, so it neither pulls the new database's documents nor pushes
+  documents encrypted with the old key, until it runs Clone.
 - **Config database**: set at Create from Config Sync's Step 1 and recorded
   in `config:meta`. Step 1 values left unset inherit the Vault Sync settings.
   `config:meta` is a crypto root of its own (its own salt and `keyCheck`),
