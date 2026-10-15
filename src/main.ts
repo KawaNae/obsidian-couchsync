@@ -481,6 +481,7 @@ export default class CouchSyncPlugin extends Plugin {
             getSettings: () => this.settings,
             vault: vaultIO,
             vaultSync: this.vaultSync,
+            requestReconcile: () => this.fireReconcile("paused"),
         });
         this.conflictOrchestrator.register();
         this.reconciler.setConflictOrchestrator(this.conflictOrchestrator);
@@ -778,7 +779,7 @@ export default class CouchSyncPlugin extends Plugin {
         const content = await this.historyManager.restoreToRecord(filePath, recordId);
         if (content === null) return false;
         try {
-            await this.vaultSync.forceLocalEdit(filePath, {});
+            await this.vaultSync.forceLocalEdit(filePath);
         } catch {
             // Sync propagation failure is non-fatal — file is already restored on disk.
         }

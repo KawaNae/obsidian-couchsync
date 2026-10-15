@@ -72,6 +72,19 @@ export interface DbToFileOptions {
 
 type DeclinedWrite = Extract<WriteResult, { applied: false }>;
 
+/** Result of `forceLocalEdit` / `forceMarkDeleted` / `keepLocalDoc`.
+ *  `stale`: the LocalDB doc no longer has the expected vclock, nothing was
+ *  written. `no-file`: the vault file to commit is gone, nothing was written. */
+export type ForceWriteOutcome = "written" | "stale" | "no-file";
+
+/** No expectation always matches. An expectation requires the doc to exist
+ *  with an equal vclock. */
+function matchesExpected(existing: FileDoc | null, expected: VectorClock | undefined): boolean {
+    if (expected === undefined) return true;
+    if (!existing) return false;
+    return compareVC(existing.vclock ?? {}, expected) === "equal";
+}
+
 /** A baseline (`lastSynced`) entry as the store writes it. */
 type BaselineRow = Extract<VclockUpdate, { op: "set" }>;
 
@@ -1115,47 +1128,77 @@ export class VaultSync {
     }
 
     /**
-     * Force-push the local vault content for `path`, merging the supplied
-     * `baselineVclock` into the new doc's vclock. Bypasses the divergent
-     * guard. Used by ConflictOrchestrator when the user picks keep-local
-     * in the divergent-edit modal — at that point the divergent state IS
-     * the resolution, and the user's content must reach the LocalDB so
-     * the push loop carries it to remote — and by restoring a version from
-     * the history.
+     * Commit the vault content of `path` over its LocalDB doc, bypassing the
+     * divergent guard. The new vclock dominates the doc it replaces, so the
+     * push loop carries the vault content to remote, and the baseline moves
+     * with it. Used when the user keeps the vault side of a conflict (an edit,
+     * or a file made again over a deletion), and to propagate a history
+     * restore.
+     *
+     * `expectedVclock`: the vclock of the doc the user decided against. When
+     * given, nothing is written unless the LocalDB doc still has exactly that
+     * vclock ("stale" otherwise): a pull may have moved the doc while the
+     * dialog was open, and the newer version must not be replaced unseen.
+     * Omit it only when there is no such decision (a history restore), and
+     * the vault content is committed over whatever doc is there.
      */
-    async forceLocalEdit(path: string, baselineVclock: VectorClock): Promise<void> {
+    async forceLocalEdit(path: string, expectedVclock?: VectorClock): Promise<ForceWriteOutcome> {
         const fileStat = await this.vault.stat(path);
-        if (!fileStat) return;
+        if (!fileStat) return "no-file";
         const content = await this.vault.readBinary(path);
         const chunks = await splitIntoChunks(content, this.hasher);
         const chunkIds = chunks.map((c) => c._id);
         const fileId = makeFileId(path);
-        await this.commitKeptVersion(path, `forceLocalEdit ${path}`, baselineVclock, () => ({
-            doc: {
-                _id: fileId,
-                schemaVersion: FILE_SCHEMA_VERSION,
-                type: "file",
-                chunks: chunkIds,
-                mtime: fileStat.mtime,
-                ctime: fileStat.ctime,
-                size: fileStat.size,
-            },
-            chunks: chunks as unknown as CouchSyncDoc[],
-            // The vault holds the kept content. mtime from the pre-read
-            // stat: if the file changed between stat and readBinary, the
-            // recorded mtime is older than the content → next stat differs
-            // → cache miss → re-hash. Always the safe direction.
-            baseline: (clock) => ({
-                path, op: "set", clock,
-                chunks: chunkIds, size: fileStat.size, mtime: fileStat.mtime,
+        const committed = await this.commitKeptVersion(
+            path, `forceLocalEdit ${path}`, expectedVclock, {}, () => ({
+                doc: {
+                    _id: fileId,
+                    schemaVersion: FILE_SCHEMA_VERSION,
+                    type: "file",
+                    chunks: chunkIds,
+                    mtime: fileStat.mtime,
+                    ctime: fileStat.ctime,
+                    size: fileStat.size,
+                },
+                chunks: chunks as unknown as CouchSyncDoc[],
+                // The vault holds the kept content. mtime from the pre-read
+                // stat: if the file changed between stat and readBinary, the
+                // recorded mtime is older than the content → next stat
+                // differs → cache miss → re-hash. Always the safe direction.
+                baseline: (clock) => ({
+                    path, op: "set", clock,
+                    chunks: chunkIds, size: fileStat.size, mtime: fileStat.mtime,
+                }),
             }),
-        }));
+        );
+        return committed === "stale" ? "stale" : "written";
+    }
+
+    /**
+     * Tombstone the LocalDB doc of `path`, bypassing the divergent guard,
+     * and record the deletion as the vault's synced state. Used when the
+     * user keeps the vault-side deletion of a conflict. `expectedVclock` is
+     * the vclock of the doc the user decided against, as in
+     * `forceLocalEdit`; there is always such a decision here.
+     */
+    async forceMarkDeleted(path: string, expectedVclock: VectorClock): Promise<ForceWriteOutcome> {
+        const committed = await this.commitKeptVersion(
+            path, `forceMarkDeleted ${path}`, expectedVclock, {}, (existing) => {
+                // The expectation guarantees a doc: an absent one is stale.
+                const { vclock: _replaced, ...doc } = existing!;
+                return {
+                    doc: { ...doc, deleted: true, mtime: Date.now() },
+                    baseline: (clock) => VaultSync.deletedBaselineRow(path, clock),
+                };
+            },
+        );
+        return committed === "stale" ? "stale" : "written";
     }
 
     /**
      * Keep the local DB doc of `path` over a concurrent remote version: the
      * user chose it in a pull conflict, where the dialog compared that doc
-     * (its vclock `seenVclock`) with the remote one (`remoteVclock`). The
+     * (its vclock `expectedVclock`) with the remote one (`remoteVclock`). The
      * counterpart of `forceLocalEdit`, whose kept content is the vault's.
      *
      * One write commits the doc again with a vclock that dominates both
@@ -1171,74 +1214,80 @@ export class VaultSync {
      * synced is left there, and the reconcile offers it as a conflict.
      *
      * Returns "stale" and writes nothing when the doc is no longer the one
-     * the dialog showed: the choice was made about a version that has been
-     * replaced since.
+     * the dialog showed, as `forceLocalEdit` does.
      */
     async keepLocalDoc(
         path: string,
-        seenVclock: VectorClock,
+        expectedVclock: VectorClock,
         remoteVclock: VectorClock,
-    ): Promise<"kept" | "stale"> {
-        const kept = await this.commitKeptVersion(path, `keepLocalDoc ${path}`, remoteVclock, (existing) => {
-            if (!existing || compareVC(existing.vclock ?? {}, seenVclock) !== "equal") return null;
-            const ls = this.lastSynced.get(toPathKey(path));
-            const { vclock: _replaced, ...doc } = existing;
-            return {
-                doc,
-                baseline: ls && baselineHoldsContent(ls, existing)
-                    ? (clock) => existing.deleted
-                        ? VaultSync.deletedBaselineRow(path, clock)
-                        : {
-                            path, op: "set", clock,
-                            chunks: existing.chunks, size: existing.size,
-                            ...(ls.mtime !== undefined ? { mtime: ls.mtime } : {}),
-                        }
-                    : null,
-            };
-        });
-        if (!kept) {
-            logInfo(`keepLocalDoc: ${path} changed since the conflict was shown — nothing kept`);
-            return "stale";
-        }
-        if (!kept.baselineRecorded) {
-            const written = await this.dbToFile(kept.doc);
+    ): Promise<ForceWriteOutcome> {
+        const committed = await this.commitKeptVersion(
+            path, `keepLocalDoc ${path}`, expectedVclock, remoteVclock, (existing) => {
+                // The expectation guarantees a doc: an absent one is stale.
+                const shown = existing!;
+                const ls = this.lastSynced.get(toPathKey(path));
+                const { vclock: _replaced, ...doc } = shown;
+                return {
+                    doc,
+                    baseline: ls && baselineHoldsContent(ls, shown)
+                        ? (clock) => shown.deleted
+                            ? VaultSync.deletedBaselineRow(path, clock)
+                            : {
+                                path, op: "set", clock,
+                                chunks: shown.chunks, size: shown.size,
+                                ...(ls.mtime !== undefined ? { mtime: ls.mtime } : {}),
+                            }
+                        : null,
+                };
+            },
+        );
+        if (committed === "stale") return "stale";
+        if (!committed.baselineRecorded) {
+            const written = await this.dbToFile(committed.doc);
             if (written.applied === false) {
                 logWarn(`keepLocalDoc: kept ${path} in the local DB; vault write skipped (${written.reason})`);
             }
         }
-        return "kept";
+        return "written";
     }
 
     /**
-     * The commit both ways of keeping this device's version share: in one
+     * The commit every way of keeping this device's version shares: in one
      * write, the kept version gets a vclock that dominates the doc it
-     * replaces and `otherVclock` (the version not kept), and, when `keep`
-     * says what the vault holds as synced, the baseline takes that vclock.
+     * replaces and `notKeptVclock` (the version not kept, when the local DB
+     * does not hold it), and, when `keep` says what the vault holds as
+     * synced, the baseline takes that vclock.
      *
-     * `keep` sees the doc as committed and returns the kept version, or
-     * null to write nothing. It may run more than once: a concurrent write
-     * between its read and the commit fails the CAS and the write is
-     * rebuilt from a fresh read.
+     * `expectedVclock` is the vclock of the doc the user decided against or
+     * chose to keep. When given, nothing is written unless the doc exists
+     * with exactly that vclock, and "stale" is returned. The check runs on
+     * the same read as the commit, so a pull that lands in between fails
+     * the CAS, the builder runs again and the check sees it. When omitted,
+     * the commit builds on whatever doc is there.
+     *
+     * `keep` sees the doc as committed and returns the kept version. It may
+     * run more than once, for the same reason.
      */
     private async commitKeptVersion(
         path: string,
         context: string,
-        otherVclock: VectorClock,
-        keep: (existing: FileDoc | null) => KeptVersion | null,
-    ): Promise<{ doc: FileDoc; baselineRecorded: boolean } | null> {
+        expectedVclock: VectorClock | undefined,
+        notKeptVclock: VectorClock,
+        keep: (existing: FileDoc | null) => KeptVersion,
+    ): Promise<{ doc: FileDoc; baselineRecorded: boolean } | "stale"> {
         const fileId = makeFileId(path);
         const deviceId = this.getSettings().deviceId;
-        const outcome: { committed: { doc: FileDoc; baselineRecorded: boolean } | null } = {
-            committed: null,
+        const outcome: { committed: { doc: FileDoc; baselineRecorded: boolean } | "stale" } = {
+            committed: "stale",
         };
         try {
             await this.db.runWriteBuilder(
                 async (snap) => {
-                    outcome.committed = null;
+                    outcome.committed = "stale";
                     const existing = (await snap.get(fileId)) as FileDoc | null;
+                    if (!matchesExpected(existing, expectedVclock)) return null;
                     const version = keep(existing);
-                    if (!version) return null;
-                    const vclock = incrementVC(mergeVC(otherVclock, existing?.vclock ?? {}), deviceId);
+                    const vclock = incrementVC(mergeVC(notKeptVclock, existing?.vclock ?? {}), deviceId);
                     const doc = { ...version.doc, vclock } as FileDoc;
                     const row = version.baseline?.(vclock) ?? null;
                     const result = { doc, baselineRecorded: row !== null };
@@ -1261,54 +1310,10 @@ export class VaultSync {
             this.surfaceWriteError(e, context);
             throw e;
         }
-        return outcome.committed;
-    }
-
-    /**
-     * Force-tombstone the local doc for `path`, merging `baselineVclock`
-     * into the tombstone's vclock. Bypasses the divergent guard. Used by
-     * ConflictOrchestrator when the user picks keep-local (= keep
-     * deletion) in the divergent-delete modal.
-     */
-    async forceMarkDeleted(path: string, baselineVclock: VectorClock): Promise<void> {
-        const fileId = makeFileId(path);
-        const deviceId = this.getSettings().deviceId;
-        try {
-            await this.db.runWriteBuilder(
-                async (snap) => {
-                    const existing = (await snap.get(fileId)) as FileDoc | null;
-                    if (!existing) {
-                        return {
-                            vclocks: [{ path, op: "delete" }],
-                            onCommit: () => { this.lastSynced.delete(toPathKey(path)); },
-                        };
-                    }
-                    if (existing.deleted) {
-                        // Already a tombstone — align the deleted baseline
-                        // instead of erasing the entry.
-                        return this.deletedBaselineTx(path, existing.vclock ?? {});
-                    }
-                    const merged = mergeVC(baselineVclock, existing.vclock ?? {});
-                    const newVclock = incrementVC(merged, deviceId);
-                    return {
-                        docs: [{
-                            doc: {
-                                ...existing,
-                                deleted: true,
-                                mtime: Date.now(),
-                                vclock: newVclock,
-                            } as unknown as CouchSyncDoc,
-                            expectedVclock: existing.vclock,
-                        }],
-                        ...this.deletedBaselineTx(path, newVclock),
-                    };
-                },
-                { maxAttempts: CAS_MAX_ATTEMPTS },
-            );
-        } catch (e) {
-            this.surfaceWriteError(e, `forceMarkDeleted ${path}`);
-            throw e;
+        if (outcome.committed === "stale") {
+            logInfo(`${context}: the doc changed since the conflict was shown — nothing written`);
         }
+        return outcome.committed;
     }
 
     /**

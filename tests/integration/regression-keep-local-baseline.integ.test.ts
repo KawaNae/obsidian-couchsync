@@ -99,6 +99,7 @@ describe("regression: Keep Local on a pull conflict keeps the baseline in step",
             getSettings: () => settings,
             vault,
             vaultSync: vs,
+            requestReconcile: () => {},
             batchThreshold: 2,
             batchDebounceMs: 20,
         }).register();

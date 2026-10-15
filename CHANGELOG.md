@@ -16,7 +16,10 @@ All notable changes to obsidian-couchsync.
   one that came into the filters when they were widened — when another
   device had a file at the same path. The pull now leaves the file as it is
   and keeps the pulled version in the local database; the conflict dialog
-  then shows both, and the chosen one is written. A never-synced file with
+  then shows both, and the chosen one is written. If another version is
+  pulled while that dialog is open, Keep Local writes nothing and the
+  dialog asks again with the newer version, instead of replacing it unseen.
+  A never-synced file with
   the same content as the pulled version is not a conflict: the device only
   records it as synced. Files the filters keep out are not offered. Clone
   still replaces the files at the same path, as its confirmation says.

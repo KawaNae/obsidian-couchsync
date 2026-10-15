@@ -4,7 +4,7 @@ import { ConflictResolver } from "./conflict-resolver.ts";
 import type { HistoryCapture } from "../history/history-capture.ts";
 import type { CouchSyncSettings } from "../settings.ts";
 import type { WriteResult } from "../sync/vault-writer.ts";
-import type { VaultSync, DbToFileOptions } from "../sync/vault-sync.ts";
+import type { VaultSync, DbToFileOptions, ForceWriteOutcome } from "../sync/vault-sync.ts";
 import type { IVaultIO } from "../types/vault-io.ts";
 import type { FileDoc, CouchSyncDoc } from "../types.ts";
 import type { IModalPresenter, ConflictBatchItem, ConflictContent } from "../types/modal-presenter.ts";
@@ -26,6 +26,10 @@ export interface ConflictOrchestratorDeps {
     getSettings: () => CouchSyncSettings;
     vault: IVaultIO;
     vaultSync: VaultSync;
+    /** Ask the reconcile to look at the vault again. A Keep Local on a
+     *  conflict it found that applied nothing is offered again this way,
+     *  with the versions as they are now. */
+    requestReconcile: () => void;
     /** Conflicts in a single drain ≥ this count are shown as ONE batch modal
      *  instead of N stacked single modals (the black-screen fix). Default 10. */
     batchThreshold?: number;
@@ -59,9 +63,10 @@ const USER_CHOSE_REMOTE: DbToFileOptions = { overwriteVaultChange: true };
 /**
  * What applying the user's choice did.
  * - `applied`: the chosen version was committed.
- * - `superseded`: nothing was written, because the local version the dialog
- *   showed had been replaced before the choice was applied. The conflict is
- *   presented again with the current versions.
+ * - `superseded`: nothing was written, because the local DB doc the dialog
+ *   showed had been replaced before the choice was applied (or the vault
+ *   file it showed was gone). The conflict is presented again with the
+ *   current versions.
  */
 type ApplyOutcome = "applied" | "superseded";
 
@@ -448,10 +453,9 @@ export class ConflictOrchestrator {
                 }
                 return "applied";
             },
-            applyKeepLocal: async () => {
-                await this.deps.vaultSync.forceLocalEdit(filePath, remoteDoc.vclock ?? {});
-                return "applied";
-            },
+            applyKeepLocal: async () => this.vaultSideKept(
+                filePath, await this.deps.vaultSync.forceLocalEdit(filePath, remoteDoc.vclock),
+            ),
             clearDurable: async () => {},
             waiters: [],
         });
@@ -494,10 +498,9 @@ export class ConflictOrchestrator {
                 }
                 return "applied";
             },
-            applyKeepLocal: async () => {
-                await this.deps.vaultSync.forceMarkDeleted(filePath, remoteDoc.vclock ?? {});
-                return "applied";
-            },
+            applyKeepLocal: async () => this.vaultSideKept(
+                filePath, await this.deps.vaultSync.forceMarkDeleted(filePath, remoteDoc.vclock),
+            ),
             clearDurable: async () => {},
             waiters: [],
         });
@@ -553,13 +556,29 @@ export class ConflictOrchestrator {
             },
             // Keep the recreated file: commit it over the tombstone with a
             // vclock that dominates it, so the recreate replicates everywhere.
-            applyKeepLocal: async () => {
-                await this.deps.vaultSync.forceLocalEdit(filePath, tombstoneDoc.vclock ?? {});
-                return "applied";
-            },
+            applyKeepLocal: async () => this.vaultSideKept(
+                filePath, await this.deps.vaultSync.forceLocalEdit(filePath, tombstoneDoc.vclock),
+            ),
             clearDurable: async () => {},
             waiters: [],
         });
+    }
+
+    /**
+     * What a Keep Local of a conflict the reconcile found did. When it wrote
+     * nothing (the local DB doc the dialog showed was replaced, or the vault
+     * file is gone), the reconcile looks at the path again and offers what
+     * is there now, as a pull conflict is offered again with the current
+     * version.
+     */
+    private vaultSideKept(filePath: string, outcome: ForceWriteOutcome): ApplyOutcome {
+        if (outcome === "written") return "applied";
+        logInfo(
+            `Conflict on ${filePath.split("/").pop()} not applied: the ` +
+            `${outcome === "no-file" ? "vault file is gone" : "local version moved"}; re-checking`,
+        );
+        this.deps.requestReconcile();
+        return "superseded";
     }
 
     /**
@@ -732,9 +751,9 @@ export class ConflictOrchestrator {
         // the vault's baseline, so the next vault change is judged against
         // the version kept.
         const kept = await this.deps.vaultSync.keepLocalDoc(
-            filePath, localDoc.vclock ?? {}, remoteDoc.vclock ?? {},
+            filePath, localDoc.vclock, remoteDoc.vclock,
         );
-        if (kept === "stale") {
+        if (kept !== "written") {
             // The local version changed while the dialog was open. Present
             // the conflict again with the current version, as for a newer
             // remote version that arrives meanwhile; one already waiting

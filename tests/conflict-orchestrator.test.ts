@@ -65,7 +65,7 @@ describe("ConflictOrchestrator", () => {
     let dbToFileOpts: Array<DbToFileOptions | undefined>;
     let saveConflictCalls: any[];
     /** What the stubbed VaultSync.keepLocalDoc answers, and its calls. */
-    let keepLocalAnswer: "kept" | "stale";
+    let keepLocalAnswer: "written" | "stale";
     let keepLocalCalls: Array<[string, Record<string, number>, Record<string, number>]>;
     const vaultSyncStub = () => ({
         keepLocalDoc: async (path: string, seen: Record<string, number>, remote: Record<string, number>) => {
@@ -118,7 +118,7 @@ describe("ConflictOrchestrator", () => {
         dbToFileCalls = [];
         dbToFileOpts = [];
         saveConflictCalls = [];
-        keepLocalAnswer = "kept";
+        keepLocalAnswer = "written";
         keepLocalCalls = [];
     });
 
@@ -148,6 +148,7 @@ describe("ConflictOrchestrator", () => {
             },
             vault: { readBinary: async () => vaultBytes.slice().buffer } as any,
             vaultSync: vaultSyncStub() as any,
+            requestReconcile: () => {},
             getSettings: () => settings,
             // Drain on the next macrotask so single-conflict tests don't wait
             // the production debounce; a synchronous burst still coalesces.
@@ -482,6 +483,7 @@ describe("ConflictOrchestrator", () => {
             getSettings: () => settings,
             vault: {} as any,
             vaultSync: vaultSyncStub() as any,
+            requestReconcile: () => {},
             batchDebounceMs: 0,
             batchThreshold: 3,
         });
