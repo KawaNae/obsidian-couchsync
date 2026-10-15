@@ -154,27 +154,34 @@ export class FakeCouchClient implements ICouchClient {
 
     async changes<T>(opts: ChangesOpts, signal?: AbortSignal): Promise<ChangesResult<T>> {
         throwIfAborted(signal);
+        return this.readChanges<T>(opts);
+    }
+
+    private readChanges<T>(opts: ChangesOpts): ChangesResult<T> {
         const since = typeof opts.since === "number" ? opts.since : 0;
-        const results: ChangeRow<T>[] = [];
-        for (const [id, stored] of this.docs) {
-            if (stored.seq <= since) continue;
-            results.push({
+        // Like CouchDB: rows in seq order (each doc at its latest seq), and
+        // a response cut at `limit` reports the seq of its last row, so the
+        // next `since` resumes right after it.
+        const entries = [...this.docs]
+            .filter(([, stored]) => stored.seq > since)
+            .sort(([, x], [, y]) => x.seq - y.seq);
+        const cut = !!opts.limit && entries.length > opts.limit;
+        const results: ChangeRow<T>[] = (cut ? entries.slice(0, opts.limit) : entries)
+            .map(([id, stored]) => ({
                 id,
                 seq: stored.seq,
                 doc: opts.include_docs ? ({ ...stored.doc, _rev: stored.rev } as T) : undefined,
                 deleted: stored.deleted,
-            });
-            if (opts.limit && results.length >= opts.limit) break;
-        }
-        return { results, last_seq: this.seqCounter };
+            }));
+        return { results, last_seq: cut ? results[results.length - 1].seq : this.seqCounter };
     }
 
     /**
      * Longpoll: drains immediately if changes exist past `since`; otherwise
      * parks the caller until `bulkDocs` produces something, the client is
-     * destroyed, or the caller's AbortSignal fires. Avoids calling
-     * `changes()` on the empty-and-quiet path so tests that spy on
-     * `changes` see only intentional polls.
+     * destroyed, or the caller's AbortSignal fires. Never goes through
+     * `changes()`, so tests that spy on `changes` see only the pipeline's
+     * own plain fetches.
      */
     async changesLongpoll<T>(opts: ChangesOpts, signal?: AbortSignal): Promise<ChangesResult<T>> {
         throwIfAborted(signal);
@@ -183,7 +190,7 @@ export class FakeCouchClient implements ICouchClient {
                 ? opts.since
                 : parseInt(String(opts.since ?? 0), 10) || 0;
             if (this.seqCounter > sinceNum) {
-                return this.changes<T>(opts);
+                return this.readChanges<T>(opts);
             }
             // Race the tick wake against the abort signal so parked
             // callers exit immediately when the session is torn down.

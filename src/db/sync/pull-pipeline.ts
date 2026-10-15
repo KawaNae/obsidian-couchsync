@@ -9,6 +9,10 @@
  *     errors with exponential backoff, routes hard errors through the
  *     shared ErrorRecovery, and exits cleanly on `isCancelled()`.
  *
+ * Both read `_changes` in batches of at most PULL_BATCH_SIZE rows. A batch
+ * is applied as one unit and the session can only stop between batches,
+ * so the bound also bounds how long a teardown waits for the pull to stop.
+ *
  * Before applying a batch, the pipeline asks the vault setup to re-check
  * that the remote DB is still the one this device set up against
  * (`recheckRoot`) when the batch carries a sign that it was re-created by
@@ -45,11 +49,13 @@ function seqNumeric(seq: number | string): number {
     return Number.isNaN(n) ? 0 : n;
 }
 
-// Lowered from 200 in v0.20.6: 200-row `_changes?include_docs=true`
-// payloads can exceed the 30s wall-clock timeout on flaky mobile
-// networks (Android iPad observed in production). 100 is the safe
-// floor that keeps catchup progressing even on borderline LTE.
-const CATCHUP_BATCH_SIZE = 100;
+// Rows per `_changes?include_docs=true` response, catchup and longpoll
+// alike: both read the same feed with the same request shape, so the same
+// payload bound applies. Lowered from 200 in v0.20.6: 200-row payloads can
+// exceed the 30s wall-clock timeout on flaky mobile networks (Android iPad
+// observed in production). 100 is the safe floor that keeps the pull
+// progressing even on borderline LTE.
+const PULL_BATCH_SIZE = 100;
 const CATCHUP_IDLE_TIMEOUT_MS = 60_000;
 const PULL_RETRY_MIN_MS = 2_000;
 const PULL_RETRY_MAX_MS = 30_000;
@@ -124,7 +130,7 @@ export class PullPipeline {
                 result = await this.deps.client.changes<CouchSyncDoc>({
                     since: this.deps.checkpoints.getRemoteSeq(),
                     include_docs: true,
-                    limit: CATCHUP_BATCH_SIZE,
+                    limit: PULL_BATCH_SIZE,
                 }, this.deps.signal);
             } catch (e) {
                 if (isAbortError(e) || this.deps.isCancelled()) return;
@@ -188,6 +194,7 @@ export class PullPipeline {
     async runLongpoll(): Promise<void> {
         const sess = this.deps.sessionEpoch;
         let exitReason: "cancelled" | "halted" = "cancelled";
+        let backlog = false;
         try {
             while (!this.deps.isCancelled()) {
                 if (this.deps.visibility.isHidden()) {
@@ -201,10 +208,21 @@ export class PullPipeline {
                 // bumping retryMs / polluting the log.
                 const cycle = this.deps.visibility.linkedAbortOnHidden(this.deps.signal);
                 try {
-                    const result = await this.deps.client.changesLongpoll<CouchSyncDoc>({
+                    // A backlog is drained with plain fetches: there is
+                    // nothing to wait for, and a plain fetch is not cut off
+                    // by the longpoll's wall-clock max-wait while its body
+                    // is still arriving.
+                    const opts = {
                         since: this.deps.checkpoints.getRemoteSeq(),
                         include_docs: true,
-                    }, cycle.signal);
+                        limit: PULL_BATCH_SIZE,
+                    };
+                    const result: ChangesResult<CouchSyncDoc> = backlog
+                        ? await this.deps.client.changes<CouchSyncDoc>(opts, cycle.signal)
+                        : await this.deps.client.changesLongpoll<CouchSyncDoc>(opts, cycle.signal);
+                    // A full batch means the feed was cut at the limit and
+                    // more changes are probably waiting past it.
+                    backlog = result.results.length >= PULL_BATCH_SIZE;
 
                     if (this.deps.isCancelled()) return;
 
